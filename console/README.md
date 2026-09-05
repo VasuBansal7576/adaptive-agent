@@ -23,9 +23,9 @@ Switching modes resets ALL per-mode state (runs, events, candidates, cursors); t
 - **Register environment**: full manifest — docs (with hashes + learner/operator classification), tool schemas, declared execution modes, policy/evaluator/reset references, capability metadata.
 - **Cancel / approval / rollback** failures surface visibly with the API correlation ID.
 
-## Expected backend endpoints (see src/api/rest.ts)
+## Expected backend endpoints (aligned with adaptive-agent-2 commit 7d3c2b5)
 
-GET `/environments`, `/runs`, `/skills`, `/candidates`; POST `/environments`, `/environments/validate`, `/runs`, `/runs/{id}/cancel`, `/runs/{id}/approvals/{approvalId}`, `/candidates/{id}/rollback`, `/learning-cycles`; SSE `/runs/{id}/events?cursor=N` with monotonically increasing sequence numbers. Error envelope `{code, message, correlationId, retry}` per SPEC.
+GET `/environments`, `/runs`, `/runs/{id}`, `/skills`, `/candidates`; POST `/environments` (strict full manifest: `docs[]` + `taskGoals[]` + canonical `{id,version,sha256}` refs + `executionModes[]`), `/environments/form` (string compatibility form), `/environments/validate` (string projection), `/runs` (canonical `taskRef` projection with `idempotencyKey`, `executionMode` recorded on the run and its events), `/runs/{id}/launch` (explicit launch, 202), `/runs/{id}/cancel`, `/runs/{id}/approvals/{approvalId}`, `/learning/launch` (`{runId, predictedEffect, evidenceIds}`), `/candidates/{id}/rollback`; SSE `/runs/{id}/events?cursor=N` with monotonically increasing sequence numbers. Error envelope `{code, message, correlationId, retry}` (FastAPI `detail` envelopes unwrapped).
 
 ## States covered
 

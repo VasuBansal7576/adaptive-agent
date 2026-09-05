@@ -91,12 +91,17 @@ describe("createRun, learning cycle, and registration", () => {
     expect(await within(dialog).findByText(/nonzero model token\/cost cap is required/)).toBeInTheDocument();
   });
 
-  it("runs a learning cycle that adds an evidence-linked candidate", async () => {
+  it("runs a learning cycle that stages an evidence-linked proposal", async () => {
     const user = userEvent.setup();
     render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
     await user.click(await screen.findByRole("tab", { name: "Candidates" }));
     await user.click(await screen.findByRole("button", { name: "Run learning cycle" }));
-    expect(await screen.findByText(/Learning cycle complete: candidate cand-sim-\d+ submitted/)).toBeInTheDocument();
+    const dialog = await screen.findByRole("dialog", { name: "Run learning cycle" });
+    await user.selectOptions(within(dialog).getByLabelText("Run (development attempt)"), "run-sim-1001");
+    await user.type(within(dialog).getByLabelText("Predicted effect"), "fewer stale updates (prediction, not a score)");
+    await user.type(within(dialog).getByLabelText("Evidence IDs (comma-separated)"), "ev-sim-31");
+    await user.click(within(dialog).getByRole("button", { name: "Stage learning cycle" }));
+    expect(await screen.findByText(/Learning cycle staged: action learn-sim-\d+ \(staged\)/)).toBeInTheDocument();
   });
 
   it("registers a complete environment manifest", async () => {
@@ -110,8 +115,8 @@ describe("createRun, learning cycle, and registration", () => {
     await user.type(screen.getByLabelText("Reset fixture reference"), "reset-it");
     await user.click(screen.getByRole("checkbox", { name: /dry_run/ }));
     fireEvent.change(screen.getByLabelText(/Documentation \(JSON array/), { target: { value: '[{"id":"doc1","sha256":"a1","classification":"learner"}]' } });
+    fireEvent.change(screen.getByLabelText(/Task goals \(JSON array/), { target: { value: '["read the counter"]' } });
     fireEvent.change(screen.getByLabelText(/Tool schemas \(JSON array/), { target: { value: '[{"name":"it.read","effect":"read"}]' } });
-    fireEvent.change(screen.getByLabelText(/Capability metadata/), { target: { value: '["read"]' } });
     await user.click(screen.getByRole("button", { name: "Register environment" }));
     expect(await screen.findByText(/Environment registered\./)).toBeInTheDocument();
     expect(await screen.findByText("it-sim")).toBeInTheDocument();

@@ -5,8 +5,14 @@ import type {
   RunRecord,
   SkillVersionSummary,
 } from "./types";
-import type { ConsoleTransport, CreateRunInput, EnvironmentPackageForm, EnvironmentRegistration } from "./transport";
-import { validatePackageFields, formToRegistration } from "./transport";
+import type {
+  ConsoleTransport,
+  CreateRunInput,
+  EnvironmentPackageForm,
+  EnvironmentRegistration,
+  LearningCycleInput,
+} from "./transport";
+import { validatePackageFields } from "./transport";
 import { parseRun } from "./validate";
 
 /**
@@ -160,6 +166,8 @@ const scripted: Record<string, ScriptedEvent[]> = {
 };
 
 /** Events for runs created through createRun in this fixture session. */
+let learningActionCount = 0;
+
 function scriptForNewRun(runId: string, input: CreateRunInput): ScriptedEvent[] {
   return [
     { sequence: 1, kind: "status", summary: `Run queued and pinned to the current active bundle (${input.executionMode} mode).` },
@@ -290,6 +298,7 @@ export function createSimulationTransport(options?: {
           budgetRef: { id: `budget-${input.idempotencyKey.slice(0, 8)}`, version: "1", sha256: hash(45) },
           status: "queued",
           lastEventSequence: 0,
+          executionMode: input.executionMode,
           environmentId: input.environmentId,
           goal: input.goal,
           budgetUsed: { calls: 0, callsCeiling: input.budget.toolCallCeiling, wallSeconds: 0, wallCeiling: input.budget.wallSecondsCeiling },
@@ -301,6 +310,13 @@ export function createSimulationTransport(options?: {
       return structuredClone(run);
     },
 
+    async launchRun(runId: string) {
+      scripted[runId] = [
+        ...(scripted[runId] ?? []),
+        { sequence: (scripted[runId]?.length ?? 0) + 1, kind: "status" as const, summary: `Run started in ${runCatalog.find((r) => r.runId === runId)?.executionMode ?? "interactive"} mode with authenticated model runner.` },
+      ];
+    },
+
     async registerEnvironment(manifest: EnvironmentRegistration) {
       const summary: EnvironmentPackageSummary = {
         environmentId: manifest.environmentId,
@@ -308,33 +324,15 @@ export function createSimulationTransport(options?: {
         validationState: "valid",
         evaluatorReady: true,
         toolCount: manifest.toolSchemas.length,
-        policyScope: manifest.policyRef,
+        policyScope: manifest.policyRef.id,
       };
       environmentCatalog = [...environmentCatalog, summary];
       return structuredClone(summary);
     },
 
-    async runLearningCycle() {
-      const candidateId = `cand-sim-${300 + candidateCatalog.length - 1}`;
-      const candidate: CandidateDiff = {
-        candidateId,
-        baseBundleRef: { id: "bundle-active", version: "7", sha256: hash(51) },
-        candidateBundleRef: { id: `bundle-${candidateId}`, version: "8", sha256: hash(52) },
-        state: "validated",
-        diff: [
-          `--- bundle-active@7/skills/recheck-before-update.py`,
-          `+++ bundle-${candidateId}@8/skills/recheck-before-update.py`,
-          `@@ -20,6 +20,9 @@`,
-          ` def handle_conflict(record):`,
-          `-    raise Abort("conflict")`,
-          `+    refreshed = read(record.id)`,
-          `+    record.version = refreshed.version`,
-          `+    return retry(record)`,
-        ].join("\n"),
-        predictedEffect: "Recover version conflicts by rereading state before retry (prediction, not a score).",
-      };
-      candidateCatalog = [candidate, ...candidateCatalog];
-      return { candidate: structuredClone(candidate) };
+    async launchLearningCycle(input: LearningCycleInput) {
+      const actionId = `learn-sim-${(learningActionCount += 1).toString().padStart(3, "0")}`;
+      return { actionId, runId: input.runId, status: "staged" as const };
     },
 
     openRunStream(runId, fromCursor, { onEvent, onState }) {
@@ -404,6 +402,3 @@ export function createSimulationTransport(options?: {
     },
   };
 }
-
-/** exposed for tests that need the raw form → manifest mapping */
-export { formToRegistration };

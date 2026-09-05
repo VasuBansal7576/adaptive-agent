@@ -39,6 +39,8 @@ export type RunRecord = {
   budgetRef: ArtifactRef;
   status: RunStatus;
   lastEventSequence: number;
+  /** recorded by POST /runs and echoed in run-started events */
+  executionMode?: "dry_run" | "interactive" | "batch" | "replay";
   outcomeRef?: ArtifactRef;
   /** console presentation fields supplied by the API projection */
   environmentId?: string;

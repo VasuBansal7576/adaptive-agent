@@ -116,6 +116,8 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     try {
       const run = await transport.createRun(input);
       dispatch({ type: "runAdded", run });
+      // explicit launch step (POST /runs/{id}/launch)
+      await transport.launchRun(run.runId);
     } catch (error) {
       failAction(error);
     }
@@ -276,9 +278,9 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
             <CandidatesView
               transport={transport}
               candidates={state.candidates}
+              runs={state.runs}
               loading={state.loading}
               onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
-              onCandidateAdded={(candidate) => dispatch({ type: "candidateAdded", candidate })}
             />
           )}
         </div>

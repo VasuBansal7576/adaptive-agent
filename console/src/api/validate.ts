@@ -119,6 +119,9 @@ export function parseRun(value: unknown, field: string): RunRecord {
     lastEventSequence: num(o.lastEventSequence, `${field}.lastEventSequence`),
   };
   if (o.outcomeRef !== undefined) run.outcomeRef = parseArtifactRef(o.outcomeRef, `${field}.outcomeRef`);
+  if (o.executionMode !== undefined) {
+    run.executionMode = oneOf(o.executionMode, ["dry_run", "interactive", "batch", "replay"] as const, `${field}.executionMode`);
+  }
   if (o.environmentId !== undefined) run.environmentId = optStr(o.environmentId, `${field}.environmentId`);
   if (o.goal !== undefined) run.goal = optStr(o.goal, `${field}.goal`);
   if (o.budgetUsed !== undefined) {

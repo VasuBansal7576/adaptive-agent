@@ -1,34 +1,40 @@
 import { useState } from "react";
-import type { ConsoleTransport } from "../api/transport";
-import type { CandidateDiff } from "../api/types";
+import type { ConsoleTransport, LearningCycleInput } from "../api/transport";
+import type { CandidateDiff, RunRecord } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
 import { Banner, EmptyState, LoadingState, Modal } from "../components/ui";
 
 export function CandidatesView({
   transport,
   candidates,
+  runs,
   loading,
   onActionError,
-  onCandidateAdded,
 }: {
   transport: ConsoleTransport;
   candidates: CandidateDiff[];
+  runs: RunRecord[];
   loading: boolean;
   onActionError: (message: string, correlationId?: string | null) => void;
-  onCandidateAdded: (candidate: CandidateDiff) => void;
 }) {
   const [rollbackTarget, setRollbackTarget] = useState<CandidateDiff | null>(null);
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
+  const [cycleOpen, setCycleOpen] = useState(false);
   const [cycleBusy, setCycleBusy] = useState(false);
+  const [cycleRunId, setCycleRunId] = useState("");
+  const [predictedEffect, setPredictedEffect] = useState("");
+  const [evidenceIds, setEvidenceIds] = useState("");
   const [notice, setNotice] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
 
-  const runCycle = async () => {
+  const runCycle = async (input: LearningCycleInput) => {
     setCycleBusy(true);
     try {
-      const { candidate } = await transport.runLearningCycle();
-      onCandidateAdded(candidate);
-      setNotice({ tone: "good", text: `✓ Learning cycle complete: candidate ${candidate.candidateId} submitted with evidence links and awaits trusted evaluation.` });
+      const { actionId, status } = await transport.launchLearningCycle(input);
+      setNotice({ tone: "good", text: `✓ Learning cycle staged: action ${actionId} (${status}) links run ${input.runId} to development evidence.` });
+      setCycleOpen(false);
+      setPredictedEffect("");
+      setEvidenceIds("");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Learning cycle failed";
       const correlationId = (error as { correlationId?: string } | null)?.correlationId ?? null;
@@ -46,7 +52,7 @@ export function CandidatesView({
           Candidates appear when the learner submits an evidence-linked proposal from a completed development
           attempt. Predicted effects are never treated as measured results.
         </EmptyState>
-        <LearningCycleButton busy={cycleBusy} onRun={() => void runCycle()} />
+        <LearningCycleButton busy={false} onRun={() => setCycleOpen(true)} />
       </div>
     );
 
@@ -81,7 +87,7 @@ export function CandidatesView({
         </p>
       </div>
 
-      <LearningCycleButton busy={cycleBusy} onRun={() => void runCycle()} />
+      <LearningCycleButton busy={false} onRun={() => setCycleOpen(true)} />
 
       {notice && <Banner tone={notice.tone} title={notice.text.replace(/^[✓✗] /, "")} />}
 
@@ -171,6 +177,79 @@ export function CandidatesView({
         ))}
       </div>
 
+      <Modal open={cycleOpen} title="Run learning cycle" onClose={() => setCycleOpen(false)}>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!cycleRunId || !predictedEffect.trim()) return;
+            const ids = evidenceIds
+              .split(/[,\s]+/)
+              .map((s) => s.trim())
+              .filter(Boolean);
+            void runCycle({ runId: cycleRunId, predictedEffect: predictedEffect.trim(), evidenceIds: ids });
+          }}
+          className="space-y-3 text-sm text-slate-300"
+        >
+          <p className="text-xs text-slate-500">
+            Stages an evidence-linked learning proposal. Predicted effects are predictions, never scores; only the
+            trusted evaluator gates promotion.
+          </p>
+          <div>
+            <label htmlFor="cycle-run" className="block text-xs font-medium text-slate-400">Run (development attempt)</label>
+            <select
+              id="cycle-run"
+              value={cycleRunId}
+              onChange={(e) => setCycleRunId(e.target.value)}
+              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
+            >
+              <option value="">Select a run…</option>
+              {runs.map((run) => (
+                <option key={run.runId} value={run.runId}>
+                  {run.runId} — {run.goal}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label htmlFor="cycle-effect" className="block text-xs font-medium text-slate-400">Predicted effect</label>
+            <textarea
+              id="cycle-effect"
+              rows={2}
+              value={predictedEffect}
+              onChange={(e) => setPredictedEffect(e.target.value)}
+              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
+              placeholder="e.g., fewer stale updates on versioned records (prediction, not a score)"
+            />
+          </div>
+          <div>
+            <label htmlFor="cycle-evidence" className="block text-xs font-medium text-slate-400">Evidence IDs (comma-separated)</label>
+            <input
+              id="cycle-evidence"
+              value={evidenceIds}
+              onChange={(e) => setEvidenceIds(e.target.value)}
+              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
+              placeholder="ev-sim-31, ev-sim-32"
+            />
+          </div>
+          <div className="flex justify-end gap-2 pt-1">
+            <button
+              type="button"
+              onClick={() => setCycleOpen(false)}
+              className="rounded-md border border-slate-600 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={cycleBusy || !cycleRunId || !predictedEffect.trim()}
+              className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-60"
+            >
+              {cycleBusy ? "Staging…" : "Stage learning cycle"}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
       <Modal open={rollbackTarget !== null} title="Request rollback" onClose={() => setRollbackTarget(null)}>
         <div className="space-y-3 text-sm text-slate-300">
           <p className="text-[13px]">
@@ -220,9 +299,9 @@ function LearningCycleButton({ busy, onRun }: { busy: boolean; onRun: () => void
         onClick={onRun}
         disabled={busy}
         className="rounded-md bg-sky-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-60"
-        title="Submits the evidence-linked candidate proposal for independent evaluation"
+        title="Stages an evidence-linked learning proposal for the selected development run"
       >
-        {busy ? "Running learning cycle…" : "Run learning cycle"}
+        Run learning cycle
       </button>
     </div>
   );

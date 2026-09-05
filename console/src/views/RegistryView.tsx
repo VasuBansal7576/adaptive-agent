@@ -1,7 +1,6 @@
 import { useState } from "react";
 import type { ConsoleTransport, EnvironmentPackageForm, EnvironmentRegistration } from "../api/transport";
-import { EXECUTION_MODES, REQUIRED_PACKAGE_FIELDS, EMPTY_PACKAGE_FORM, formToRegistration } from "../api/transport";
-import type { EnvironmentPackageSummary } from "../api/types";
+import { EXECUTION_MODES, REQUIRED_PACKAGE_FIELDS, EMPTY_PACKAGE_FORM, formToRegistration } from "../api/transport";import type { EnvironmentPackageSummary } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
 import { Banner, EmptyState, LoadingState } from "../components/ui";
 
@@ -73,7 +72,8 @@ export function RegistryView({
     setSubmitState("registering");
     setFieldErrors({});
     try {
-      const manifest = formToRegistration(form);
+      // strict full manifest: docs[] + taskGoals[] + canonical refs + modes
+      const manifest: EnvironmentRegistration = await formToRegistration(form);
       const environment = await transport.registerEnvironment(manifest);
       setSubmitState("registered");
       onRegistered(environment);
@@ -196,8 +196,8 @@ export function RegistryView({
 
           {([
             ["docs", "Documentation (JSON array: [{id, sha256, classification: \"learner\"|\"operator\"}])", 4],
+            ["taskGoals", "Task goals (JSON array of strings)", 2],
             ["toolSchemas", "Tool schemas (JSON array: [{name, version, inputSchema, outputSchema, effect}])", 4],
-            ["capabilities", "Capability metadata (JSON array of strings)", 2],
           ] as const).map(([key, label, rows]) => (
             <div key={key}>
               <label htmlFor={`pkg-${key}`} className="block text-xs font-medium text-slate-400">
