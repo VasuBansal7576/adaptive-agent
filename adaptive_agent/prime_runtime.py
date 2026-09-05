@@ -1,15 +1,10 @@
 """Prime Agent runtime adapter with a task-scoped execution boundary.
 
 The adapter talks to the installed Prime Agent Python kernel (`rlm.repl`) over
-its documented JSON-lines protocol.  It intentionally does not call Prime
-Inference: model provenance is pinned to the authenticated Codex subscription
-selector ``openai-codex/gpt-5.6-luna``.
-
-The host process is trusted.  Learner cells are run in a separate process with
-an empty credential-free environment, a private working directory, resource
-limits, a broker-only host bridge, and a conservative source policy.  Docker
-is supported as an optional stronger boundary; the host fallback is explicit in
-``ExecutionMode`` and is never presented as container isolation.
+its documented JSON-lines protocol. Every learner task runs in a Docker
+container with no host mounts or network. Model configuration and observed
+parent model evidence are kept separate; this module never treats requested
+configuration as an inference result.
 """
 from __future__ import annotations
 
@@ -19,7 +14,6 @@ import json
 import os
 import queue
 import re
-import resource
 import shutil
 import signal
 import subprocess
@@ -150,6 +144,22 @@ class ExecutionResult:
     provenance: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ModelObservation:
+    """Evidence supplied by the trusted parent after a real model response."""
+
+    provider: str
+    model: str
+    response_id: str
+    usage: Mapping[str, Any]
+    observed_at: float
+
+    def public(self) -> dict[str, Any]:
+        return {"provider": self.provider, "model": self.model,
+                "responseId": self.response_id, "usage": dict(self.usage),
+                "observedAt": self.observed_at}
+
+
 @dataclass
 class PrimeRuntimeConfig:
     task_id: str
@@ -245,33 +255,6 @@ def _find_runtime_src(explicit: Path | str | None) -> Path:
             return candidate
     raise AdapterError("installed Prime Agent rlm.repl runtime was not found")
 
-
-def _safe_env(root: Path, runtime_src: Path) -> dict[str, str]:
-    # Do not inherit provider credentials, cloud credentials, agent tokens, or
-    # arbitrary user configuration.  The runtime only needs Python and its
-    # bundled source path.
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": str(root / "home"),
-        "TMPDIR": str(root / "tmp"),
-        "PYTHONPATH": str(runtime_src),
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONUNBUFFERED": "1",
-    }
-    return env
-
-
-def _limit_process(max_cpu: int, max_memory: int, max_processes: int) -> None:
-    try:
-        resource.setrlimit(resource.RLIMIT_CPU, (max_cpu, max_cpu + 1))
-        resource.setrlimit(resource.RLIMIT_AS, (max_memory, max_memory))
-        resource.setrlimit(resource.RLIMIT_NPROC, (max_processes, max_processes))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 * 1024, 16 * 1024 * 1024))
-    except (OSError, ValueError):
-        # Windows and some managed hosts do not expose all rlimits.  The
-        # provenance records this limitation; process cancellation remains.
-        pass
 
 
 _IMAGE_CACHE: dict[str, str] = {}
@@ -511,6 +494,7 @@ class PrimeRuntimeAdapter:
         self._children = 0
         self._closed = False
         self._started_at = time.time()
+        self._model_observation: ModelObservation | None = None
         self._mode = ExecutionMode.PRIME_SUBSCRIPTION_DOCKER
         self._runtime_src = _find_runtime_src(config.runtime_src)
 
@@ -522,8 +506,9 @@ class PrimeRuntimeAdapter:
         return {
             "adapter": "adaptive-agent.prime-runtime",
             "mode": self._mode.value,
-            "provider": self.config.provider,
-            "model": self.config.model,
+            "requestedProvider": self.config.provider,
+            "requestedModel": self.config.model,
+            "observedModelInvocation": self._model_observation.public() if self._model_observation else None,
             "kernel": "Prime Agent rlm.repl protocol v3",
             "runtimeSource": str(self._runtime_src),
             "isolation": "per-run Docker container; nonroot, read-only root, tmpfs /tmp, dropped capabilities, no-new-privileges, pids/memory/cpu limits",
@@ -533,6 +518,24 @@ class PrimeRuntimeAdapter:
                        "cpuSeconds": self.config.max_cpu_seconds, "processes": self.config.max_processes},
             "limitations": "Docker daemon/image availability is an environment dependency; authenticated model calls stay in the trusted parent, never in the learner container",
         }
+
+    def record_model_observation(self, evidence: Mapping[str, Any], *, trusted_parent: bool = False) -> ModelObservation:
+        """Record parent-owned response/usage evidence, never learner claims."""
+        if not trusted_parent:
+            raise SecurityViolation("only the trusted parent may record model evidence")
+        if not isinstance(evidence, Mapping):
+            raise AdapterError("model evidence must be an object")
+        provider = evidence.get("provider")
+        model = evidence.get("model")
+        response_id = evidence.get("responseId") or evidence.get("response_id")
+        usage = evidence.get("usage")
+        if provider != self.config.provider or model != self.config.model:
+            raise AdapterError("model evidence does not match requested subscription path")
+        if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
+            raise AdapterError("model evidence requires a response id and non-empty usage")
+        observation = ModelObservation(provider, model, response_id, dict(usage), time.time())
+        self._model_observation = observation
+        return observation
 
     def start(self) -> None:
         with self._lock:
