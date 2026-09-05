@@ -26,7 +26,7 @@ Later implementation and submission gates are specified so the documentation can
 | SRC-002 | User working preferences | Confirmed engineering and stack preferences |
 | SRC-003 | [Syndicate event page](https://luma.com/d0kq45ek) | Read on 2026-09-06; primary source for the Track 1 and AO obligations below |
 | SRC-004 | Product clarification relayed by the orchestrator on 2026-09-06 | Confirmed product intent and learning constraints |
-| SRC-005 | Prime Agent static source review at commit `9c54a35dac3a2ad17910074d66664859ea175666`, relayed by the orchestrator | Static findings; distinct from installed Prime 0.9.2 and not runtime verification |
+| SRC-005 | [Prime Agent static source at commit `9c54a35dac3a2ad17910074d66664859ea175666`](https://github.com/PrimeIntellect-ai/prime-agent/tree/9c54a35dac3a2ad17910074d66664859ea175666), relayed by the orchestrator | Static findings; distinct from installed Prime 0.9.2 and not runtime verification |
 | SRC-006 | [Backpass](https://github.com/kunchenguid/backpass) review relayed by the orchestrator | Supplied influence assessment; not a required dependency |
 | SRC-007 | [Vision](https://github.com/kunchenguid/vision) review relayed by the orchestrator | Supplied influence assessment; not a required dependency |
 | SRC-008 | [Official Devpost rules](https://syndicate-by-maximor.devpost.com/rules) and [official Syndicate brief](https://maaztwts.notion.site/Syndicate-3cc32902e4a38075bfa9f03149ef150d) | Prior browser research by the controlling assistant, relayed on 2026-09-06; not independently verified by this worker or this AO orchestrator |
