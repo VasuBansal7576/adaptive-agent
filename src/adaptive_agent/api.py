@@ -226,6 +226,11 @@ class ControlPlane:
             self._emit(run_id, "status", "Run started with authenticated model runner.")
         try:
             invocation = self.model_runner(goal=run["goal"], environment=env["manifest"], emit=lambda k, s, d=None: self._emit(run_id, k, s, d))
+            provider = getattr(invocation, "provider", "")
+            model = getattr(invocation, "model", "")
+            usage = getattr(invocation, "usage", None)
+            if provider != "openai-codex" or model != "openai-codex/gpt-5.6-luna" or not isinstance(usage, Mapping):
+                raise ModelUnavailableError("model runner did not return authenticated provider, model, and usage")
             provenance = {"provider": invocation.provider, "model": invocation.model, "usage": dict(invocation.usage)}
             self._emit(run_id, "evidence", "Authenticated model response received.", json.dumps(provenance, sort_keys=True))
             outcome = dict(self.evaluator(goal=run["goal"], model_output=invocation.text, environment=env["manifest"]))

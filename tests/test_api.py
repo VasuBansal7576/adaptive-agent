@@ -65,3 +65,18 @@ def test_unknown_manifest_fields_are_rejected():
     api = client()
     invalid = {**manifest(), "privileged": True}
     assert api.post("/environments/register", json=invalid).status_code == 422
+
+
+def test_unverified_model_provenance_fails_closed():
+    class Unverified:
+        text = "done"
+        provider = "simulation"
+        model = "fixture"
+        usage = {"outputTokens": 1}
+
+    plane = ControlPlane(model_runner=lambda **_: Unverified(), evaluator=evaluator)
+    api = TestClient(create_app(plane))
+    assert api.post("/environments/register", json=manifest()).status_code == 201
+    run = api.post("/runs", json={"goal": "read", "environmentId": "neutral", "idempotencyKey": "unverified"}).json()
+    api.post(f"/runs/{run['runId']}/launch")
+    assert api.get(f"/runs/{run['runId']}").json()["status"] == "failed"
