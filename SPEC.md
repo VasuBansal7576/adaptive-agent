@@ -13,9 +13,10 @@ The same core discovers a solution, records evidence, proposes reusable procedur
 Finance, customer support, and IT are evaluation environments, not separate products or handwritten workflows.
 Results on these environments cannot establish success in arbitrary domains.
 
-The authorized work is limited to `SPEC.md`, `MILESTONES.md`, and `README.md`, their verification, and a local specification commit under the confirmed documentation authorization.
+The authorized work is limited to `SPEC.md`, `MILESTONES.md`, and `README.md`, their verification, local specification commits, fast-forward integration into local `main`, and synchronization to the filesystem-only origin.
 The initial repository is empty at `a09b012` and has a local filesystem origin.
-Implementation, dependency installation, remote creation, publication, pushes, pull requests, merging to `main`, and submission are outside this phase.
+Implementation, dependency installation, public remote creation, publication, pushes to public remotes, pull requests, and submission are outside this phase.
+The local `main` fast-forward and filesystem-only `origin/main` synchronization are authorized and complete.
 Later implementation and submission gates are specified so the documentation can support the full objective.
 
 ## Sources and evidence limits
@@ -74,7 +75,7 @@ Requirement IDs retain their meaning when details change.
 | DEC-006 | Build window, rubric, public artifacts, membership, demo length, and conditional deployment URL are confirmed | Exact submission form fields, team completion, and synthetic-fixture acceptability need release-time verification |
 | DEC-007 | Bounded Prime API bridge spike selects the small backend; Python with SQLite is the default | Model, provider, resource cap, and Prime source revision must be pinned before execution |
 | DEC-008 | Tool broker enforces permissions; explicit approval for policy-designated actions | Learned content cannot authorize actions |
-| DEC-009 | Documentation completion and local commit are authorized; orchestrator coordinates later integration and execution | No further product-scope confirmation is needed for this commit |
+| DEC-009 | Documentation completion, local commits, local `main` fast-forward, and filesystem-only origin synchronization are authorized and complete | Public remote work, publication, and execution remain separately authorized |
 
 ## Stable requirements
 
@@ -216,7 +217,8 @@ The following are proposed contracts, not files or APIs already present in the r
 | `TaskInput` | `taskId`, `environmentRef`, natural-language `goal`, allowed input references, and evaluation partition assigned by the controller; hidden answers are absent |
 | `RunRequest` | Task reference, `modelProfileRef`, `budgetRef`, requested execution mode, and idempotency key; active version is pinned by the server, not chosen by untrusted text |
 | `ExecutionConfig` | Allowed tool subset, compatible skill references, instruction variant, execution mode, step limit, child count/depth limits, and capability discovery request; all values bounded by server policy |
-| `ToolCall` | `runId`, `callId`, tool name, schema-valid arguments, and optional approval token; capability supplied out of band by the adapter |
+| `ToolCall` | `runId`, `callId`, `idempotencyKey`, tool name, canonical schema-valid arguments, and optional approval token; capability supplied out of band by the adapter |
+| `ToolOperation` | Unique `(runId, idempotencyKey)`, canonical tool and argument hash, preparation and dispatch timestamps, result reference, and state `prepared`, `dispatched`, `succeeded`, `failed`, `outcome_unknown`, or `reconciled`; retries preserve the key |
 | `ToolResult` | Call reference, tool/schema version, observed time, success/error union, redacted output reference, side-effect status, and broker provenance |
 | `EvidenceRecord` | Run reference, sequence, event type, content hash, source reference, trust class, visibility class, and redaction status; append-only |
 | `SkillVersion` | Skill ID, immutable version and parent, applicability predicates, preconditions, procedure text or Python source, expected tool contracts, failure handling, evidence references, and content hash |
@@ -226,8 +228,8 @@ The following are proposed contracts, not files or APIs already present in the r
 | `CapabilitySet` | Run-scoped capability IDs, tool/schema versions, effect classes, resource scopes, expiry, and discovery provenance; it contains no credentials and cannot expand policy |
 | `EvaluatorContract` | Evaluator version, accepted outcome input schema, result schema, reset requirement, timeout, trust owner, hidden-data boundary, and safety-test set; learner code cannot implement or edit it |
 | `BudgetSpec` | Model token ceiling, tool-call ceiling, child ceiling, wall-time ceiling, cost ceiling, reservation, and accounting currency; parent and children draw from one decreasing ledger |
-| `CandidateRecord` | Candidate ID, base hash, state `draft | validated | evaluating | promoted | rejected | quarantined | superseded | rolled_back`, diff refs, evidence refs, and transition audit |
-| `EvaluationRecord` | Evaluation ID, candidate/base hashes, state `queued | running | valid | invalid | cancelled`, partition, paired run refs, report ref, and validity reason |
+| `CandidateRecord` | Candidate ID, base hash, state `draft`, `validated`, `evaluating`, `promoted`, `rejected`, `quarantined`, `superseded`, or `rolled_back`, diff refs, evidence refs, and transition audit |
+| `EvaluationRecord` | Evaluation ID, candidate/base hashes, state `queued`, `running`, `valid`, `invalid`, or `cancelled`, partition, paired run refs, report ref, and validity reason |
 
 Visibility classes are `learner`, `operator`, and `evaluator_only`.
 The retrieval service filters visibility and environment access before ranking, including cached queries and child-session requests.
@@ -245,10 +247,13 @@ Operator reports show aggregate metrics by default and keep hidden task details 
 The control API accepts environment registration, run creation, cancellation, candidate proposal, evaluation requests, and rollback requests.
 Reads return run status, evidence references, candidate diffs, evaluation summaries, and active version history.
 Run events use monotonically increasing sequence numbers and resume from the last acknowledged cursor.
-Validation failures return `INVALID_INPUT`; forbidden requests return `FORBIDDEN`; stale base versions return `VERSION_CONFLICT`.
+Validation failures return `INVALID_INPUT`; forbidden requests return `FORBIDDEN`; stale base versions return `VERSION_CONFLICT`; changed payloads under an existing operation key return `IDEMPOTENCY_CONFLICT`.
 Exhausted budgets return `BUDGET_EXHAUSTED`; unavailable tools return `TOOL_UNAVAILABLE`; uncertain side effects return `OUTCOME_UNKNOWN`.
 These errors include a correlation ID and safe recovery guidance, not credentials or hidden evaluator data.
-Retries reuse idempotency keys and cannot create duplicate runs, evaluations, promotions, or external actions.
+Retries preserve the same tool operation idempotency key and cannot create duplicate runs, evaluations, promotions, or external actions.
+The broker stores the canonical tool name and arguments before dispatch.
+The same `(runId, idempotencyKey)` with the same canonical input returns the stored result, pending status, or unresolved status without redispatch.
+The same key with a changed canonical tool or argument payload returns `IDEMPOTENCY_CONFLICT` and never dispatches.
 
 ### Example learning contract
 
@@ -309,7 +314,7 @@ type CapabilitySet = {
 	}>;
 	provenance: ArtifactRef;
 };
-type ToolRequest = {
+type ToolCall = {
 	runId: string;
 	stepId: string;
 	callId: string;
@@ -319,7 +324,7 @@ type ToolRequest = {
 	approvalToken?: string;
 };
 type ToolError = {
-	code: "INVALID_INPUT" | "FORBIDDEN" | "VERSION_CONFLICT" |
+	code: "INVALID_INPUT" | "FORBIDDEN" | "VERSION_CONFLICT" | "IDEMPOTENCY_CONFLICT" |
 		"BUDGET_EXHAUSTED" | "TOOL_UNAVAILABLE" | "OUTCOME_UNKNOWN";
 	message: string;
 	correlationId: string;
@@ -380,10 +385,12 @@ type EvaluationRecord = {
 };
 ```
 
-The step state advances from `planned` to `running` or `awaiting_approval`, then to a terminal step status.
-A tool timeout can enter `outcome_unknown`; only broker reconciliation can resolve it to success or failure.
+The step state advances from `planned` to `running` or `awaiting_approval`, then to a terminal step status or the unresolved `outcome_unknown` status.
+A tool timeout can enter `outcome_unknown`; that status is not terminal, and only broker reconciliation can resolve the operation to success, failure, or confirmed no-effect.
 The next state-changing step is blocked while a prior effect remains unknown.
 Run success requires all required outcome checks and no unresolved step effects.
+Cancellation and timeout can make a run terminal while one or more operation records remain unresolved.
+Operation-level reconciliation continues for those records without reopening the run or allowing further learner actions.
 Candidate and evaluation records add the immutable hashes and state fields listed above, with evaluation states `queued`, `running`, `valid`, `invalid`, or `cancelled`.
 A metric failure can be a valid evaluation report but leads to a rejected candidate.
 Only the trusted controller can mark an evaluation valid.
@@ -402,15 +409,18 @@ Cost accounting records provider currency and a normalized microunit value when 
 
 SQLite stores environments, runs, steps, tool operations, evidence references, candidates, evaluations, bundle versions, active pointers, and promotion decisions.
 Foreign keys bind each run, report, and decision to existing immutable versions.
-Unique constraints cover run idempotency keys, `(runId, sequence)` events, `(runId, callId)` operations, candidate content hashes, and promotion decision IDs.
+Unique constraints cover run idempotency keys, `(runId, sequence)` events, `(runId, callId)` operation references, `(runId, idempotencyKey)` tool operations, candidate content hashes, and promotion decision IDs.
 The same idempotency key with different canonical input is a conflict, never a second operation.
 Artifact files are written to a temporary name, hashed, and atomically renamed before the transaction references them.
 Unreferenced files can be garbage-collected after recovery; referenced missing files invalidate evaluation and block promotion.
 
 The coordinator records a tool operation as prepared before dispatch and appends its result durably after return.
-On restart, prepared operations without a result are reconciled against the provider's idempotency status or marked `OUTCOME_UNKNOWN`.
+On restart, prepared operations without a result are reconciled against the provider's idempotency status or marked `outcome_unknown` in the operation ledger.
+A terminal cancelled or timed-out run does not reopen when its operation ledger continues reconciliation.
+No learner action can resume from that run, and a reconciled result cannot trigger a second dispatch.
 A lease with an expiry and monotonically increasing fencing token prevents two coordinators from dispatching the same claimed step.
 The broker rejects stale fencing tokens.
+Operation preparation, approval binding, and the first dispatch record commit atomically before an external call is made.
 Evaluation reports become immutable only after every expected pair and artifact is present.
 A report's validity, candidate transition, promotion decision, and active-pointer update use one transaction where they must succeed together.
 An interrupted evaluation cannot activate a candidate and can resume only from validated complete pairs or restart with clean fixtures.
@@ -559,7 +569,7 @@ Track evidence reports all four metrics, including regressions and tradeoffs, wi
 | EVAL-002 | Leave-one-environment-out transfer and separate within-environment adaptation, with unchanged core hash and disclosure of training exposure |
 | EVAL-003 | Injection, denied tools, approval bypass, poisoned feedback, hidden-answer retrieval, evaluator tampering, and direct harness-write attempts |
 | EVAL-004 | Rejected harmful edits, insufficient evidence, stale base, rollback, interrupted promotion, and fixture contamination |
-| EVAL-005 | Cost and concurrency caps, child failures, duplicate operations, event reconnection, and cancellation during uncertain side effects |
+| EVAL-005 | Cost and concurrency caps, child failures, duplicate operations, same-key replay and payload conflicts, single-use approval, event reconnection, and cancellation during uncertain side effects |
 | EVAL-006 | Sealed final B0/L/A comparison on all three known domains plus the new fourth environment, including exposure disclosure, confidence intervals, and failed tasks |
 
 ## Security and operational behavior
@@ -571,7 +581,10 @@ Hidden evaluators do not execute learner-authored scoring code.
 Any learned Python is untrusted code and receives the same limits as the parent kernel.
 
 Tool permissions bind environment, run, tool, resource scope, expiry, and side-effect class.
-A policy-designated approval token binds the exact tool and canonical arguments, expires, and cannot be reused for a different operation.
+A policy-designated approval token binds the run, tool operation idempotency key, exact tool, and canonical arguments.
+The broker consumes the approval atomically with operation preparation and the first dispatch record.
+An approval expires, cannot be reused, and cannot authorize a second effect.
+Replay of the same approved request can resolve the original operation only.
 The broker checks policy again immediately before execution.
 Documentation that asks the agent to disable these controls remains inert data.
 Real financial, customer, or production IT writes are outside the default evaluation profile.
@@ -625,9 +638,9 @@ Keyboard navigation, semantic labels, focus restoration, non-color status indica
 | ACC-006 | Attempt hidden-answer retrieval, evaluator/policy edits, secret reads, and child-mediated access | All attempts are denied, logged, and fail the required safety suite if any succeeds |
 | ACC-007 | Evaluate a harmful candidate, quarantine suspicious code, then rollback a promoted version | Failed candidates remain inactive; rollback restores the prior pointer and audit history; affected safety runs are cancelled |
 | ACC-008 | Execute the frozen cross-domain protocol and prepare the comparison | EVAL-001 and EVAL-002 evidence shows exposure, splits, paired settings, four metrics, uncertainty, overhead, and limits |
-| ACC-009 | Try denied tool arguments, replayed approvals, and ambiguous write retries | No unauthorized effect; approval scope is enforced; ambiguous writes require reconciliation |
+| ACC-009 | Retry a tool request with the same run and idempotency key, replay its approval, then change its canonical tool or arguments | Same input returns the stored result, pending status, or unresolved status without redispatch; changed input returns `IDEMPOTENCY_CONFLICT`; approval is consumed once and binds only the original operation |
 | ACC-010 | Inspect and control the console at the specified widths using keyboard navigation | Loading, empty, error, stale-stream, cancellation, and recovery states are usable without hidden information or duplicate events |
-| ACC-011 | Interrupt runs and promotion, disconnect the console, and exhaust child budgets | EVAL-004 and EVAL-005 show atomic activation, safe reconciliation, replayable events, no duplicate writes, and bounded use |
+| ACC-011 | Interrupt runs and promotion, cancel or time out a run with an uncertain tool effect, disconnect the console, and exhaust child budgets | `outcome_unknown` remains unresolved; operation reconciliation continues without reopening the terminal run or allowing learner actions; EVAL-004 and EVAL-005 show atomic activation, replayable events, no duplicate writes, and bounded use |
 | ACC-012 | Review AO history, demo plan, and eventual submission record | AO use is documented through the work and demo; actual submission receipt is required only in the authorized submission phase |
 | ACC-013 | Review the pinned Prime source, adapter, license notices, and public explanation | Reuse is credited; predicted refine outcomes are distinguished from evaluator results; supplied findings are verified or qualified |
 | ACC-014 | Review the authorized final package against SRC-008 | One track, all member prerequisites, public links, rubric coverage, demo length, conditional deployment URL, and submission timing are evidenced |

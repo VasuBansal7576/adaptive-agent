@@ -9,9 +9,10 @@ Product acceptance and competition compliance remain unverified until implementa
 M0 and M1 are the documentation phase.
 M0 is complete through the supplied product and official-rule clarification.
 M1 ends with a verified local commit containing only `SPEC.md`, `MILESTONES.md`, and `README.md`.
-The orchestrator owns any separately authorized integration into `main`.
+The local `main` fast-forward and filesystem-only origin synchronization for the documentation commits are authorized and complete.
 M2 through M6 require future implementation, publication, or submission authority appropriate to each action.
-The current worker does not install dependencies, create application code, publish, push, open pull requests, merge, or submit.
+The current worker does not install dependencies, create application code, publish, push to public remotes, open pull requests, or submit.
+It has completed local integration into `main` and synchronization to the filesystem-only origin.
 
 The dependency chain is M0 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6.
 After M2 fixes the contracts, environment fixtures and console work can proceed independently under assigned owners.
@@ -148,7 +149,7 @@ The evaluation owner controls hidden partitions and reports rather than delegati
 
 Codex AO worker and orchestrator defaults, including existing AO sessions, use GPT-5.6 Luna Medium.
 Devin build-time work uses SWE-1.7 Medium.
-OpenCode build-time work must use GLM-5.3-Flash, selected and running now, or Muse Spark1.3.
+OpenCode build-time work must use GLM-5.3-Flash, selected, or Muse Spark1.3.
 Big Pickle is not permitted.
 Do not assign Astra, Sol, or Terra, and do not spawn additional workers for this plan.
 Prime is the proposed product runtime and is also available for bounded bridge work.
@@ -159,7 +160,8 @@ The official kernel bootstrap was repaired with `UV_NO_CACHE=1` after a broken s
 Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
 The product bridge, safety isolation, and behavioral evaluation remain unverified.
 These smoke results do not by themselves prove task completion.
-The separate GLM contract review remains pending and is not launched or repeated by this plan.
+The GLM contract review is complete, and its findings are addressed in this correction.
+No new or repeated review is part of this plan.
 Qodo is an optional code reviewer, not an outcome evaluator or a replacement for product tests.
 Backpass and Vision are influences and do not require installation.
 
@@ -169,7 +171,8 @@ The full sealed evaluation is a controlled evidence run, not a routine test that
 Use non-sealed fixtures in regular CI and restrict sealed reports and credentials.
 Assign an owner to every failing check and distinguish code regressions from provider outages or missing credentials.
 Any future authorized pull request needs review findings addressed and relevant checks passing before integration.
-The current documentation task creates no pull request and performs no merge.
+The current documentation task creates no pull request or public remote operation.
+Its local `main` fast-forward and filesystem-only `origin/main` synchronization are complete.
 
 ## Requirement traceability
 
@@ -215,4 +218,4 @@ Inspect SPEC.md in the AO Browser without creating a server or installing depend
 Check for whitespace errors, em dashes, and prose paragraphs with multiple sentences on one physical line.
 Stage only the three named documents and inspect the staged diff before making a conventional local commit without an agent co-author.
 Report the commit, changed files, checks, and remaining execution assumptions through AO.
-The handoff is a local specification commit ready for review and authorized integration, not completed implementation or submission.
+The handoff includes completed local specification commits and local `main` integration, not completed implementation, public publication, or submission.

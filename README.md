@@ -22,8 +22,8 @@ Default Prime Inference returned HTTP 402 for lack of balance, while the subscri
 Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
 The product bridge, safety isolation, and behavioral evaluation remain unverified.
 
-The authorized phase ends with a verified local specification commit.
-Implementation, installation, remote creation, publication, pushes, pull requests, merging to main, and submission require later authorization.
+The authorized phase includes verified local specification commits, fast-forward integration into local `main`, and synchronization to the filesystem-only origin, all complete.
+Implementation, installation, public remote creation, publication, pushes to public remotes, pull requests, and submission require later authorization.
 The official build window closes on 2026-09-07 at 03:30 IST.
 Public repository and social-demo obligations are recorded in the milestones and are not yet fulfilled.
 
