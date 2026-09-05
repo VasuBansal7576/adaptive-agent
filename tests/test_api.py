@@ -259,6 +259,29 @@ def test_control_plane_runs_generic_luna_python_through_prime_capability_seam():
     assert kernel.capability_calls[0]["capabilityId"] == "counter.read"
     assert len(sink.observations) == 2
 
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    eval_runner = EvaluationRunner(protocol, packages, safety_cases={"EVAL-004": True, "EVAL-005": True})
+    base_hash = plane.active_bundle_hash
+    candidate = plane.create_candidate(CandidateProposalRequest(
+        baseBundleHash=base_hash, editOperations=["bounded generic planner refinement"], changedArtifactHashes=["artifact-planner"],
+        supportingEvidenceIds=[run["runId"]], predictedEffect="improves verified task completion", proposerVersion="luna",
+    ))
+
+    def evaluate_row(arm, package, task, seed):
+        return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+
+    report = eval_runner.run_validation(base_hash=base_hash, candidate_hash=candidate["candidateId"], execute=evaluate_row)
+    evaluation = plane.queue_evaluation(EvaluationRequest(
+        candidateId=candidate["candidateId"], baseBundleHash=base_hash, protocolHash=report.protocol_hash,
+        partitionRef={"id": "validation", "version": "1", "sha256": "partition"},
+    ))
+    recorded = plane.record_trusted_evaluation(evaluation["evaluationId"], report)
+    assert recorded["promotionEligible"] is True
+    promoted = plane.record_trusted_decision(candidate["candidateId"], evaluation["evaluationId"], "promoted", "independent validation passed")
+    assert promoted["state"] == "promoted"
+
 
 def test_operator_bootstrap_and_loopback_origin_boundary():
     api = TestClient(create_app(ControlPlane()), base_url="http://127.0.0.1")
