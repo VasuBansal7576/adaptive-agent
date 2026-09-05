@@ -131,6 +131,13 @@ const scripted: Record<string, ScriptedEvent[]> = {
     { sequence: 1, kind: "status", summary: "Run queued and pinned to bundle v7." },
     { sequence: 2, kind: "tool", summary: "inventory.read completed." },
     { sequence: 3, kind: "status", summary: "Cancelled by operator; future calls revoked. Dispatched external actions were not undone." },
+    {
+      sequence: 4,
+      kind: "tool",
+      summary: "Retry attempt rejected: idempotency key reused with changed arguments.",
+      detail: "Operation-level reconciliation of the prior dispatch continues; the run stays closed.",
+      error: { code: "IDEMPOTENCY_CONFLICT", message: "Key run-sim-1005:op-2 was used with a different canonical payload", correlationId: "corr-sim-5d", retry: "never" },
+    },
   ],
   "run-sim-1006": [
     { sequence: 1, kind: "status", summary: "Run queued and pinned to bundle v7." },

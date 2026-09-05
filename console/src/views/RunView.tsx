@@ -140,12 +140,14 @@ export function RunView({
             )}
             {selected.status === "timed_out" && (
               <Banner tone="warn" title="Run timed out">
-                An external effect may be unresolved. The broker will reconcile before further state changes.
+                An external effect may remain unresolved. Operation-level reconciliation continues without reopening
+                the run; a reconciled result cannot trigger a second dispatch.
               </Banner>
             )}
             {selected.status === "cancelled" && (
               <Banner tone="info" title="Run cancelled">
-                Future calls were revoked. Already dispatched external actions were not undone; reconciliation occurs on restart.
+                Future calls were revoked. Already dispatched external actions were not undone; operation-level
+                reconciliation continues without reopening the run.
               </Banner>
             )}
 
