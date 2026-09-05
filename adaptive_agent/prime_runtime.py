@@ -327,8 +327,13 @@ class _KernelProcess:
             "--pids-limit", str(pids), "--memory", str(config.max_memory_bytes),
             "--cpus", "0.5", "--ulimit", "nofile=64:64", "--ulimit", "fsize=16777216:16777216",
             "--user", "65534:65534", "--env", "HOME=/tmp", "--env", "TMPDIR=/tmp",
-            image,
         ]
+        ao_session = os.environ.get("AO_SESSION_ID")
+        if ao_session:
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", ao_session):
+                raise AdapterError("invalid AO_SESSION_ID for Docker cleanup label")
+            command.extend(["--label", f"ao.session={ao_session}"])
+        command.append(image)
         try:
             self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, close_fds=True)
@@ -389,7 +394,14 @@ class _KernelProcess:
             self.proc.stdin.write(data)
             self.proc.stdin.flush()
 
-    def execute(self, cell_id: str, code: str, timeout: float) -> dict[str, Any]:
+    @staticmethod
+    def _append_output(chunks: list[str], text: str, limit: int) -> None:
+        used = sum(len(chunk) for chunk in chunks)
+        if used >= limit:
+            return
+        chunks.append(text[: max(0, limit - used)])
+
+    def execute(self, cell_id: str, code: str, timeout: float, max_output_chars: int = 65536) -> dict[str, Any]:
         self.send({"type": "execute", "id": cell_id, "code": code})
         collected: dict[str, Any] = {"stdout": [], "stderr": [], "result": None, "error": None}
         deadline = time.monotonic() + timeout
@@ -405,9 +417,9 @@ class _KernelProcess:
                 continue
             kind = event.get("event")
             if kind == "stdout":
-                collected["stdout"].append(str(event.get("text", "")))
+                self._append_output(collected["stdout"], str(event.get("text", "")), max_output_chars)
             elif kind == "stderr":
-                collected["stderr"].append(str(event.get("text", "")))
+                self._append_output(collected["stderr"], str(event.get("text", "")), max_output_chars)
             elif kind == "result":
                 collected["result"] = str(event.get("text", ""))
             elif kind == "error":
@@ -561,18 +573,57 @@ class PrimeRuntimeAdapter:
         if cancel and cancel.is_set():
             self.cancel(cell_id)
             return ExecutionResult(self.config.task_id, cell_id, "aborted", None, "", "", None, 0, self.mode, self.provenance())
+        stop_watcher = threading.Event()
+        if cancel is not None:
+            def watch_cancel() -> None:
+                while not stop_watcher.wait(0.02):
+                    if cancel.is_set():
+                        self.cancel(cell_id)
+                        return
+            threading.Thread(target=watch_cancel, daemon=True).start()
         try:
-            raw = self.kernel.execute(cell_id, code, effective_timeout)
+            raw = self.kernel.execute(cell_id, code, effective_timeout, self.config.max_output_chars)
             status = raw.get("status", "error")
+            if cancel is not None and cancel.is_set() and status != "ok":
+                status = "aborted"
             if status not in {"ok", "error", "aborted"}:
                 status = "error"
             return ExecutionResult(self.config.task_id, cell_id, status, raw.get("result"),
-                                   "".join(raw.get("stdout", []))[-self.config.max_output_chars:],
-                                   "".join(raw.get("stderr", []))[-self.config.max_output_chars:],
+                                   "".join(raw.get("stdout", [])),
+                                   "".join(raw.get("stderr", [])),
                                    raw.get("error"), int((time.monotonic() - started) * 1000), self.mode, self.provenance())
         except TimeoutError:
             return ExecutionResult(self.config.task_id, cell_id, "aborted", None, "", "", {"ename": "TimeoutError", "evalue": "cell timeout"},
                                    int((time.monotonic() - started) * 1000), self.mode, self.provenance())
+        finally:
+            stop_watcher.set()
+
+    def execute_child(self, code: str, *, timeout: float | None = None) -> ExecutionResult:
+        """Run one bounded child in a fresh Docker kernel with no parent state."""
+        with self._lock:
+            if self._children >= self.config.child_runs:
+                raise SecurityViolation("child run budget exhausted")
+            self._children += 1
+        child_id = f"{self.config.task_id}-child-{self._children}"
+        child_root = self.root / "children" / child_id
+        child = PrimeRuntimeAdapter(
+            PrimeRuntimeConfig(
+                task_id=child_id, root_dir=child_root, model=self.config.model,
+                provider=self.config.provider, python=self.config.python,
+                runtime_src=self.config.runtime_src, max_output_chars=self.config.max_output_chars,
+                max_cell_seconds=min(timeout or self.config.max_cell_seconds, self.config.max_cell_seconds),
+                max_memory_bytes=self.config.max_memory_bytes, max_cpu_seconds=self.config.max_cpu_seconds,
+                max_processes=self.config.max_processes, max_artifact_bytes=self.config.max_artifact_bytes,
+                child_runs=0, require_docker=True, docker_image=self.config.docker_image,
+            ),
+            broker=CapabilityBroker(child_id),
+        )
+        try:
+            result = child.execute(code, timeout=timeout)
+            result.provenance["parentRunId"] = self.config.task_id
+            return result
+        finally:
+            child.close(remove_workspace=True)
 
     def cancel(self, cell_id: str | None = None) -> None:
         with self._lock:
@@ -598,11 +649,15 @@ class PrimeRuntimeAdapter:
         raise SecurityViolation(f"unsupported host request: {request_type}")
 
     def export_artifact(self, source: str | Path, *, artifact_id: str | None = None, version: str = "1") -> ArtifactRef:
-        src = (self.root / source).resolve() if not Path(source).is_absolute() else Path(source).resolve()
+        requested = Path(source)
+        raw_src = requested if requested.is_absolute() else self.root / requested
+        if raw_src.is_symlink():
+            raise SecurityViolation("symlink artifacts are not allowed")
+        src = raw_src.resolve()
         root = self.root.resolve()
         if src != root and root not in src.parents:
             raise SecurityViolation("artifact must remain inside the task workspace")
-        if src.is_symlink() or not src.is_file():
+        if not src.is_file():
             raise AdapterError("artifact must be a regular file")
         size = src.stat().st_size
         if size > self.config.max_artifact_bytes:

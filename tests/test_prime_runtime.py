@@ -82,6 +82,34 @@ class PrimeRuntimeTests(unittest.TestCase):
         followup = adapter.execute("6 * 7")
         self.assertEqual(followup.result, "42")
 
+    def test_bounded_child_has_fresh_state_and_budget(self):
+        adapter = self.make(child_runs=1)
+        parent = adapter.execute("parent_only = 1")
+        self.assertEqual(parent.status, "ok")
+        child = adapter.execute_child("child_only = 2\nchild_only")
+        self.assertEqual(child.result, "2")
+        self.assertEqual(child.provenance["parentRunId"], "test")
+        missing = adapter.execute("child_only")
+        self.assertEqual(missing.status, "error")
+        with self.assertRaises(SecurityViolation):
+            adapter.execute_child("3 * 3")
+
+    def test_output_is_bounded_and_external_cancel_aborts(self):
+        adapter = self.make(max_output_chars=64, max_cell_seconds=3)
+        output = adapter.execute("print('x' * 10000)")
+        self.assertLessEqual(len(output.stdout), 64)
+        cancel = threading.Event()
+        holder = {}
+        worker = threading.Thread(target=lambda: holder.setdefault("result", adapter.execute("while True: pass", cancel=cancel)))
+        worker.start()
+        deadline = time.time() + 3
+        while adapter.kernel is None and time.time() < deadline:
+            time.sleep(0.01)
+        cancel.set()
+        worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(holder["result"].status, "aborted")
+
     def test_artifact_export_is_content_addressed_and_workspace_bound(self):
         adapter = self.make()
         artifact = adapter.root / "answer.txt"
@@ -91,6 +119,12 @@ class PrimeRuntimeTests(unittest.TestCase):
         self.assertTrue(Path(ref.path).is_file())
         with self.assertRaises(SecurityViolation):
             adapter.export_artifact(Path(tempfile.gettempdir()) / "outside")
+        outside = Path(tempfile.mkdtemp()) / "secret"
+        outside.write_text("hidden")
+        link = adapter.root / "link"
+        link.symlink_to(outside)
+        with self.assertRaises(SecurityViolation):
+            adapter.export_artifact(link)
 
     def test_docker_boundary_is_required_and_child_budget_is_denied(self):
         with self.assertRaises(AdapterError):

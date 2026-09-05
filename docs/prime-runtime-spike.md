@@ -18,7 +18,9 @@ not a claim that the full product boundary is complete.
   executed state-sharing cells (`value = 40; value + 2`, then `value + 1`) with
   results `42` and `41`.
 - A real host bridge request returned run-scoped capability metadata and a
-  broker call returned a structured result. Learner requests for
+  broker call returned a structured result. Bounded child execution starts a
+  fresh Docker kernel with separate state and consumes the configured child
+  budget. Learner requests for
   `harness.write`, policy/evaluator/promotion writes, credentials, and hidden
   data were denied.
 - The requested model configuration is the subscription selector
@@ -37,7 +39,8 @@ The adapter now fails closed unless Docker is available. It builds a minimal
 image containing the verified Prime runtime source, then starts one learner
 container per task with no host mounts or Docker socket, `--network=none`, a
 nonroot uid, read-only root, writable tmpfs `/tmp`, dropped capabilities,
-`no-new-privileges`, pids/memory/cpu limits, and bounded file descriptors.
+`no-new-privileges`, pids/memory/cpu limits, bounded file descriptors, and
+when present the trusted `AO_SESSION_ID` cleanup label.
 The parent keeps the JSON-lines protocol on stdio, so broker replies work
 without learner network access. Provider credentials and model authentication
 remain in the trusted parent and are never copied into the image or container.
@@ -45,7 +48,9 @@ remain in the trusted parent and are never copied into the image or container.
 The image build itself is a trusted deployment operation and may pull the
 pinned Python base image. If Docker or that image is unavailable, adapter
 startup fails; there is no host-process fallback. The learner source policy is
-defense in depth only. Container policy is the isolation boundary. The
-configured model provenance is not a model-call result: a complete goal-to-
-model-to-tool/evaluator evidence chain still belongs to the control-plane
-integration and is not claimed by this bridge spike.
+defense in depth only. Container policy is the isolation boundary. Output is
+bounded before accumulation, cancellation interrupts the active cell, and
+artifact export rejects traversal and symlinks. The requested model
+configuration is not a model-call result: a complete goal-to-model-to-tool/
+evaluator evidence chain still belongs to the control-plane integration and is
+not claimed by this bridge spike.
