@@ -76,6 +76,14 @@ class EnvironmentRegistration(ApiModel):
             raise ValueError("unsupported manifest schemaVersion")
         return value
 
+    @field_validator("execution_modes")
+    @classmethod
+    def supported_modes(cls, value: list[str]) -> list[str]:
+        allowed = {"interactive", "batch", "dry_run", "replay"}
+        if not value or any(mode not in allowed for mode in value):
+            raise ValueError("executionModes must contain interactive, batch, dry_run, or replay")
+        return value
+
 
 class EnvironmentFormRegistration(ApiModel):
     """String-valued shape emitted by the console registry form."""
