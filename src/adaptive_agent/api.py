@@ -544,6 +544,10 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
         response.set_cookie("adaptive_operator_session", plane.operator_token, httponly=True, samesite="strict", secure=False, path="/")
         return {"status": "ready", "transport": "live"}
 
+    @app.get("/session")
+    def session_status() -> JsonObject:
+        return {"authenticated": True, "transport": "live"}
+
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}

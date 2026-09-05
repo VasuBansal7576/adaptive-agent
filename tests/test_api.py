@@ -177,6 +177,7 @@ def test_operator_bootstrap_and_loopback_origin_boundary():
     api = TestClient(create_app(ControlPlane()), base_url="http://127.0.0.1")
     # No server-issued cookie or bearer token may mutate or read protected data.
     assert api.get("/runs").status_code == 401
+    assert api.get("/session").status_code == 401
     assert api.post("/environments/register", json=manifest()).status_code == 401
     # Rebinding the Host or Origin is rejected before authentication.
     assert api.get("/runs", headers={"host": "unrelated.example"}).status_code == 403
@@ -186,4 +187,5 @@ def test_operator_bootstrap_and_loopback_origin_boundary():
     assert bootstrap.status_code == 200
     assert "adaptive_operator_session" in bootstrap.headers["set-cookie"]
     assert "token" not in bootstrap.text.lower()
+    assert api.get("/session").json() == {"authenticated": True, "transport": "live"}
     assert api.get("/runs", headers={"origin": "http://127.0.0.1"}).status_code == 200
