@@ -19,6 +19,7 @@ class Invocation:
     text = "done"
     provider = "openai-codex"
     model = "openai-codex/gpt-5.6-luna"
+    response_id = "resp-test-1"
     usage = {"inputTokens": 4, "outputTokens": 1}
 
 
@@ -74,6 +75,7 @@ def test_unverified_model_provenance_fails_closed():
         text = "done"
         provider = "simulation"
         model = "fixture"
+        response_id = "fixture-response"
         usage = {"outputTokens": 1}
 
     plane = ControlPlane(model_runner=lambda **_: Unverified(), evaluator=evaluator)

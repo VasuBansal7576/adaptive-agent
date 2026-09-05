@@ -132,6 +132,7 @@ class ModelInvocation(Protocol):
     text: str
     provider: str
     model: str
+    response_id: str
     usage: Mapping[str, Any]
 
 
@@ -255,13 +256,14 @@ class ControlPlane:
             invocation = self.model_runner(goal=run["goal"], environment=env["manifest"], emit=lambda k, s, d=None: self._emit(run_id, k, s, d))
             provider = getattr(invocation, "provider", "")
             model = getattr(invocation, "model", "")
+            response_id = getattr(invocation, "response_id", getattr(invocation, "responseId", ""))
             usage = getattr(invocation, "usage", None)
-            if provider != "openai-codex" or model != "openai-codex/gpt-5.6-luna" or not isinstance(usage, Mapping):
-                raise ModelUnavailableError("model runner did not return authenticated provider, model, and usage")
+            if provider != "openai-codex" or model != "openai-codex/gpt-5.6-luna" or not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
+                raise ModelUnavailableError("model runner did not return authenticated provider, model, response id, and usage")
             with self._lock:
                 if run["status"] == "cancelled":
                     return
-            provenance = {"provider": invocation.provider, "model": invocation.model, "usage": dict(invocation.usage)}
+            provenance = {"provider": invocation.provider, "model": invocation.model, "responseId": response_id, "usage": dict(invocation.usage)}
             self._emit(run_id, "evidence", "Authenticated model response received.", json.dumps(provenance, sort_keys=True))
             outcome = dict(self.evaluator(goal=run["goal"], model_output=invocation.text, environment=env["manifest"]))
             with self._lock:
