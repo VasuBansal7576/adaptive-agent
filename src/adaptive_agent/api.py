@@ -156,6 +156,46 @@ class LearningRequest(ApiModel):
     evidence_ids: list[str] = Field(default_factory=list, alias="evidenceIds")
 
 
+class CandidateProposalRequest(ApiModel):
+    base_bundle_hash: str = Field(alias="baseBundleHash", min_length=1)
+    edit_operations: list[str] = Field(alias="editOperations", min_length=1)
+    changed_artifact_hashes: list[str] = Field(alias="changedArtifactHashes", min_length=1)
+    supporting_evidence_ids: list[str] = Field(alias="supportingEvidenceIds", min_length=1)
+    predicted_effect: str = Field(alias="predictedEffect", min_length=1)
+    proposer_version: str = Field(alias="proposerVersion", min_length=1)
+
+    @model_validator(mode="after")
+    def bounded_change(self) -> "CandidateProposalRequest":
+        if len(self.changed_artifact_hashes) > 3 or sum(len(edit.splitlines()) for edit in self.edit_operations) > 200:
+            raise ValueError("candidate exceeds bounded edit limits")
+        return self
+
+
+class EvaluationRequest(ApiModel):
+    candidate_id: str = Field(alias="candidateId", min_length=1)
+    base_bundle_hash: str = Field(alias="baseBundleHash", min_length=1)
+    protocol_hash: str = Field(alias="protocolHash", min_length=1)
+    partition_ref: JsonObject = Field(alias="partitionRef")
+
+
+class CandidateDecisionRequest(ApiModel):
+    evaluation_id: str = Field(alias="evaluationId", min_length=1)
+    decision: str
+    reason: str = Field(min_length=1)
+
+    @field_validator("decision")
+    @classmethod
+    def valid_decision(cls, value: str) -> str:
+        if value not in {"promoted", "rejected", "quarantined"}:
+            raise ValueError("decision must be promoted, rejected, or quarantined")
+        return value
+
+
+class RollbackRouteRequest(ApiModel):
+    candidate_id: str = Field(alias="candidateId", min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class ApprovalRequest(ApiModel):
     approve: bool
 
@@ -249,7 +289,71 @@ class ControlPlane:
         self.events: dict[str, list[JsonObject]] = {}
         self.idempotency: dict[str, tuple[str, str]] = {}
         self.learning_actions: list[JsonObject] = []
+        self.candidates: dict[str, JsonObject] = {}
+        self.evaluations: dict[str, JsonObject] = {}
+        self.active_bundle_hash = _hash("bundle-active")
+        self.version_history: list[JsonObject] = [{"bundleHash": self.active_bundle_hash, "state": "active", "at": _now()}]
+        self.approvals: dict[tuple[str, str], bool] = {}
         self._lock = threading.RLock()
+
+    def create_candidate(self, payload: CandidateProposalRequest) -> JsonObject:
+        with self._lock:
+            if payload.base_bundle_hash != self.active_bundle_hash:
+                raise IdempotencyConflict("active bundle changed; candidate base is stale")
+            candidate_id = f"cand_{uuid.uuid4().hex}"
+            candidate = {
+                "candidateId": candidate_id,
+                "baseBundleHash": payload.base_bundle_hash,
+                "state": "validated",
+                "editOperations": list(payload.edit_operations),
+                "changedArtifactHashes": list(payload.changed_artifact_hashes),
+                "supportingEvidenceIds": list(payload.supporting_evidence_ids),
+                "predictedEffect": payload.predicted_effect,
+                "proposerVersion": payload.proposer_version,
+                "createdAt": _now(),
+            }
+            self.candidates[candidate_id] = candidate
+            return dict(candidate)
+
+    def queue_evaluation(self, payload: EvaluationRequest) -> JsonObject:
+        with self._lock:
+            candidate = self.candidates.get(payload.candidate_id)
+            if candidate is None:
+                raise KeyError("candidate not found")
+            if payload.base_bundle_hash != candidate["baseBundleHash"]:
+                raise ValueError("evaluation base does not match candidate")
+            evaluation_id = f"eval_{uuid.uuid4().hex}"
+            evaluation = {
+                "evaluationId": evaluation_id,
+                "candidateId": payload.candidate_id,
+                "baseBundleHash": payload.base_bundle_hash,
+                "protocolHash": payload.protocol_hash,
+                "partitionRef": payload.partition_ref,
+                "state": "queued",
+                "trusted": False,
+                "createdAt": _now(),
+            }
+            self.evaluations[evaluation_id] = evaluation
+            candidate["state"] = "evaluating"
+            return dict(evaluation)
+
+    def record_trusted_decision(self, candidate_id: str, evaluation_id: str, decision: str, reason: str) -> JsonObject:
+        """Apply a decision only from a trusted evaluator integration."""
+        with self._lock:
+            candidate = self.candidates.get(candidate_id)
+            evaluation = self.evaluations.get(evaluation_id)
+            if candidate is None or evaluation is None or evaluation["candidateId"] != candidate_id:
+                raise KeyError("candidate or evaluation not found")
+            if evaluation["state"] != "valid":
+                raise ValueError("only a valid trusted evaluation may activate a candidate")
+            evaluation["decision"] = decision
+            evaluation["reason"] = reason
+            evaluation["trusted"] = True
+            candidate["state"] = decision
+            if decision == "promoted":
+                self.active_bundle_hash = _hash(candidate_id)
+                self.version_history.append({"bundleHash": self.active_bundle_hash, "candidateId": candidate_id, "state": "active", "at": _now()})
+            return dict(candidate)
 
     def register_environment(self, payload: EnvironmentRegistration) -> JsonObject:
         with self._lock:
@@ -467,6 +571,14 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="run not found")
             return dict(run)
 
+    @app.get("/runs/{run_id}/evidence")
+    def run_evidence(run_id: str) -> list[JsonObject]:
+        with plane._lock:
+            if run_id not in plane.runs:
+                raise HTTPException(status_code=404, detail="run not found")
+            # Evaluator-only events are never exposed through this projection.
+            return [dict(event) for event in plane.events.get(run_id, []) if event.get("kind") == "evidence" and event.get("visibility") != "evaluator_only"]
+
     @app.post("/runs", status_code=201)
     def create_run(payload: CreateRunRequest) -> JsonObject:
         try:
@@ -513,6 +625,18 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/runs/{run_id}/approvals/{approval_id}")
+    def submit_approval(run_id: str, approval_id: str, payload: ApprovalRequest) -> JsonObject:
+        with plane._lock:
+            if run_id not in plane.runs:
+                raise HTTPException(status_code=404, detail="run not found")
+            key = (run_id, approval_id)
+            if key in plane.approvals:
+                raise HTTPException(status_code=409, detail={"code": "IDEMPOTENCY_CONFLICT", "message": "approval already consumed", "correlationId": uuid.uuid4().hex, "retry": "never"})
+            plane.approvals[key] = payload.approve
+            plane._emit(run_id, "approval", "Approval accepted." if payload.approve else "Approval rejected.")
+            return {"runId": run_id, "approvalId": approval_id, "approved": payload.approve}
+
     def _launch_learning(payload: LearningRequest) -> JsonObject:
         if payload.run_id not in plane.runs:
             raise HTTPException(status_code=404, detail="run not found")
@@ -537,11 +661,59 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
 
     @app.get("/candidates")
     def candidates() -> list[JsonObject]:
-        return []
+        with plane._lock:
+            return [dict(candidate) for candidate in plane.candidates.values()]
+
+    @app.post("/candidates", status_code=201)
+    def create_candidate(payload: CandidateProposalRequest) -> JsonObject:
+        try:
+            return plane.create_candidate(payload)
+        except IdempotencyConflict as exc:
+            raise HTTPException(status_code=409, detail={"code": "VERSION_CONFLICT", "message": str(exc), "correlationId": uuid.uuid4().hex, "retry": "never"}) from exc
+
+    @app.post("/evaluations", status_code=202)
+    def create_evaluation(payload: EvaluationRequest) -> JsonObject:
+        try:
+            return plane.queue_evaluation(payload)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"code": "VERSION_CONFLICT", "message": str(exc), "correlationId": uuid.uuid4().hex, "retry": "never"}) from exc
+
+    @app.get("/evaluations")
+    def evaluations() -> list[JsonObject]:
+        with plane._lock:
+            return [dict(evaluation) for evaluation in plane.evaluations.values()]
+
+    @app.post("/candidates/{candidate_id}/decision")
+    def candidate_decision(candidate_id: str, payload: CandidateDecisionRequest) -> JsonObject:
+        # Browser/operator requests cannot forge a trusted report. Decisions
+        # remain queued until the evaluator integration calls the trusted method.
+        with plane._lock:
+            if candidate_id not in plane.candidates or payload.evaluation_id not in plane.evaluations:
+                raise HTTPException(status_code=404, detail="candidate or evaluation not found")
+            raise HTTPException(status_code=403, detail={"code": "FORBIDDEN", "message": "only the trusted evaluator may decide a candidate", "correlationId": uuid.uuid4().hex, "retry": "never"})
+
+    @app.get("/versions/active")
+    def active_versions() -> list[JsonObject]:
+        with plane._lock:
+            return [dict(version) for version in plane.version_history]
 
     @app.post("/candidates/{candidate_id}/rollback")
     def rollback(candidate_id: str, payload: RollbackRequest) -> JsonObject:
-        raise HTTPException(status_code=404, detail="candidate not found")
+        return rollback_resource(RollbackRouteRequest(candidateId=candidate_id, reason=payload.reason))
+
+    @app.post("/rollbacks")
+    def rollback_resource(payload: RollbackRouteRequest) -> JsonObject:
+        with plane._lock:
+            candidate = plane.candidates.get(payload.candidate_id)
+            if candidate is None:
+                raise HTTPException(status_code=404, detail="candidate not found")
+            prior = plane.version_history[-2] if len(plane.version_history) > 1 else plane.version_history[0]
+            plane.active_bundle_hash = prior["bundleHash"]
+            candidate["state"] = "rolled_back"
+            plane.version_history.append({"bundleHash": prior["bundleHash"], "candidateId": payload.candidate_id, "state": "rolled_back", "reason": payload.reason, "at": _now()})
+            return plane.version_history[-1]
 
     return app
 

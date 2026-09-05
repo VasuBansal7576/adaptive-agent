@@ -125,6 +125,33 @@ def test_cancelled_run_cannot_be_reopened_by_late_model_result():
     assert api.get(f"/runs/{run['runId']}").json()["status"] == "cancelled"
 
 
+def test_candidate_evaluation_decision_and_rollback_boundaries():
+    plane = ControlPlane(model_runner=model_runner, evaluator=evaluator)
+    api = TestClient(create_app(plane))
+    api.post("/environments/register", json=manifest())
+    candidate = api.post(
+        "/candidates",
+        json={
+            "baseBundleHash": plane.active_bundle_hash,
+            "editOperations": ["retry after VERSION_CONFLICT"],
+            "changedArtifactHashes": ["artifact-1"],
+            "supportingEvidenceIds": ["ev-1"],
+            "predictedEffect": "fewer stale writes",
+            "proposerVersion": "planner-1",
+        },
+    )
+    assert candidate.status_code == 201
+    candidate_id = candidate.json()["candidateId"]
+    evaluation = api.post(
+        "/evaluations",
+        json={"candidateId": candidate_id, "baseBundleHash": plane.active_bundle_hash, "protocolHash": "protocol-1", "partitionRef": {"id": "validation", "version": "1", "sha256": "v"}},
+    )
+    assert evaluation.status_code == 202
+    evaluation_id = evaluation.json()["evaluationId"]
+    assert api.post(f"/candidates/{candidate_id}/decision", json={"evaluationId": evaluation_id, "decision": "promoted", "reason": "looks good"}).status_code == 403
+    assert api.post(f"/candidates/{candidate_id}/rollback", json={"reason": "operator safety rollback"}).status_code == 200
+
+
 def test_prime_bridge_records_parent_owned_model_observation():
     calls = []
 
