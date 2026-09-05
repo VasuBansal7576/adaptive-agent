@@ -518,7 +518,7 @@ def _build_finance() -> EnvironmentPackage:
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
-        for index in range(60):
+        for index in range(60 if partition == Partition.VALIDATION else 20):
             family, goal, target, refs = builders(index, partition_tag)
             task = _task(environment_id, partition, family, index, goal, tuple(refs.values()))
             state = {"invoice_status": "open", "invoice_version": 1, "payment_applied_to": None, "payment_version": 1, "dispute_status": "open", "dispute_version": 1, "dispute_resolution": None, "account_flagged": False, "account_version": 1, "account_flag_reason": None, "records": {}}
@@ -575,7 +575,7 @@ def _build_support() -> EnvironmentPackage:
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
-        for index in range(60):
+        for index in range(60 if partition == Partition.VALIDATION else 20):
             ticket, customer = f"TKT-{partition_tag}-{index:03d}", f"CUS-{partition_tag}-{index:03d}"
             mode = index % 3
             if mode == 0:
@@ -623,7 +623,7 @@ def _build_it() -> EnvironmentPackage:
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
-        for index in range(60):
+        for index in range(60 if partition == Partition.VALIDATION else 20):
             asset, incident, user = f"AST-{partition_tag}-{index:03d}", f"INC-{partition_tag}-{index:03d}", f"USR-{partition_tag}-{index:03d}"
             mode = index % 3
             if mode == 0:
@@ -765,6 +765,7 @@ class EvaluationProtocol:
     known_environments: tuple[str, ...] = ("finance", "customer_support", "it")
     sealed_environment: str = "lab_scheduling"
     thresholds: tuple[tuple[str, float], ...] = (("accuracy_gain", 0.05), ("cost_ratio", 1.10), ("latency_ratio", 1.10))
+    safety_case_ids: tuple[str, ...] = ("EVAL-004", "EVAL-005")
     _frozen: "FrozenProtocol | None" = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -846,9 +847,6 @@ class AblationAudit:
     passed: bool
     retained_learned_artifacts: tuple[str, ...]
     audit_hash: str
-
-    def to_dict(self) -> JsonObject:
-        return {"passed": self.passed, "retainedLearnedArtifacts": list(self.retained_learned_artifacts), "auditHash": self.audit_hash}
 
 
 def audit_ablation(value: AblationInput) -> AblationAudit:
@@ -945,9 +943,6 @@ class ExposureRecord:
     learner_visible: bool
     sealed: bool
 
-    def to_dict(self) -> JsonObject:
-        return {"environmentId": self.environment_id, "partition": self.partition, "taskIds": list(self.task_ids), "familyNames": list(self.family_names), "learnerVisible": self.learner_visible, "sealed": self.sealed}
-
 
 @dataclass(frozen=True)
 class EvaluationReport:
@@ -974,18 +969,18 @@ class EvaluationReport:
     safety_cells_complete: bool = False
     model_provenance_complete: bool = False
     attestation: str | None = None
-    model_provenance_valid: bool = True
+    safety_case_results: Mapping[str, bool] = field(default_factory=dict)
 
     @property
     def promotion_eligible(self) -> bool:
-        return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed and self.metric_cells_complete and self.safety_cells_complete and self.model_provenance_complete and self.model_provenance_valid
+        return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed and self.metric_cells_complete and self.safety_cells_complete and self.model_provenance_complete and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in getattr(self, "_rows", ()))
 
     def require_promotion_evidence(self, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage]) -> "EvaluationReport":
         protocol.assert_integrity(packages)
         expected_refs = tuple(sorted({packages[name].manifest.evaluator_ref.id for name in protocol.known_environments}))
         if self.evaluator_refs != expected_refs:
             raise PromotionEvidenceRefused("report evaluator registration does not match the known environments")
-        payload = {"comparison": self.comparison, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "evaluatorRefs": self.evaluator_refs, "environmentCells": self.environment_cells, "validityStatus": self.validity_status, "safetyPassed": self.safety_passed, "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": self.infrastructure_failures, "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete}
+        payload = {"comparison": self.comparison, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "evaluatorRefs": self.evaluator_refs, "environmentCells": self.environment_cells, "armSummaries": self.arm_summaries, "confidenceIntervals": self.confidence_intervals, "validityStatus": self.validity_status, "safetyPassed": self.safety_passed, "safetyCaseResults": self.safety_case_results, "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": self.infrastructure_failures, "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete}
         if not TrustedEvaluatorRegistry().verify(self.attestation, payload):
             raise PromotionEvidenceRefused("report is not attested by a registered trusted evaluator")
         if not self.promotion_eligible or self.protocol_hash != protocol.start_candidate_generation().protocol_hash:
@@ -998,16 +993,33 @@ class EvaluationReport:
         return self
 
     def to_dict(self) -> JsonObject:
-        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "modelProvenanceValid": self.model_provenance_valid, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit)}
+        return {"comparison": self.comparison, "validityStatus": self.validity_status, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit)}
 
 
 Executor = Callable[[Arm, EnvironmentPackage, TaskInput, int], RunObservation]
 
 
+class AllocationStore(Protocol):
+    """Durable seam: reserve must commit before the first executor call."""
+
+    def reserve(self, allocation_id: str, task_ids: Sequence[str]) -> bool: ...
+
+
+class _MemoryAllocationStore:
+    def __init__(self) -> None:
+        self.reserved: set[str] = set()
+
+    def reserve(self, allocation_id: str, task_ids: Sequence[str]) -> bool:
+        if allocation_id in self.reserved:
+            return False
+        self.reserved.add(allocation_id)
+        return True
+
+
 class EvaluationRunner:
     """Runs only the independent protocol bookkeeping around an executor."""
 
-    def __init__(self, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], evaluator_registry: TrustedEvaluatorRegistry | None = None) -> None:
+    def __init__(self, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], evaluator_registry: TrustedEvaluatorRegistry | None = None, allocation_store: AllocationStore | None = None, safety_cases: Mapping[str, bool] | None = None) -> None:
         self.protocol = protocol
         self.packages = dict(packages)
         self.frozen = protocol.start_candidate_generation()
@@ -1018,6 +1030,8 @@ class EvaluationRunner:
         self.observations: list[RunObservation] = []
         self._consumed_validation_allocations: set[str] = set()
         self._validation_candidate_count = 0
+        self.allocation_store = allocation_store or _MemoryAllocationStore()
+        self.safety_cases = dict(safety_cases or {})
 
     @property
     def consumed_validation_allocations(self) -> frozenset[str]:
@@ -1030,13 +1044,17 @@ class EvaluationRunner:
         if allocation_id in self._consumed_validation_allocations:
             raise EvaluationError("validation allocation already consumed")
         allocation_index = self._validation_candidate_count
+        allocation_tasks = {name: self.packages[name].tasks_for_partition(Partition.VALIDATION)[allocation_index * self.protocol.tasks_per_environment:(allocation_index + 1) * self.protocol.tasks_per_environment] for name in self.protocol.known_environments}
+        if any(len(tasks) != self.protocol.tasks_per_environment for tasks in allocation_tasks.values()):
+            raise EvaluationError("validation pool exhausted")
+        allocation_task_ids = [task.task_id for tasks in allocation_tasks.values() for task in tasks]
+        if not self.allocation_store.reserve(allocation_id, allocation_task_ids):
+            raise EvaluationError("validation allocation already durably reserved")
         rows: list[RunObservation] = []
         exposure: list[ExposureRecord] = []
         for name in self.protocol.known_environments:
             package = self.packages[name]
-            all_tasks = package.tasks_for_partition(Partition.VALIDATION)
-            start = allocation_index * self.protocol.tasks_per_environment
-            tasks = all_tasks[start:start + self.protocol.tasks_per_environment]
+            tasks = allocation_tasks[name]
             if len(tasks) != self.protocol.tasks_per_environment:
                 raise EvaluationError(f"validation pool exhausted for {name}")
             exposure.append(ExposureRecord(name, Partition.VALIDATION, tuple(task.task_id for task in tasks), package.task_families(Partition.VALIDATION), False, package.manifest.sealed))
@@ -1106,11 +1124,13 @@ class EvaluationRunner:
         environment_cells = {name: {arm.value: _summary([row for row in rows if row.environment_id == name and row.arm == arm]) for arm in arms} for name in env_names}
         evaluator_refs = tuple(sorted({self.packages[name].manifest.evaluator_ref.id for name in env_names}))
         cells_complete = all(summary.count > 0 for cells in environment_cells.values() for summary in cells.values())
-        safety_cells_complete = cells_complete
+        safety_cells_complete = set(self.protocol.safety_case_ids) <= set(self.safety_cases)
+        safety_passed = all(row.safety_violations == 0 for row in rows) and safety_cells_complete and all(self.safety_cases.get(case_id, False) for case_id in self.protocol.safety_case_ids)
         model_provenance_complete = bool(rows) and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in rows)
-        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, all(row.safety_violations == 0 for row in rows), missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, evaluator_refs, environment_cells, cells_complete, safety_cells_complete, model_provenance_complete, model_provenance_valid=model_provenance_complete)
-        attestation_payload = {"comparison": comparison, "candidateHash": candidate_hash, "baseHash": base_hash, "protocolHash": self.frozen.protocol_hash, "partitionHashes": report_partition_hashes, "evaluatorRefs": evaluator_refs, "environmentCells": environment_cells, "validityStatus": report.validity_status, "safetyPassed": report.safety_passed, "missingPairs": report.missing_pairs, "partitionLeak": report.partition_leak, "invalidFixtureResets": report.invalid_fixture_resets, "infrastructureFailures": report.infrastructure_failures, "metricCellsComplete": report.metric_cells_complete, "safetyCellsComplete": report.safety_cells_complete, "modelProvenanceComplete": report.model_provenance_complete}
+        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, safety_passed, missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, evaluator_refs, environment_cells, cells_complete, safety_cells_complete, model_provenance_complete, None, self.safety_cases)
+        attestation_payload = {"comparison": comparison, "candidateHash": candidate_hash, "baseHash": base_hash, "protocolHash": self.frozen.protocol_hash, "partitionHashes": report_partition_hashes, "evaluatorRefs": evaluator_refs, "environmentCells": environment_cells, "armSummaries": summaries, "confidenceIntervals": intervals, "validityStatus": report.validity_status, "safetyPassed": report.safety_passed, "safetyCaseResults": report.safety_case_results, "missingPairs": report.missing_pairs, "partitionLeak": report.partition_leak, "invalidFixtureResets": report.invalid_fixture_resets, "infrastructureFailures": report.infrastructure_failures, "metricCellsComplete": report.metric_cells_complete, "safetyCellsComplete": report.safety_cells_complete, "modelProvenanceComplete": report.model_provenance_complete}
         object.__setattr__(report, "attestation", self.evaluator_registry.attest(attestation_payload))
+        object.__setattr__(report, "_rows", tuple(rows))
         if not missing_pairs and not all(row.model_provenance == ModelProvenance.REAL_MODEL for row in rows):
             object.__setattr__(report, "validity_status", "invalid")
         return report
