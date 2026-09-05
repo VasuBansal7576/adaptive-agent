@@ -456,6 +456,12 @@ class EnvironmentPackage:
         selected = [spec for spec in self._specs.values() if spec.task.partition == Partition(partition)]
         return sha256_json({"environmentId": self.environment_id, "partition": Partition(partition).value, "specs": [{"task": spec.task.to_dict(), "target": spec.target, "initialState": spec.initial_state} for spec in sorted(selected, key=lambda x: x.task.task_id)], "handlers": {name: inspect.getsource(handler) for name, handler in sorted(self._handlers.items())}, "evaluator": inspect.getsource(self.evaluate), "evaluatorVersion": self.evaluator_version})
 
+    def structural_signature(self, partition: Partition | str) -> str:
+        """Hash split structure without entity identifiers or target values."""
+        selected = [spec for spec in self._specs.values() if spec.task.partition == Partition(partition)]
+        shape = [{"family": spec.task.family, "targetKeys": sorted(spec.target), "stateKeys": sorted(spec.initial_state)} for spec in sorted(selected, key=lambda x: x.task.task_id)]
+        return sha256_json(shape)
+
     @staticmethod
     def _validate_arguments(schema: ToolSchema, arguments: Mapping[str, JsonValue]) -> None:
         if not isinstance(arguments, Mapping):
