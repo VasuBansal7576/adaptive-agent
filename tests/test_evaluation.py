@@ -20,6 +20,7 @@ from adaptive_agent.evaluation import (
     audit_ablation,
     build_environment_packages,
     clustered_paired_bootstrap,
+    TrustedEvaluatorRegistry,
 )
 
 
@@ -204,6 +205,21 @@ class EvaluationTests(unittest.TestCase):
     allocations = [set(task_id for env, task_id, arm in seen[index * 120:index * 120 + 120]) for index in range(3)]
     self.assertTrue(allocations[0].isdisjoint(allocations[1]))
     self.assertTrue(allocations[1].isdisjoint(allocations[2]))
+
+  def test_promotion_requires_attested_registered_report_not_caller_gate_fields(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    registry = TrustedEvaluatorRegistry()
+    runner = EvaluationRunner(protocol, packages, registry)
+    def execute(arm, package, task, seed):
+        return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+    report = runner.run_validation(base_hash="base-v1", candidate_hash="candidate-v1", execute=execute)
+    self.assertTrue(report.promotion_eligible)
+    self.assertEqual(report.base_hash, "base-v1")
+    forged = dataclasses.replace(report, validity_status="valid", safety_passed=True, candidate_hash="candidate-v2")
+    with self.assertRaises(PromotionEvidenceRefused):
+        forged.require_promotion_evidence(protocol, packages)
 
 
   def test_ablation_audit_rejects_retained_learned_material(self):
