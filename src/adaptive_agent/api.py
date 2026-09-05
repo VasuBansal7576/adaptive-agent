@@ -61,7 +61,8 @@ class EnvironmentRegistration(ApiModel):
     schema_version: int = Field(1, alias="schemaVersion")
     environment_id: str = Field(alias="environmentId", min_length=1)
     version: str = Field(min_length=1)
-    docs: list[JsonObject] = Field(default_factory=list)
+    docs: list[JsonObject] = Field(min_length=1)
+    task_goals: list[str] = Field(alias="taskGoals", min_length=1)
     tool_schemas: list[ToolSchemaInput] = Field(alias="toolSchemas", min_length=1)
     policy_ref: JsonObject = Field(alias="policyRef")
     evaluator_ref: JsonObject = Field(alias="evaluatorRef")
@@ -94,6 +95,7 @@ class EnvironmentFormRegistration(ApiModel):
     policy_ref: str = Field(alias="policyRef", min_length=1)
     evaluator_ref: str = Field(alias="evaluatorRef", min_length=1)
     reset_ref: str = Field(alias="resetRef", min_length=1)
+    task_goals: list[str] = Field(alias="taskGoals", min_length=1)
 
     def manifest(self) -> EnvironmentRegistration:
         try:
@@ -105,6 +107,8 @@ class EnvironmentFormRegistration(ApiModel):
         return EnvironmentRegistration(
             environmentId=self.environment_id,
             version=self.version,
+            docs=[{"id": "console-docs", "version": self.version, "sha256": _hash(self.tool_schemas)}],
+            taskGoals=self.task_goals,
             toolSchemas=schemas,
             policyRef=_ref(self.policy_ref),
             evaluatorRef=_ref(self.evaluator_ref),
@@ -293,6 +297,7 @@ class ControlPlane:
                 "status": "queued",
                 "lastEventSequence": 0,
                 "environmentId": payload.environment_id,
+                "executionMode": payload.execution_mode,
                 "goal": payload.goal,
                 "budgetUsed": {"calls": 0, "callsCeiling": 100, "wallSeconds": 0, "wallCeiling": 900},
             }
@@ -326,7 +331,7 @@ class ControlPlane:
             if env is None:
                 raise KeyError("environment is not registered")
             run["status"] = "running"
-            self._emit(run_id, "status", "Run started with authenticated model runner.")
+            self._emit(run_id, "status", f"Run started in {run['executionMode']} mode with authenticated model runner.")
         try:
             invocation = self.model_runner(goal=run["goal"], environment=env["manifest"], emit=lambda k, s, d=None: self._emit(run_id, k, s, d))
             provider = getattr(invocation, "provider", "")
@@ -403,11 +408,11 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail="request body must be valid JSON") from exc
         if not isinstance(value, dict):
             raise HTTPException(status_code=422, detail="manifest must be an object")
-        allowed = {"environmentId", "version", "toolSchemas", "policyRef", "evaluatorRef", "resetRef"}
+        allowed = {"environmentId", "version", "toolSchemas", "policyRef", "evaluatorRef", "resetRef", "taskGoals"}
         unknown = sorted(set(value) - allowed)
         if unknown:
             return {"ok": False, "missingFields": unknown}
-        required = ["environmentId", "version", "toolSchemas", "policyRef", "evaluatorRef", "resetRef"]
+        required = ["environmentId", "version", "toolSchemas", "policyRef", "evaluatorRef", "resetRef", "taskGoals"]
         missing = [key for key in required if not isinstance(value.get(key), str) or not value[key].strip()]
         if missing:
             return {"ok": False, "missingFields": missing}
@@ -424,6 +429,8 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
             reset = {"id": value["resetRef"], "version": "1", "sha256": _hash(value["resetRef"])}
             EnvironmentRegistration(
                 environmentId=value["environmentId"], version=value["version"], toolSchemas=schemas,
+                docs=[{"id": "console-docs", "version": value["version"], "sha256": _hash(value["toolSchemas"])}],
+                taskGoals=json.loads(value["taskGoals"]) if value["taskGoals"].lstrip().startswith("[") else [value["taskGoals"]],
                 policyRef=refs, evaluatorRef=evaluator, resetRef=reset,
             )
         except (json.JSONDecodeError, ValueError, ValidationError) as exc:
@@ -436,8 +443,12 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
 
     # Keep the resource-style route as a compatibility alias for clients that
     # model registration as creation.  Both routes use the same strict model.
-    @app.post("/environments", status_code=201, include_in_schema=False)
-    def register_environment_alias(payload: EnvironmentFormRegistration) -> JsonObject:
+    @app.post("/environments", status_code=201)
+    def register_environment(payload: EnvironmentRegistration) -> JsonObject:
+        return plane.register_environment(payload)
+
+    @app.post("/environments/form", status_code=201, include_in_schema=False)
+    def register_environment_form(payload: EnvironmentFormRegistration) -> JsonObject:
         try:
             return plane.register_environment(payload.manifest())
         except ValueError as exc:

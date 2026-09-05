@@ -8,6 +8,8 @@ def manifest():
     return {
         "environmentId": "neutral",
         "version": "1",
+        "docs": [{"id": "docs-neutral", "version": "1", "sha256": "d"}],
+        "taskGoals": ["read the counter"],
         "toolSchemas": [{"name": "counter.read", "version": "1", "inputSchema": {"type": "object"}, "outputSchema": {"type": "object"}, "effect": "read"}],
         "policyRef": {"id": "policy", "version": "1", "sha256": "p"},
         "evaluatorRef": {"id": "evaluator", "version": "1", "sha256": "e"},
