@@ -221,6 +221,14 @@ class EvaluationTests(unittest.TestCase):
     with self.assertRaises(PromotionEvidenceRefused):
         forged.require_promotion_evidence(protocol, packages)
 
+  def test_report_dict_matches_control_plane_consumption_contract(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    runner = EvaluationRunner(protocol, packages)
+    report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=[])
+    self.assertTrue({"protocolHash", "baseHash", "candidateHash", "validityStatus", "promotionEligible", "partitionHashes", "evaluatorRefs", "attestation", "modelProvenanceComplete", "metricCellsComplete", "safetyCellsComplete", "exposure", "armSummaries", "confidenceIntervals", "workload"} <= set(report.to_dict()))
+
 
   def test_ablation_audit_rejects_retained_learned_material(self):
     clean = audit_ablation(AblationInput("a", "generic safety instructions", ("finance operations",)))
