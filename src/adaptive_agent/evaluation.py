@@ -12,6 +12,7 @@ import json
 import math
 import random
 import statistics
+import inspect
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -49,6 +50,11 @@ class Arm(StrEnum):
 class Provenance(StrEnum):
     DETERMINISTIC_SIMULATION = "deterministic_simulation"
     LIVE_PROVIDER = "live_provider"
+
+
+class ModelProvenance(StrEnum):
+    REAL_MODEL = "real_model"
+    SYNTHETIC_MODEL = "synthetic_model"
 
 
 def _jsonable(value: Any) -> JsonValue:
@@ -285,6 +291,7 @@ class RunObservation:
     fixture_reset_ok: bool = True
     infrastructure_failure: str | None = None
     provenance: Provenance = Provenance.DETERMINISTIC_SIMULATION
+    model_provenance: ModelProvenance = ModelProvenance.SYNTHETIC_MODEL
     model_profile: str = "openai-codex/gpt-5.6-luna"
     core_planner_hash: str = ""
     budget: BudgetSpec = field(default_factory=BudgetSpec)
@@ -413,10 +420,11 @@ class EnvironmentPackage:
         return Outcome(passed, passed and all(result.side_effect != "unknown" for result in session.transcript), 0, "objective state matched" if passed else "objective state not matched", self.evaluator_version)
 
     def public_fixture_hash(self) -> str:
-        return sha256_json({"manifest": self.manifest.to_dict(), "documents": [doc.to_dict() for doc in self._documents], "tasks": [task.to_dict() for task in sorted((spec.task for spec in self._specs.values()), key=lambda x: x.task_id)], "fixtureVersion": self.fixture_version})
+        return sha256_json({"manifest": self.manifest.to_dict(), "documents": [doc.to_dict() for doc in self._documents], "tasks": [{"task": spec.task.to_dict(), "target": spec.target, "initialState": spec.initial_state} for spec in sorted(self._specs.values(), key=lambda x: x.task.task_id)], "handlers": {name: inspect.getsource(handler) for name, handler in sorted(self._handlers.items())}, "evaluator": inspect.getsource(self.evaluate), "evaluatorVersion": self.evaluator_version, "fixtureVersion": self.fixture_version})
 
     def partition_hash(self, partition: Partition | str) -> str:
-        return sha256_json({"environmentId": self.environment_id, "partition": Partition(partition).value, "tasks": [task.to_dict() for task in sorted(self.tasks_for_partition(partition), key=lambda x: x.task_id)], "families": self.task_families(partition)})
+        selected = [spec for spec in self._specs.values() if spec.task.partition == Partition(partition)]
+        return sha256_json({"environmentId": self.environment_id, "partition": Partition(partition).value, "specs": [{"task": spec.task.to_dict(), "target": spec.target, "initialState": spec.initial_state} for spec in sorted(selected, key=lambda x: x.task.task_id)], "handlers": {name: inspect.getsource(handler) for name, handler in sorted(self._handlers.items())}, "evaluator": inspect.getsource(self.evaluate), "evaluatorVersion": self.evaluator_version})
 
     @staticmethod
     def _validate_arguments(schema: ToolSchema, arguments: Mapping[str, JsonValue]) -> None:
@@ -441,7 +449,8 @@ def _schema(name: str, effect: str, properties: JsonObject, required: Sequence[s
 
 
 def _task(environment_id: str, partition: Partition, family: str, index: int, goal: str, refs: Sequence[str]) -> TaskInput:
-    return TaskInput(f"{environment_id}-{partition.value}-{index:02d}", _ref(environment_id), goal, tuple(refs), partition, family)
+    framing = {Partition.DEVELOPMENT: "Use the operational records to learn and complete this task", Partition.VALIDATION: "Independently complete and verify this unseen task", Partition.FINAL: "Audit this sealed task against the authoritative records"}[partition]
+    return TaskInput(f"{environment_id}-{partition.value}-{index:02d}", _ref(environment_id), f"{framing}: {goal}", tuple(refs), partition, f"{family}_{partition.value}")
 
 
 def _make_manifest(environment_id: str, docs: Sequence[Document], tools: Sequence[ToolSchema], *, sealed: bool = False) -> EnvironmentManifest:
@@ -458,6 +467,8 @@ def _build_finance() -> EnvironmentPackage:
     tools = (
         _schema("finance.invoice.read", "read", {"invoice_id": {"type": "string"}}, ["invoice_id"]),
         _schema("finance.payment.read", "read", {"payment_id": {"type": "string"}}, ["payment_id"]),
+        _schema("finance.dispute.read", "read", {"dispute_id": {"type": "string"}}, ["dispute_id"]),
+        _schema("finance.account.read", "read", {"account_id": {"type": "string"}}, ["account_id"]),
         _schema("finance.invoice.apply_payment", "write", {"invoice_id": {"type": "string"}, "payment_id": {"type": "string"}, "expected_version": {"type": "integer"}}, ["invoice_id", "payment_id", "expected_version"]),
         _schema("finance.dispute.resolve", "write", {"dispute_id": {"type": "string"}, "resolution": {"type": "string"}, "expected_version": {"type": "integer"}}, ["dispute_id", "resolution", "expected_version"]),
         _schema("finance.account.flag", "write", {"account_id": {"type": "string"}, "reason": {"type": "string"}, "expected_version": {"type": "integer"}}, ["account_id", "reason", "expected_version"]),
@@ -479,35 +490,47 @@ def _build_finance() -> EnvironmentPackage:
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
-        for index in range(20):
+        for index in range(60):
             family, goal, target, refs = builders(index, partition_tag)
             task = _task(environment_id, partition, family, index, goal, tuple(refs.values()))
-            state = {"invoice_status": "open", "payment_applied_to": None, "dispute_status": "open", "dispute_resolution": None, "account_flagged": False, "account_flag_reason": None, "records": {}}
+            state = {"invoice_status": "open", "invoice_version": 1, "payment_applied_to": None, "payment_version": 1, "dispute_status": "open", "dispute_version": 1, "dispute_resolution": None, "account_flagged": False, "account_version": 1, "account_flag_reason": None, "records": {}}
             state["invoice_id"], state["payment_id"], state["dispute_id"], state["account_id"] = f"INV-{partition_tag}-{index:03d}", f"PAY-{partition_tag}-{index:03d}", f"DSP-{partition_tag}-{index:03d}", f"ACC-{partition_tag}-{index:03d}"
             specs.append(_TaskSpec(task, target, state))
 
-    def read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        return {"ok": True, "record": dict(args)}, "none"
+    def invoice_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
+        return {"ok": args["invoice_id"] == state["invoice_id"], "record": {"invoiceId": state["invoice_id"], "status": state["invoice_status"], "version": state["invoice_version"]}}, "none"
+
+    def payment_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
+        return {"ok": args["payment_id"] == state["payment_id"], "record": {"paymentId": state["payment_id"], "appliedTo": state["payment_applied_to"], "version": state["payment_version"]}}, "none"
+
+    def dispute_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
+        return {"ok": args["dispute_id"] == state["dispute_id"], "record": {"disputeId": state["dispute_id"], "status": state["dispute_status"], "resolution": state["dispute_resolution"], "version": state["dispute_version"]}}, "none"
+
+    def account_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
+        return {"ok": args["account_id"] == state["account_id"], "record": {"accountId": state["account_id"], "flagged": state["account_flagged"], "reason": state["account_flag_reason"], "version": state["account_version"]}}, "none"
 
     def apply_payment(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        if args["expected_version"] != 1 or args["invoice_id"] != state["invoice_id"] or args["payment_id"] != state["payment_id"]:
+        if args["expected_version"] != state["invoice_version"] or args["invoice_id"] != state["invoice_id"] or args["payment_id"] != state["payment_id"]:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["invoice_status"], state["payment_applied_to"] = "paid", state["invoice_id"]
+        state["invoice_version"], state["payment_version"] = state["invoice_version"] + 1, state["payment_version"] + 1
         return {"ok": True}, "confirmed"
 
     def resolve(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        if args["expected_version"] != 1 or args["dispute_id"] != state["dispute_id"] or args["resolution"] != "customer-approved":
+        if args["expected_version"] != state["dispute_version"] or args["dispute_id"] != state["dispute_id"] or args["resolution"] != "customer-approved":
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["dispute_status"], state["dispute_resolution"] = "resolved", args["resolution"]
+        state["dispute_version"] += 1
         return {"ok": True}, "confirmed"
 
     def flag(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        if args["expected_version"] != 1 or args["account_id"] != state["account_id"] or args["reason"] != "enhanced-review":
+        if args["expected_version"] != state["account_version"] or args["account_id"] != state["account_id"] or args["reason"] != "enhanced-review":
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["account_flagged"], state["account_flag_reason"] = True, args["reason"]
+        state["account_version"] += 1
         return {"ok": True}, "confirmed"
 
-    handlers = {"finance.invoice.read": read, "finance.payment.read": read, "finance.invoice.apply_payment": apply_payment, "finance.dispute.resolve": resolve, "finance.account.flag": flag}
+    handlers = {"finance.invoice.read": invoice_read, "finance.payment.read": payment_read, "finance.dispute.read": dispute_read, "finance.account.read": account_read, "finance.invoice.apply_payment": apply_payment, "finance.dispute.resolve": resolve, "finance.account.flag": flag}
     return EnvironmentPackage(_make_manifest(environment_id, docs, tools), docs, specs, handlers)
 
 
@@ -524,7 +547,7 @@ def _build_support() -> EnvironmentPackage:
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
-        for index in range(20):
+        for index in range(60):
             ticket, customer = f"TKT-{partition_tag}-{index:03d}", f"CUS-{partition_tag}-{index:03d}"
             mode = index % 3
             if mode == 0:
@@ -534,20 +557,24 @@ def _build_support() -> EnvironmentPackage:
             else:
                 family, goal, target = "ticket_prioritization", f"Set ticket {ticket} to high priority after reviewing its impact.", {"ticket_priority": "high"}
             task = _task(environment_id, partition, family, index, goal, (ticket, customer))
-            state = {"ticket_id": ticket, "customer_id": customer, "ticket_status": "open", "ticket_tag": None, "ticket_priority": "normal", "records": {}}
+            state = {"ticket_id": ticket, "customer_id": customer, "ticket_version": 1, "ticket_status": "open", "ticket_tag": None, "ticket_priority": "normal", "records": {}}
             specs.append(_TaskSpec(task, target, state))
 
-    def read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        return {"ok": True, "record": dict(args)}, "none"
+    def ticket_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
+        return {"ok": args["ticket_id"] == state["ticket_id"], "record": {"ticketId": state["ticket_id"], "status": state["ticket_status"], "tag": state["ticket_tag"], "priority": state["ticket_priority"], "version": state["ticket_version"]}}, "none"
+
+    def customer_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
+        return {"ok": args["customer_id"] == state["customer_id"], "record": {"customerId": state["customer_id"], "ticketId": state["ticket_id"]}}, "none"
 
     def update(state: JsonObject, args: Mapping[str, JsonValue], field: str, expected: str) -> tuple[JsonObject, str]:
-        if args["expected_version"] != 1 or args["ticket_id"] != state["ticket_id"] or args[field] != expected:
+        if args["expected_version"] != state["ticket_version"] or args["ticket_id"] != state["ticket_id"] or args[field] != expected:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state[f"ticket_{field}"] = args[field]
+        state["ticket_version"] += 1
         return {"ok": True}, "confirmed"
 
     handlers = {
-        "support.ticket.read": read, "support.customer.read": read,
+        "support.ticket.read": ticket_read, "support.customer.read": customer_read,
         "support.ticket.set_status": lambda s, a: update(s, a, "status", "resolved"),
         "support.ticket.add_tag": lambda s, a: update(s, a, "tag", "specialist"),
         "support.ticket.set_priority": lambda s, a: update(s, a, "priority", "high"),
@@ -568,7 +595,7 @@ def _build_it() -> EnvironmentPackage:
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
-        for index in range(20):
+        for index in range(60):
             asset, incident, user = f"AST-{partition_tag}-{index:03d}", f"INC-{partition_tag}-{index:03d}", f"USR-{partition_tag}-{index:03d}"
             mode = index % 3
             if mode == 0:
@@ -578,31 +605,37 @@ def _build_it() -> EnvironmentPackage:
             else:
                 family, goal, target = "asset_ownership", f"Set user {user} as the owner of asset {asset}.", {"asset_owner": user}
             task = _task(environment_id, partition, family, index, goal, (asset, incident, user))
-            state = {"asset_id": asset, "incident_id": incident, "user_id": user, "incident_status": "open", "access_granted": False, "access_user": None, "asset_owner": None, "records": {}}
+            state = {"asset_id": asset, "incident_id": incident, "user_id": user, "asset_version": 1, "incident_version": 1, "incident_status": "open", "access_granted": False, "access_user": None, "asset_owner": None, "records": {}}
             specs.append(_TaskSpec(task, target, state))
 
-    def read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        return {"ok": True, "record": dict(args)}, "none"
+    def asset_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
+        return {"ok": args["asset_id"] == state["asset_id"], "record": {"assetId": state["asset_id"], "ownerId": state["asset_owner"], "version": state["asset_version"]}}, "none"
+
+    def incident_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
+        return {"ok": args["incident_id"] == state["incident_id"], "record": {"incidentId": state["incident_id"], "status": state["incident_status"], "version": state["incident_version"]}}, "none"
 
     def incident(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        if args["expected_version"] != 1 or args["incident_id"] != state["incident_id"] or args["status"] != "closed":
+        if args["expected_version"] != state["incident_version"] or args["incident_id"] != state["incident_id"] or args["status"] != "closed":
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["incident_status"] = "closed"
+        state["incident_version"] += 1
         return {"ok": True}, "confirmed"
 
     def access(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        if args["expected_version"] != 1 or args["asset_id"] != state["asset_id"] or args["user_id"] != state["user_id"]:
+        if args["expected_version"] != state["asset_version"] or args["asset_id"] != state["asset_id"] or args["user_id"] != state["user_id"]:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["access_granted"], state["access_user"] = True, args["user_id"]
+        state["asset_version"] += 1
         return {"ok": True}, "confirmed"
 
     def owner(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        if args["expected_version"] != 1 or args["asset_id"] != state["asset_id"] or args["owner_id"] != state["user_id"]:
+        if args["expected_version"] != state["asset_version"] or args["asset_id"] != state["asset_id"] or args["owner_id"] != state["user_id"]:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["asset_owner"] = args["owner_id"]
+        state["asset_version"] += 1
         return {"ok": True}, "confirmed"
 
-    handlers = {"it.asset.read": read, "it.incident.read": read, "it.incident.set_status": incident, "it.access.grant": access, "it.asset.set_owner": owner}
+    handlers = {"it.asset.read": asset_read, "it.incident.read": incident_read, "it.incident.set_status": incident, "it.access.grant": access, "it.asset.set_owner": owner}
     return EnvironmentPackage(_make_manifest(environment_id, docs, tools), docs, specs, handlers)
 
 
@@ -620,19 +653,20 @@ def _build_lab() -> EnvironmentPackage:
     for index in range(20):
         barcode, slot, operator = f"SMP-FIN-{index:03d}", f"SLOT-FIN-{index:03d}", f"OP-FIN-{index:03d}"
         task = _task(environment_id, Partition.FINAL, "chain_of_custody_scheduling", index, f"Schedule sample {barcode} in its compatible slot and record receipt by operator {operator}.", (barcode,))
-        state = {"sample_barcode": barcode, "slot_id": slot, "operator_id": operator, "booking_slot": None, "custody_event": None, "custody_operator": None, "records": {}}
+        state = {"sample_barcode": barcode, "slot_id": slot, "operator_id": operator, "assay": "mass-spec", "date": "2026-09-08", "slot_capacity": 1, "slot_booked": 0, "booking_slot": None, "custody_event": None, "custody_operator": None, "records": {}}
         specs.append(_TaskSpec(task, {"booking_slot": slot, "custody_event": "received", "custody_operator": operator}, state))
 
     def lookup(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        return {"ok": args["sample_barcode"] == state["sample_barcode"], "sample": state["sample_barcode"]}, "none"
+        return {"ok": args["sample_barcode"] == state["sample_barcode"], "sample": {"barcode": state["sample_barcode"], "assay": state["assay"], "requiredDate": state["date"], "custodyRequired": True}}, "none"
 
     def search(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        return {"ok": True, "slots": [state["slot_id"]]}, "none"
+        compatible = args["assay"] == state["assay"] and args["date"] == state["date"] and state["slot_booked"] < state["slot_capacity"]
+        return {"ok": compatible, "slots": [state["slot_id"]] if compatible else [], "capacityRemaining": state["slot_capacity"] - state["slot_booked"]}, "none"
 
     def book(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        if args["sample_barcode"] != state["sample_barcode"] or args["slot_id"] != state["slot_id"] or args["operator_id"] != state["operator_id"]:
+        if args["sample_barcode"] != state["sample_barcode"] or args["slot_id"] != state["slot_id"] or args["operator_id"] != state["operator_id"] or state["slot_booked"] >= state["slot_capacity"]:
             return {"ok": False, "code": "POLICY_DENIED"}, "none"
-        state["booking_slot"] = args["slot_id"]
+        state["booking_slot"], state["slot_booked"] = args["slot_id"], state["slot_booked"] + 1
         return {"ok": True}, "confirmed"
 
     def custody(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -903,7 +937,7 @@ class EvaluationReport:
 
     @property
     def promotion_eligible(self) -> bool:
-        return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed
+        return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in getattr(self, "_rows", ()))
 
     def require_promotion_evidence(self, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage]) -> "EvaluationReport":
         protocol.assert_integrity(packages)
@@ -932,19 +966,37 @@ class EvaluationRunner:
         self.frozen = protocol.start_candidate_generation()
         protocol.assert_integrity(self.packages)
         self.observations: list[RunObservation] = []
+        self._consumed_validation_allocations: set[str] = set()
+        self._validation_candidate_count = 0
+
+    @property
+    def consumed_validation_allocations(self) -> frozenset[str]:
+        return frozenset(self._consumed_validation_allocations)
 
     def run_validation(self, *, base_hash: str, candidate_hash: str, execute: Executor) -> EvaluationReport:
+        if self._validation_candidate_count >= self.protocol.validation_candidate_limit:
+            raise EvaluationError("validation candidate allocation limit exhausted")
+        allocation_id = f"{base_hash}:{candidate_hash}"
+        if allocation_id in self._consumed_validation_allocations:
+            raise EvaluationError("validation allocation already consumed")
+        allocation_index = self._validation_candidate_count
         rows: list[RunObservation] = []
         exposure: list[ExposureRecord] = []
         for name in self.protocol.known_environments:
             package = self.packages[name]
-            tasks = package.tasks_for_partition(Partition.VALIDATION)
+            all_tasks = package.tasks_for_partition(Partition.VALIDATION)
+            start = allocation_index * self.protocol.tasks_per_environment
+            tasks = all_tasks[start:start + self.protocol.tasks_per_environment]
+            if len(tasks) != self.protocol.tasks_per_environment:
+                raise EvaluationError(f"validation pool exhausted for {name}")
             exposure.append(ExposureRecord(name, Partition.VALIDATION, tuple(task.task_id for task in tasks), package.task_families(Partition.VALIDATION), False, package.manifest.sealed))
             for task in tasks:
                 for seed in self.protocol.seeds:
                     rows.extend((execute(Arm.B0, package, task, seed), execute(Arm.L, package, task, seed)))
         self.observations.extend(rows)
-        return self._report("validation", base_hash, candidate_hash, rows, (Arm.B0, Arm.L), exposure)
+        self._consumed_validation_allocations.add(allocation_id)
+        self._validation_candidate_count += 1
+        return self._report("validation", base_hash, candidate_hash, rows, (Arm.B0, Arm.L), exposure, task_overrides={name: self.packages[name].tasks_for_partition(Partition.VALIDATION)[allocation_index * self.protocol.tasks_per_environment:(allocation_index + 1) * self.protocol.tasks_per_environment] for name in self.protocol.known_environments})
 
     def run_final(self, *, base_hash: str, learned_hash: str, ablation: AblationInput, execute: Executor) -> EvaluationReport:
         audit = audit_ablation(ablation)
@@ -958,7 +1010,7 @@ class EvaluationRunner:
                 for seed in self.protocol.seeds:
                     rows.extend((execute(Arm.B0, package, task, seed), execute(Arm.L, package, task, seed), execute(Arm.A, package, task, seed)))
         self.observations.extend(rows)
-        report = self._report("final", "B0", learned_hash, rows, (Arm.B0, Arm.L, Arm.A), exposure, ablation_audit=audit)
+        report = self._report("final", base_hash, learned_hash, rows, (Arm.B0, Arm.L, Arm.A), exposure, ablation_audit=audit)
         return report
 
     def report_from_observations(self, *, comparison: str, base_hash: str, candidate_hash: str, observations: Sequence[RunObservation], expected_partitions: Iterable[str] | None = None, ablation_audit: AblationAudit | None = None) -> EvaluationReport:
@@ -966,14 +1018,15 @@ class EvaluationRunner:
         exposure = tuple(ExposureRecord(name, Partition.VALIDATION if comparison == "validation" else Partition.FINAL, tuple(task.task_id for task in self.packages[name].tasks_for_partition(Partition.VALIDATION if comparison == "validation" else Partition.FINAL)), self.packages[name].task_families(Partition.VALIDATION if comparison == "validation" else Partition.FINAL), False, self.packages[name].manifest.sealed) for name in (self.protocol.known_environments if comparison == "validation" else (*self.protocol.known_environments, self.protocol.sealed_environment)))
         return self._report(comparison, base_hash, candidate_hash, list(observations), arms, exposure, expected_partitions=expected_partitions, ablation_audit=ablation_audit)
 
-    def _report(self, comparison: str, base_hash: str, candidate_hash: str, rows: Sequence[RunObservation], arms: Sequence[Arm], exposure: Sequence[ExposureRecord], *, expected_partitions: Iterable[str] | None = None, ablation_audit: AblationAudit | None = None) -> EvaluationReport:
+    def _report(self, comparison: str, base_hash: str, candidate_hash: str, rows: Sequence[RunObservation], arms: Sequence[Arm], exposure: Sequence[ExposureRecord], *, expected_partitions: Iterable[str] | None = None, ablation_audit: AblationAudit | None = None, task_overrides: Mapping[str, Sequence[TaskInput]] | None = None) -> EvaluationReport:
         partition = Partition.VALIDATION if comparison == "validation" else Partition.FINAL
         env_names = self.protocol.known_environments if comparison == "validation" else (*self.protocol.known_environments, self.protocol.sealed_environment)
-        expected = len(env_names) * self.protocol.tasks_per_environment * len(self.protocol.seeds) * len(arms)
+        selected_tasks = task_overrides or {name: self.packages[name].tasks_for_partition(partition)[:self.protocol.tasks_per_environment] for name in env_names}
+        expected = sum(len(selected_tasks[name]) for name in env_names) * len(self.protocol.seeds) * len(arms)
         expected_keys = {
             (name, task.task_id, seed, arm)
             for name in env_names
-            for task in self.packages[name].tasks_for_partition(partition)
+            for task in selected_tasks[name]
             for seed in self.protocol.seeds
             for arm in arms
         }
@@ -988,7 +1041,7 @@ class EvaluationRunner:
         if duplicate_or_unexpected:
             failures_set.add("duplicate_or_unexpected_pair")
         for name in env_names:
-            for task in self.packages[name].tasks_for_partition(partition):
+            for task in selected_tasks[name]:
                 for seed in self.protocol.seeds:
                     pair = [row for row in rows if row.environment_id == name and row.task_id == task.task_id and row.seed == seed]
                     if len(pair) == len(arms) and len({(row.model_profile, row.core_planner_hash, row.budget) for row in pair}) != 1:
@@ -1000,7 +1053,11 @@ class EvaluationRunner:
         intervals = clustered_paired_bootstrap(baseline, candidate, draws=self.protocol.bootstrap_draws, analysis_seed=self.protocol.analysis_seed) if not missing_pairs and not partition_leak and not resets and not failures else ()
         validity = "valid" if not missing_pairs and not partition_leak and not resets and not failures and all(row.status == "complete" for row in rows) and (ablation_audit is None or ablation_audit.passed) else ("incomplete" if missing_pairs else "invalid")
         report_partition_hashes = {f"{name}:{partition.value}": self.frozen.partition_hashes[f"{name}:{partition.value}"] for name in env_names}
-        return EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, all(row.safety_violations == 0 for row in rows), missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit)
+        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, all(row.safety_violations == 0 for row in rows), missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit)
+        object.__setattr__(report, "_rows", tuple(rows))
+        if not missing_pairs and not all(row.model_provenance == ModelProvenance.REAL_MODEL for row in rows):
+            object.__setattr__(report, "validity_status", "invalid")
+        return report
 
 
 __all__ = [

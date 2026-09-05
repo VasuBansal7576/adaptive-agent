@@ -10,6 +10,7 @@ from adaptive_agent.evaluation import (
     EvaluationError,
     EvaluationProtocol,
     EvaluationRunner,
+    ModelProvenance,
     Partition,
     PromotionEvidenceRefused,
     ProviderUnavailable,
@@ -64,6 +65,34 @@ class EvaluationTests(unittest.TestCase):
     self.assertTrue(sealed.manifest.sealed)
     self.assertFalse(sealed.learner_tasks())
     self.assertTrue(all("SLOT-" not in text for text in sealed.learner_container_files().values()))
+
+  def test_task_families_and_entities_are_disjoint_across_splits(self):
+    for package in build_environment_packages().values():
+        family_sets = [set(package.task_families(partition)) for partition in Partition if package.tasks_for_partition(partition)]
+        for left, right in zip(family_sets, family_sets[1:]):
+            self.assertTrue(left.isdisjoint(right))
+        partitions = [package.tasks_for_partition(partition) for partition in Partition if package.tasks_for_partition(partition)]
+        for left, right in zip(partitions, partitions[1:]):
+            self.assertTrue({ref for task in left for ref in task.allowed_input_refs}.isdisjoint({ref for task in right for ref in task.allowed_input_refs}))
+
+  def test_fixture_reads_return_authoritative_records_and_versions(self):
+    packages = build_environment_packages()
+    finance = packages["finance"]
+    task = finance.learner_tasks()[0]
+    session = finance.reset(task.task_id, 3)
+    result = finance.invoke(session, "finance.invoice.read", {"invoice_id": "INV-DEV-000"})
+    self.assertEqual(result.output["record"]["version"], 1)
+    self.assertEqual(result.output["record"]["status"], "open")
+    support = packages["customer_support"]
+    support_task = support.learner_tasks()[0]
+    support_result = support.invoke(support.reset(support_task.task_id, 3), "support.ticket.read", {"ticket_id": "TKT-DEV-000"})
+    self.assertEqual(support_result.output["record"]["version"], 1)
+    lab = packages["lab_scheduling"]
+    lab_task = lab.tasks_for_partition(Partition.FINAL)[0]
+    lab_session = lab.reset(lab_task.task_id, 3)
+    sample = lab.invoke(lab_session, "lab.sample.lookup", {"sample_barcode": "SMP-FIN-000"})
+    slot = lab.invoke(lab_session, "lab.slot.search", {"assay": sample.output["sample"]["assay"], "date": sample.output["sample"]["requiredDate"]})
+    self.assertEqual(slot.output["slots"], ["SLOT-FIN-000"])
 
   def test_live_provider_and_deterministic_simulation_are_distinct_provenance(self):
     package = build_environment_packages()["finance"]
@@ -143,6 +172,38 @@ class EvaluationTests(unittest.TestCase):
     leaked = dataclasses.replace(rows[0], partition=Partition.FINAL)
     leaked_report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=[leaked])
     self.assertTrue(leaked_report.partition_leak)
+
+  def test_simulated_model_rows_cannot_be_promotion_evidence(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    runner = EvaluationRunner(protocol, packages)
+    rows = []
+    for name in protocol.known_environments:
+        for task in packages[name].tasks_for_partition(Partition.VALIDATION)[:20]:
+            for seed in protocol.seeds:
+                rows.extend((_observation(name, task, seed, Arm.B0), _observation(name, task, seed, Arm.L, True)))
+    report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=rows)
+    self.assertEqual(report.validity_status, "invalid")
+    self.assertFalse(report.promotion_eligible)
+
+  def test_validation_allocations_are_disjoint_and_candidate_limited(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    runner = EvaluationRunner(protocol, packages)
+    seen = []
+    def execute(arm, package, task, seed):
+        seen.append((package.environment_id, task.task_id, arm))
+        return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+    for index in range(3):
+        report = runner.run_validation(base_hash="base", candidate_hash=f"candidate-{index}", execute=execute)
+        self.assertTrue(report.promotion_eligible)
+    with self.assertRaisesRegex(EvaluationError, "limit exhausted"):
+        runner.run_validation(base_hash="base", candidate_hash="candidate-3", execute=execute)
+    allocations = [set(task_id for env, task_id, arm in seen[index * 120:index * 120 + 120]) for index in range(3)]
+    self.assertTrue(allocations[0].isdisjoint(allocations[1]))
+    self.assertTrue(allocations[1].isdisjoint(allocations[2]))
 
 
   def test_ablation_audit_rejects_retained_learned_material(self):
