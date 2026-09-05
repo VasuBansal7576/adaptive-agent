@@ -43,6 +43,7 @@ def test_register_create_and_live_lifecycle():
     assert response.status_code == 201
     run = response.json()
     assert run["status"] == "queued"
+    assert api.post(f"/runs/{run['runId']}/launch").status_code == 202
     events = api.get(f"/runs/{run['runId']}/events").text
     assert "Authenticated model response received" in events
     assert "Run succeeded" in events

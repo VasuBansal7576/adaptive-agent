@@ -323,7 +323,7 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
             return [dict(run) for run in plane.runs.values()]
 
     @app.post("/runs", status_code=201)
-    def create_run(payload: CreateRunRequest, background: BackgroundTasks) -> JsonObject:
+    def create_run(payload: CreateRunRequest) -> JsonObject:
         try:
             run, existing = plane.create_run(payload)
         except KeyError as exc:
@@ -332,8 +332,6 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except IdempotencyConflict as exc:
             raise HTTPException(status_code=409, detail={"code": "IDEMPOTENCY_CONFLICT", "message": str(exc), "correlationId": uuid.uuid4().hex, "retry": "never"}) from exc
-        if not existing:
-            background.add_task(plane.launch, run["runId"])
         return run
 
     @app.post("/runs/{run_id}/launch", status_code=202)
