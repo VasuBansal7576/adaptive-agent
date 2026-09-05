@@ -479,8 +479,8 @@ def _schema(name: str, effect: str, properties: JsonObject, required: Sequence[s
 
 
 def _task(environment_id: str, partition: Partition, family: str, index: int, goal: str, refs: Sequence[str]) -> TaskInput:
-    framing = {Partition.DEVELOPMENT: "Use the operational records to learn and complete this task", Partition.VALIDATION: "Independently complete and verify this unseen task", Partition.FINAL: "Audit this sealed task against the authoritative records"}[partition]
-    return TaskInput(f"{environment_id}-{partition.value}-{index:02d}", _ref(environment_id), f"{framing}: {goal}", tuple(refs), partition, f"{family}_{partition.value}")
+    framing = {Partition.DEVELOPMENT: "Learn from this single-record task", Partition.VALIDATION: "Verify this cross-record task using independent prerequisites", Partition.FINAL: "Audit this conditional decision with sealed decoys"}[partition]
+    return TaskInput(f"{environment_id}-{partition.value}-{index:02d}", _ref(environment_id), f"{framing}: {goal}", tuple(refs), partition, family)
 
 
 def _make_manifest(environment_id: str, docs: Sequence[Document], tools: Sequence[ToolSchema], *, sealed: bool = False) -> EnvironmentManifest:
@@ -522,8 +522,16 @@ def _build_finance() -> EnvironmentPackage:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
         for index in range(60 if partition == Partition.VALIDATION else 20):
             family, goal, target, refs = builders(index, partition_tag)
+            if partition == Partition.DEVELOPMENT:
+                family = f"single_record_{family}"
+            elif partition == Partition.VALIDATION:
+                family = f"cross_record_prerequisite_{family}"
+                target["prerequisite_verified"] = True
+            else:
+                family = f"conditional_decision_{family}"
+                target["decision_recorded"] = "approved"
             task = _task(environment_id, partition, family, index, goal, tuple(refs.values()))
-            state = {"invoice_status": "open", "invoice_version": 1, "payment_applied_to": None, "payment_version": 1, "dispute_status": "open", "dispute_version": 1, "dispute_resolution": None, "account_flagged": False, "account_version": 1, "account_flag_reason": None, "records": {}}
+            state = {"partition": partition.value, "invoice_status": "open", "invoice_version": 1, "payment_applied_to": None, "payment_version": 1, "dispute_status": "open", "dispute_version": 1, "dispute_resolution": None, "account_flagged": False, "account_version": 1, "account_flag_reason": None, "prerequisite_verified": False, "decision_recorded": None, "records": {}}
             state["invoice_id"], state["payment_id"], state["dispute_id"], state["account_id"] = f"INV-{partition_tag}-{index:03d}", f"PAY-{partition_tag}-{index:03d}", f"DSP-{partition_tag}-{index:03d}", f"ACC-{partition_tag}-{index:03d}"
             specs.append(_TaskSpec(task, target, state))
 
@@ -544,6 +552,7 @@ def _build_finance() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["invoice_status"], state["payment_applied_to"] = "paid", state["invoice_id"]
         state["invoice_version"], state["payment_version"] = state["invoice_version"] + 1, state["payment_version"] + 1
+        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     def resolve(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -551,6 +560,7 @@ def _build_finance() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["dispute_status"], state["dispute_resolution"] = "resolved", args["resolution"]
         state["dispute_version"] += 1
+        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     def flag(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -558,6 +568,7 @@ def _build_finance() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["account_flagged"], state["account_flag_reason"] = True, args["reason"]
         state["account_version"] += 1
+        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     handlers = {"finance.invoice.read": invoice_read, "finance.payment.read": payment_read, "finance.dispute.read": dispute_read, "finance.account.read": account_read, "finance.invoice.apply_payment": apply_payment, "finance.dispute.resolve": resolve, "finance.account.flag": flag}
@@ -586,8 +597,16 @@ def _build_support() -> EnvironmentPackage:
                 family, goal, target = "ticket_categorization", f"Categorize ticket {ticket} as requiring specialist follow-up.", {"ticket_tag": "specialist"}
             else:
                 family, goal, target = "ticket_prioritization", f"Set ticket {ticket} to high priority after reviewing its impact.", {"ticket_priority": "high"}
+            if partition == Partition.DEVELOPMENT:
+                family = f"single_record_{family}"
+            elif partition == Partition.VALIDATION:
+                family = f"cross_record_prerequisite_{family}"
+                target["prerequisite_verified"] = True
+            else:
+                family = f"conditional_decision_{family}"
+                target["decision_recorded"] = "approved"
             task = _task(environment_id, partition, family, index, goal, (ticket, customer))
-            state = {"ticket_id": ticket, "customer_id": customer, "ticket_version": 1, "ticket_status": "open", "ticket_tag": None, "ticket_priority": "normal", "records": {}}
+            state = {"partition": partition.value, "ticket_id": ticket, "customer_id": customer, "ticket_version": 1, "ticket_status": "open", "ticket_tag": None, "ticket_priority": "normal", "prerequisite_verified": False, "decision_recorded": None, "records": {}}
             specs.append(_TaskSpec(task, target, state))
 
     def ticket_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -601,6 +620,7 @@ def _build_support() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state[f"ticket_{field}"] = args[field]
         state["ticket_version"] += 1
+        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     handlers = {
@@ -634,8 +654,16 @@ def _build_it() -> EnvironmentPackage:
                 family, goal, target = "access_provisioning", f"Grant user {user} access to asset {asset} after verifying the request.", {"access_granted": True, "access_user": user}
             else:
                 family, goal, target = "asset_ownership", f"Set user {user} as the owner of asset {asset}.", {"asset_owner": user}
+            if partition == Partition.DEVELOPMENT:
+                family = f"single_record_{family}"
+            elif partition == Partition.VALIDATION:
+                family = f"cross_record_prerequisite_{family}"
+                target["prerequisite_verified"] = True
+            else:
+                family = f"conditional_decision_{family}"
+                target["decision_recorded"] = "approved"
             task = _task(environment_id, partition, family, index, goal, (asset, incident, user))
-            state = {"asset_id": asset, "incident_id": incident, "user_id": user, "asset_version": 1, "incident_version": 1, "incident_status": "open", "access_granted": False, "access_user": None, "asset_owner": None, "records": {}}
+            state = {"partition": partition.value, "asset_id": asset, "incident_id": incident, "user_id": user, "asset_version": 1, "incident_version": 1, "incident_status": "open", "access_granted": False, "access_user": None, "asset_owner": None, "prerequisite_verified": False, "decision_recorded": None, "records": {}}
             specs.append(_TaskSpec(task, target, state))
 
     def asset_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -649,6 +677,7 @@ def _build_it() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["incident_status"] = "closed"
         state["incident_version"] += 1
+        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     def access(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -656,6 +685,7 @@ def _build_it() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["access_granted"], state["access_user"] = True, args["user_id"]
         state["asset_version"] += 1
+        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     def owner(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -663,6 +693,7 @@ def _build_it() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["asset_owner"] = args["owner_id"]
         state["asset_version"] += 1
+        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     handlers = {"it.asset.read": asset_read, "it.incident.read": incident_read, "it.incident.set_status": incident, "it.access.grant": access, "it.asset.set_owner": owner}
