@@ -80,6 +80,8 @@ Do not reuse validation tasks after candidate feedback or expose sealed traces t
 The proposed validation panel has 20 tasks per known environment, three seeds per task, and two arms, totaling 360 scored runs per candidate.
 The final panel has 20 tasks per environment, three seeds per task, and fixed baseline, learned agent, and memory-disabled ablation arms across four environments, totaling 720 scored runs.
 Training attempts, safety tests, rejected candidates, transfer experiments, and retries add to those totals.
+For `N` candidates, the predeclared total workload is `N * 360 + 720 + training + transfer + safety + retries` scored or attempted runs under one overall model, tool, wall-time, and cost budget.
+Freeze that overall budget before candidate generation and record every term, including cancelled, rejected, or provider-retry work.
 Use the M2 measurements to calculate actual elapsed time and cost before reserving the run budget.
 If the panel cannot be completed, report incomplete evidence and withhold unsupported improvement claims.
 If the final performance target fails, M4 remains unmet even when all runs finished and the software checks pass.

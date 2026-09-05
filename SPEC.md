@@ -496,9 +496,14 @@ An optional later adaptation measurement uses a separate fourth-environment supp
 Final evidence compares three frozen arms: the original fixed baseline B0, the learned agent L, and a memory-disabled ablation A.
 B0 retains the initial generic instructions and has no acquired procedural skills or adaptive updates.
 L uses the final promoted bundle with learning disabled during scoring.
-A uses L's execution configuration but removes acquired procedural memory, retrieved learned skills, and copies of learned procedures embedded in prompts.
-A retains environment docs, live tools, and per-task working state so the ablation measures reusable learning rather than basic task access.
-The report records any learned configuration that remains in A and limits causal claims accordingly.
+The immutable inventory across B0, L, and A is the model and provider version, model parameters, system safety instructions, core planner hash, execution mode, tool schemas, policy and evaluator references, sandbox image, retrieval engine version, concurrency limits, token and tool budgets, wall-time and cost ceilings, task seeds, fixture state, and analysis code.
+A starts from that same inventory and masks or reverts every candidate-edited procedure, prompt, memory, retrieved learned skill, and orchestration decision that could carry learned behavior.
+A retains only the initial generic instructions, environment documentation, live broker tools, capability discovery, and per-task working state needed for the task.
+The evaluator audits the A bundle and its exported prompt and retrieval inputs for learned artifacts before scoring.
+If the audit finds any retained learned behavior, A is invalid for the intended ablation and the report labels L-versus-A as an incomplete comparison rather than a memory result.
+With a clean audit, L-versus-A estimates the performance difference associated with the retained learned bundle under fixed operational conditions.
+It does not prove that memory alone caused the difference, because masking can change execution behavior and other bundle interactions can remain.
+The report records the exact mask, any retained configuration, and the limits of the comparison.
 Promotion comparisons use the current active parent Bp against the candidate, while final reporting compares B0, L, and A.
 All arms use matching models, seeds, budgets, fixtures, and isolated state.
 The final test is not reused to select a new candidate after scores are observed.
@@ -517,6 +522,8 @@ That panel requires 360 scored runs for one two-arm comparison across three envi
 The proposed sealed final test uses at least 20 independent task instances per environment and three seeds for B0, L, and A across four environments, totaling 720 scored runs.
 Training begins with 20 tasks per known environment and reserves separate validation and final task families.
 These counts exclude training attempts, transfer experiments, safety tests, retries, and rejected candidate evaluations.
+For `N` candidates, the predeclared total workload is `N * 360 + 720 + training + transfer + safety + retries` scored or attempted runs under one overall model, tool, wall-time, and cost budget.
+The overall budget is frozen before candidate generation, and every term is recorded even when a run is cancelled, rejected, or repeated after a provider failure.
 The implementation owner must estimate cost and elapsed time from the vertical slice before committing to the full evaluation schedule.
 Budget or deadline pressure cannot turn an underpowered or incomplete evaluation into a passing result.
 The same task/seed pairs and model settings are used in both arms, with execution order alternated.
@@ -525,6 +532,8 @@ Compute uncertainty by a paired bootstrap over task instances, stratified by env
 Use 10,000 bootstrap draws and a recorded analysis seed.
 The balanced panel score weights each environment equally.
 
+The promotion gate compares the current active parent Bp with the candidate under the paired validation protocol.
+The final product gate compares the frozen learned agent L with the fixed baseline B0 under the sealed final protocol.
 The proposed default gate requires all of the following conditions.
 
 - The balanced accuracy gain is at least 5 percentage points and its 95% paired confidence interval has a lower bound above zero.
@@ -539,8 +548,8 @@ A zero baseline denominator uses the protocol's predeclared absolute bound rathe
 The evaluator owner freezes task counts, model/provider version, cost ceilings, thresholds, and safety cases before any candidate sees evaluation results.
 Changing that protocol invalidates the old comparison for promotion and requires a fresh unseen allocation.
 The sealed final target applies the same accuracy, reliability, safety, cost, and latency gate to L versus B0 across all four environments.
-The ablation is an explanatory comparison, not a substitute for that final target.
-If L does not beat A, report that the experiment did not demonstrate a benefit from retained procedural memory.
+The ablation is an explanatory comparison, not a substitute for the final L-versus-B0 gate.
+If L does not beat A, report that the experiment did not show an advantage for the retained learned bundle under the audited mask.
 A failed final target means the performance objective is unmet even if implementation checks pass.
 Track evidence reports all four metrics, including regressions and tradeoffs, without asserting that every metric improved.
 
