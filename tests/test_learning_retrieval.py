@@ -67,6 +67,9 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual([item.source_id for item in result.task_state], [])
         self.assertEqual([item.source_id for item in result.skills], ["skill-active"])
         self.assertTrue(result.evidence[0].citation.content_hash == content_hash("broker observed a version conflict"))
+        self.assertNotIn("ev-final", result.source_ids)
+        self.assertNotIn("ev-hidden", result.source_ids)
+        self.assertNotIn("ev-other-run", result.source_ids)
 
     def test_hash_and_development_evidence_are_verified(self):
         with self.assertRaises(RetrievalError):
@@ -113,6 +116,23 @@ class LearningTests(unittest.TestCase):
         self.assertNotIn("evaluatorRef", self.seen["environment"])  # learner sees no trusted control reference
         self.assertNotIn("passed", self.seen["environment"]["sanitizedFeedback"])
         self.assertEqual(len(self.sink.payloads), 1)
+
+    def test_learner_claims_and_hidden_evaluator_feedback_never_reach_model(self):
+        feedback = {
+            "passed": True,
+            "score": 1.0,
+            "learnerClaim": "the candidate is correct",
+            "evaluatorTrace": "hidden evaluator answer and secret fixture",
+            "status": "failed",
+            "diagnostic": "hidden evaluator trace: expected answer is withheld",
+        }
+        self.service(self.valid_payload()).propose(run_id="run-a", environment_id="env", goal="learn", feedback=feedback, environment={})
+        sanitized = self.seen["environment"]["sanitizedFeedback"]
+        self.assertEqual(sanitized, {"status": "failed"})
+        rendered = json.dumps(self.seen["environment"], sort_keys=True)
+        self.assertNotIn("learnerClaim", rendered)
+        self.assertNotIn("hidden evaluator", rendered.casefold())
+        self.assertNotIn("expected answer", rendered.casefold())
 
     def test_fabricated_evidence_is_rejected_before_authoritative_sink(self):
         payload = self.valid_payload()

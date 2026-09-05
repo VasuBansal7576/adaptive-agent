@@ -81,7 +81,7 @@ def sanitize_feedback(feedback: Mapping[str, Any] | None) -> dict[str, Any]:
     diagnostic = feedback.get("diagnostic")
     if isinstance(diagnostic, str) and len(diagnostic) <= 1000:
         lowered = diagnostic.casefold()
-        if not any(term in lowered for term in ("expected answer", "hidden answer", "evaluator code", "secret", "credential")):
+        if not any(term in lowered for term in ("expected answer", "hidden answer", "hidden evaluator", "evaluator trace", "evaluator code", "secret", "credential")):
             clean["diagnostic"] = diagnostic
     observations = feedback.get("observations")
     if isinstance(observations, list):
