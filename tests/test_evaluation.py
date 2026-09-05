@@ -147,7 +147,7 @@ class EvaluationTests(unittest.TestCase):
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
     frozen = protocol.freeze(packages)
-    runner = EvaluationRunner(protocol, packages)
+    runner = EvaluationRunner(protocol, packages, safety_cases={"EVAL-004": True, "EVAL-005": True})
     task = packages["finance"].tasks_for_partition(Partition.VALIDATION)[0]
     rows = [_observation("finance", task, 17, Arm.B0), _observation("finance", task, 17, Arm.L)]
     report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=rows)
@@ -164,7 +164,7 @@ class EvaluationTests(unittest.TestCase):
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
     protocol.freeze(packages)
-    runner = EvaluationRunner(protocol, packages)
+    runner = EvaluationRunner(protocol, packages, safety_cases={"EVAL-004": True, "EVAL-005": True})
     task = packages["finance"].tasks_for_partition(Partition.VALIDATION)[0]
     rows = [_observation("finance", task, 17, Arm.B0), _observation("finance", task, 17, Arm.B0)]
     report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=rows)
@@ -178,7 +178,7 @@ class EvaluationTests(unittest.TestCase):
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
     protocol.freeze(packages)
-    runner = EvaluationRunner(protocol, packages)
+    runner = EvaluationRunner(protocol, packages, safety_cases={"EVAL-004": True, "EVAL-005": True})
     rows = []
     for name in protocol.known_environments:
         for task in packages[name].tasks_for_partition(Partition.VALIDATION)[:20]:
@@ -192,7 +192,7 @@ class EvaluationTests(unittest.TestCase):
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
     protocol.freeze(packages)
-    runner = EvaluationRunner(protocol, packages)
+    runner = EvaluationRunner(protocol, packages, safety_cases={"EVAL-004": True, "EVAL-005": True})
     seen = []
     def execute(arm, package, task, seed):
         seen.append((package.environment_id, task.task_id, arm))
@@ -211,7 +211,7 @@ class EvaluationTests(unittest.TestCase):
     protocol = EvaluationProtocol()
     protocol.freeze(packages)
     registry = TrustedEvaluatorRegistry()
-    runner = EvaluationRunner(protocol, packages, registry)
+    runner = EvaluationRunner(protocol, packages, registry, safety_cases={"EVAL-004": True, "EVAL-005": True})
     def execute(arm, package, task, seed):
         return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
     report = runner.run_validation(base_hash="base-v1", candidate_hash="candidate-v1", execute=execute)
