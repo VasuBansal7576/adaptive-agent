@@ -146,15 +146,20 @@ Each workstream gets a branch/worktree boundary, explicit contracts, dependencie
 Cross-session contract changes and true blockers go through AO.
 The evaluation owner controls hidden partitions and reports rather than delegating that authority to the learner.
 
-Build-time AO work uses Devin, OpenCode, and GPT-5.6 Luna.
+Codex AO worker and orchestrator defaults, including existing AO sessions, use GPT-5.6 Luna Medium.
+Devin build-time work uses SWE-1.7 Medium.
+OpenCode build-time work must use GLM-5.3-Flash, selected and running now, or Muse Spark1.3.
+Big Pickle is not permitted.
 Do not assign Astra, Sol, or Terra, and do not spawn additional workers for this plan.
 Prime is the proposed product runtime and is also available for bounded bridge work.
-Prime 0.9.2 session 3 authenticated a ChatGPT subscription, configured `openai-codex/gpt-5.6-luna`, and returned `4` for an actual Python `2+2` call.
+Prime runtime smoke uses GPT-5.6 Luna through a ChatGPT subscription.
+Prime 0.9.2 session 3 authenticated that subscription, configured `openai-codex/gpt-5.6-luna`, and returned `4` for an actual Python `2+2` call.
 Default Prime Inference returned HTTP 402 for lack of balance, while the subscription provider worked.
 The official kernel bootstrap was repaired with `UV_NO_CACHE=1` after a broken setuptools cache.
 Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
 The product bridge, safety isolation, and behavioral evaluation remain unverified.
 These smoke results do not by themselves prove task completion.
+The separate GLM contract review remains pending and is not launched or repeated by this plan.
 Qodo is an optional code reviewer, not an outcome evaluator or a replacement for product tests.
 Backpass and Vision are influences and do not require installation.
 
