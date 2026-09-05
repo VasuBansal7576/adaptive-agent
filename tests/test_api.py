@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from threading import Event, Thread
 
 from adaptive_agent.api import ControlPlane, create_app
 
@@ -80,3 +81,24 @@ def test_unverified_model_provenance_fails_closed():
     run = api.post("/runs", json={"goal": "read", "environmentId": "neutral", "idempotencyKey": "unverified"}).json()
     api.post(f"/runs/{run['runId']}/launch")
     assert api.get(f"/runs/{run['runId']}").json()["status"] == "failed"
+
+
+def test_cancelled_run_cannot_be_reopened_by_late_model_result():
+    started, release = Event(), Event()
+
+    def slow_model(**kwargs):
+        started.set()
+        release.wait(timeout=2)
+        return Invocation()
+
+    plane = ControlPlane(model_runner=slow_model, evaluator=evaluator)
+    api = TestClient(create_app(plane))
+    api.post("/environments/register", json=manifest())
+    run = api.post("/runs", json={"goal": "read", "environmentId": "neutral", "idempotencyKey": "cancel"}).json()
+    thread = Thread(target=plane.launch, args=(run["runId"],))
+    thread.start()
+    assert started.wait(timeout=1)
+    assert api.post(f"/runs/{run['runId']}/cancel").status_code == 200
+    release.set()
+    thread.join(timeout=2)
+    assert api.get(f"/runs/{run['runId']}").json()["status"] == "cancelled"

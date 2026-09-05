@@ -258,10 +258,15 @@ class ControlPlane:
             usage = getattr(invocation, "usage", None)
             if provider != "openai-codex" or model != "openai-codex/gpt-5.6-luna" or not isinstance(usage, Mapping):
                 raise ModelUnavailableError("model runner did not return authenticated provider, model, and usage")
+            with self._lock:
+                if run["status"] == "cancelled":
+                    return
             provenance = {"provider": invocation.provider, "model": invocation.model, "usage": dict(invocation.usage)}
             self._emit(run_id, "evidence", "Authenticated model response received.", json.dumps(provenance, sort_keys=True))
             outcome = dict(self.evaluator(goal=run["goal"], model_output=invocation.text, environment=env["manifest"]))
             with self._lock:
+                if run["status"] == "cancelled":
+                    return
                 run["outcomeRef"] = _ref(f"outcome_{run_id}", "1", outcome)
                 run["status"] = "succeeded" if outcome.get("passed") is True else "failed"
             self._emit(run_id, "evidence", "Trusted evaluator recorded outcome.", json.dumps(outcome, sort_keys=True))
