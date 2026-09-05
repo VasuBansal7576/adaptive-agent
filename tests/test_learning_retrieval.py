@@ -2,7 +2,7 @@ import hashlib
 import json
 import unittest
 
-from adaptive_agent.learning import LearningError, LearningService
+from adaptive_agent.learning import LearningError, LearningService, PlannerLearningAdapter
 from adaptive_agent.retrieval import AccessFilteredRetriever, InMemorySourceProvider, RetrievalError, SourceKind, SourceRecord, content_hash
 
 
@@ -27,6 +27,24 @@ class Sink:
     def create_candidate(self, payload):
         self.payloads.append(dict(payload))
         return {"candidateId": "candidate-from-authority", "state": "validated", **payload}
+
+
+class PlannerClient:
+    def __init__(self, payload):
+        self.payload = payload
+        self.messages = None
+
+    def invoke(self, *, goal, environment, messages):
+        self.messages = messages
+        return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": "planner-response", "text": json.dumps(self.payload), "usage": {"totalTokens": 20}}
+
+
+class EvidenceSink:
+    def __init__(self):
+        self.calls = []
+
+    def record_model_observation(self, evidence, *, trusted_parent=False):
+        self.calls.append((dict(evidence), trusted_parent))
 
 
 class RetrievalTests(unittest.TestCase):
@@ -116,6 +134,15 @@ class LearningTests(unittest.TestCase):
     def test_stale_base_is_rejected(self):
         with self.assertRaisesRegex(LearningError, "pinned active"):
             self.service(self.valid_payload()).propose(run_id="run-a", environment_id="env", goal="learn", base_bundle_hash="b" * 64, environment={})
+
+    def test_session2_planner_client_adapter_records_trusted_observation(self):
+        client = PlannerClient(self.valid_payload())
+        evidence_sink = EvidenceSink()
+        service = LearningService(self.retriever, PlannerLearningAdapter(client, evidence_sink), self.sink, lambda: "a" * 64)
+        service.propose(run_id="run-a", environment_id="env", goal="learn", environment={})
+        self.assertTrue(evidence_sink.calls[0][1])
+        self.assertEqual(client.messages[0]["role"], "system")
+        self.assertIn("bounded learning patch", client.messages[0]["content"])
 
 
 if __name__ == "__main__":

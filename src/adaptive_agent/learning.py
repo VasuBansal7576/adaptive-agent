@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .retrieval import AccessFilteredRetriever, Citation, RetrievalError, RetrievalResult, canonical_json
 
@@ -31,6 +31,18 @@ class ModelInvocation(Protocol):
 
 class AuthenticatedModelRunner(Protocol):
     def __call__(self, *, goal: str, environment: dict[str, Any], emit: Callable[[str, str, str | None], None]) -> ModelInvocation: ...
+
+
+class PlannerModelClient(Protocol):
+    """Structural copy of session 2's planner client seam."""
+
+    def invoke(self, *, goal: str, environment: Mapping[str, Any], messages: Sequence[Mapping[str, str]]) -> Mapping[str, Any]: ...
+
+
+class PlannerEvidenceSink(Protocol):
+    """Parent-owned sink for trusted model observations."""
+
+    def record_model_observation(self, evidence: Mapping[str, Any], *, trusted_parent: bool = False) -> Any: ...
 
 
 class CandidateSink(Protocol):
@@ -75,6 +87,57 @@ def sanitize_feedback(feedback: Mapping[str, Any] | None) -> dict[str, Any]:
     if isinstance(observations, list):
         clean["observations"] = [item for item in observations if isinstance(item, str) and len(item) <= 300][:8]
     return clean
+
+
+sanitize_execution_feedback = sanitize_feedback
+
+
+class PlannerLearningAdapter:
+    """Adapt session 2's PlannerModelClient to proposal generation.
+
+    The adapter deliberately records provenance through the parent sink and
+    passes proposal instructions as messages.  It does not import ``planner``
+    or execute a planner/kernel turn, which keeps learning independent from
+    task execution and prevents learner text from becoming authority.
+    """
+
+    def __init__(self, client: PlannerModelClient, evidence_sink: PlannerEvidenceSink) -> None:
+        self.client = client
+        self.evidence_sink = evidence_sink
+
+    def __call__(self, *, goal: str, environment: dict[str, Any], emit: Callable[[str, str, str | None], None]) -> ModelInvocation:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Propose one generic bounded learning patch from verified development evidence. "
+                    "Return only the JSON proposal schema requested by the caller. "
+                    "Predicted effects are hypotheses, not outcomes. Do not emit fixture IDs, action sequences, "
+                    "hidden evaluator material, policy changes, credentials, or broker/store/planner edits."
+                ),
+            },
+            {"role": "user", "content": json.dumps({"goal": goal, "environment": environment}, sort_keys=True, ensure_ascii=False)},
+        ]
+        raw = self.client.invoke(goal=goal, environment=environment, messages=messages)
+        if not isinstance(raw, Mapping):
+            raise LearningError("planner client returned a non-object response")
+        provider, model = raw.get("provider"), raw.get("model")
+        response_id = raw.get("responseId", raw.get("response_id"))
+        text, usage = raw.get("text"), raw.get("usage")
+        if not all(isinstance(value, str) and value.strip() for value in (provider, model, response_id, text)) or not isinstance(usage, Mapping) or not usage:
+            raise LearningError("planner response provenance is incomplete")
+        self.evidence_sink.record_model_observation({"provider": provider, "model": model, "responseId": response_id, "usage": dict(usage)}, trusted_parent=True)
+        emit("model", "Authenticated model proposal received.", response_id)
+        return _Invocation(text=text, provider=provider, model=model, response_id=response_id, usage=dict(usage))
+
+
+@dataclass(frozen=True)
+class _Invocation:
+    text: str
+    provider: str
+    model: str
+    response_id: str
+    usage: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
