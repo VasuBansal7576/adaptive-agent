@@ -10,15 +10,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import secrets
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
@@ -295,6 +297,9 @@ class ControlPlane:
         self.version_history: list[JsonObject] = [{"bundleHash": self.active_bundle_hash, "state": "active", "at": _now()}]
         self.approvals: dict[tuple[str, str], bool] = {}
         self._lock = threading.RLock()
+        # Held by the local operator session and never returned in a JSON
+        # response or passed into the learner/runtime process.
+        self.operator_token = secrets.token_urlsafe(32)
 
     def create_candidate(self, payload: CandidateProposalRequest) -> JsonObject:
         with self._lock:
@@ -484,10 +489,60 @@ class IdempotencyConflict(RuntimeError):
         self.run_id = run_id
 
 
+def _loopback_name(value: str | None) -> bool:
+    if not value:
+        return False
+    # urlsplit handles host:port and bracketed IPv6 literals consistently.
+    parsed = urlsplit(f"http://{value}")
+    return parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def _same_loopback_origin(request: Request) -> bool:
+    host = request.headers.get("host")
+    if not _loopback_name(host):
+        return False
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    parsed = urlsplit(origin)
+    if parsed.scheme not in {"http", "https"} or not _loopback_name(parsed.netloc):
+        return False
+    host_parsed = urlsplit(f"//{host}")
+    if parsed.hostname != host_parsed.hostname or parsed.scheme != request.url.scheme:
+        return False
+    origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    host_port = host_parsed.port or (443 if request.url.scheme == "https" else 80)
+    return origin_port == host_port
+
+
+def _has_operator_session(request: Request, plane: ControlPlane) -> bool:
+    bearer = request.headers.get("authorization", "")
+    token = bearer.removeprefix("Bearer ").strip() if bearer.startswith("Bearer ") else ""
+    cookie = request.cookies.get("adaptive_operator_session", "")
+    return secrets.compare_digest(token or cookie, plane.operator_token)
+
+
 def create_app(control: ControlPlane | None = None) -> FastAPI:
     plane = control or ControlPlane()
     app = FastAPI(title="Adaptive Agent Control API", version="0.1.0")
     app.state.control_plane = plane
+
+    @app.middleware("http")
+    async def access_boundary(request: Request, call_next: Callable[..., Any]) -> Any:
+        if not _same_loopback_origin(request):
+            return JSONResponse(status_code=403, content={"code": "FORBIDDEN", "message": "control API requires a loopback Host and same-origin request", "correlationId": uuid.uuid4().hex, "retry": "never"})
+        if request.url.path in {"/health", "/session/bootstrap"}:
+            return await call_next(request)
+        if not _has_operator_session(request, plane):
+            return JSONResponse(status_code=401, content={"code": "FORBIDDEN", "message": "operator session required", "correlationId": uuid.uuid4().hex, "retry": "never"})
+        return await call_next(request)
+
+    @app.get("/session/bootstrap")
+    def session_bootstrap(response: Response) -> JsonObject:
+        # The token is delivered only as an HttpOnly cookie. Browser JavaScript
+        # receives a readiness marker, never the credential itself.
+        response.set_cookie("adaptive_operator_session", plane.operator_token, httponly=True, samesite="strict", secure=False, path="/")
+        return {"status": "ready", "transport": "live"}
 
     @app.get("/health")
     def health() -> dict[str, str]:

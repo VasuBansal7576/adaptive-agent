@@ -36,7 +36,8 @@ def evaluator(**kwargs):
 
 def client():
     plane = ControlPlane(model_runner=model_runner, evaluator=evaluator)
-    api = TestClient(create_app(plane))
+    api = TestClient(create_app(plane), base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").json() == {"status": "ready", "transport": "live"}
     assert api.post("/environments/register", json=manifest()).status_code == 201
     return api
 
@@ -97,7 +98,8 @@ def test_unverified_model_provenance_fails_closed():
         usage = {"outputTokens": 1}
 
     plane = ControlPlane(model_runner=lambda **_: Unverified(), evaluator=evaluator)
-    api = TestClient(create_app(plane))
+    api = TestClient(create_app(plane), base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
     assert api.post("/environments/register", json=manifest()).status_code == 201
     run = api.post("/runs", json={"goal": "read", "environmentId": "neutral", "idempotencyKey": "unverified"}).json()
     api.post(f"/runs/{run['runId']}/launch")
@@ -113,7 +115,8 @@ def test_cancelled_run_cannot_be_reopened_by_late_model_result():
         return Invocation()
 
     plane = ControlPlane(model_runner=slow_model, evaluator=evaluator)
-    api = TestClient(create_app(plane))
+    api = TestClient(create_app(plane), base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
     api.post("/environments/register", json=manifest())
     run = api.post("/runs", json={"goal": "read", "environmentId": "neutral", "idempotencyKey": "cancel"}).json()
     thread = Thread(target=plane.launch, args=(run["runId"],))
@@ -127,7 +130,8 @@ def test_cancelled_run_cannot_be_reopened_by_late_model_result():
 
 def test_candidate_evaluation_decision_and_rollback_boundaries():
     plane = ControlPlane(model_runner=model_runner, evaluator=evaluator)
-    api = TestClient(create_app(plane))
+    api = TestClient(create_app(plane), base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
     api.post("/environments/register", json=manifest())
     candidate = api.post(
         "/candidates",
@@ -167,3 +171,19 @@ def test_prime_bridge_records_parent_owned_model_observation():
     result = runner(goal="goal", environment={}, emit=lambda *_: None)
     assert result.response_id == "resp-1"
     assert calls[0][1] is True
+
+
+def test_operator_bootstrap_and_loopback_origin_boundary():
+    api = TestClient(create_app(ControlPlane()), base_url="http://127.0.0.1")
+    # No server-issued cookie or bearer token may mutate or read protected data.
+    assert api.get("/runs").status_code == 401
+    assert api.post("/environments/register", json=manifest()).status_code == 401
+    # Rebinding the Host or Origin is rejected before authentication.
+    assert api.get("/runs", headers={"host": "unrelated.example"}).status_code == 403
+    assert api.get("/runs", headers={"origin": "https://unrelated.example"}).status_code == 403
+    # Same-origin bootstrap establishes a cookie-only operator session.
+    bootstrap = api.get("/session/bootstrap")
+    assert bootstrap.status_code == 200
+    assert "adaptive_operator_session" in bootstrap.headers["set-cookie"]
+    assert "token" not in bootstrap.text.lower()
+    assert api.get("/runs", headers={"origin": "http://127.0.0.1"}).status_code == 200
