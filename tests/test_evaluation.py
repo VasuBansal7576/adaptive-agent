@@ -1,0 +1,162 @@
+import dataclasses
+import unittest
+
+from adaptive_agent.evaluation import (
+    AblationInput,
+    Arm,
+    ArtifactRef,
+    BudgetSpec,
+    EnvironmentManifest,
+    EvaluationError,
+    EvaluationProtocol,
+    EvaluationRunner,
+    Partition,
+    PromotionEvidenceRefused,
+    ProviderUnavailable,
+    Provenance,
+    RunObservation,
+    TaskInput,
+    audit_ablation,
+    build_environment_packages,
+    clustered_paired_bootstrap,
+)
+
+
+def _observation(env, task, seed, arm, passed=True, *, partition=Partition.VALIDATION):
+    return RunObservation(task.task_id, env, partition, seed, arm, passed, passed, 0, 100 if arm is Arm.B0 else 105, 1.0, core_planner_hash="same")
+
+
+class EvaluationTests(unittest.TestCase):
+  def test_required_argument_schemas_reject_privileged_fields_and_unknown_tools(self):
+    packages = build_environment_packages()
+    task = packages["finance"].learner_tasks()[0]
+    payload = task.to_dict()
+    self.assertEqual(TaskInput.from_mapping(payload), task)
+    with self.assertRaisesRegex(EvaluationError, "privileged task fields"):
+        TaskInput.from_mapping({**payload, "expectedAnswer": "paid"})
+    manifest = packages["finance"].manifest.to_dict()
+    self.assertEqual(EnvironmentManifest.from_mapping(manifest).environment_id, "finance")
+    with self.assertRaisesRegex(EvaluationError, "privileged manifest fields"):
+        EnvironmentManifest.from_mapping({**manifest, "actionSequence": ["finance.invoice.read"]})
+    session = packages["finance"].reset(task.task_id, 11)
+    with self.assertRaisesRegex(EvaluationError, "unknown tool arguments"):
+        packages["finance"].invoke(session, "finance.invoice.read", {"invoice_id": "INV-DEV-000", "secret": "no"})
+
+  def test_reset_is_deterministic_and_isolated_between_sessions(self):
+    package = build_environment_packages()["finance"]
+    task = package.tasks_for_partition(Partition.DEVELOPMENT)[0]
+    first = package.reset(task.task_id, 7)
+    second = package.reset(task.task_id, 7)
+    package.invoke(first, "finance.invoice.apply_payment", {"invoice_id": "INV-DEV-000", "payment_id": "PAY-DEV-000", "expected_version": 1})
+    self.assertNotEqual(first.state, second.state)
+    self.assertEqual(second.state["invoice_status"], "open")
+    self.assertEqual(package.reset(task.task_id, 7).state, package.reset(task.task_id, 7).state)
+
+  def test_partition_retrieval_withholds_validation_and_final_from_learner(self):
+    packages = build_environment_packages()
+    for package in packages.values():
+        learner_ids = {task.task_id for task in package.learner_tasks()}
+        self.assertEqual(learner_ids & {task.task_id for task in package.tasks_for_partition(Partition.VALIDATION)}, set())
+        self.assertEqual(learner_ids & {task.task_id for task in package.tasks_for_partition(Partition.FINAL)}, set())
+        self.assertTrue(all("expected" not in path.lower() for path in package.learner_container_files()))
+        self.assertTrue(all("answer" not in document.text.lower() for document in package.learner_documents()))
+    sealed = packages["lab_scheduling"]
+    self.assertTrue(sealed.manifest.sealed)
+    self.assertFalse(sealed.learner_tasks())
+    self.assertTrue(all("SLOT-" not in text for text in sealed.learner_container_files().values()))
+
+  def test_live_provider_and_deterministic_simulation_are_distinct_provenance(self):
+    package = build_environment_packages()["finance"]
+    task = package.learner_tasks()[0]
+    simulated = package.invoke(package.reset(task.task_id, 1), "finance.invoice.read", {"invoice_id": "INV-DEV-000"})
+    self.assertIs(simulated.provenance, Provenance.DETERMINISTIC_SIMULATION)
+    self.assertEqual(simulated.provider_id, "deterministic-fixture")
+    with self.assertRaises(ProviderUnavailable):
+        package.invoke(package.reset(task.task_id, 1), "finance.invoice.read", {"invoice_id": "INV-DEV-000"}, provider=Provenance.LIVE_PROVIDER)
+    class Provider:
+        provider_id = "sandbox-provider"
+        def call(self, tool, arguments):
+            return {"ok": True, "providerTool": tool}
+    live = package.invoke(package.reset(task.task_id, 1), "finance.invoice.read", {"invoice_id": "INV-DEV-000"}, provider=Provenance.LIVE_PROVIDER, live_provider=Provider())
+    self.assertIs(live.provenance, Provenance.LIVE_PROVIDER)
+    self.assertEqual(live.provider_id, "sandbox-provider")
+
+  def test_protocol_freezes_hashes_before_candidate_generation_and_detects_drift(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    frozen = protocol.freeze(packages)
+    self.assertTrue(frozen.protocol_hash)
+    self.assertEqual(len(frozen.fixture_hashes), 4)
+    self.assertEqual(len(frozen.partition_hashes), 12)
+    protocol.start_candidate_generation()
+    with self.assertRaisesRegex(EvaluationError, "already frozen"):
+        protocol.freeze(packages)
+    changed = dict(packages)
+    changed["finance"] = build_environment_packages()["finance"]
+    changed["finance"].manifest = dataclasses.replace(changed["finance"].manifest, version="2")
+    with self.assertRaisesRegex(PromotionEvidenceRefused, "fixture hash changed"):
+        protocol.assert_integrity(changed)
+
+  def test_clustered_bootstrap_is_seeded_and_clusters_all_seeds_per_task(self):
+    packages = build_environment_packages()
+    baseline, candidate = [], []
+    for env in ("finance", "customer_support", "it"):
+        tasks = packages[env].tasks_for_partition(Partition.VALIDATION)[:2]
+        for task in tasks:
+            for seed in (17, 23, 29):
+                baseline.append(_observation(env, task, seed, Arm.B0, True))
+                candidate.append(_observation(env, task, seed, Arm.L, task.task_id.endswith("00")))
+    one = clustered_paired_bootstrap(baseline, candidate, analysis_seed=9)
+    two = clustered_paired_bootstrap(baseline, candidate, analysis_seed=9)
+    self.assertEqual(one, two)
+    self.assertTrue(all(item.draws == 10_000 and item.analysis_seed == 9 for item in one))
+    self.assertLess(next(item for item in one if item.metric == "accuracy").point, 0)
+
+
+  def test_incomplete_report_cannot_be_promotion_evidence_and_hashes_are_checked(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    frozen = protocol.freeze(packages)
+    runner = EvaluationRunner(protocol, packages)
+    task = packages["finance"].tasks_for_partition(Partition.VALIDATION)[0]
+    rows = [_observation("finance", task, 17, Arm.B0), _observation("finance", task, 17, Arm.L)]
+    report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=rows)
+    self.assertEqual(report.validity_status, "incomplete")
+    self.assertFalse(report.promotion_eligible)
+    with self.assertRaises(PromotionEvidenceRefused):
+        report.require_promotion_evidence(protocol, packages)
+    invalid = dataclasses.replace(report, protocol_hash="wrong")
+    with self.assertRaises(PromotionEvidenceRefused):
+        invalid.require_promotion_evidence(protocol, packages)
+    self.assertTrue(frozen.protocol_hash)
+
+  def test_invalid_duplicate_or_leaked_pair_is_not_a_valid_report(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    runner = EvaluationRunner(protocol, packages)
+    task = packages["finance"].tasks_for_partition(Partition.VALIDATION)[0]
+    rows = [_observation("finance", task, 17, Arm.B0), _observation("finance", task, 17, Arm.B0)]
+    report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=rows)
+    self.assertEqual(report.validity_status, "incomplete")
+    self.assertIn("duplicate_or_unexpected_pair", report.infrastructure_failures)
+    leaked = dataclasses.replace(rows[0], partition=Partition.FINAL)
+    leaked_report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=[leaked])
+    self.assertTrue(leaked_report.partition_leak)
+
+
+  def test_ablation_audit_rejects_retained_learned_material(self):
+    clean = audit_ablation(AblationInput("a", "generic safety instructions", ("finance operations",)))
+    self.assertTrue(clean.passed)
+    dirty = audit_ablation(AblationInput("a", "generic safety instructions", (), ({"source": "learned", "id": "skill-1"},)))
+    self.assertFalse(dirty.passed)
+    self.assertEqual(dirty.retained_learned_artifacts, ("artifact:0",))
+
+
+  def test_protocol_counts_and_budget_match_spec_defaults(self):
+    protocol = EvaluationProtocol()
+    self.assertEqual(protocol.validation_run_count, 360)
+    self.assertEqual(protocol.final_run_count, 720)
+    workload = protocol.workload(candidate_count=2, training_runs=60, transfer_runs=12, safety_runs=8, retries=4)
+    self.assertEqual(workload.total_attempted_runs, 1_524)
+    self.assertGreater(BudgetSpec().model_tokens, 0)
