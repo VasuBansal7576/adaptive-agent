@@ -529,12 +529,12 @@ def _build_finance() -> EnvironmentPackage:
         for index in range(60 if partition == Partition.VALIDATION else 20):
             family, goal, target, refs = builders(index, partition_tag)
             if partition == Partition.DEVELOPMENT:
-                family = f"single_record_{family}"
+                family = ("single_invoice_record", "single_dispute_record", "single_account_record")[index % 3]
             elif partition == Partition.VALIDATION:
-                family = f"cross_record_prerequisite_{family}"
+                family = ("invoice_payment_join", "dispute_customer_approval", "account_history_correlation")[index % 3]
                 target["prerequisite_verified"] = True
             else:
-                family = f"conditional_decision_{family}"
+                family = ("conditional_settlement_decision", "conditional_dispute_escalation", "conditional_risk_decision")[index % 3]
                 target["decision_recorded"] = "approved"
             task = _task(environment_id, partition, family, index, goal, tuple(refs.values()))
             state = {"partition": partition.value, "invoice_status": "open", "invoice_version": 1, "payment_applied_to": None, "payment_version": 1, "dispute_status": "open", "dispute_version": 1, "dispute_resolution": None, "account_flagged": False, "account_version": 1, "account_flag_reason": None, "prerequisite_verified": False, "decision_recorded": None, "records": {}}
@@ -604,12 +604,12 @@ def _build_support() -> EnvironmentPackage:
             else:
                 family, goal, target = "ticket_prioritization", f"Set ticket {ticket} to high priority after reviewing its impact.", {"ticket_priority": "high"}
             if partition == Partition.DEVELOPMENT:
-                family = f"single_record_{family}"
+                family = ("single_ticket_resolution", "single_ticket_tagging", "single_ticket_priority")[index % 3]
             elif partition == Partition.VALIDATION:
-                family = f"cross_record_prerequisite_{family}"
+                family = ("ticket_customer_join", "ticket_history_check", "ticket_impact_correlation")[index % 3]
                 target["prerequisite_verified"] = True
             else:
-                family = f"conditional_decision_{family}"
+                family = ("conditional_ticket_resolution", "conditional_specialist_route", "conditional_priority_decision")[index % 3]
                 target["decision_recorded"] = "approved"
             task = _task(environment_id, partition, family, index, goal, (ticket, customer))
             state = {"partition": partition.value, "ticket_id": ticket, "customer_id": customer, "ticket_version": 1, "ticket_status": "open", "ticket_tag": None, "ticket_priority": "normal", "prerequisite_verified": False, "decision_recorded": None, "records": {}}
@@ -661,12 +661,12 @@ def _build_it() -> EnvironmentPackage:
             else:
                 family, goal, target = "asset_ownership", f"Set user {user} as the owner of asset {asset}.", {"asset_owner": user}
             if partition == Partition.DEVELOPMENT:
-                family = f"single_record_{family}"
+                family = ("single_incident_record", "single_access_record", "single_asset_record")[index % 3]
             elif partition == Partition.VALIDATION:
-                family = f"cross_record_prerequisite_{family}"
+                family = ("incident_asset_join", "user_asset_entitlement", "asset_owner_history")[index % 3]
                 target["prerequisite_verified"] = True
             else:
-                family = f"conditional_decision_{family}"
+                family = ("conditional_incident_close", "conditional_access_grant", "conditional_owner_change")[index % 3]
                 target["decision_recorded"] = "approved"
             task = _task(environment_id, partition, family, index, goal, (asset, incident, user))
             state = {"partition": partition.value, "asset_id": asset, "incident_id": incident, "user_id": user, "asset_version": 1, "incident_version": 1, "incident_status": "open", "access_granted": False, "access_user": None, "asset_owner": None, "prerequisite_verified": False, "decision_recorded": None, "records": {}}
