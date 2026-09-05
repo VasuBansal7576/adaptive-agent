@@ -31,7 +31,7 @@ class Kernel:
 
     def execute(self, code, *, timeout=None, cancel=None):
         self.code.append(code)
-        return KernelResult()
+        return KernelResult(stdout="token=secret-value")
 
 
 class Sink:
@@ -71,7 +71,8 @@ def test_generic_model_python_loop_round_trips_sanitized_feedback_and_evidence()
     assert all(trusted for _, trusted in sink.observations)
     feedback = client.messages[1][2][-1]["content"]
     assert "broker-result" in feedback
-    assert "[REDACTED]" not in feedback
+    assert "token=[REDACTED]" in feedback
+    assert "secret-value" not in feedback
 
 
 def test_model_identity_and_action_shape_are_strict():
@@ -97,4 +98,3 @@ def test_turn_and_cancellation_boundaries_stop_before_another_model_call():
     result = LunaPlanner(client, Kernel(), Sink()).run(goal="goal", environment={}, cancel=cancel)
     assert result.status == "cancelled"
     assert not client.messages
-

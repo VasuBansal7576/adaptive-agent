@@ -12,6 +12,7 @@ import argparse
 import importlib
 import inspect
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from threading import Event
@@ -90,6 +91,8 @@ def _redact(value: Any) -> Any:
         return {str(key): "[REDACTED]" if str(key).lower() in hidden else _redact(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_redact(item) for item in value]
+    if isinstance(value, str):
+        return re.sub(r"(?i)\b(authorization|cookie|password|secret|token|api[_-]?key)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", value)
     return value
 
 
@@ -279,4 +282,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = ["KernelExecutor", "LunaPlanner", "MODEL_NAME", "MODEL_PROVIDER", "PlannerError", "PlannerEvent", "PlannerEvidenceSink", "PlannerLimits", "PlannerModelClient", "PlannerResult", "PlannerBudgetExceeded", "PlannerCancelled", "main"]
-
