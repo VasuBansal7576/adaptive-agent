@@ -177,6 +177,8 @@ class PrimeRuntimeConfig:
     child_runs: int = 0
     require_docker: bool = True
     docker_image: str | None = None
+    # Supplied by the trusted parent/AO session, never by learner code.
+    ao_session_id: str | None = None
 
 
 # This is deliberately narrower than Python's full library surface.  A task
@@ -328,11 +330,7 @@ class _KernelProcess:
             "--cpus", "0.5", "--ulimit", "nofile=64:64", "--ulimit", "fsize=16777216:16777216",
             "--user", "65534:65534", "--env", "HOME=/tmp", "--env", "TMPDIR=/tmp",
         ]
-        ao_session = os.environ.get("AO_SESSION_ID")
-        if ao_session:
-            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", ao_session):
-                raise AdapterError("invalid AO_SESSION_ID for Docker cleanup label")
-            command.extend(["--label", f"ao.session={ao_session}"])
+        command.extend(["--label", self.adapter.cleanup_label])
         command.append(image)
         try:
             self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -497,7 +495,11 @@ class PrimeRuntimeAdapter:
             raise AdapterError("host execution is forbidden; Docker isolation is mandatory")
         if shutil.which("docker") is None:
             raise AdapterError("Docker CLI is required for the Prime learner boundary")
+        ao_session_id = config.ao_session_id or os.environ.get("AO_SESSION_ID")
+        if not ao_session_id or not re.fullmatch(r"[A-Za-z0-9_.:-]+", ao_session_id):
+            raise AdapterError("trusted AO_SESSION_ID is required for Docker cleanup")
         self.config = config
+        self._ao_session_id = ao_session_id
         self.root = Path(config.root_dir) if config.root_dir else Path(tempfile.mkdtemp(prefix=f"adaptive-{config.task_id}-"))
         self.root.mkdir(parents=True, exist_ok=True)
         self.broker = broker or CapabilityBroker(config.task_id)
@@ -514,6 +516,11 @@ class PrimeRuntimeAdapter:
     def mode(self) -> ExecutionMode:
         return self._mode
 
+    @property
+    def cleanup_label(self) -> str:
+        """Trusted AO label propagated to every learner Docker container."""
+        return f"ao.session={self._ao_session_id}"
+
     def provenance(self) -> dict[str, Any]:
         return {
             "adapter": "adaptive-agent.prime-runtime",
@@ -524,6 +531,7 @@ class PrimeRuntimeAdapter:
             "kernel": "Prime Agent rlm.repl protocol v3",
             "runtimeSource": str(self._runtime_src),
             "isolation": "per-run Docker container; nonroot, read-only root, tmpfs /tmp, dropped capabilities, no-new-privileges, pids/memory/cpu limits",
+            "cleanupLabel": f"ao.session={self._ao_session_id}",
             "network": "none inside learner container; broker bridge uses the parent stdio protocol",
             "credentials": "not inherited by learner process",
             "limits": {"cellSeconds": self.config.max_cell_seconds, "memoryBytes": self.config.max_memory_bytes,
@@ -615,6 +623,7 @@ class PrimeRuntimeAdapter:
                 max_memory_bytes=self.config.max_memory_bytes, max_cpu_seconds=self.config.max_cpu_seconds,
                 max_processes=self.config.max_processes, max_artifact_bytes=self.config.max_artifact_bytes,
                 child_runs=0, require_docker=True, docker_image=self.config.docker_image,
+                ao_session_id=self.config.ao_session_id,
             ),
             broker=CapabilityBroker(child_id),
         )

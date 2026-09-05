@@ -63,6 +63,16 @@ class PrimeRuntimeTests(unittest.TestCase):
         self.assertEqual(denied.status, "error")
         self.assertIn("denied", denied.error["evalue"])
 
+    def test_docker_cleanup_label_is_trusted_and_required(self):
+        adapter = self.make(ao_session_id="trusted-session")
+        self.assertEqual(adapter.cleanup_label, "ao.session=trusted-session")
+        self.assertEqual(adapter.provenance()["cleanupLabel"], "ao.session=trusted-session")
+        import unittest.mock as mock
+        from adaptive_agent import prime_runtime
+        with mock.patch.dict(prime_runtime.os.environ, {"AO_SESSION_ID": ""}, clear=False):
+            with self.assertRaises(AdapterError):
+                PrimeRuntimeAdapter(PrimeRuntimeConfig(task_id="missing-label"))
+
     def test_docker_unavailable_fails_closed_without_host_execution(self):
         import unittest.mock as mock
         from adaptive_agent import prime_runtime

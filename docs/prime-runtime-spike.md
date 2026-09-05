@@ -40,11 +40,13 @@ image containing the verified Prime runtime source, then starts one learner
 container per task with no host mounts or Docker socket, `--network=none`, a
 nonroot uid, read-only root, writable tmpfs `/tmp`, dropped capabilities,
 `no-new-privileges`, pids/memory/cpu limits, bounded file descriptors, and
-when present the trusted `AO_SESSION_ID` cleanup label.
+the required trusted `AO_SESSION_ID` cleanup label.
 The parent keeps the JSON-lines protocol on stdio, so broker replies work
 without learner network access. Provider credentials and model authentication
 remain in the trusted parent and are never copied into the image or container.
 
+Every learner container carries only the trusted parent/AO
+`ao.session=$AO_SESSION_ID` cleanup label; learner payloads cannot set labels.
 The image build itself is a trusted deployment operation and may pull the
 pinned Python base image. If Docker or that image is unavailable, adapter
 startup fails; there is no host-process fallback. The learner source policy is
