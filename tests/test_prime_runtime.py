@@ -27,9 +27,15 @@ class PrimeRuntimeTests(unittest.TestCase):
         second = adapter.execute("value + 1")
         self.assertEqual((first.status, first.result), ("ok", "42"))
         self.assertEqual(second.result, "41")
-        self.assertEqual(first.provenance["provider"], "openai-codex")
-        self.assertEqual(first.provenance["model"], "openai-codex/gpt-5.6-luna")
+        self.assertEqual(first.provenance["requestedProvider"], "openai-codex")
+        self.assertEqual(first.provenance["requestedModel"], "openai-codex/gpt-5.6-luna")
+        self.assertIsNone(first.provenance["observedModelInvocation"])
         self.assertEqual(first.provenance["kernel"], "Prime Agent rlm.repl protocol v3")
+        with self.assertRaises(SecurityViolation):
+            adapter.record_model_observation({"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": "r", "usage": {"input": 1}})
+        observed = adapter.record_model_observation({"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": "r", "usage": {"input": 1}}, trusted_parent=True)
+        self.assertEqual(observed.response_id, "r")
+        self.assertEqual(adapter.provenance()["observedModelInvocation"]["responseId"], "r")
 
     def test_broker_capability_discovery_and_harness_denial(self):
         root = Path(tempfile.mkdtemp(prefix="adaptive-test-"))
@@ -53,6 +59,14 @@ class PrimeRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(denied.status, "error")
         self.assertIn("denied", denied.error["evalue"])
+
+    def test_docker_unavailable_fails_closed_without_host_execution(self):
+        import unittest.mock as mock
+        from adaptive_agent import prime_runtime
+        with mock.patch.object(prime_runtime.shutil, "which", return_value=None), mock.patch.object(prime_runtime.subprocess, "Popen") as popen:
+            with self.assertRaises(AdapterError):
+                PrimeRuntimeAdapter(PrimeRuntimeConfig(task_id="no-docker"))
+            popen.assert_not_called()
 
     def test_source_policy_blocks_filesystem_network_and_direct_harness(self):
         adapter = self.make()

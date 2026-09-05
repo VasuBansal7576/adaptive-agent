@@ -21,7 +21,7 @@ not a claim that the full product boundary is complete.
   broker call returned a structured result. Learner requests for
   `harness.write`, policy/evaluator/promotion writes, credentials, and hidden
   data were denied.
-- The configured model provenance is the authenticated subscription selector
+- The requested model configuration is the subscription selector
   `openai-codex/gpt-5.6-luna` through provider `openai-codex`. The adapter does
   not call the balance-gated default Prime Inference path (which previously
   returned HTTP 402).
