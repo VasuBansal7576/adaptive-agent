@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 from threading import Event, Thread
 
-from adaptive_agent.api import ControlPlane, create_app
+from adaptive_agent.api import ControlPlane, create_app, make_authenticated_model_runner
 
 
 def manifest():
@@ -105,3 +105,20 @@ def test_cancelled_run_cannot_be_reopened_by_late_model_result():
     release.set()
     thread.join(timeout=2)
     assert api.get(f"/runs/{run['runId']}").json()["status"] == "cancelled"
+
+
+def test_prime_bridge_records_parent_owned_model_observation():
+    calls = []
+
+    class Client:
+        def invoke(self, **kwargs):
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": "resp-1", "text": "answer", "usage": {"outputTokens": 2}}
+
+    class Sink:
+        def record_model_observation(self, evidence, *, trusted_parent=False):
+            calls.append((evidence, trusted_parent))
+
+    runner = make_authenticated_model_runner(Client(), Sink())
+    result = runner(goal="goal", environment={}, emit=lambda *_: None)
+    assert result.response_id == "resp-1"
+    assert calls[0][1] is True

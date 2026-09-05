@@ -13,6 +13,7 @@ import json
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -134,6 +135,47 @@ class ModelInvocation(Protocol):
     model: str
     response_id: str
     usage: Mapping[str, Any]
+
+
+class AuthenticatedModelClient(Protocol):
+    """Trusted parent client for the configured subscription provider."""
+
+    def invoke(self, *, goal: str, environment: JsonObject) -> Mapping[str, Any]: ...
+
+
+class ModelEvidenceSink(Protocol):
+    """Prime adapter seam for record_model_observation(..., trusted_parent=True)."""
+
+    def record_model_observation(self, evidence: Mapping[str, Any], *, trusted_parent: bool = False) -> Any: ...
+
+
+@dataclass(frozen=True)
+class AuthenticatedInvocation:
+    text: str
+    provider: str
+    model: str
+    response_id: str
+    usage: Mapping[str, Any]
+
+
+def make_authenticated_model_runner(client: AuthenticatedModelClient, evidence_sink: ModelEvidenceSink) -> ModelRunner:
+    """Bridge a parent-owned model response into the run controller."""
+    def runner(*, goal: str, environment: JsonObject, emit: Callable[[str, str, str | None], None]) -> AuthenticatedInvocation:
+        del emit
+        raw = client.invoke(goal=goal, environment=environment)
+        if not isinstance(raw, Mapping):
+            raise ModelUnavailableError("model client returned a non-object response")
+        provider = raw.get("provider")
+        model = raw.get("model")
+        response_id = raw.get("responseId", raw.get("response_id"))
+        text = raw.get("text")
+        usage = raw.get("usage")
+        if not all(isinstance(value, str) and value.strip() for value in (provider, model, response_id, text)) or not isinstance(usage, Mapping) or not usage:
+            raise ModelUnavailableError("authenticated model response requires provider, model, response id, text, and usage")
+        evidence_sink.record_model_observation({"provider": provider, "model": model, "responseId": response_id, "usage": dict(usage)}, trusted_parent=True)
+        return AuthenticatedInvocation(text, provider, model, response_id, dict(usage))
+
+    return runner
 
 
 class ModelRunner(Protocol):
