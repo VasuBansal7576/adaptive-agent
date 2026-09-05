@@ -68,7 +68,8 @@ class EvaluationTests(unittest.TestCase):
     self.assertTrue(all("SLOT-" not in text for text in sealed.learner_container_files().values()))
 
   def test_task_families_and_entities_are_disjoint_across_splits(self):
-    for package in build_environment_packages().values():
+    packages = build_environment_packages()
+    for package in packages.values():
         family_sets = [set(package.task_families(partition)) for partition in Partition if package.tasks_for_partition(partition)]
         for left, right in zip(family_sets, family_sets[1:]):
             self.assertTrue(left.isdisjoint(right))
@@ -77,6 +78,9 @@ class EvaluationTests(unittest.TestCase):
             self.assertTrue({ref for task in left for ref in task.allowed_input_refs}.isdisjoint({ref for task in right for ref in task.allowed_input_refs}))
         signatures = [package.structural_signature(partition) for partition in Partition if package.tasks_for_partition(partition)]
         self.assertEqual(len(signatures), len(set(signatures)))
+    self.assertTrue(any("join" in family for family in packages["finance"].task_families(Partition.VALIDATION)))
+    self.assertTrue(any("conditional" in family for family in packages["customer_support"].task_families(Partition.FINAL)))
+    self.assertTrue(any("history" in family for family in packages["it"].task_families(Partition.VALIDATION)))
 
   def test_fixture_reads_return_authoritative_records_and_versions(self):
     packages = build_environment_packages()
@@ -207,6 +211,19 @@ class EvaluationTests(unittest.TestCase):
     allocations = [set(task_id for env, task_id, arm in seen[index * 120:index * 120 + 120]) for index in range(3)]
     self.assertTrue(allocations[0].isdisjoint(allocations[1]))
     self.assertTrue(allocations[1].isdisjoint(allocations[2]))
+
+  def test_validation_reservation_survives_executor_failure_and_blocks_replay(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    runner = EvaluationRunner(protocol, packages)
+    def fail_before_result(arm, package, task, seed):
+        raise RuntimeError("executor interrupted")
+    with self.assertRaises(RuntimeError):
+        runner.run_validation(base_hash="base", candidate_hash="candidate", execute=fail_before_result)
+    self.assertIn("base:candidate", runner.allocation_store.reserved)
+    with self.assertRaisesRegex(EvaluationError, "durably reserved"):
+        runner.run_validation(base_hash="base", candidate_hash="candidate", execute=fail_before_result)
 
   def test_promotion_requires_attested_registered_report_not_caller_gate_fields(self):
     packages = build_environment_packages()
