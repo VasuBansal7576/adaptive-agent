@@ -3,7 +3,7 @@ from threading import Event
 
 import pytest
 
-from adaptive_agent.planner import LunaPlanner, PlannerError, PlannerLimits
+from adaptive_agent.planner import LunaPlanner, PlannerError, PlannerLimits, make_luna_model_runner
 
 
 @dataclass
@@ -98,3 +98,15 @@ def test_turn_and_cancellation_boundaries_stop_before_another_model_call():
     result = LunaPlanner(client, Kernel(), Sink()).run(goal="goal", environment={}, cancel=cancel)
     assert result.status == "cancelled"
     assert not client.messages
+
+
+def test_control_plane_runner_adapter_returns_authenticated_final_invocation():
+    client = Client([response("r1", '{"action":"finish","answer":"done"}')])
+    events = []
+    invocation = make_luna_model_runner(client, Kernel(), Sink())(
+        goal="goal", environment={"toolSchemas": []}, emit=lambda *event: events.append(event)
+    )
+    assert invocation.text == "done"
+    assert invocation.provider == "openai-codex"
+    assert invocation.response_id == "r1"
+    assert events[-1][0] == "status"

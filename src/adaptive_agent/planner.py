@@ -79,6 +79,17 @@ class PlannerResult:
     events: tuple[PlannerEvent, ...]
 
 
+@dataclass(frozen=True)
+class LunaInvocation:
+    """Final answer and authenticated metadata for the control-plane runner."""
+
+    text: str
+    provider: str
+    model: str
+    response_id: str
+    usage: Mapping[str, Any]
+
+
 def _bounded_text(value: Any, limit: int) -> str:
     text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
     return text[:limit]
@@ -252,6 +263,46 @@ class LunaPlanner:
         return _bounded_text(_redact(payload), self.limits.max_output_chars)
 
 
+def make_luna_model_runner(
+    client: PlannerModelClient,
+    kernel: KernelExecutor,
+    evidence_sink: PlannerEvidenceSink,
+    *,
+    limits: PlannerLimits = PlannerLimits(),
+) -> Callable[..., LunaInvocation]:
+    """Adapt the multi-turn planner to ``ControlPlane.model_runner``.
+
+    The kernel is supplied by the trusted parent, normally a Prime runtime
+    whose host requests are wired to the authoritative broker.  This adapter
+    never creates a local tool provider or accepts learner-side credentials.
+    """
+    def runner(*, goal: str, environment: Mapping[str, Any], emit: Callable[[str, str, str | None], None]) -> LunaInvocation:
+        observed: dict[str, Any] = {}
+
+        class RecordingClient:
+            def invoke(self, **kwargs: Any) -> Mapping[str, Any]:
+                raw = client.invoke(**kwargs)
+                if isinstance(raw, Mapping):
+                    observed.update(raw)
+                return raw
+
+        result = LunaPlanner(
+            RecordingClient(),
+            kernel,
+            evidence_sink,
+            limits=limits,
+            emit=lambda event: emit(event.kind, event.summary, event.detail),
+        ).run(goal=goal, environment=environment)
+        if result.status != "succeeded":
+            raise PlannerError(f"planner ended with status {result.status}")
+        provider, model, response_id, usage, answer = observed.get("provider"), observed.get("model"), observed.get("responseId", observed.get("response_id")), observed.get("usage"), result.answer
+        if not isinstance(provider, str) or not isinstance(model, str) or not isinstance(response_id, str) or not isinstance(usage, Mapping) or not isinstance(answer, str):
+            raise PlannerError("planner did not retain authenticated final response metadata")
+        return LunaInvocation(answer, provider, model, response_id, dict(usage))
+
+    return runner
+
+
 def _load_object(path: str) -> Any:
     module_name, separator, attribute = path.partition(":")
     if not separator or not module_name or not attribute:
@@ -281,4 +332,4 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0 if result.status == "succeeded" else 1
 
 
-__all__ = ["KernelExecutor", "LunaPlanner", "MODEL_NAME", "MODEL_PROVIDER", "PlannerError", "PlannerEvent", "PlannerEvidenceSink", "PlannerLimits", "PlannerModelClient", "PlannerResult", "PlannerBudgetExceeded", "PlannerCancelled", "main"]
+__all__ = ["KernelExecutor", "LunaInvocation", "LunaPlanner", "MODEL_NAME", "MODEL_PROVIDER", "PlannerError", "PlannerEvent", "PlannerEvidenceSink", "PlannerLimits", "PlannerModelClient", "PlannerResult", "PlannerBudgetExceeded", "PlannerCancelled", "main", "make_luna_model_runner"]
