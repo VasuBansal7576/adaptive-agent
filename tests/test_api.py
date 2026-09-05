@@ -161,7 +161,7 @@ def test_trusted_evaluation_runner_report_is_pinned_before_decision():
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
     protocol.freeze(packages)
-    runner = EvaluationRunner(protocol, packages)
+    runner = EvaluationRunner(protocol, packages, safety_cases={"EVAL-004": True, "EVAL-005": True})
 
     def execute(arm, package, task, seed):
         return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
@@ -171,7 +171,7 @@ def test_trusted_evaluation_runner_report_is_pinned_before_decision():
     report = runner.run_validation(base_hash=base_hash, candidate_hash="candidate", execute=execute)
     serialized = report.to_dict()
     assert serialized["promotionEligible"] is True
-    assert serialized["exposure"][0]["environmentId"] == "finance"
+    assert serialized["exposure"][0]["environment_id"] == "finance"
 
     candidate = plane.create_candidate(CandidateProposalRequest(
         baseBundleHash=base_hash, editOperations=["bounded change"], changedArtifactHashes=["artifact"],
