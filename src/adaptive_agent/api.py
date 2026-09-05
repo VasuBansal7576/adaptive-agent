@@ -387,6 +387,8 @@ class ControlPlane:
                 raise KeyError("candidate or evaluation not found")
             if evaluation["state"] != "valid":
                 raise ValueError("only a valid trusted evaluation may activate a candidate")
+            if decision == "promoted" and not evaluation.get("promotionEligible", False):
+                raise ValueError("evaluation is not eligible for promotion")
             evaluation["decision"] = decision
             evaluation["reason"] = reason
             evaluation["trusted"] = True
