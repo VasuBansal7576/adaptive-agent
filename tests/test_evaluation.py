@@ -75,6 +75,8 @@ class EvaluationTests(unittest.TestCase):
         partitions = [package.tasks_for_partition(partition) for partition in Partition if package.tasks_for_partition(partition)]
         for left, right in zip(partitions, partitions[1:]):
             self.assertTrue({ref for task in left for ref in task.allowed_input_refs}.isdisjoint({ref for task in right for ref in task.allowed_input_refs}))
+        signatures = [package.structural_signature(partition) for partition in Partition if package.tasks_for_partition(partition)]
+        self.assertEqual(len(signatures), len(set(signatures)))
 
   def test_fixture_reads_return_authoritative_records_and_versions(self):
     packages = build_environment_packages()
