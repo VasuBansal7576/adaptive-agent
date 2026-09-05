@@ -26,10 +26,10 @@ Later implementation and submission gates are specified so the documentation can
 | SRC-002 | User working preferences | Confirmed engineering and stack preferences |
 | SRC-003 | [Syndicate event page](https://luma.com/d0kq45ek) | Read on 2026-09-06; primary source for the Track 1 and AO obligations below |
 | SRC-004 | Product clarification relayed by the orchestrator on 2026-09-06 | Confirmed product intent and learning constraints |
-| SRC-005 | Prime Agent source review relayed by the orchestrator | Supplied findings; exact repository revision and independent source verification pending |
+| SRC-005 | Prime Agent static source review at commit `9c54a35dac3a2ad17910074d66664859ea175666`, relayed by the orchestrator | Static findings; distinct from installed Prime 0.9.2 and not runtime verification |
 | SRC-006 | [Backpass](https://github.com/kunchenguid/backpass) review relayed by the orchestrator | Supplied influence assessment; not a required dependency |
 | SRC-007 | [Vision](https://github.com/kunchenguid/vision) review relayed by the orchestrator | Supplied influence assessment; not a required dependency |
-| SRC-008 | [Official Devpost rules](https://syndicate-by-maximor.devpost.com/rules) and [official Syndicate brief](https://maaztwts.notion.site/Syndicate-3cc32902e4a38075bfa9f03149ef150d) | Constraints verified by the user and orchestrator and supplied on 2026-09-06; direct fetch in this worker was unavailable |
+| SRC-008 | [Official Devpost rules](https://syndicate-by-maximor.devpost.com/rules) and [official Syndicate brief](https://maaztwts.notion.site/Syndicate-3cc32902e4a38075bfa9f03149ef150d) | Prior browser research by the controlling assistant, relayed on 2026-09-06; not independently verified by this worker or this AO orchestrator |
 
 SRC-003 calls for architecture creation, execution, diagnosis, and iterative improvement on unfamiliar tasks.
 It asks for evidence across domains covering accuracy, reliability, cost, and speed.
@@ -45,7 +45,7 @@ Organizer feedback tentatively accepts synthetic scenarios, but that is not a bl
 These are documented obligations, not a claim that this project has met them.
 Publication and submission remain future actions requiring authorization.
 
-The Prime review identifies a persistent IPython workspace, optional independent RLM child sessions, editable memories, prompts, Python skills, and refine proposals with rollback.
+The static Prime review at commit `9c54a35dac3a2ad17910074d66664859ea175666` identifies a persistent IPython workspace, optional independent RLM child sessions, editable memories, prompts, Python skills, and refine proposals with rollback.
 Its `expectedOutcome` is a prediction, not measured performance.
 Structural validation, conflict handling, audit, and undo exist, but the inspected apply path did not establish a held-out performance gate.
 Direct harness create, update, and delete operations must pass through this project's promotion boundary too.
@@ -138,15 +138,19 @@ The operator can inspect the comparison and request rollback, which is also audi
 The implementation starts with a bounded Prime API bridge spike, limited to one working session with a 90-minute engineering timebox.
 The spike must create a persistent kernel, execute two state-sharing calls, obtain structured outputs, cancel execution, and intercept refine and direct CRUD before activation.
 It also checks child isolation, external tool routing, artifact export, version pinning, and the available authentication path.
-Prime 0.9.2 is installed and AO reaches its login screen, but user login and real inference remain unverified as of the supplied setup status.
-The installed version does not prove any required API is available.
+Prime 0.9.2 is installed and session 3 authenticated Prime with a ChatGPT subscription.
+The session configured `openai-codex/gpt-5.6-luna`, and an actual Python `2+2` call returned `4`.
+Default Prime Inference returned HTTP 402 for lack of balance, while the subscription provider worked.
+The official kernel bootstrap was repaired with `UV_NO_CACHE=1` after a broken setuptools cache.
+These smoke results verify a narrow execution path only.
+Prime bridge contract coverage, safety isolation, and behavioral evaluation remain unverified.
 The spike records the pinned source revision, MIT notices, verified callable interfaces, and unsupported operations without inventing Prime endpoints.
 
 The default is a small Python control plane with an ASGI API and SQLite because Prime execution and learned Python skills fit that runtime.
 If Prime offers a stable API or CLI with structured I/O, a thin adapter uses that interface.
 If Prime cannot expose the required interception and isolation, the fallback is an isolated IPython executor behind the same adapter contract, with a bounded independent-child implementation only where needed.
 The fallback must still meet every product requirement and disclose that the Prime integration was not used.
-An authentication delay does not justify reporting simulated output as working inference.
+The smoke path does not establish that the required bridge, isolation, or evaluator integration works.
 Avoid separate microservices when modules in one trusted backend suffice.
 A React, Tailwind, and Vite console reads the control API and event stream.
 The initial deployment is a single authenticated operator on a loopback-only service.
@@ -208,10 +212,10 @@ The following are proposed contracts, not files or APIs already present in the r
 
 | Contract | Required fields and constraints |
 | --- | --- |
-| `EnvironmentManifest` | `schemaVersion`, `environmentId`, `version`, `docs[]` with hashes and classifications, `toolSchemas[]`, `policyRef`, trusted `evaluatorRef`, `resetRef`, and capability metadata; no planner patch or action sequence |
+| `EnvironmentManifest` | `schemaVersion`, `environmentId`, `version`, `docs[]` with hashes and classifications, `toolSchemas[]`, `policyRef`, trusted `evaluatorRef`, `resetRef`, declared `executionModes`, and capability metadata; no planner patch or action sequence |
 | `TaskInput` | `taskId`, `environmentRef`, natural-language `goal`, allowed input references, and evaluation partition assigned by the controller; hidden answers are absent |
-| `RunRequest` | Task reference, `modelProfileRef`, `budgetRef`, and idempotency key; active version is pinned by the server, not chosen by untrusted text |
-| `ExecutionConfig` | Allowed tool subset, compatible skill references, instruction variant, step limit, and child count/depth limits; all values bounded by server policy |
+| `RunRequest` | Task reference, `modelProfileRef`, `budgetRef`, requested execution mode, and idempotency key; active version is pinned by the server, not chosen by untrusted text |
+| `ExecutionConfig` | Allowed tool subset, compatible skill references, instruction variant, execution mode, step limit, child count/depth limits, and capability discovery request; all values bounded by server policy |
 | `ToolCall` | `runId`, `callId`, tool name, schema-valid arguments, and optional approval token; capability supplied out of band by the adapter |
 | `ToolResult` | Call reference, tool/schema version, observed time, success/error union, redacted output reference, side-effect status, and broker provenance |
 | `EvidenceRecord` | Run reference, sequence, event type, content hash, source reference, trust class, visibility class, and redaction status; append-only |
@@ -219,6 +223,11 @@ The following are proposed contracts, not files or APIs already present in the r
 | `CandidateProposal` | Candidate ID, base bundle hash, allowed edit operations, changed artifact hashes, supporting development evidence IDs, predicted effect, and proposer version |
 | `EvaluationReport` | Candidate/base hashes, protocol hash, partition reference, paired run IDs, metric aggregates, uncertainty, safety results, validity status, and evaluator provenance |
 | `PromotionDecision` | Candidate/base hashes, trusted report reference, gate version, decision/reason, prior/new active pointer, and transaction timestamp |
+| `CapabilitySet` | Run-scoped capability IDs, tool/schema versions, effect classes, resource scopes, expiry, and discovery provenance; it contains no credentials and cannot expand policy |
+| `EvaluatorContract` | Evaluator version, accepted outcome input schema, result schema, reset requirement, timeout, trust owner, hidden-data boundary, and safety-test set; learner code cannot implement or edit it |
+| `BudgetSpec` | Model token ceiling, tool-call ceiling, child ceiling, wall-time ceiling, cost ceiling, reservation, and accounting currency; parent and children draw from one decreasing ledger |
+| `CandidateRecord` | Candidate ID, base hash, state `draft | validated | evaluating | promoted | rejected | quarantined | superseded | rolled_back`, diff refs, evidence refs, and transition audit |
+| `EvaluationRecord` | Evaluation ID, candidate/base hashes, state `queued | running | valid | invalid | cancelled`, partition, paired run refs, report ref, and validity reason |
 
 Visibility classes are `learner`, `operator`, and `evaluator_only`.
 The retrieval service filters visibility and environment access before ranking, including cached queries and child-session requests.
@@ -277,7 +286,28 @@ type EnvironmentManifest = {
 	policyRef: ArtifactRef;
 	evaluatorRef: ArtifactRef;
 	resetRef: ArtifactRef;
+	executionModes: Array<"interactive" | "batch" | "dry_run" | "replay">;
 	capabilities: string[];
+};
+type BudgetSpec = {
+	modelTokens: number;
+	toolCalls: number;
+	childRuns: number;
+	wallTimeSeconds: number;
+	costMicrounits: number;
+	currency: string;
+};
+type CapabilitySet = {
+	runId: string;
+	capabilities: Array<{
+		id: string;
+		tool: string;
+		version: string;
+		effect: "read" | "write";
+		resourceScope: string;
+		expiresAt: string;
+	}>;
+	provenance: ArtifactRef;
 };
 type ToolRequest = {
 	runId: string;
@@ -329,6 +359,25 @@ type StepRecord = {
 	callId?: string;
 	error?: ToolError;
 };
+type CandidateRecord = {
+	candidateId: string;
+	baseBundleRef: ArtifactRef;
+	state: "draft" | "validated" | "evaluating" | "promoted" |
+		"rejected" | "quarantined" | "superseded" | "rolled_back";
+	diffRefs: ArtifactRef[];
+	evidenceRefs: ArtifactRef[];
+	lastTransition: string;
+};
+type EvaluationRecord = {
+	evaluationId: string;
+	candidateRef: ArtifactRef;
+	baseRef: ArtifactRef;
+	state: "queued" | "running" | "valid" | "invalid" | "cancelled";
+	partitionRef: ArtifactRef;
+	pairedRunRefs: ArtifactRef[];
+	reportRef?: ArtifactRef;
+	validityReason?: string;
+};
 ```
 
 The step state advances from `planned` to `running` or `awaiting_approval`, then to a terminal step status.
@@ -338,6 +387,16 @@ Run success requires all required outcome checks and no unresolved step effects.
 Candidate and evaluation records add the immutable hashes and state fields listed above, with evaluation states `queued`, `running`, `valid`, `invalid`, or `cancelled`.
 A metric failure can be a valid evaluation report but leads to a rejected candidate.
 Only the trusted controller can mark an evaluation valid.
+
+Capability discovery runs after manifest validation and before the first execution step.
+The broker returns only the run-scoped `CapabilitySet` for the requested mode and policy.
+The learner may choose among returned capabilities, but cannot request a new effect class, resource scope, credential, or expiry.
+The coordinator rejects an execution mode that the manifest or policy does not declare.
+`dry_run` validates calls without dispatching side effects, and `replay` reads recorded envelopes without contacting a provider.
+`interactive` permits approval pauses, while `batch` fails approval-required writes instead of waiting for an operator.
+The evaluator contract receives a reset state and sanitized outcome input, returns a versioned result, and remains outside the learner process.
+The budget ledger reserves parent and child limits before dispatch, records actual usage after each step, and rejects any operation whose reservation would exceed a ceiling.
+Cost accounting records provider currency and a normalized microunit value when a provider reports price data; missing prices remain explicitly unknown.
 
 ### Durable storage and recovery
 
@@ -574,9 +633,11 @@ Browser inspection covers the rendered console and its interactions after implem
 Synthetic fixtures, mocks, live runtime execution, and real external effects must be identified separately in every result.
 
 Product scope and the local specification commit are authorized without further confirmation.
-The remaining execution dependencies are Prime login and inference verification, the bridge spike, a pinned model/provider and budget, fixture schemas, and a frozen evaluation protocol.
-Prime login requires the user's credentials and is outside this documentation worker's work.
-Devin 3000.6.14 is installed with an existing login reused; its live AO smoke test is ongoing according to supplied coordination.
-Neither installation status is evidence of a working product integration.
+The remaining execution dependencies are the bounded Prime bridge spike, safety-isolation verification, behavioral evaluation, a pinned model/provider and budget, fixture schemas, and a frozen evaluation protocol.
+Prime session 3 authenticated a ChatGPT subscription, configured `openai-codex/gpt-5.6-luna`, and returned `4` for an actual Python `2+2` call.
+Default Prime Inference returned HTTP 402 for lack of balance, so the subscription provider is the verified provider path.
+Devin 3000.6.14 session 4 and OpenCode session 5 each executed `pwd` successfully with no file changes.
+Codex shell and file tools also work; unrelated `gbrain`, `monid`, and `applyto_realfast` warnings are environmental noise and not product evidence.
+These smoke results do not verify the product bridge, safety isolation, or behavioral evaluation.
 Before publication or submission, verify team prerequisites, synthetic-scenario acceptability, authorization, access controls, attribution, retention, and the then-current official form.
 [MILESTONES.md](MILESTONES.md) ties these gates to delivery ownership and [README.md](README.md) summarizes the current repository state.

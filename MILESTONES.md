@@ -24,7 +24,7 @@ No additional workers are spawned during this documentation task.
 | --- | --- | --- | --- |
 | M0 | Confirmed scope and official constraints | SRC-001 through SRC-008 | One Track 1 product, learning mechanism, phase boundary, event window, rubric, and public artifact obligations recorded |
 | M1 | Implementable documentation and local commit | M0 | DOC-001 through DOC-008 checked; only the three requested documents committed; hash and verification results sent to the orchestrator |
-| M2 | Prime bridge decision and runnable end-to-end vertical slice | M1; implementation authorization; runtime login or fallback; model/budget | A supplied neutral environment goal runs through the actual executor, external broker, trusted outcome evaluator, stored evidence, one candidate comparison, gate decision, and console; no mocked inference is reported as live |
+| M2 | Prime bridge decision and runnable end-to-end vertical slice | M1; implementation authorization; Prime adapter or isolated fallback; model/budget | A supplied neutral environment goal runs through the actual executor, external broker, trusted outcome evaluator, stored evidence, one candidate comparison, gate decision, and console; no mocked inference is reported as live |
 | M3 | Full bounded learning lifecycle and three environment packs | M2; fixed contracts; trusted fixture owners | Finance, support, and IT packages use the same core; automatic proposals, protected validation, direct CRUD gating, rejection, quarantine, version conflict, and rollback pass ACC-001 through ACC-007 and ACC-009 |
 | M4 | Complete independent evaluation and operational acceptance | M3; sealed fourth environment; frozen protocol; resource budget | EVAL-001 through EVAL-006 and ACC-008 through ACC-011 plus ACC-015 pass the required acceptance and final performance target; runtime and browser evidence retained |
 | M5 | Reviewed release and submission package | M4; publication authority; member prerequisites; official form review | Public artifacts prepared and, when authorized, accessible; demo meets 3 to 5 minutes; rubric mapping, AO session evidence, credits, privacy review, and open limitations checked |
@@ -41,7 +41,7 @@ Check persistent state with two real kernel calls and verify structured output, 
 Pin the verified source version and record the MIT license notices used.
 Select the small backend and runtime adapter based on those results.
 Use the specified isolated IPython fallback if Prime cannot meet the adapter boundary, and disclose the choice.
-A login blocker can delay the Prime path but cannot be hidden behind fake inference evidence.
+An unavailable Prime API, provider, or safety boundary can delay the Prime path but cannot be hidden behind simulated evidence.
 
 The vertical slice uses one neutral package with documentation, a stateful tool, a policy rule, a reset fixture, and an objective outcome check.
 It includes a task whose first attempt can fail and whose verified outcome can support a bounded corrective proposal.
@@ -144,11 +144,15 @@ Each workstream gets a branch/worktree boundary, explicit contracts, dependencie
 Cross-session contract changes and true blockers go through AO.
 The evaluation owner controls hidden partitions and reports rather than delegating that authority to the learner.
 
-Codex, OpenCode, Devin, and Prime are available build-time options according to supplied coordination.
-Luna is suitable for bounded tasks with clear contracts and review.
-Prime 0.9.2 is installed, reaches a login screen in AO, and awaits user login; inference is unverified.
-Devin 3000.6.14 is installed with an existing login reused, while its live AO smoke test is ongoing.
-Availability or login alone does not prove task completion.
+Build-time AO work uses Devin, OpenCode, and GPT-5.6 Luna.
+Do not assign Astra, Sol, or Terra, and do not spawn additional workers for this plan.
+Prime is the proposed product runtime and is also available for bounded bridge work.
+Prime 0.9.2 session 3 authenticated a ChatGPT subscription, configured `openai-codex/gpt-5.6-luna`, and returned `4` for an actual Python `2+2` call.
+Default Prime Inference returned HTTP 402 for lack of balance, while the subscription provider worked.
+The official kernel bootstrap was repaired with `UV_NO_CACHE=1` after a broken setuptools cache.
+Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
+The product bridge, safety isolation, and behavioral evaluation remain unverified.
+These smoke results do not by themselves prove task completion.
 Qodo is an optional code reviewer, not an outcome evaluator or a replacement for product tests.
 Backpass and Vision are influences and do not require installation.
 
@@ -199,6 +203,7 @@ The current documentation task creates no pull request and performs no merge.
 Check every requirement ID for a stable definition, acceptance reference, and milestone mapping.
 Review the source boundaries, trust separation, baseline definitions, split isolation, numerical defaults, event timing, and authorization wording across all three files.
 Check local links and verify external URLs against the supplied sources, reporting inaccessible sources rather than claiming they loaded.
+For SRC-008, preserve that the rules were established by prior browser research from the controlling assistant and relayed to this worker, not independently verified by this worker or this AO orchestrator.
 Inspect SPEC.md in the AO Browser without creating a server or installing dependencies.
 Check for whitespace errors, em dashes, and prose paragraphs with multiple sentences on one physical line.
 Stage only the three named documents and inspect the staged diff before making a conventional local commit without an agent co-author.

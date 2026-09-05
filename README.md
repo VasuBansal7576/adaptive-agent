@@ -17,6 +17,11 @@ There are no application commands, installed project dependencies, configured pa
 The proposed stack is React, Tailwind, Vite, and Bun with a small backend selected by a bounded Prime API bridge spike.
 Prime is the proposed runtime, with isolated IPython as a documented fallback if its interfaces cannot support the required boundaries.
 
+The verified smoke path uses Prime 0.9.2 session 3 with a ChatGPT subscription, `openai-codex/gpt-5.6-luna`, and an actual Python `2+2` result of `4`.
+Default Prime Inference returned HTTP 402 for lack of balance, while the subscription provider worked.
+Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
+The product bridge, safety isolation, and behavioral evaluation remain unverified.
+
 The authorized phase ends with a verified local specification commit.
 Implementation, installation, remote creation, publication, pushes, pull requests, merging to main, and submission require later authorization.
 The official build window closes on 2026-09-07 at 03:30 IST.
