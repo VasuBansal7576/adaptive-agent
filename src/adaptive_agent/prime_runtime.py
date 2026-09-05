@@ -9,6 +9,8 @@ configuration as an inference result.
 from __future__ import annotations
 
 import ast
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -169,6 +171,8 @@ class PrimeRuntimeConfig:
     python: str | None = None
     runtime_src: Path | str | None = None
     max_output_chars: int = 65536
+    max_protocol_frame_bytes: int = 1024 * 1024
+    max_pending_events: int = 128
     max_cell_seconds: float = 30.0
     max_memory_bytes: int = 512 * 1024 * 1024
     max_cpu_seconds: int = 30
@@ -182,7 +186,7 @@ class PrimeRuntimeConfig:
 # This is deliberately narrower than Python's full library surface.  A task
 # can still use expressions and pure computation; side effects must go through
 # the trusted broker.
-_ALLOWED_IMPORTS = frozenset({"math", "statistics", "json", "re", "datetime", "decimal", "itertools", "functools", "collections"})
+_ALLOWED_IMPORTS = frozenset({"math", "statistics", "json", "re", "base64", "datetime", "decimal", "itertools", "functools", "collections"})
 _BLOCKED_CALLS = frozenset({"open", "eval", "exec", "compile", "__import__", "input", "breakpoint", "getattr", "globals", "locals", "vars", "dir"})
 _BLOCKED_NAMES = frozenset({"os", "sys", "subprocess", "socket", "pathlib", "shutil", "resource", "ctypes", "signal", "builtins", "__builtins__", "importlib"})
 
@@ -305,7 +309,8 @@ class _KernelProcess:
     def __init__(self, adapter: "PrimeRuntimeAdapter") -> None:
         self.adapter = adapter
         self.proc: subprocess.Popen[bytes] | None = None
-        self.events: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.events: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=adapter.config.max_pending_events)
+        self.container_name = ""
         self.write_lock = threading.Lock()
         self.reader: threading.Thread | None = None
         self.stderr_reader: threading.Thread | None = None
@@ -319,8 +324,10 @@ class _KernelProcess:
         image = _runtime_image(runtime_src, config.docker_image)
         memory = max(16, config.max_memory_bytes // (1024 * 1024))
         pids = max(4, config.max_processes)
+        safe_task = re.sub(r"[^A-Za-z0-9_.-]", "-", config.task_id)[:32] or "task"
+        self.container_name = f"adaptive-prime-{safe_task}-{uuid.uuid4().hex[:16]}"
         command = [
-            "docker", "run", "--rm", "-i", "--init",
+            "docker", "run", "--rm", "-i", "--init", "--name", self.container_name,
             "--network=none", "--read-only",
             "--tmpfs", f"/tmp:rw,nosuid,nodev,noexec,size={memory}m",
             "--cap-drop=ALL", "--security-opt", "no-new-privileges:true",
@@ -353,26 +360,110 @@ class _KernelProcess:
                 self.kill()
                 raise AdapterError("Docker Prime kernel ready handshake timed out")
 
+    def _owned_container_cleanup(self) -> None:
+        """Stop/remove only this adapter's uniquely named container."""
+        if not self.container_name:
+            return
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", self.container_name],
+                capture_output=True, timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _protocol_failure(self, message: str) -> None:
+        """Fail closed on an oversized/corrupt frame or pending-event flood."""
+        error = AdapterError(message)
+        self.start_error = error
+        self._owned_container_cleanup()
+        # The reader itself owns the protocol pipe; also terminate the Docker
+        # CLI so no orphaned host process survives a frame violation.
+        self.kill()
+        fatal = {"event": "fatal", "error": message}
+        try:
+            self.events.put_nowait(fatal)
+        except queue.Full:
+            # Retain the control failure rather than allowing unbounded memory.
+            try:
+                self.events.get_nowait()
+                self.events.put_nowait(fatal)
+            except queue.Empty:
+                pass
+
     def _read_events(self) -> None:
         assert self.proc and self.proc.stdout
-        for raw in iter(self.proc.stdout.readline, b""):
+        limit = self.adapter.config.max_protocol_frame_bytes
+        while True:
+            raw = self.proc.stdout.readline(limit + 1)
+            if not raw:
+                break
+            if len(raw) > limit or not raw.endswith(b"\n"):
+                self._protocol_failure("Prime kernel protocol frame exceeded its byte limit")
+                break
             try:
                 event = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                self.start_error = AdapterError(f"invalid Prime kernel frame: {exc}")
-                continue
+                self._protocol_failure(f"invalid Prime kernel frame: {exc}")
+                break
+            try:
+                event = self._bound_event(event)
+            except AdapterError as exc:
+                self._protocol_failure(str(exc))
+                break
             if event.get("event") == "ready":
                 self.ready.set()
             elif event.get("event") == "host_request":
                 self._handle_host_request(event)
             else:
-                self.events.put(event)
+                try:
+                    self.events.put_nowait(event)
+                except queue.Full:
+                    self._protocol_failure("Prime kernel pending event limit exceeded")
+                    break
         self.ready.set()
+
+    def _bound_event(self, event: Any) -> dict[str, Any]:
+        if not isinstance(event, dict):
+            raise AdapterError("Prime kernel event must be an object")
+        limit = self.adapter.config.max_output_chars
+        kind = event.get("event")
+        bounded = dict(event)
+        if kind in {"stdout", "stderr", "result"} and isinstance(bounded.get("text"), str):
+            bounded["text"] = bounded["text"][:limit]
+        if kind == "error":
+            for key in ("ename", "evalue"):
+                if isinstance(bounded.get(key), str):
+                    bounded[key] = bounded[key][:limit]
+            trace = bounded.get("traceback")
+            if isinstance(trace, list):
+                remaining = limit
+                bounded_trace = []
+                for line in trace:
+                    if not isinstance(line, str) or remaining <= 0:
+                        break
+                    clipped = line[:remaining]
+                    bounded_trace.append(clipped)
+                    remaining -= len(clipped)
+                bounded["traceback"] = bounded_trace
+        return bounded
 
     def _read_stderr(self) -> None:
         assert self.proc and self.proc.stderr
-        for raw in iter(self.proc.stderr.readline, b""):
-            self.stderr_chunks.append(raw.decode("utf-8", "replace"))
+        limit = self.adapter.config.max_protocol_frame_bytes
+        retained = 0
+        while True:
+            raw = self.proc.stderr.readline(limit + 1)
+            if not raw:
+                break
+            if len(raw) > limit or not raw.endswith(b"\n"):
+                self._protocol_failure("Prime kernel stderr exceeded its byte limit")
+                break
+            text = raw.decode("utf-8", "replace")
+            if retained < self.adapter.config.max_output_chars:
+                text = text[: self.adapter.config.max_output_chars - retained]
+                self.stderr_chunks.append(text)
+                retained += len(text)
 
     def _handle_host_request(self, event: dict[str, Any]) -> None:
         request_id = event.get("id")
@@ -390,6 +481,9 @@ class _KernelProcess:
         if not self.proc or not self.proc.stdin:
             raise AdapterError("Prime kernel is not running")
         data = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+        if len(data) > self.adapter.config.max_protocol_frame_bytes:
+            self._protocol_failure("outbound Prime kernel protocol frame exceeded its byte limit")
+            raise AdapterError("outbound Prime kernel protocol frame exceeded its byte limit")
         with self.write_lock:
             self.proc.stdin.write(data)
             self.proc.stdin.flush()
@@ -424,6 +518,8 @@ class _KernelProcess:
                 collected["result"] = str(event.get("text", ""))
             elif kind == "error":
                 collected["error"] = {k: event.get(k) for k in ("ename", "evalue", "traceback")}
+            elif kind == "fatal":
+                raise AdapterError(str(event.get("error", "Prime kernel protocol failure")))
             elif kind == "done":
                 collected["status"] = event.get("status", "error")
                 return collected
@@ -451,25 +547,39 @@ class _KernelProcess:
             return
 
     def shutdown(self) -> None:
-        if not self.proc:
+        proc = self.proc
+        if not proc:
+            self._owned_container_cleanup()
             return
         try:
-            self.send({"type": "shutdown", "id": uuid.uuid4().hex})
-            self.proc.wait(timeout=2)
-        except (Exception,):
-            self.kill()
+            if self.proc is proc:
+                self.send({"type": "shutdown", "id": uuid.uuid4().hex})
+            proc.wait(timeout=2)
+        except Exception:
+            self._owned_container_cleanup()
+            try:
+                if os.name != "nt":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+                proc.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         finally:
-            for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+            self._owned_container_cleanup()
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
                 try:
                     stream.close()
                 except (AttributeError, OSError):
                     pass
-            self.proc = None
+            if self.proc is proc:
+                self.proc = None
 
     def kill(self) -> None:
-        if not self.proc:
-            return
         proc = self.proc
+        self._owned_container_cleanup()
+        if not proc:
+            return
         try:
             if os.name != "nt":
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -477,14 +587,19 @@ class _KernelProcess:
                 proc.kill()
             proc.wait(timeout=2)
         except (OSError, subprocess.TimeoutExpired):
-            proc.kill()
+            try:
+                proc.kill()
+            except OSError:
+                pass
         finally:
+            self._owned_container_cleanup()
             for stream in (proc.stdin, proc.stdout, proc.stderr):
                 try:
                     stream.close()
                 except (AttributeError, OSError):
                     pass
-            self.proc = None
+            if self.proc is proc:
+                self.proc = None
 
 
 class PrimeRuntimeAdapter:
@@ -507,6 +622,7 @@ class PrimeRuntimeAdapter:
         self._closed = False
         self._started_at = time.time()
         self._model_observation: ModelObservation | None = None
+        self._artifact_transfers: dict[str, dict[str, Any]] = {}
         self._mode = ExecutionMode.PRIME_SUBSCRIPTION_DOCKER
         self._runtime_src = _find_runtime_src(config.runtime_src)
 
@@ -611,6 +727,8 @@ class PrimeRuntimeAdapter:
                 task_id=child_id, root_dir=child_root, model=self.config.model,
                 provider=self.config.provider, python=self.config.python,
                 runtime_src=self.config.runtime_src, max_output_chars=self.config.max_output_chars,
+                max_protocol_frame_bytes=self.config.max_protocol_frame_bytes,
+                max_pending_events=self.config.max_pending_events,
                 max_cell_seconds=min(timeout or self.config.max_cell_seconds, self.config.max_cell_seconds),
                 max_memory_bytes=self.config.max_memory_bytes, max_cpu_seconds=self.config.max_cpu_seconds,
                 max_processes=self.config.max_processes, max_artifact_bytes=self.config.max_artifact_bytes,
@@ -640,6 +758,17 @@ class PrimeRuntimeAdapter:
             if not isinstance(capability_id, str):
                 raise AdapterError("capabilityId is required")
             return {"value": self.broker.call(capability_id, arguments)}
+        if request_type == "artifact.begin":
+            return self._artifact_begin(payload)
+        if request_type == "artifact.chunk":
+            return self._artifact_chunk(payload)
+        if request_type == "artifact.finish":
+            return self._artifact_finish(payload)
+        if request_type == "artifact.abort":
+            transfer_id = payload.get("transferId")
+            if isinstance(transfer_id, str):
+                self._artifact_transfers.pop(transfer_id, None)
+            return {"aborted": True}
         if request_type == "rlm.run":
             if self._children >= self.config.child_runs:
                 raise SecurityViolation("child run budget exhausted")
@@ -647,6 +776,73 @@ class PrimeRuntimeAdapter:
         if request_type in {"harness.write", "policy.write", "evaluator.write", "promotion.write", "credentials.read", "hidden.read"}:
             raise SecurityViolation(f"learner request denied: {request_type}")
         raise SecurityViolation(f"unsupported host request: {request_type}")
+
+    def _artifact_begin(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        artifact_id = payload.get("artifactId")
+        version = payload.get("version", "1")
+        size = payload.get("size")
+        if (not isinstance(artifact_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", artifact_id)
+                or not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", version)
+                or not isinstance(size, int) or isinstance(size, bool) or size < 0
+                or size > self.config.max_artifact_bytes):
+            raise AdapterError("invalid artifact metadata")
+        if self._artifact_transfers:
+            raise AdapterError("only one artifact transfer may be active")
+        transfer_id = uuid.uuid4().hex
+        self._artifact_transfers[transfer_id] = {
+            "artifactId": artifact_id, "version": version, "size": size,
+            "offset": 0, "data": bytearray(),
+        }
+        # Leave room for JSON/base64 framing under max_protocol_frame_bytes.
+        max_chunk = max(1024, min(self.config.max_artifact_bytes,
+                                  ((self.config.max_protocol_frame_bytes - 4096) * 3) // 4))
+        return {"transferId": transfer_id, "maxChunkBytes": max_chunk}
+
+    def _artifact_chunk(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        transfer_id = payload.get("transferId")
+        offset = payload.get("offset")
+        encoded = payload.get("data")
+        transfer = self._artifact_transfers.get(transfer_id) if isinstance(transfer_id, str) else None
+        if transfer is None or not isinstance(offset, int) or offset != transfer["offset"] or not isinstance(encoded, str):
+            raise AdapterError("invalid artifact chunk")
+        try:
+            data = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (binascii.Error, ValueError, UnicodeEncodeError):
+            raise AdapterError("artifact chunk is not valid base64") from None
+        if not data or len(data) > transfer["size"] - transfer["offset"]:
+            raise AdapterError("artifact chunk exceeds declared size")
+        transfer["data"].extend(data)
+        transfer["offset"] += len(data)
+        return {"transferId": transfer_id, "offset": transfer["offset"]}
+
+    def _artifact_finish(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        transfer_id = payload.get("transferId")
+        expected = payload.get("sha256")
+        transfer = self._artifact_transfers.get(transfer_id) if isinstance(transfer_id, str) else None
+        if transfer is None or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise AdapterError("invalid artifact completion")
+        if transfer["offset"] != transfer["size"]:
+            raise AdapterError("artifact is incomplete")
+        data = bytes(transfer["data"])
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != expected:
+            self._artifact_transfers.pop(transfer_id, None)
+            raise AdapterError("artifact digest mismatch")
+        self._artifact_transfers.pop(transfer_id, None)
+        ref = self._store_artifact_bytes(transfer["artifactId"], transfer["version"], data)
+        return {"artifact": {"id": ref.id, "version": ref.version, "sha256": ref.sha256,
+                              "bytes": ref.bytes, "path": ref.path}}
+
+    def _store_artifact_bytes(self, artifact_id: str, version: str, data: bytes) -> ArtifactRef:
+        if len(data) > self.config.max_artifact_bytes:
+            raise AdapterError("artifact exceeds configured size limit")
+        digest = hashlib.sha256(data).hexdigest()
+        dest = self.root / "artifacts" / f"{artifact_id}-{digest[:16]}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, dest)
+        return ArtifactRef(artifact_id, version, digest, len(data), str(dest))
 
     def export_artifact(self, source: str | Path, *, artifact_id: str | None = None, version: str = "1") -> ArtifactRef:
         requested = Path(source)
@@ -667,13 +863,7 @@ class PrimeRuntimeAdapter:
         if not re.fullmatch(r"[A-Za-z0-9._-]+", artifact_id):
             raise AdapterError("invalid artifact id")
         data = src.read_bytes()
-        digest = hashlib.sha256(data).hexdigest()
-        dest = self.root / "artifacts" / f"{artifact_id}-{digest[:16]}"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_suffix(".tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, dest)
-        return ArtifactRef(artifact_id, version, digest, size, str(dest))
+        return self._store_artifact_bytes(artifact_id, version, data)
 
     def close(self, *, remove_workspace: bool = False) -> None:
         with self._lock:
