@@ -320,7 +320,10 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
         model used by registration.  Unknown keys are rejected rather than
         silently becoming privileged configuration.
         """
-        value = await request.json()
+        try:
+            value = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="request body must be valid JSON") from exc
         if not isinstance(value, dict):
             raise HTTPException(status_code=422, detail="manifest must be an object")
         allowed = {"environmentId", "version", "toolSchemas", "policyRef", "evaluatorRef", "resetRef"}

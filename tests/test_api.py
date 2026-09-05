@@ -66,6 +66,7 @@ def test_unknown_manifest_fields_are_rejected():
     api = client()
     invalid = {**manifest(), "privileged": True}
     assert api.post("/environments/register", json=invalid).status_code == 422
+    assert api.post("/environments/validate", content=b"not-json", headers={"content-type": "application/json"}).status_code == 422
 
 
 def test_unverified_model_provenance_fails_closed():
