@@ -11,9 +11,21 @@ React + Tailwind + Vite console for the Adaptive Agent control plane (SPEC "Oper
 
 ## Transport modes
 
-- `simulation` (default): deterministic fixtures, always labeled with a persistent
-  "SIMULATED — development fixture, not live inference" banner. Never presented as live inference.
-- `live`: REST + SSE against the SPEC control API (`createRestTransport` in `src/api/rest.ts`). Expected endpoints are documented there; contract deltas should change only that file plus `src/api/types.ts`.
+- `live` (default): REST + SSE against the SPEC control API (`createRestTransport` in `src/api/rest.ts`). Every payload passes boundary-schema validation (`src/api/validate.ts`) before entering UI state; API errors surface as visible banners with correlation IDs.
+- `simulation`: deterministic fixtures, available only as an **explicit dev-only opt-in** — `?sim=1` on a dev build, or the "Use simulation (dev)" toggle (hidden in production builds). Always labeled with a persistent "SIMULATED — development fixture, not live inference" banner, and its stream badge never shows a green "connected" state that could be mistaken for live inference.
+
+Switching modes resets ALL per-mode state (runs, events, candidates, cursors); the stream badge reports stream connectivity only, never model inference.
+
+## Operator actions
+
+- **Create run**: goal, environment, model profile, budget ceilings (tool calls / wall time / required nonzero model token cap), execution mode; idempotency key generated per submission and reused on retry; the server pins the active bundle.
+- **Run learning cycle**: submits the evidence-linked candidate proposal for independent evaluation.
+- **Register environment**: full manifest — docs (with hashes + learner/operator classification), tool schemas, declared execution modes, policy/evaluator/reset references, capability metadata.
+- **Cancel / approval / rollback** failures surface visibly with the API correlation ID.
+
+## Expected backend endpoints (see src/api/rest.ts)
+
+GET `/environments`, `/runs`, `/skills`, `/candidates`; POST `/environments`, `/environments/validate`, `/runs`, `/runs/{id}/cancel`, `/runs/{id}/approvals/{approvalId}`, `/candidates/{id}/rollback`, `/learning-cycles`; SSE `/runs/{id}/events?cursor=N` with monotonically increasing sequence numbers. Error envelope `{code, message, correlationId, retry}` per SPEC.
 
 ## States covered
 

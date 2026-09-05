@@ -7,6 +7,8 @@ export type ConsoleState = {
   transportMode: "simulation" | "live";
   loading: boolean;
   loadError: string | null;
+  /** last failed operator action, surfaced until dismissed or retried */
+  actionError: { message: string; correlationId: string | null } | null;
   environments: EnvironmentPackageSummary[];
   runs: RunRecord[];
   skills: SkillVersionSummary[];
@@ -23,6 +25,7 @@ export const initialConsoleState: ConsoleState = {
   transportMode: "simulation",
   loading: true,
   loadError: null,
+  actionError: null,
   environments: [],
   runs: [],
   skills: [],
@@ -41,14 +44,19 @@ export type ConsoleAction =
   | { type: "selectRun"; runId: string | null }
   | { type: "connection"; state: ConnectionState }
   | { type: "event"; event: RunEvent }
-  | { type: "runUpdated"; run: RunRecord };
+  | { type: "runUpdated"; run: RunRecord }
+  | { type: "runAdded"; run: RunRecord }
+  | { type: "environmentAdded"; environment: EnvironmentPackageSummary }
+  | { type: "candidateAdded"; candidate: CandidateDiff }
+  | { type: "actionError"; message: string; correlationId?: string | null }
+  | { type: "actionErrorCleared" };
 
 /**
  * Apply an event with cursor semantics:
  * - sequence <= cursor: duplicate (replay after reconnect) -> dropped
  * - sequence == cursor + 1: applied, cursor advances
- * - sequence > cursor + 1: gap -> buffered? No: we request reconnection from
- *   cursor; out-of-order events are dropped and the stream restarts from the
+ * - sequence > cursor + 1: gap -> request reconnection from cursor; the
+ *   out-of-order event is dropped and the stream restarts from the
  *   acknowledged cursor, guaranteeing no duplicate application.
  */
 export function applyEvent(state: ConsoleState, event: RunEvent): ConsoleState {
@@ -90,13 +98,24 @@ function derivedStatus(summary: string, current: RunRecord["status"]): RunRecord
   return current;
 }
 
+/** Reset ALL per-mode state. Switching transports must never leak runs, events,
+ *  candidates, or cursors from the previous mode (ghost data). */
+function resetForMode(mode: ConsoleState["transportMode"]): ConsoleState {
+  return { ...initialConsoleState, transportMode: mode };
+}
+
 export function reducer(state: ConsoleState, action: ConsoleAction): ConsoleState {
   switch (action.type) {
     case "transport":
-      return { ...initialConsoleState, transportMode: action.mode };
+      return resetForMode(action.mode);
     case "loadStart":
-      return { ...state, loading: true, loadError: null };
-    case "loadOk":
+      return { ...state, loading: true, loadError: null, actionError: null };
+    case "loadOk": {
+      // the selected run must exist in the CURRENT mode's runs; never carry a
+      // stale selection (and its events) across a mode boundary
+      const selection = action.runs.some((r) => r.runId === state.selectedRunId)
+        ? state.selectedRunId
+        : action.runs[0]?.runId ?? null;
       return {
         ...state,
         loading: false,
@@ -105,8 +124,9 @@ export function reducer(state: ConsoleState, action: ConsoleAction): ConsoleStat
         runs: action.runs,
         skills: action.skills,
         candidates: action.candidates,
-        selectedRunId: state.selectedRunId ?? action.runs[0]?.runId ?? null,
+        selectedRunId: selection,
       };
+    }
     case "loadError":
       return { ...state, loading: false, loadError: action.message };
     case "selectRun":
@@ -117,6 +137,32 @@ export function reducer(state: ConsoleState, action: ConsoleAction): ConsoleStat
       return applyEvent(state, action.event);
     case "runUpdated":
       return { ...state, runs: state.runs.map((r) => (r.runId === action.run.runId ? action.run : r)) };
+    case "runAdded":
+      return {
+        ...state,
+        runs: [action.run, ...state.runs.filter((r) => r.runId !== action.run.runId)],
+        selectedRunId: action.run.runId,
+        actionError: null,
+      };
+    case "environmentAdded":
+      return {
+        ...state,
+        environments: [
+          ...state.environments.filter((e) => e.environmentId !== action.environment.environmentId),
+          action.environment,
+        ],
+        actionError: null,
+      };
+    case "candidateAdded":
+      return {
+        ...state,
+        candidates: [action.candidate, ...state.candidates.filter((c) => c.candidateId !== action.candidate.candidateId)],
+        actionError: null,
+      };
+    case "actionError":
+      return { ...state, actionError: { message: action.message, correlationId: action.correlationId ?? null } };
+    case "actionErrorCleared":
+      return { ...state, actionError: null };
     default:
       return state;
   }

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import type { ConsoleTransport } from "../api/transport";
+import type { ConsoleTransport, CreateRunInput } from "../api/transport";
+import { EXECUTION_MODES, newIdempotencyKey } from "../api/transport";
 import { describeToolError } from "../api/errors";
-import type { ApprovalRequest, RunEvent, RunRecord } from "../api/types";
+import type { ApprovalRequest, EnvironmentPackageSummary, RunEvent, RunRecord } from "../api/types";
 import type { ConnectionState } from "../state/consoleStore";
 import { StatusBadge } from "../components/StatusBadge";
 import { Banner, EmptyState, LoadingState, Modal } from "../components/ui";
@@ -23,8 +24,11 @@ export function RunView({
   connection,
   selectedRunId,
   loading,
+  environments,
   onSelectRun,
   onCancel,
+  onCreateRun,
+  onActionError,
 }: {
   transport: ConsoleTransport;
   runs: RunRecord[];
@@ -33,11 +37,15 @@ export function RunView({
   connection: ConnectionState;
   selectedRunId: string | null;
   loading: boolean;
+  environments: EnvironmentPackageSummary[];
   onSelectRun: (runId: string) => void;
   onCancel: (run: RunRecord) => void;
+  onCreateRun: (input: CreateRunInput) => void;
+  onActionError: (message: string, correlationId?: string | null) => void;
 }) {
   const selected = runs.find((r) => r.runId === selectedRunId) ?? null;
   const [approval, setApproval] = useState<{ request: ApprovalRequest } | null>(null);
+  const [newRunOpen, setNewRunOpen] = useState(false);
   const approvalShown = useRef<string | null>(null);
 
   // surface the latest pending approval of the selected run as a dialog
@@ -54,10 +62,31 @@ export function RunView({
   if (loading) return <LoadingState label="Loading runs…" />;
   if (runs.length === 0)
     return (
-      <EmptyState title="No runs yet">
-        Create a run by choosing a registered environment, a goal, a model profile, and a resource budget. The
-        active skill version is pinned by the server.
-      </EmptyState>
+      <div className="space-y-4">
+        <EmptyState title="No runs yet">
+          Create a run by choosing a registered environment, a goal, a model profile, and a resource budget. The
+          active skill version is pinned by the server.
+        </EmptyState>
+        <div>
+          <button
+            type="button"
+            onClick={() => setNewRunOpen(true)}
+            className="rounded-md bg-sky-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-sky-500"
+          >
+            New run
+          </button>
+        </div>
+        <NewRunDialog
+          open={newRunOpen}
+          onClose={() => setNewRunOpen(false)}
+          environments={environments}
+          transport={transport}
+          onCreateRun={(input) => {
+            setNewRunOpen(false);
+            onCreateRun(input);
+          }}
+        />
+      </div>
     );
 
   const runEvents = selected ? events[selected.runId] ?? [] : [];
@@ -66,9 +95,18 @@ export function RunView({
   return (
     <section aria-labelledby="runs-heading" className="grid gap-6 lg:grid-cols-[minmax(280px,380px)_1fr]">
       <div>
-        <h2 id="runs-heading" className="text-base font-semibold text-slate-100">
-          Runs
-        </h2>
+        <div className="flex items-center justify-between gap-2">
+          <h2 id="runs-heading" className="text-base font-semibold text-slate-100">
+            Runs
+          </h2>
+          <button
+            type="button"
+            onClick={() => setNewRunOpen(true)}
+            className="rounded-md bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500"
+          >
+            New run
+          </button>
+        </div>
         <ul className="mt-3 space-y-2">
           {runs.map((run) => (
             <li key={run.runId}>
@@ -198,11 +236,32 @@ export function RunView({
         )}
       </div>
 
+      <NewRunDialog
+        open={newRunOpen}
+        onClose={() => setNewRunOpen(false)}
+        environments={environments}
+        transport={transport}
+        onCreateRun={(input) => {
+          setNewRunOpen(false);
+          onCreateRun(input);
+        }}
+      />
+
       <ApprovalDialog
         request={approval?.request ?? null}
-        transport={transport}
         runId={selected?.runId ?? ""}
-        onDecided={() => setApproval(null)}
+        onDecide={async (approve) => {
+          if (!approval) return;
+          try {
+            await transport.submitApproval(selected?.runId ?? "", approval.request.approvalId, approve);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "Approval submission failed";
+            const correlationId = (error as { correlationId?: string } | null)?.correlationId ?? null;
+            onActionError(`Approval failed: ${message}`, correlationId);
+          } finally {
+            setApproval(null);
+          }
+        }}
       />
     </section>
   );
@@ -232,30 +291,195 @@ function BudgetBar({ label, used, ceiling, unit }: { label: string; used: number
   );
 }
 
+function NewRunDialog({
+  open,
+  onClose,
+  environments,
+  transport,
+  onCreateRun,
+}: {
+  open: boolean;
+  onClose: () => void;
+  environments: EnvironmentPackageSummary[];
+  transport: ConsoleTransport;
+  onCreateRun: (input: CreateRunInput) => void;
+}) {
+  const [goal, setGoal] = useState("");
+  const [environmentId, setEnvironmentId] = useState("");
+  const [modelProfile, setModelProfile] = useState("");
+  const [executionMode, setExecutionMode] = useState<CreateRunInput["executionMode"]>("interactive");
+  const [toolCallCeiling, setToolCallCeiling] = useState("100");
+  const [wallSecondsCeiling, setWallSecondsCeiling] = useState("900");
+  const [modelTokenCeiling, setModelTokenCeiling] = useState("");
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    if (open) {
+      setEnvironmentId((prev) => prev || environments[0]?.environmentId || "");
+    }
+  }, [open, environments]);
+
+  const validate = (): boolean => {
+    const errors: Record<string, string> = {};
+    if (!goal.trim()) errors.goal = "Goal is required";
+    if (!environmentId) errors.environmentId = "Environment is required";
+    if (!modelProfile.trim()) errors.modelProfile = "Model profile is required";
+    const calls = Number(toolCallCeiling);
+    if (!Number.isFinite(calls) || calls <= 0) errors.toolCallCeiling = "Tool-call ceiling must be a positive number";
+    const wall = Number(wallSecondsCeiling);
+    if (!Number.isFinite(wall) || wall <= 0) errors.wallSecondsCeiling = "Wall-time ceiling must be a positive number";
+    const tokens = Number(modelTokenCeiling);
+    if (!Number.isFinite(tokens) || tokens <= 0) errors.modelTokenCeiling = "A nonzero model token/cost cap is required before execution (SPEC)";
+    setFieldErrors(errors);
+    return Object.keys(errors).length === 0;
+  };
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!validate()) return;
+    onCreateRun({
+      environmentId,
+      goal: goal.trim(),
+      modelProfile: modelProfile.trim(),
+      idempotencyKey: newIdempotencyKey(),
+      budget: {
+        toolCallCeiling: Number(toolCallCeiling),
+        wallSecondsCeiling: Number(wallSecondsCeiling),
+        modelTokenCeiling: Number(modelTokenCeiling),
+      },
+      executionMode,
+    });
+    setGoal("");
+    setModelProfile("");
+    setModelTokenCeiling("");
+    setFieldErrors({});
+  };
+
+  return (
+    <Modal open={open} title="Create run" onClose={onClose}>
+      <form onSubmit={submit} noValidate className="space-y-3 text-sm text-slate-300">
+        <p className="text-xs text-slate-500">
+          The server pins the active skill bundle; the console never chooses it. The idempotency key is generated per
+          submission and reused verbatim on retry.
+        </p>
+        <div>
+          <label htmlFor="newrun-goal" className="block text-xs font-medium text-slate-400">Goal</label>
+          <textarea
+            id="newrun-goal"
+            rows={2}
+            value={goal}
+            onChange={(e) => setGoal(e.target.value)}
+            aria-invalid={fieldErrors.goal ? true : undefined}
+            aria-describedby={fieldErrors.goal ? "newrun-goal-error" : undefined}
+            className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
+            placeholder="e.g., Reconcile the Q3 ledger batch"
+          />
+          {fieldErrors.goal && <p id="newrun-goal-error" role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.goal}</p>}
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <label htmlFor="newrun-env" className="block text-xs font-medium text-slate-400">Environment</label>
+            <select
+              id="newrun-env"
+              value={environmentId}
+              onChange={(e) => setEnvironmentId(e.target.value)}
+              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
+            >
+              <option value="">Select…</option>
+              {environments.map((env) => (
+                <option key={env.environmentId} value={env.environmentId}>
+                  {env.environmentId} v{env.version}
+                </option>
+              ))}
+            </select>
+            {fieldErrors.environmentId && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.environmentId}</p>}
+          </div>
+          <div>
+            <label htmlFor="newrun-model" className="block text-xs font-medium text-slate-400">Model profile</label>
+            <input
+              id="newrun-model"
+              value={modelProfile}
+              onChange={(e) => setModelProfile(e.target.value)}
+              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
+              placeholder="e.g., profile-subscription"
+            />
+            {fieldErrors.modelProfile && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.modelProfile}</p>}
+          </div>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div>
+            <label htmlFor="newrun-calls" className="block text-xs font-medium text-slate-400">Tool-call ceiling</label>
+            <input id="newrun-calls" type="number" min="1" value={toolCallCeiling} onChange={(e) => setToolCallCeiling(e.target.value)}
+              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
+            {fieldErrors.toolCallCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.toolCallCeiling}</p>}
+          </div>
+          <div>
+            <label htmlFor="newrun-wall" className="block text-xs font-medium text-slate-400">Wall-time ceiling (s)</label>
+            <input id="newrun-wall" type="number" min="1" value={wallSecondsCeiling} onChange={(e) => setWallSecondsCeiling(e.target.value)}
+              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
+            {fieldErrors.wallSecondsCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.wallSecondsCeiling}</p>}
+          </div>
+          <div>
+            <label htmlFor="newrun-tokens" className="block text-xs font-medium text-slate-400">Model token cap</label>
+            <input id="newrun-tokens" type="number" min="1" value={modelTokenCeiling} onChange={(e) => setModelTokenCeiling(e.target.value)}
+              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" placeholder="required" />
+            {fieldErrors.modelTokenCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.modelTokenCeiling}</p>}
+          </div>
+        </div>
+        <div>
+          <label htmlFor="newrun-mode" className="block text-xs font-medium text-slate-400">Execution mode</label>
+          <select
+            id="newrun-mode"
+            value={executionMode}
+            onChange={(e) => setExecutionMode(e.target.value as CreateRunInput["executionMode"])}
+            className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
+          >
+            {EXECUTION_MODES.map((mode) => (
+              <option key={mode.value} value={mode.value}>{mode.value}</option>
+            ))}
+          </select>
+        </div>
+        <div className="flex justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border border-slate-600 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500"
+          >
+            Create run
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 function ApprovalDialog({
   request,
-  transport,
   runId,
-  onDecided,
+  onDecide,
 }: {
   request: ApprovalRequest | null;
-  transport: ConsoleTransport;
   runId: string;
-  onDecided: () => void;
+  onDecide: (approve: boolean) => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   if (!request) return null;
   const decide = async (approve: boolean) => {
     setBusy(true);
     try {
-      await transport.submitApproval(runId, request.approvalId, approve);
+      await onDecide(approve);
     } finally {
       setBusy(false);
-      onDecided();
     }
   };
   return (
-    <Modal open title="Approval required" onClose={() => onDecided()}>
+    <Modal open title="Approval required" onClose={() => void decide(false)}>
       <div className="space-y-3 text-sm text-slate-300">
         <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-[13px]">
           <dt className="text-slate-500">Tool</dt>
@@ -278,7 +502,7 @@ function ApprovalDialog({
         <div className="flex justify-end gap-2 pt-1">
           <button
             type="button"
-            onClick={() => decide(false)}
+            onClick={() => void decide(false)}
             disabled={busy}
             className="rounded-md border border-slate-600 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800"
           >
@@ -286,7 +510,7 @@ function ApprovalDialog({
           </button>
           <button
             type="button"
-            onClick={() => decide(true)}
+            onClick={() => void decide(true)}
             disabled={busy}
             className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-60"
           >

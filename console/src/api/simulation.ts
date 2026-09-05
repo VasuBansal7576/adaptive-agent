@@ -5,29 +5,35 @@ import type {
   RunRecord,
   SkillVersionSummary,
 } from "./types";
-import type { ConsoleTransport, EnvironmentPackageForm } from "./transport";
-import { validatePackageFields } from "./transport";
+import type { ConsoleTransport, CreateRunInput, EnvironmentPackageForm, EnvironmentRegistration } from "./transport";
+import { validatePackageFields, formToRegistration } from "./transport";
+import { parseRun } from "./validate";
 
 /**
  * DETERMINISTIC SIMULATION TRANSPORT — development fixture only.
  *
  * This module never contacts a backend and never represents live inference.
  * The UI renders a persistent "SIMULATED" banner whenever this transport is
- * active (see App.tsx). All sequences are fixed and reproducible.
+ * active (see App.tsx), and the option exists only as an explicit dev-only
+ * opt-in. All sequences are fixed and reproducible.
  */
 
 export const SIMULATION_LABEL = "SIMULATED — development fixture, not live inference";
 
 type ScriptedEvent = Omit<RunEvent, "runId" | "at">;
 
+function hash(pad: number): string {
+  return `sim-hash-${String(pad).padStart(40, "0")}`;
+}
+
 const baseRun: RunRecord = {
   runId: "run-sim-1001",
-  taskRef: { id: "task-finance-007", version: "1", sha256: "sim-task-hash-0000000000000000000000000000000000000001" },
-  environmentRef: { id: "env-finance", version: "1.2.0", sha256: "sim-env-hash-000000000000000000000000000000000000002" },
-  policyRef: { id: "policy-finance", version: "3", sha256: "sim-pol-hash-0000000000000000000000000000000000000003" },
-  modelProfileRef: { id: "profile-subscription", version: "1", sha256: "sim-model-hash-00000000000000000000000000000000000004" },
-  skillBundleRef: { id: "bundle-active", version: "7", sha256: "sim-bundle-hash-00000000000000000000000000000000000005" },
-  budgetRef: { id: "budget-default", version: "1", sha256: "sim-budget-hash-00000000000000000000000000000000000006" },
+  taskRef: { id: "task-finance-007", version: "1", sha256: hash(1) },
+  environmentRef: { id: "env-finance", version: "1.2.0", sha256: hash(2) },
+  policyRef: { id: "policy-finance", version: "3", sha256: hash(3) },
+  modelProfileRef: { id: "profile-subscription", version: "1", sha256: hash(4) },
+  skillBundleRef: { id: "bundle-active", version: "7", sha256: hash(5) },
+  budgetRef: { id: "budget-default", version: "1", sha256: hash(6) },
   status: "running",
   lastEventSequence: 0,
   environmentId: "finance-sim",
@@ -35,7 +41,7 @@ const baseRun: RunRecord = {
   budgetUsed: { calls: 5, callsCeiling: 100, wallSeconds: 96, wallCeiling: 900 },
 };
 
-const runCatalog: RunRecord[] = [
+let runCatalog: RunRecord[] = [
   baseRun,
   {
     ...baseRun,
@@ -49,14 +55,14 @@ const runCatalog: RunRecord[] = [
     runId: "run-sim-1003",
     status: "failed",
     lastEventSequence: 6,
-    outcomeRef: { id: "outcome-1003", version: "1", sha256: "sim-outcome-hash-00000000000000000000000000000000007" },
+    outcomeRef: { id: "outcome-1003", version: "1", sha256: hash(7) },
   },
   {
     ...baseRun,
     runId: "run-sim-1004",
     status: "succeeded",
     lastEventSequence: 8,
-    outcomeRef: { id: "outcome-1004", version: "1", sha256: "sim-outcome-hash-00000000000000000000000000000000008" },
+    outcomeRef: { id: "outcome-1004", version: "1", sha256: hash(8) },
   },
   {
     ...baseRun,
@@ -153,19 +159,29 @@ const scripted: Record<string, ScriptedEvent[]> = {
   ],
 };
 
-const skillCatalog: SkillVersionSummary[] = [
-  { skillId: "recheck-before-update", version: "3", parentVersion: "2", state: "active", applicability: "tools with optimistic versioning", evidenceRefs: ["ev-sim-31", "ev-sim-32"], contentHash: "sim-skill-hash-1" },
-  { skillId: "batch-reconcile", version: "5", parentVersion: "4", state: "proposed", applicability: "multi-entry ledger batches", evidenceRefs: ["ev-sim-44"], contentHash: "sim-skill-hash-2" },
-  { skillId: "unsafe-bulk-write", version: "1", parentVersion: null, state: "quarantined", applicability: "—", evidenceRefs: ["ev-sim-51"], contentHash: "sim-skill-hash-3" },
-  { skillId: "stale-cache-read", version: "2", parentVersion: "1", state: "rejected", applicability: "—", evidenceRefs: ["ev-sim-61"], contentHash: "sim-skill-hash-4" },
-  { skillId: "batch-reconcile", version: "4", parentVersion: "3", state: "rolled_back", applicability: "multi-entry ledger batches", evidenceRefs: ["ev-sim-40"], contentHash: "sim-skill-hash-5" },
+/** Events for runs created through createRun in this fixture session. */
+function scriptForNewRun(runId: string, input: CreateRunInput): ScriptedEvent[] {
+  return [
+    { sequence: 1, kind: "status", summary: `Run queued and pinned to the current active bundle (${input.executionMode} mode).` },
+    { sequence: 2, kind: "step", summary: "Retrieved 2 documentation chunks for the goal." },
+    { sequence: 3, kind: "tool", summary: "inventory.read completed (read effect confirmed)." },
+    { sequence: 4, kind: "budget", summary: "Budget checkpoint recorded against the reserved ledger." },
+  ];
+}
+
+let skillCatalog: SkillVersionSummary[] = [
+  { skillId: "recheck-before-update", version: "3", parentVersion: "2", state: "active", applicability: "tools with optimistic versioning", evidenceRefs: ["ev-sim-31", "ev-sim-32"], contentHash: hash(11) },
+  { skillId: "batch-reconcile", version: "5", parentVersion: "4", state: "proposed", applicability: "multi-entry ledger batches", evidenceRefs: ["ev-sim-44"], contentHash: hash(12) },
+  { skillId: "unsafe-bulk-write", version: "1", parentVersion: null, state: "quarantined", applicability: "—", evidenceRefs: ["ev-sim-51"], contentHash: hash(13) },
+  { skillId: "stale-cache-read", version: "2", parentVersion: "1", state: "rejected", applicability: "—", evidenceRefs: ["ev-sim-61"], contentHash: hash(14) },
+  { skillId: "batch-reconcile", version: "4", parentVersion: "3", state: "rolled_back", applicability: "multi-entry ledger batches", evidenceRefs: ["ev-sim-40"], contentHash: hash(15) },
 ];
 
-const candidateCatalog: CandidateDiff[] = [
+let candidateCatalog: CandidateDiff[] = [
   {
     candidateId: "cand-sim-202",
-    baseBundleRef: { id: "bundle-active", version: "7", sha256: "sim-bundle-hash-7" },
-    candidateBundleRef: { id: "bundle-cand-202", version: "8", sha256: "sim-bundle-hash-8" },
+    baseBundleRef: { id: "bundle-active", version: "7", sha256: hash(21) },
+    candidateBundleRef: { id: "bundle-cand-202", version: "8", sha256: hash(22) },
     state: "promoted",
     diff: [
       "--- bundle-active@7/skills/recheck-before-update.py",
@@ -186,13 +202,13 @@ const candidateCatalog: CandidateDiff[] = [
       p95LatencyRatio: 1.04,
       gateDecision: "promoted",
       gateReasons: ["Accuracy gain ≥ 5pp with CI lower bound > 0", "No environment regressed", "Safety suite passed"],
-      evaluationRef: { id: "eval-sim-88", version: "1", sha256: "sim-eval-hash-8" },
+      evaluationRef: { id: "eval-sim-88", version: "1", sha256: hash(23) },
     },
     audit: [
       {
         rollbackId: "rb-sim-01",
-        fromRef: { id: "bundle-cand-101", version: "7", sha256: "sim-bundle-hash-7a" },
-        toRef: { id: "bundle-active", version: "6", sha256: "sim-bundle-hash-6" },
+        fromRef: { id: "bundle-cand-101", version: "7", sha256: hash(24) },
+        toRef: { id: "bundle-active", version: "6", sha256: hash(25) },
         reason: "Safety suite flagged unbounded child fan-out.",
         at: "2026-09-06T12:40:00Z",
         affectedRuns: ["run-sim-1003", "run-sim-1005"],
@@ -201,8 +217,8 @@ const candidateCatalog: CandidateDiff[] = [
   },
   {
     candidateId: "cand-sim-203",
-    baseBundleRef: { id: "bundle-active", version: "7", sha256: "sim-bundle-hash-7" },
-    candidateBundleRef: { id: "bundle-cand-203", version: "8", sha256: "sim-bundle-hash-9" },
+    baseBundleRef: { id: "bundle-active", version: "7", sha256: hash(26) },
+    candidateBundleRef: { id: "bundle-cand-203", version: "8", sha256: hash(27) },
     state: "rejected",
     diff: [
       "--- bundle-active@7/config/execution.json",
@@ -220,12 +236,12 @@ const candidateCatalog: CandidateDiff[] = [
       p95LatencyRatio: 0.91,
       gateDecision: "rejected",
       gateReasons: ["Reliability regressed below baseline in finance", "Safety case 'approval bypass' failed"],
-      evaluationRef: { id: "eval-sim-89", version: "1", sha256: "sim-eval-hash-9" },
+      evaluationRef: { id: "eval-sim-89", version: "1", sha256: hash(28) },
     },
   },
 ];
 
-const environmentCatalog: EnvironmentPackageSummary[] = [
+let environmentCatalog: EnvironmentPackageSummary[] = [
   { environmentId: "finance-sim", version: "1.2.0", validationState: "valid", evaluatorReady: true, toolCount: 4, policyScope: "finance/ledger/*" },
   { environmentId: "support-sim", version: "0.9.1", validationState: "valid", evaluatorReady: false, toolCount: 3, policyScope: "support/tickets/*" },
 ];
@@ -259,6 +275,66 @@ export function createSimulationTransport(options?: {
 
     async listCandidates() {
       return structuredClone(candidateCatalog);
+    },
+
+    async createRun(input: CreateRunInput) {
+      const runId = `run-sim-${1007 + runCatalog.length - 6}`;
+      const run: RunRecord = parseRun(
+        {
+          runId,
+          taskRef: { id: `task-${input.environmentId}`, version: "1", sha256: hash(31 + runCatalog.length) },
+          environmentRef: { id: `env-${input.environmentId}`, version: "1", sha256: hash(41) },
+          policyRef: { id: `policy-${input.environmentId}`, version: "1", sha256: hash(42) },
+          modelProfileRef: { id: input.modelProfile, version: "1", sha256: hash(43) },
+          skillBundleRef: { id: "bundle-active", version: "7", sha256: hash(44) },
+          budgetRef: { id: `budget-${input.idempotencyKey.slice(0, 8)}`, version: "1", sha256: hash(45) },
+          status: "queued",
+          lastEventSequence: 0,
+          environmentId: input.environmentId,
+          goal: input.goal,
+          budgetUsed: { calls: 0, callsCeiling: input.budget.toolCallCeiling, wallSeconds: 0, wallCeiling: input.budget.wallSecondsCeiling },
+        },
+        "createdRun",
+      );
+      runCatalog = [...runCatalog, run];
+      scripted[runId] = scriptForNewRun(runId, input);
+      return structuredClone(run);
+    },
+
+    async registerEnvironment(manifest: EnvironmentRegistration) {
+      const summary: EnvironmentPackageSummary = {
+        environmentId: manifest.environmentId,
+        version: manifest.version,
+        validationState: "valid",
+        evaluatorReady: true,
+        toolCount: manifest.toolSchemas.length,
+        policyScope: manifest.policyRef,
+      };
+      environmentCatalog = [...environmentCatalog, summary];
+      return structuredClone(summary);
+    },
+
+    async runLearningCycle() {
+      const candidateId = `cand-sim-${300 + candidateCatalog.length - 1}`;
+      const candidate: CandidateDiff = {
+        candidateId,
+        baseBundleRef: { id: "bundle-active", version: "7", sha256: hash(51) },
+        candidateBundleRef: { id: `bundle-${candidateId}`, version: "8", sha256: hash(52) },
+        state: "validated",
+        diff: [
+          `--- bundle-active@7/skills/recheck-before-update.py`,
+          `+++ bundle-${candidateId}@8/skills/recheck-before-update.py`,
+          `@@ -20,6 +20,9 @@`,
+          ` def handle_conflict(record):`,
+          `-    raise Abort("conflict")`,
+          `+    refreshed = read(record.id)`,
+          `+    record.version = refreshed.version`,
+          `+    return retry(record)`,
+        ].join("\n"),
+        predictedEffect: "Recover version conflicts by rereading state before retry (prediction, not a score).",
+      };
+      candidateCatalog = [candidate, ...candidateCatalog];
+      return { candidate: structuredClone(candidate) };
     },
 
     openRunStream(runId, fromCursor, { onEvent, onState }) {
@@ -305,8 +381,12 @@ export function createSimulationTransport(options?: {
       };
     },
 
-    async cancelRun() {
-      /* fixture: caller updates local state */
+    async cancelRun(runId: string) {
+      runCatalog = runCatalog.map((r) => (r.runId === runId && (r.status === "queued" || r.status === "running" || r.status === "awaiting_approval") ? { ...r, status: "cancelled" as const } : r));
+      scripted[runId] = [
+        ...(scripted[runId] ?? []),
+        { sequence: (scripted[runId]?.length ?? 0) + 1, kind: "status" as const, summary: "Cancelled by operator; future calls revoked. Dispatched external actions were not undone." },
+      ];
     },
 
     async submitApproval() {
@@ -324,3 +404,6 @@ export function createSimulationTransport(options?: {
     },
   };
 }
+
+/** exposed for tests that need the raw form → manifest mapping */
+export { formToRegistration };

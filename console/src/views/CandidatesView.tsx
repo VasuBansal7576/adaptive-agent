@@ -8,23 +8,46 @@ export function CandidatesView({
   transport,
   candidates,
   loading,
+  onActionError,
+  onCandidateAdded,
 }: {
   transport: ConsoleTransport;
   candidates: CandidateDiff[];
   loading: boolean;
+  onActionError: (message: string, correlationId?: string | null) => void;
+  onCandidateAdded: (candidate: CandidateDiff) => void;
 }) {
   const [rollbackTarget, setRollbackTarget] = useState<CandidateDiff | null>(null);
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
+  const [cycleBusy, setCycleBusy] = useState(false);
   const [notice, setNotice] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
+
+  const runCycle = async () => {
+    setCycleBusy(true);
+    try {
+      const { candidate } = await transport.runLearningCycle();
+      onCandidateAdded(candidate);
+      setNotice({ tone: "good", text: `✓ Learning cycle complete: candidate ${candidate.candidateId} submitted with evidence links and awaits trusted evaluation.` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Learning cycle failed";
+      const correlationId = (error as { correlationId?: string } | null)?.correlationId ?? null;
+      onActionError(`Learning cycle failed: ${message}`, correlationId);
+    } finally {
+      setCycleBusy(false);
+    }
+  };
 
   if (loading) return <LoadingState label="Loading candidates…" />;
   if (candidates.length === 0)
     return (
-      <EmptyState title="No candidates yet">
-        Candidates appear when the learner submits an evidence-linked proposal from a completed development
-        attempt. Predicted effects are never treated as measured results.
-      </EmptyState>
+      <div className="space-y-4">
+        <EmptyState title="No candidates yet">
+          Candidates appear when the learner submits an evidence-linked proposal from a completed development
+          attempt. Predicted effects are never treated as measured results.
+        </EmptyState>
+        <LearningCycleButton busy={cycleBusy} onRun={() => void runCycle()} />
+      </div>
     );
 
   const submitRollback = async () => {
@@ -35,7 +58,11 @@ export function CandidatesView({
       setNotice({ tone: "good", text: `✓ Rollback of ${rollbackTarget.candidateId} recorded; new runs use the previous approved version.` });
       setRollbackTarget(null);
       setReason("");
-    } catch {
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Rollback failed";
+      const correlationId = (error as { correlationId?: string } | null)?.correlationId ?? null;
+      // visible failure with correlation id; no partial state was applied
+      onActionError(`Rollback failed: ${message}`, correlationId);
       setNotice({ tone: "bad", text: "✗ Rollback request failed. Check connection and retry; no partial state was applied." });
     } finally {
       setBusy(false);
@@ -53,6 +80,8 @@ export function CandidatesView({
           promotion; rollback restores the prior approved version and is audited.
         </p>
       </div>
+
+      <LearningCycleButton busy={cycleBusy} onRun={() => void runCycle()} />
 
       {notice && <Banner tone={notice.tone} title={notice.text.replace(/^[✓✗] /, "")} />}
 
@@ -180,5 +209,21 @@ export function CandidatesView({
         </div>
       </Modal>
     </section>
+  );
+}
+
+function LearningCycleButton({ busy, onRun }: { busy: boolean; onRun: () => void }) {
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={onRun}
+        disabled={busy}
+        className="rounded-md bg-sky-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-60"
+        title="Submits the evidence-linked candidate proposal for independent evaluation"
+      >
+        {busy ? "Running learning cycle…" : "Run learning cycle"}
+      </button>
+    </div>
   );
 }

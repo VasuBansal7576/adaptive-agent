@@ -22,11 +22,19 @@ export const STATUS_META: Record<
   promoted: { glyph: "✓", label: "Promoted", tone: "good" },
   valid: { glyph: "✓", label: "Valid", tone: "good" },
   invalid: { glyph: "✗", label: "Invalid", tone: "bad" },
-  "live": { glyph: "●", label: "Live", tone: "good" },
+  "live": { glyph: "●", label: "Stream connected", tone: "good" },
+  "ready": { glyph: "✓", label: "Ready", tone: "good" },
   "stale": { glyph: "◌", label: "Stale", tone: "warn" },
   "reconnecting": { glyph: "◌", label: "Reconnecting", tone: "info" },
   "connecting": { glyph: "◌", label: "Connecting", tone: "info" },
   "closed": { glyph: "○", label: "Closed", tone: "neutral" },
+  // simulated-stream badges deliberately avoid the green "connected" tone so a
+  // fixture stream is never mistaken for live inference
+  "sim_stream_connected": { glyph: "◐", label: "Simulated stream connected (fixture)", tone: "warn" },
+  "sim_stream_stale": { glyph: "◌", label: "Simulated stream stale", tone: "warn" },
+  "sim_stream_reconnecting": { glyph: "◌", label: "Simulated stream reconnecting", tone: "info" },
+  "sim_stream_connecting": { glyph: "◌", label: "Simulated stream connecting", tone: "info" },
+  "sim_stream_closed": { glyph: "○", label: "Simulated stream closed", tone: "neutral" },
 };
 
 const TONE_CLASS: Record<string, string> = {

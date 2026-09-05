@@ -19,8 +19,30 @@ const TABS = [
 
 type TabId = (typeof TABS)[number]["id"];
 
+/** Dev-only simulation opt-in: `?sim=1` in a dev build, or the explicit toggle. */
+function simulationOptedIn(): boolean {
+  return import.meta.env.DEV && new URLSearchParams(window.location.search).has("sim");
+}
+
+/** Stream badge copy that never implies model inference. A green "live" badge
+ *  only means the event stream is connected — and in simulation mode it never
+ *  shows as live inference at all. */
+function streamBadge(mode: "simulation" | "live", connection: string): { status: string } {
+  if (mode === "simulation") {
+    if (connection === "live") return { status: "sim_stream_connected" };
+    if (connection === "stale") return { status: "sim_stream_stale" };
+    if (connection === "reconnecting") return { status: "sim_stream_reconnecting" };
+    if (connection === "closed") return { status: "sim_stream_closed" };
+    return { status: "sim_stream_connecting" };
+  }
+  return { status: connection };
+}
+
 export function App({ transport: transportProp }: { transport?: ConsoleTransport }) {
-  const [transport, setTransport] = useState<ConsoleTransport>(() => transportProp ?? createSimulationTransport());
+  const [transport, setTransport] = useState<ConsoleTransport>(() => {
+    if (transportProp) return transportProp;
+    return simulationOptedIn() ? createSimulationTransport() : createRestTransport();
+  });
   const [state, dispatch] = useReducer(reducer, {
     ...initialConsoleState,
     transportMode: transport.mode,
@@ -44,10 +66,12 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     }
   }, [transport]);
 
-  // load (and reload) whenever the transport changes; close any open stream first
+  // load (and reload) whenever the transport changes; the reducer's transport
+  // action clears ALL prior-mode state (runs, events, candidates, cursors)
   useEffect(() => {
     closeStreamRef.current?.();
     closeStreamRef.current = null;
+    dispatch({ type: "transport", mode: transport.mode });
     void load();
     return () => closeStreamRef.current?.();
   }, [load]);
@@ -70,17 +94,34 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     closeStreamRef.current = close;
     return close;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.selectedRunId, transport]);
+  }, [state.selectedRunId, transport, state.loading]);
+
+  const failAction = (error: unknown) => {
+    const correlationId = (error as { correlationId?: string } | null)?.correlationId ?? null;
+    const message = error instanceof Error ? error.message : "Unknown action failure";
+    dispatch({ type: "actionError", message, correlationId });
+  };
 
   const cancelRun = async (runId: string) => {
     try {
       await transport.cancelRun(runId);
       const run = state.runs.find((r) => r.runId === runId);
       if (run) dispatch({ type: "runUpdated", run: { ...run, status: "cancelled" } });
-    } catch {
-      /* error banner stays visible; the operator can retry */
+    } catch (error) {
+      failAction(error); // visible, with correlation id when the API provides one
     }
   };
+
+  const createRun = async (input: Parameters<ConsoleTransport["createRun"]>[0]) => {
+    try {
+      const run = await transport.createRun(input);
+      dispatch({ type: "runAdded", run });
+    } catch (error) {
+      failAction(error);
+    }
+  };
+
+  const onStreamBadge = streamBadge(transport.mode, state.connection);
 
   const onTabKeyDown = (event: React.KeyboardEvent, index: number) => {
     let next: number | null = null;
@@ -96,8 +137,24 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
   };
 
   const switchTransport = () => {
-    setTransport(transport.mode === "simulation" ? createRestTransport() : createSimulationTransport());
+    if (transport.mode === "simulation") {
+      // leaving the dev fixture: URL opt-out keeps reloads consistent
+      if (import.meta.env.DEV && window.location.search.includes("sim=1")) {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("sim");
+        window.history.replaceState(null, "", url);
+      }
+      setTransport(createRestTransport());
+    } else if (import.meta.env.DEV) {
+      // simulation is a dev-only, explicit opt-in
+      const url = new URL(window.location.href);
+      url.searchParams.set("sim", "1");
+      window.history.replaceState(null, "", url);
+      setTransport(createSimulationTransport());
+    }
   };
+
+  const showSimToggle = transport.mode === "simulation" || import.meta.env.DEV;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200">
@@ -109,15 +166,20 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               <p className="text-xs text-slate-500">Runs, evidence, skills, and promotion under operator authority</p>
             </div>
             <div className="flex items-center gap-2">
-              <StatusBadge status={state.connection} />
-              <button
-                type="button"
-                onClick={switchTransport}
-                className="rounded-md border border-slate-600 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800"
-                aria-label={transport.mode === "simulation" ? "Switch to live control API" : "Switch to simulation fixtures"}
-              >
-                {transport.mode === "simulation" ? "Use live API" : "Use simulation"}
-              </button>
+              {/* badge text states stream connectivity only — never model inference */}
+              <span title="Event stream connectivity; does not indicate model inference">
+                <StatusBadge status={onStreamBadge.status} />
+              </span>
+              {showSimToggle && (
+                <button
+                  type="button"
+                  onClick={switchTransport}
+                  className="rounded-md border border-slate-600 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800"
+                  aria-label={transport.mode === "simulation" ? "Switch to live control API" : "Switch to simulation fixtures (development only)"}
+                >
+                  {transport.mode === "simulation" ? "Use live API" : "Use simulation (dev)"}
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -132,6 +194,21 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
       )}
 
       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+        {state.actionError && (
+          <div className="mb-4">
+            <Banner tone="bad" title="Action failed" role="alert">
+              {state.actionError.message}
+              {state.actionError.correlationId ? ` — correlation ${state.actionError.correlationId}` : ""}
+              <button
+                type="button"
+                onClick={() => dispatch({ type: "actionErrorCleared" })}
+                className="ml-2 underline underline-offset-2"
+              >
+                Dismiss
+              </button>
+            </Banner>
+          </div>
+        )}
         {state.loadError && (
           <div className="mb-4">
             <Banner tone="bad" title="Failed to load console data" role="alert">
@@ -170,7 +247,13 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
 
         <div role="tabpanel" id={`panel-${activeTab}`} aria-labelledby={`tab-${activeTab}`} tabIndex={-1}>
           {activeTab === "registry" && (
-            <RegistryView transport={transport} environments={state.environments} loading={state.loading} />
+            <RegistryView
+              transport={transport}
+              environments={state.environments}
+              loading={state.loading}
+              onRegistered={(environment) => dispatch({ type: "environmentAdded", environment })}
+              onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
+            />
           )}
           {activeTab === "runs" && (
             <RunView
@@ -181,13 +264,22 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               connection={state.connection}
               selectedRunId={state.selectedRunId}
               loading={state.loading}
+              environments={state.environments}
               onSelectRun={(runId) => dispatch({ type: "selectRun", runId })}
               onCancel={(run) => void cancelRun(run.runId)}
+              onCreateRun={(input) => void createRun(input)}
+              onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
             />
           )}
           {activeTab === "skills" && <SkillsView skills={state.skills} loading={state.loading} />}
           {activeTab === "candidates" && (
-            <CandidatesView transport={transport} candidates={state.candidates} loading={state.loading} />
+            <CandidatesView
+              transport={transport}
+              candidates={state.candidates}
+              loading={state.loading}
+              onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
+              onCandidateAdded={(candidate) => dispatch({ type: "candidateAdded", candidate })}
+            />
           )}
         </div>
       </main>
