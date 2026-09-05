@@ -317,10 +317,24 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
     def register_environment(payload: EnvironmentRegistration) -> JsonObject:
         return plane.register_environment(payload)
 
+    # Keep the resource-style route as a compatibility alias for clients that
+    # model registration as creation.  Both routes use the same strict model.
+    @app.post("/environments", status_code=201, include_in_schema=False)
+    def register_environment_alias(payload: EnvironmentRegistration) -> JsonObject:
+        return plane.register_environment(payload)
+
     @app.get("/runs")
     def runs() -> list[JsonObject]:
         with plane._lock:
             return [dict(run) for run in plane.runs.values()]
+
+    @app.get("/runs/{run_id}")
+    def get_run(run_id: str) -> JsonObject:
+        with plane._lock:
+            run = plane.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            return dict(run)
 
     @app.post("/runs", status_code=201)
     def create_run(payload: CreateRunRequest) -> JsonObject:
@@ -368,14 +382,23 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/learning/launch", status_code=202)
-    def launch_learning(payload: LearningRequest) -> JsonObject:
+    def _launch_learning(payload: LearningRequest) -> JsonObject:
         if payload.run_id not in plane.runs:
             raise HTTPException(status_code=404, detail="run not found")
         action = {"actionId": f"learn_{uuid.uuid4().hex}", "runId": payload.run_id, "predictedEffect": payload.predicted_effect, "evidenceIds": payload.evidence_ids, "status": "staged", "createdAt": _now()}
         plane.learning_actions.append(action)
         plane._emit(payload.run_id, "evidence", "Evidence-linked learning proposal staged.", payload.predicted_effect)
         return action
+
+    @app.post("/learning/launch", status_code=202)
+    def launch_learning(payload: LearningRequest) -> JsonObject:
+        return _launch_learning(payload)
+
+    @app.post("/runs/{run_id}/learning", status_code=202, include_in_schema=False)
+    def launch_run_learning(run_id: str, payload: LearningRequest) -> JsonObject:
+        if payload.run_id != run_id:
+            raise HTTPException(status_code=422, detail="runId does not match path")
+        return _launch_learning(payload)
 
     @app.get("/skills")
     def skills() -> list[JsonObject]:
