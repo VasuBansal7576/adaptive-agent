@@ -76,6 +76,33 @@ class EnvironmentRegistration(ApiModel):
         return value
 
 
+class EnvironmentFormRegistration(ApiModel):
+    """String-valued shape emitted by the console registry form."""
+
+    environment_id: str = Field(alias="environmentId", min_length=1)
+    version: str = Field(min_length=1)
+    tool_schemas: str = Field(alias="toolSchemas", min_length=1)
+    policy_ref: str = Field(alias="policyRef", min_length=1)
+    evaluator_ref: str = Field(alias="evaluatorRef", min_length=1)
+    reset_ref: str = Field(alias="resetRef", min_length=1)
+
+    def manifest(self) -> EnvironmentRegistration:
+        try:
+            schemas = json.loads(self.tool_schemas)
+        except json.JSONDecodeError as exc:
+            raise ValueError("toolSchemas must be valid JSON") from exc
+        if not isinstance(schemas, list):
+            raise ValueError("toolSchemas must be a JSON array")
+        return EnvironmentRegistration(
+            environmentId=self.environment_id,
+            version=self.version,
+            toolSchemas=schemas,
+            policyRef=_ref(self.policy_ref),
+            evaluatorRef=_ref(self.evaluator_ref),
+            resetRef=_ref(self.reset_ref),
+        )
+
+
 class CreateRunRequest(ApiModel):
     goal: str = Field(min_length=1)
     environment_id: str = Field(alias="environmentId", min_length=1)
@@ -325,8 +352,11 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
     # Keep the resource-style route as a compatibility alias for clients that
     # model registration as creation.  Both routes use the same strict model.
     @app.post("/environments", status_code=201, include_in_schema=False)
-    def register_environment_alias(payload: EnvironmentRegistration) -> JsonObject:
-        return plane.register_environment(payload)
+    def register_environment_alias(payload: EnvironmentFormRegistration) -> JsonObject:
+        try:
+            return plane.register_environment(payload.manifest())
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/runs")
     def runs() -> list[JsonObject]:
