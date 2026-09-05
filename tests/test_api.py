@@ -3,6 +3,7 @@ from threading import Event, Thread
 
 from adaptive_agent.api import CandidateProposalRequest, ControlPlane, EvaluationRequest, create_app, make_authenticated_model_runner
 from adaptive_agent.evaluation import Arm, EvaluationProtocol, EvaluationRunner, ModelProvenance, Partition, RunObservation, build_environment_packages
+from adaptive_agent.planner import make_luna_model_runner
 
 
 def manifest():
@@ -201,6 +202,62 @@ def test_prime_bridge_records_parent_owned_model_observation():
     result = runner(goal="goal", environment={}, emit=lambda *_: None)
     assert result.response_id == "resp-1"
     assert calls[0][1] is True
+
+
+def test_control_plane_runs_generic_luna_python_through_prime_capability_seam():
+    class PlannerClient:
+        def __init__(self):
+            self.turn = 0
+
+        def invoke(self, *, goal, environment, messages):
+            self.turn += 1
+            text = (
+                '{"action":"execute","code":"result = host_request({\\"type\\": \\"broker.call\\", '
+                '\\"capabilityId\\": \\"counter.read\\", \\"arguments\\": {}})"}'
+                if self.turn == 1 else '{"action":"finish","answer":"done"}'
+            )
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"resp-{self.turn}", "text": text, "usage": {"outputTokens": 3}}
+
+    class PrimeResult:
+        status = "ok"
+        result = "{\"value\": {\"count\": 1}}"
+        stdout = ""
+        stderr = ""
+        error = None
+
+    class PrimeKernel:
+        def __init__(self):
+            self.codes = []
+            self.capability_calls = []
+
+        def execute(self, code, *, timeout=None, cancel=None):
+            self.codes.append(code)
+            namespace = {"host_request": self.host_request}
+            exec(code, {"__builtins__": {}}, namespace)
+            return PrimeResult()
+
+        def host_request(self, payload):
+            self.capability_calls.append(payload)
+            return {"value": {"count": 1}}
+
+    class Sink:
+        def __init__(self):
+            self.observations = []
+
+        def record_model_observation(self, evidence, *, trusted_parent=False):
+            self.observations.append((evidence, trusted_parent))
+
+    kernel, sink = PrimeKernel(), Sink()
+    planner_runner = make_luna_model_runner(PlannerClient(), kernel, sink)
+    plane = ControlPlane(model_runner=planner_runner, evaluator=lambda **_: {"passed": True})
+    api = TestClient(create_app(plane), base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    api.post("/environments/register", json=manifest())
+    run = api.post("/runs", json={"goal": "read the counter", "environmentId": "neutral", "idempotencyKey": "planner"}).json()
+    assert api.post(f"/runs/{run['runId']}/launch").status_code == 202
+    assert api.get(f"/runs/{run['runId']}").json()["status"] == "succeeded"
+    assert kernel.capability_calls[0]["capabilityId"] == "counter.read"
+    assert len(sink.observations) == 2
 
 
 def test_operator_bootstrap_and_loopback_origin_boundary():
