@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import subprocess
 import tempfile
 import threading
 import time
@@ -122,6 +125,45 @@ class PrimeRuntimeTests(unittest.TestCase):
         worker.join(3)
         self.assertFalse(worker.is_alive())
         self.assertEqual(holder["result"].status, "aborted")
+
+    def test_learner_artifact_transfer_is_bounded_and_content_addressed(self):
+        adapter = self.make(max_artifact_bytes=1024)
+        data = b"learner-created-bytes"
+        encoded = base64.b64encode(data).decode()
+        digest = hashlib.sha256(data).hexdigest()
+        code = ("from rlm import host_request\n"
+                "import base64\n"
+                f"blob = base64.b64decode({encoded!r})\n"
+                f"transfer = await host_request('artifact.begin', {{'artifactId':'generated', 'version':'1', 'size':{len(data)}}})\n"
+                "await host_request('artifact.chunk', {'transferId': transfer['transferId'], 'offset': 0, 'data': base64.b64encode(blob).decode()})\n"
+                f"await host_request('artifact.finish', {{'transferId': transfer['transferId'], 'sha256': {digest!r}}})")
+        result = adapter.execute(code)
+        self.assertEqual(result.status, "ok")
+        self.assertTrue(list((adapter.root / "artifacts").glob("generated-*")))
+        oversized = adapter.execute("from rlm import host_request\nawait host_request('artifact.begin', {'artifactId':'x', 'size': 2048})")
+        self.assertEqual(oversized.status, "error")
+        traversal = adapter.execute("from rlm import host_request\nawait host_request('artifact.begin', {'artifactId':'../escape', 'size': 1})")
+        self.assertEqual(traversal.status, "error")
+
+    def test_oversized_protocol_frame_fails_and_cleans_owned_container(self):
+        adapter = self.make(max_protocol_frame_bytes=2048, max_output_chars=4096)
+        adapter.start()
+        name = adapter.kernel.container_name
+        with self.assertRaises(AdapterError):
+            adapter.execute("print('x' * 10000)")
+        adapter.close()
+        running = subprocess.run(["docker", "ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], capture_output=True, text=True, check=True)
+        self.assertNotIn(name, running.stdout)
+
+    def test_hard_timeout_removes_owned_uncooperative_container(self):
+        adapter = self.make(max_cell_seconds=0.05)
+        adapter.start()
+        name = adapter.kernel.container_name
+        result = adapter.execute("while True: pass", timeout=0.05)
+        self.assertEqual(result.status, "aborted")
+        adapter.close()
+        running = subprocess.run(["docker", "ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], capture_output=True, text=True, check=True)
+        self.assertNotIn(name, running.stdout)
 
     def test_artifact_export_is_content_addressed_and_workspace_bound(self):
         adapter = self.make()
