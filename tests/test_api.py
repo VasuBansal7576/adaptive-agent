@@ -63,6 +63,21 @@ def test_idempotency_replays_and_conflicts():
     assert conflict.json()["detail"]["code"] == "IDEMPOTENCY_CONFLICT"
 
 
+def test_spec_task_ref_run_request_is_supported():
+    api = client()
+    response = api.post(
+        "/runs",
+        json={
+            "taskRef": {"id": "task-1", "version": "1", "sha256": "t", "goal": "read the counter", "environmentId": "neutral"},
+            "modelProfileRef": {"id": "model", "version": "1", "sha256": "m"},
+            "budgetRef": {"id": "budget", "version": "1", "sha256": "b"},
+            "idempotencyKey": "spec-run",
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["goal"] == "read the counter"
+
+
 def test_unknown_manifest_fields_are_rejected():
     api = client()
     invalid = {**manifest(), "privileged": True}

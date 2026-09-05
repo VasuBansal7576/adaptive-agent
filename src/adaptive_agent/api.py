@@ -19,7 +19,7 @@ from typing import Any, Protocol
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 JsonObject = dict[str, Any]
@@ -113,12 +113,37 @@ class EnvironmentFormRegistration(ApiModel):
 
 
 class CreateRunRequest(ApiModel):
-    goal: str = Field(min_length=1)
-    environment_id: str = Field(alias="environmentId", min_length=1)
+    # The console may send the convenient goal/environment projection, while
+    # external clients can submit the canonical SPEC task reference.
+    goal: str | None = Field(default=None, min_length=1)
+    environment_id: str | None = Field(default=None, alias="environmentId", min_length=1)
+    task_ref: JsonObject | None = Field(default=None, alias="taskRef")
     model_profile_ref: JsonObject | None = Field(default=None, alias="modelProfileRef")
     budget_ref: JsonObject | None = Field(default=None, alias="budgetRef")
     idempotency_key: str = Field(alias="idempotencyKey", min_length=1, max_length=256)
     execution_mode: str = Field("interactive", alias="executionMode")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_task_projection(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        task = normalized.get("taskRef")
+        if isinstance(task, dict):
+            if not normalized.get("goal") and isinstance(task.get("goal"), str):
+                normalized["goal"] = task["goal"]
+            if not normalized.get("environmentId"):
+                env = task.get("environmentId")
+                if not env and isinstance(task.get("environmentRef"), dict):
+                    env = task["environmentRef"].get("id")
+                if isinstance(env, str):
+                    normalized["environmentId"] = env
+        if not isinstance(normalized.get("goal"), str) or not normalized["goal"].strip():
+            raise ValueError("goal or taskRef.goal is required")
+        if not isinstance(normalized.get("environmentId"), str) or not normalized["environmentId"].strip():
+            raise ValueError("environmentId or taskRef.environmentId is required")
+        return normalized
 
 
 class LearningRequest(ApiModel):
