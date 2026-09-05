@@ -1,17 +1,18 @@
 # Adaptive Agent milestones
 
-Status: implementable delivery plan for the confirmed Track 1 product, with only the documentation phase currently authorized.
+Status: implementation is active for the confirmed Track 1 product, with M2-M4 coordination owned from this integration branch.
 Product acceptance and competition compliance remain unverified until implementation and submission evidence exist.
 [SPEC.md](SPEC.md) defines stable requirements, contracts, acceptance scenarios, and evaluation cases.
 
 ## Authorization and sequencing
 
-M0 and M1 are the documentation phase.
+M0 and M1 completed the documentation phase.
 M0 is complete through the supplied product and official-rule clarification.
 M1 ends with a verified local commit containing only `SPEC.md`, `MILESTONES.md`, and `README.md`.
 The local `main` fast-forward and filesystem-only origin synchronization for the documentation commits are authorized and complete.
-M2 through M6 require future implementation, publication, or submission authority appropriate to each action.
-The current worker does not install dependencies, create application code, publish, push to public remotes, open pull requests, or submit.
+M2 through M4 are active implementation and evaluation gates.
+M5 and M6 require future publication or submission authority appropriate to each action.
+The current worker may install dependencies and create application code within the active implementation scope, but does not publish, push to public remotes, open pull requests, or submit.
 It has completed local integration into `main` and synchronization to the filesystem-only origin.
 
 The dependency chain is M0 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6.
@@ -171,7 +172,7 @@ The full sealed evaluation is a controlled evidence run, not a routine test that
 Use non-sealed fixtures in regular CI and restrict sealed reports and credentials.
 Assign an owner to every failing check and distinguish code regressions from provider outages or missing credentials.
 Any future authorized pull request needs review findings addressed and relevant checks passing before integration.
-The current documentation task creates no pull request or public remote operation.
+The current implementation task creates no pull request or public remote operation.
 Its local `main` fast-forward and filesystem-only `origin/main` synchronization are complete.
 
 ## Requirement traceability
@@ -218,4 +219,4 @@ Inspect SPEC.md in the AO Browser without creating a server or installing depend
 Check for whitespace errors, em dashes, and prose paragraphs with multiple sentences on one physical line.
 Stage only the three named documents and inspect the staged diff before making a conventional local commit without an agent co-author.
 Report the commit, changed files, checks, and remaining execution assumptions through AO.
-The handoff includes completed local specification commits and local `main` integration, not completed implementation, public publication, or submission.
+The handoff includes completed local specification commits and local `main` integration, while implementation is active and public publication or submission remains incomplete.

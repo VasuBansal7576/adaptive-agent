@@ -12,8 +12,8 @@ This is procedural adaptation, not model-weight training or a promise of univers
 - [SPEC.md](SPEC.md) defines requirements, contracts, architecture, learning, evaluation, security, and acceptance.
 - [MILESTONES.md](MILESTONES.md) defines the runnable vertical slice, full delivery gates, AO ownership, and submission traceability.
 
-The repository currently contains documentation only.
-There are no application commands, installed project dependencies, configured package manager, or application CI to run.
+Implementation is active from this clean integration branch.
+The repository still has no application commands, installed project dependencies, configured package manager, or application CI until the first reviewed M2 code lands.
 The proposed stack is React, Tailwind, Vite, and Bun with a small backend selected by a bounded Prime API bridge spike.
 Prime is the proposed runtime, with isolated IPython as a documented fallback if its interfaces cannot support the required boundaries.
 
@@ -22,8 +22,9 @@ Default Prime Inference returned HTTP 402 for lack of balance, while the subscri
 Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
 The product bridge, safety isolation, and behavioral evaluation remain unverified.
 
-The authorized phase includes verified local specification commits, fast-forward integration into local `main`, and synchronization to the filesystem-only origin, all complete.
-Implementation, installation, public remote creation, publication, pushes to public remotes, pull requests, and submission require later authorization.
+The active phase covers implementation, local verification, and M2-M4 coordination.
+Local specification commits, fast-forward integration into local `main`, and synchronization to the filesystem-only origin are complete.
+Public remote creation, publication, pushes to public remotes, pull requests, and submission require later authorization.
 The official build window closes on 2026-09-07 at 03:30 IST.
 Public repository and social-demo obligations are recorded in the milestones and are not yet fulfilled.
 
