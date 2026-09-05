@@ -342,6 +342,42 @@ class ControlPlane:
             candidate["state"] = "evaluating"
             return dict(evaluation)
 
+    def record_trusted_evaluation(self, evaluation_id: str, report: object) -> JsonObject:
+        """Attach an independent runner report to a queued evaluation.
+
+        The evaluator owns this call; browser routes never accept report data.
+        Accepting the runner's object directly keeps the control plane decoupled
+        from fixture construction while still checking the immutable request
+        pins before a report can affect promotion state.
+        """
+        with self._lock:
+            evaluation = self.evaluations.get(evaluation_id)
+            if evaluation is None:
+                raise KeyError("evaluation not found")
+            to_dict = getattr(report, "to_dict", None)
+            if not callable(to_dict):
+                raise TypeError("trusted evaluation report must provide to_dict()")
+            payload = to_dict()
+            if not isinstance(payload, Mapping):
+                raise TypeError("trusted evaluation report must serialize to an object")
+            protocol_hash = payload.get("protocolHash")
+            base_hash = payload.get("baseHash")
+            if protocol_hash != evaluation["protocolHash"]:
+                raise ValueError("evaluation report protocol hash does not match request")
+            if base_hash != evaluation["baseBundleHash"]:
+                raise ValueError("evaluation report base hash does not match request")
+            candidate = self.candidates.get(evaluation["candidateId"])
+            if candidate is None:
+                raise KeyError("candidate not found")
+            trusted = dict(payload)
+            trusted["evaluatorTrusted"] = True
+            evaluation["report"] = trusted
+            evaluation["trusted"] = True
+            evaluation["state"] = "valid" if trusted.get("validityStatus") == "valid" else "invalid"
+            evaluation["promotionEligible"] = bool(trusted.get("promotionEligible", False))
+            evaluation["updatedAt"] = _now()
+            return dict(evaluation)
+
     def record_trusted_decision(self, candidate_id: str, evaluation_id: str, decision: str, reason: str) -> JsonObject:
         """Apply a decision only from a trusted evaluator integration."""
         with self._lock:

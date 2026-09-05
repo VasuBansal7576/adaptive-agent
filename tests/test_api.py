@@ -1,7 +1,8 @@
 from fastapi.testclient import TestClient
 from threading import Event, Thread
 
-from adaptive_agent.api import ControlPlane, create_app, make_authenticated_model_runner
+from adaptive_agent.api import CandidateProposalRequest, ControlPlane, EvaluationRequest, create_app, make_authenticated_model_runner
+from adaptive_agent.evaluation import Arm, EvaluationProtocol, EvaluationRunner, ModelProvenance, Partition, RunObservation, build_environment_packages
 
 
 def manifest():
@@ -154,6 +155,35 @@ def test_candidate_evaluation_decision_and_rollback_boundaries():
     evaluation_id = evaluation.json()["evaluationId"]
     assert api.post(f"/candidates/{candidate_id}/decision", json={"evaluationId": evaluation_id, "decision": "promoted", "reason": "looks good"}).status_code == 403
     assert api.post(f"/candidates/{candidate_id}/rollback", json={"reason": "operator safety rollback"}).status_code == 200
+
+
+def test_trusted_evaluation_runner_report_is_pinned_before_decision():
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    runner = EvaluationRunner(protocol, packages)
+
+    def execute(arm, package, task, seed):
+        return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+
+    plane = ControlPlane()
+    base_hash = plane.active_bundle_hash
+    report = runner.run_validation(base_hash=base_hash, candidate_hash="candidate", execute=execute)
+    serialized = report.to_dict()
+    assert serialized["promotionEligible"] is True
+    assert serialized["exposure"][0]["environmentId"] == "finance"
+
+    candidate = plane.create_candidate(CandidateProposalRequest(
+        baseBundleHash=base_hash, editOperations=["bounded change"], changedArtifactHashes=["artifact"],
+        supportingEvidenceIds=["evidence"], predictedEffect="improves accuracy", proposerVersion="test",
+    ))
+    evaluation = plane.queue_evaluation(EvaluationRequest(
+        candidateId=candidate["candidateId"], baseBundleHash=base_hash, protocolHash=report.protocol_hash,
+        partitionRef={"id": "validation", "version": "1", "sha256": "partition"},
+    ))
+    recorded = plane.record_trusted_evaluation(evaluation["evaluationId"], report)
+    assert recorded["state"] == "valid"
+    assert recorded["report"]["evaluatorTrusted"] is True
 
 
 def test_prime_bridge_records_parent_owned_model_observation():

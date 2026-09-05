@@ -819,6 +819,13 @@ class AblationAudit:
     retained_learned_artifacts: tuple[str, ...]
     audit_hash: str
 
+    def to_dict(self) -> JsonObject:
+        return {
+            "passed": self.passed,
+            "retainedLearnedArtifacts": list(self.retained_learned_artifacts),
+            "auditHash": self.audit_hash,
+        }
+
 
 def audit_ablation(value: AblationInput) -> AblationAudit:
     hits: list[str] = []
@@ -914,6 +921,16 @@ class ExposureRecord:
     learner_visible: bool
     sealed: bool
 
+    def to_dict(self) -> JsonObject:
+        return {
+            "environmentId": self.environment_id,
+            "partition": self.partition,
+            "taskIds": list(self.task_ids),
+            "familyNames": list(self.family_names),
+            "learnerVisible": self.learner_visible,
+            "sealed": self.sealed,
+        }
+
 
 @dataclass(frozen=True)
 class EvaluationReport:
@@ -934,10 +951,11 @@ class EvaluationReport:
     workload: WorkloadPlan
     analysis_seed: int
     ablation_audit: AblationAudit | None = None
+    model_provenance_valid: bool = True
 
     @property
     def promotion_eligible(self) -> bool:
-        return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in getattr(self, "_rows", ()))
+        return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed and self.model_provenance_valid
 
     def require_promotion_evidence(self, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage]) -> "EvaluationReport":
         protocol.assert_integrity(packages)
@@ -951,7 +969,7 @@ class EvaluationReport:
         return self
 
     def to_dict(self) -> JsonObject:
-        return {"comparison": self.comparison, "validityStatus": self.validity_status, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit)}
+        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit), "modelProvenanceValid": self.model_provenance_valid}
 
 
 Executor = Callable[[Arm, EnvironmentPackage, TaskInput, int], RunObservation]
@@ -1053,13 +1071,13 @@ class EvaluationRunner:
         intervals = clustered_paired_bootstrap(baseline, candidate, draws=self.protocol.bootstrap_draws, analysis_seed=self.protocol.analysis_seed) if not missing_pairs and not partition_leak and not resets and not failures else ()
         validity = "valid" if not missing_pairs and not partition_leak and not resets and not failures and all(row.status == "complete" for row in rows) and (ablation_audit is None or ablation_audit.passed) else ("incomplete" if missing_pairs else "invalid")
         report_partition_hashes = {f"{name}:{partition.value}": self.frozen.partition_hashes[f"{name}:{partition.value}"] for name in env_names}
-        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, all(row.safety_violations == 0 for row in rows), missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit)
-        object.__setattr__(report, "_rows", tuple(rows))
-        if not missing_pairs and not all(row.model_provenance == ModelProvenance.REAL_MODEL for row in rows):
+        model_provenance_valid = all(row.model_provenance == ModelProvenance.REAL_MODEL for row in rows)
+        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, all(row.safety_violations == 0 for row in rows), missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, model_provenance_valid)
+        if not missing_pairs and not model_provenance_valid:
             object.__setattr__(report, "validity_status", "invalid")
         return report
 
 
 __all__ = [
-    "AblationAudit", "AblationInput", "Arm", "ArtifactRef", "BootstrapEstimate", "BudgetSpec", "Document", "EnvironmentManifest", "EnvironmentPackage", "EvaluationError", "EvaluationProtocol", "EvaluationReport", "EvaluationRunner", "FixtureSession", "FrozenProtocol", "LiveProvider", "MetricSummary", "Outcome", "Partition", "PromotionEvidenceRefused", "ProviderUnavailable", "Provenance", "RunObservation", "TaskInput", "ToolResult", "ToolSchema", "WorkloadPlan", "audit_ablation", "build_environment_packages", "canonical_json", "clustered_paired_bootstrap", "customer_support_environment", "finance_environment", "it_environment", "sealed_lab_scheduling_environment", "sha256_json",
+    "AblationAudit", "AblationInput", "Arm", "ArtifactRef", "BootstrapEstimate", "BudgetSpec", "Document", "EnvironmentManifest", "EnvironmentPackage", "EvaluationError", "EvaluationProtocol", "EvaluationReport", "EvaluationRunner", "FixtureSession", "FrozenProtocol", "LiveProvider", "MetricSummary", "ModelProvenance", "Outcome", "Partition", "PromotionEvidenceRefused", "ProviderUnavailable", "Provenance", "RunObservation", "TaskInput", "ToolResult", "ToolSchema", "WorkloadPlan", "audit_ablation", "build_environment_packages", "canonical_json", "clustered_paired_bootstrap", "customer_support_environment", "finance_environment", "it_environment", "sealed_lab_scheduling_environment", "sha256_json",
 ]
