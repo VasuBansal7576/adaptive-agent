@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from adaptive_agent.learning_projection import DurableBrokerLearningProjection
+import pytest
+
+from adaptive_agent.learning_projection import DurableBrokerLearningProjection, LearningProjectionError
 from test_learning_store_integration import ENVIRONMENT, RUN, _setup_store
 
 
@@ -36,6 +38,8 @@ def test_projection_joins_call_and_redacts_hidden_values(tmp_path: Path):
     assert "hunter2" not in record["content"]
     assert record["sourceEvidenceId"] == "ev-projection"
     assert record["sourceCallId"] == call_id
+    assert record["trustedOutcome"] is True
+    assert record["outcomePassed"] is True
     derived = store.get_evidence("broker:ev-projection")
     assert derived["event_type"] == "learning_evidence_projection"
     assert store.evidence_provenance("broker:ev-projection")["partition"] == "development"
@@ -86,3 +90,17 @@ def test_persisted_projection_reused_after_raw_event_is_gone(tmp_path: Path):
     assert sum(item.get("sourceId") == record["sourceId"] for item in raw) == 1
     persisted = store.list_learning_records(environment_id=ENVIRONMENT, run_id=RUN)
     assert [row["record_id"] for row in persisted].count(record_id) == 1
+
+
+def test_projection_requires_durable_trusted_outcome(tmp_path: Path):
+    store, _, _ = _setup_store(tmp_path)
+    with store._connect() as connection:
+        connection.execute("DELETE FROM outcomes WHERE run_id = ?", (RUN,))
+        connection.commit()
+    with pytest.raises(LearningProjectionError, match="trusted evaluator outcome"):
+        DurableBrokerLearningProjection(store).project(
+            environment_id=ENVIRONMENT,
+            run_id=RUN,
+            task_id="task-durable",
+            outcome_passed=True,
+        )
