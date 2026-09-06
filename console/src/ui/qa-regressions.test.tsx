@@ -161,6 +161,29 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect(await screen.findByText(/Proposal validation passed — this is not a performance result/)).toBeInTheDocument();
   });
 
+  it("shows the workflow strip and Learn-from-this-run only for server-declared eligible runs", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const runs = await sim.listRuns();
+    const eligible = { ...runs[3], learningEligible: true };
+    const ineligible = { ...runs[0], status: "running" as const, learningEligible: false };
+    const transport: ConsoleTransport = { ...sim, listRuns: async () => [eligible, ineligible] };
+    render(<App transport={transport} />);
+    await screen.findAllByRole("button", { name: /run-sim-1004/ });
+    // workflow guidance renders all four stages with honest captions
+    expect(screen.getByText("1. Execute goal")).toBeInTheDocument();
+    expect(screen.getByText("2. Learn from verified attempt")).toBeInTheDocument();
+    expect(screen.getByText("3. Evaluate candidate")).toBeInTheDocument();
+    expect(screen.getByText("4. Activate only if gate passes")).toBeInTheDocument();
+    // select the eligible run: the Learn action appears
+    await user.click(screen.getAllByRole("button", { name: /run-sim-1004/ })[0]);
+    expect(await screen.findByRole("button", { name: "Learn from this run" })).toBeInTheDocument();
+    // select the ineligible run: guidance replaces the action, no fake progress
+    await user.click(screen.getAllByRole("button", { name: /run-sim-1001/ })[0]);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Learn from this run" })).not.toBeInTheDocument());
+    expect(screen.getByText(/Eligible after a server-verified outcome/)).toBeInTheDocument();
+  });
+
   it("lists a run whose learningEligible flips true after the terminal outcome, without a full reload (QA run_a1662f…)", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
@@ -256,7 +279,7 @@ describe("qa regressions: createRun recovery and honesty", () => {
     // default and only option is the declared mode
     expect(modeSelect).toHaveValue("dry_run");
     expect(within(modeSelect).getAllByRole("option")).toHaveLength(1);
-    expect(screen.queryByText(/interactive/)).not.toBeInTheDocument();
+    expect(within(dialog).queryByText(/interactive/)).not.toBeInTheDocument(); // only declared modes in the dialog
   });
 
   it("acknowledges successful package validation visibly", async () => {

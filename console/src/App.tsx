@@ -50,6 +50,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
   });
   const [activeTab, setActiveTab] = useState<TabId>("runs");
   const [streamNonce, setStreamNonce] = useState(0);
+  const [learningRequest, setLearningRequest] = useState<{ runId: string } | null>(null);
   const closeStreamRef = useRef<(() => void) | null>(null);
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
@@ -393,6 +394,14 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               onSelectRun={(runId) => dispatch({ type: "selectRun", runId })}
               onCancel={(run) => void cancelRun(run.runId)}
               onCreateRun={createRun}
+              onLearnFromRun={(runId) => {
+                // the invoking control unmounts when the tab switches: mark it
+                // so the dialog can return focus here on close
+                const invoker = document.activeElement;
+                if (invoker instanceof HTMLElement) invoker.setAttribute("data-acc010-focus-return", "");
+                setLearningRequest({ runId });
+                setActiveTab("candidates");
+              }}
               onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
               onReconnect={() => void manualReconnect()}
             />
@@ -407,6 +416,8 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
               onRefreshCandidates={() => void refreshCandidates()}
               onRefreshRuns={() => void refreshRunRecords(true)}
+              learningRequest={learningRequest}
+              onLearningRequestConsumed={() => setLearningRequest(null)}
             />
           )}
         </div>

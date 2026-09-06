@@ -61,18 +61,23 @@ export function Modal({
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const restoreRef = useRef<HTMLElement | null>(null);
+  // stable onClose: the effect subscribes once per open; a changing onClose
+  // identity must not tear down listeners or steal focus mid-render
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
     restoreRef.current = document.activeElement as HTMLElement | null;
     const panel = panelRef.current;
     // initial focus prefers the first text field (DOM order) over buttons
-    panel?.querySelector<HTMLElement>("textarea, input, select, button, [tabindex]")?.focus();
+    const activePanel = panel;
+    activePanel?.querySelector<HTMLElement>("textarea, input, select, button, [tabindex]")?.focus();
 
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (event.key !== "Tab" || !panel) return;
@@ -90,12 +95,32 @@ export function Modal({
         first.focus();
       }
     };
+    // Attach to BOTH the panel and the document. The panel listener covers
+    // keys pressed inside the focused dialog; the document listener covers
+    // synthetic/edge cases. Each effect removes exactly its own listeners.
+    activePanel?.addEventListener("keydown", onKey);
     document.addEventListener("keydown", onKey);
     return () => {
+      activePanel?.removeEventListener("keydown", onKey);
       document.removeEventListener("keydown", onKey);
-      restoreRef.current?.focus();
+      // restore focus to the invoking control. An explicitly marked
+      // focus-return target (set when the invoking control unmounts, e.g., a
+      // tab switch carried the action elsewhere) takes precedence; otherwise
+      // restore to the captured element when it is still connected.
+      const marked = document.querySelector<HTMLElement>("[data-acc010-focus-return]");
+      if (marked?.isConnected) {
+        marked.focus();
+        marked.removeAttribute("data-acc010-focus-return");
+        return;
+      }
+      const restore = restoreRef.current;
+      if (restore && restore.isConnected) {
+        restore.focus();
+        return;
+      }
+      document.querySelector<HTMLElement>("[data-acc010-learning-cycle]")?.focus();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
   return (

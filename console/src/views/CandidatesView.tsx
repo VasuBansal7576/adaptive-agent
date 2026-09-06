@@ -12,6 +12,8 @@ export function CandidatesView({
   onActionError,
   onRefreshCandidates,
   onRefreshRuns,
+  learningRequest,
+  onLearningRequestConsumed,
 }: {
   transport: ConsoleTransport;
   candidates: CandidateDiff[];
@@ -21,6 +23,9 @@ export function CandidatesView({
   onRefreshCandidates: () => void;
   /** refresh authoritative run records (eligibility) without a reload */
   onRefreshRuns: () => void;
+  /** carried selection from "Learn from this run": opens the dialog preselected */
+  learningRequest: { runId: string } | null;
+  onLearningRequestConsumed: () => void;
 }) {
   const [rollbackTarget, setRollbackTarget] = useState<CandidateDiff | null>(null);
   const [reason, setReason] = useState("");
@@ -28,6 +33,21 @@ export function CandidatesView({
   const [cycleOpen, setCycleOpen] = useState(false);
   const [cycleBusy, setCycleBusy] = useState(false);
   const [cycleRunId, setCycleRunId] = useState("");
+  // "Learn from this run" carries the selected run into this dialog
+  useEffect(() => {
+    if (learningRequest) {
+      onRefreshRuns();
+      setCycleRunId(learningRequest.runId);
+      setCycleOpen(true);
+      onLearningRequestConsumed();
+      // the dialog was invoked from another tab: its focus-return target is
+      // the learning-cycle action here (the original invoker unmounted)
+      requestAnimationFrame(() => {
+        document.querySelector("[data-acc010-learning-cycle]")?.setAttribute("data-acc010-focus-return", "");
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [learningRequest]);
   const [notice, setNotice] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
   const [evalJobs, setEvalJobs] = useState<EvaluationJob[] | null>(null);
   const [evalJobsError, setEvalJobsError] = useState<string | null>(null);
@@ -293,6 +313,7 @@ export function CandidatesView({
         onClose={() => setCycleOpen(false)}
         runs={eligibleRuns}
         busy={cycleBusy}
+        preselectedRunId={cycleRunId}
         onSubmit={(input) => void runCycle(input)}
       />
 
@@ -362,6 +383,7 @@ function LearningCycleButton({ busy, onRun }: { busy: boolean; onRun: () => void
         type="button"
         onClick={onRun}
         disabled={busy}
+        data-acc010-learning-cycle=""
         className="rounded-md bg-sky-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-60"
         title="Select a completed development run; the runtime generates the proposal and evidence"
       >
@@ -376,15 +398,22 @@ function LearningCycleModal({
   onClose,
   runs,
   busy,
+  preselectedRunId,
   onSubmit,
 }: {
   open: boolean;
   onClose: () => void;
   runs: RunRecord[];
   busy: boolean;
+  /** run carried in from "Learn from this run" (or a previous dialog session) */
+  preselectedRunId?: string;
   onSubmit: (input: LearningCycleInput) => void;
 }) {
-  const [runId, setRunId] = useState("");
+  const [runId, setRunId] = useState(preselectedRunId ?? "");
+  // keep the carried selection in sync when the dialog opens
+  useEffect(() => {
+    if (open && preselectedRunId) setRunId(preselectedRunId);
+  }, [open, preselectedRunId]);
   return (
     <Modal open={open} title="Run learning cycle" onClose={onClose}>
       <form

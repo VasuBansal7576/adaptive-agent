@@ -43,6 +43,7 @@ const RUNS = [
   run("run_acc010_succeeded_1", "succeeded", "Reconcile invoice INV-DEV-003 against payment PAY-DEV-003 and apply the matching payment.", true, { outcomeRef: { id: "o1", version: "1", sha256: "1".repeat(64) } }),
   run("run_acc010_failed_with_long_identifier_2", "failed", "Dispute the duplicated charge on statement period 2026-08 and record the customer-visible resolution outcome for the support transcript.", true),
   run("run_acc010_running_3", "running", "Sweep the reconciliation batch for stale entries.", false),
+  run("run_acc010_running_deny_6", "running", "Export the settled batch; cancellation is refused after dispatch.", false),
   run("run_acc010_awaiting_approval_4", "awaiting_approval", "Apply the verified payment batch after operator approval.", false),
   run("run_acc010_timed_out_5", "timed_out", "Retry the idempotent export after the broker timeout window.", false),
 ];
@@ -98,6 +99,25 @@ const server = createServer((req, res) => {
   if (FIXTURES[path] !== undefined) {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(FIXTURES[path]));
+    return;
+  }
+  if (req.method === "POST" && /^\/runs\/[^/]+\/cancel$/.test(path)) {
+    const runId = decodeURIComponent(path.split("/")[2]);
+    if (runId.includes("deny")) {
+      // classified failure fixture: broker refuses cancellation
+      res.writeHead(409, { "content-type": "application/json" });
+      res.end(JSON.stringify({ detail: { code: "FORBIDDEN", message: "cancellation window closed; effect already dispatched", correlationId: "corr-acc010-deny", retry: "never" } }));
+      return;
+    }
+    const found = RUNS.find((r) => r.runId === runId);
+    if (found && ["queued", "running", "awaiting_approval"].includes(found.status)) {
+      found.status = "cancelled";
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: "run not found" }));
     return;
   }
   if (path.startsWith("/runs/") && path.endsWith("/events")) {
