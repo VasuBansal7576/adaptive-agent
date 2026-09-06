@@ -12,21 +12,42 @@ This is procedural adaptation, not model-weight training or a promise of univers
 - [SPEC.md](SPEC.md) defines requirements, contracts, architecture, learning, evaluation, security, and acceptance.
 - [MILESTONES.md](MILESTONES.md) defines the runnable vertical slice, full delivery gates, AO ownership, and submission traceability.
 
-The repository currently contains documentation only.
-There are no application commands, installed project dependencies, configured package manager, or application CI to run.
-The proposed stack is React, Tailwind, Vite, and Bun with a small backend selected by a bounded Prime API bridge spike.
-Prime is the proposed runtime, with isolated IPython as a documented fallback if its interfaces cannot support the required boundaries.
+Implementation is active in parallel AO worktrees, but the implementation branches are not yet integrated into this documentation branch.
+The Python control-plane package, Prime adapter, Luna planner, durable learning and evaluation seams, and React console are present on those branches.
+The exact branch refs, dirty-worktree status, and component ownership are tracked in [MILESTONES.md](MILESTONES.md).
 
-The verified smoke path uses Prime 0.9.2 session 3 with a ChatGPT subscription, `openai-codex/gpt-5.6-luna`, and an actual Python `2+2` result of `4`.
+The Python package is configured through `pyproject.toml` on the implementation branches.
+Its implemented entry points are `adaptive-agent` for the FastAPI control plane and operator-console backend, and `adaptive-agent-plan` for the authenticated Luna planner loop.
+The console package is configured through `package.json` and uses React, Tailwind, Vite, and Bun.
+The implemented console commands are `bun run dev`, `bun run test`, `bun run build`, `bunx tsc --noEmit`, and `bun run api:smoke`.
+`adaptive-agent` and `adaptive-agent-plan` are branch-local implementation commands until the corresponding branch work is integrated.
+
+The verified Prime smoke path uses Prime 0.9.2 session 3 with a ChatGPT subscription, `openai-codex/gpt-5.6-luna`, and an actual Python `2+2` result of `4`.
 Default Prime Inference returned HTTP 402 for lack of balance, while the subscription provider worked.
+The bounded Prime runtime adapter also recorded persistent kernel results `42` and `41`, a structured host-bridge response, and denied learner requests for harness, policy, evaluator, credential, and hidden-data access.
 Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
-The product bridge, safety isolation, and behavioral evaluation remain unverified.
+The console worker reported a live FastAPI session, registration, create/launch, SSE cursor, and cancellation smoke as passing.
+That smoke used a synthetic neutral environment and does not establish a real model-to-tool-to-evaluator product run.
 
-The authorized phase includes verified local specification commits, fast-forward integration into local `main`, and synchronization to the filesystem-only origin, all complete.
-Implementation, installation, public remote creation, publication, pushes to public remotes, pull requests, and submission require later authorization.
+Tests and fixture runs are not interchangeable with those real-run checks.
+The backend and benchmark tests use synthetic providers, drivers, and deterministic fixtures, while console tests use simulation fixtures and captured wire frames.
+The implementation branches have not produced a sealed four-environment evaluation, a measured performance result, or a complete behavioral acceptance result.
+
+The documentation phase and its local `main` integration are complete.
+Implementation, local verification, and M2-M4 coordination are active across the worker branches.
+Public remote creation, publication, pushes to public remotes, pull requests, and submission remain unauthorized and incomplete.
 The official build window closes on 2026-09-07 at 03:30 IST.
 Public repository and social-demo obligations are recorded in the milestones and are not yet fulfilled.
 
-Prime source reuse must preserve verified MIT notices.
+Prime source reuse must preserve the verified MIT attribution and notices.
+The reused source is Prime Agent by Prime Intellect AI, pinned for the initial static review at commit [`9c54a35dac3a2ad17910074d66664859ea175666`](https://github.com/PrimeIntellect-ai/prime-agent/tree/9c54a35dac3a2ad17910074d66664859ea175666), under the MIT License.
+The installed Prime 0.9.2 runtime smoke is separate from that pinned static-source review.
 Backpass and Vision inform evidence handling and bounded edits, but are not required dependencies or autonomous evaluators.
-Evaluation targets and source-review limitations are documented in the specification; no measured performance or track-compliance result is claimed.
+Evaluation targets, source-review limitations, and acceptance meanings remain defined by the specification.
+No measured performance, full acceptance, public publication, or submission result is claimed.
+
+One explicit blocker remains unmet.
+The user-accepted Luna-through-ChatGPT subscription path has no API-key or provider switch.
+The trusted parent records actual model usage and rejects after aggregate token exhaustion.
+Local token limits and post-response rejection are not hard provider enforcement, so the strict per-call output-token-cap criterion remains UNMET.
+This documentation does not alter the pass meaning of any requirement in [SPEC.md](SPEC.md).
