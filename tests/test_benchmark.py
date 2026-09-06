@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from adaptive_agent.benchmark import ResumableEvaluationDriver
-from adaptive_agent.evaluation import EvaluationProtocol, ModelProvenance, Partition, RunObservation, build_environment_packages
+from adaptive_agent.evaluation import EvaluationError, EvaluationProtocol, ModelProvenance, Partition, RunObservation, build_environment_packages
 from adaptive_agent.store import Store
 
 
@@ -47,6 +47,46 @@ class BenchmarkDriverTests(unittest.TestCase):
             result = driver.run("bench-2", Partition.DEVELOPMENT)
             self.assertTrue(result.failed)
             self.assertFalse(result.complete)
+
+    def test_crash_after_first_task_keeps_full_immutable_panel_for_resume(self):
+        packages = build_environment_packages()
+        protocol = EvaluationProtocol()
+        protocol.freeze(packages)
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            calls = []
+            def crash(task, frozen_config, bundle):
+                calls.append(task.task_id)
+                if task.partition is Partition.DEVELOPMENT:
+                    return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+                raise KeyboardInterrupt("simulated process crash")
+            class TrustedSmokeEvidence:
+                durable = True
+                def verify(self, observation, frozen, package):
+                    return True
+            driver = ResumableEvaluationDriver(store, protocol, packages, crash, object(), evidence_store=TrustedSmokeEvidence())
+            driver.run("bench-crash", Partition.DEVELOPMENT)
+            calls.clear()
+            with self.assertRaises(KeyboardInterrupt):
+                driver.run("bench-crash", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
+            with store._connect() as conn:
+                plan = conn.execute("SELECT panel_json FROM benchmark_plans WHERE benchmark_id = ? AND partition = 'validation'", ("bench-crash",)).fetchone()
+            self.assertEqual(len(__import__("json").loads(plan["panel_json"])), 60)
+            self.assertEqual(len(calls), 1)
+
+    def test_benchmark_id_is_fenced_to_frozen_inputs_and_bundle(self):
+        packages = build_environment_packages()
+        protocol = EvaluationProtocol()
+        protocol.freeze(packages)
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            def execute(task, frozen_config, bundle):
+                return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.SYNTHETIC_MODEL)
+            first = ResumableEvaluationDriver(store, protocol, packages, execute, {"bundle": "one"})
+            first.run("fenced", Partition.DEVELOPMENT)
+            changed = ResumableEvaluationDriver(store, protocol, packages, execute, {"bundle": "two"})
+            with self.assertRaisesRegex(EvaluationError, "different frozen inputs"):
+                changed.run("fenced", Partition.DEVELOPMENT)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ runtime; there is no scripted or synthetic solver here.
 from __future__ import annotations
 
 import json
+import secrets
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
@@ -18,10 +19,13 @@ from adaptive_agent.evaluation import (
     EvaluationError,
     EvaluationProtocol,
     FrozenProtocol,
+    BudgetSpec,
     ModelProvenance,
     Partition,
+    Provenance,
     RunObservation,
     TaskInput,
+    sha256_json,
 )
 from adaptive_agent.evaluation_store import SQLiteAllocationStore, SQLiteRunEvidenceStore
 from adaptive_agent.store import Store
@@ -54,10 +58,11 @@ class BenchmarkSummary:
     benchmark_id: str
     partition: Partition
     statuses: tuple[BenchmarkTaskStatus, ...]
+    expected_count: int = 0
 
     @property
     def complete(self) -> bool:
-        return bool(self.statuses) and all(item.status == "complete" for item in self.statuses)
+        return len(self.statuses) == self.expected_count and self.expected_count > 0 and all(item.status == "complete" for item in self.statuses)
 
     @property
     def failed(self) -> bool:
@@ -75,8 +80,13 @@ class ResumableEvaluationDriver:
         self.bundle = bundle
         self.allocation_store = allocation_store or SQLiteAllocationStore(store)
         self.evidence_store = evidence_store or SQLiteRunEvidenceStore(store)
+        self.owner_id = secrets.token_urlsafe(12)
         with store._connect() as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS benchmark_task_runs (benchmark_id TEXT NOT NULL, task_id TEXT NOT NULL, environment_id TEXT NOT NULL, partition TEXT NOT NULL, arm TEXT NOT NULL, seed INTEGER NOT NULL, status TEXT NOT NULL, error TEXT, observation_json TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(benchmark_id, task_id, arm, seed))")
+            conn.execute("CREATE TABLE IF NOT EXISTS benchmark_task_runs (benchmark_id TEXT NOT NULL, task_id TEXT NOT NULL, environment_id TEXT NOT NULL, partition TEXT NOT NULL, arm TEXT NOT NULL, seed INTEGER NOT NULL, status TEXT NOT NULL, error TEXT, observation_json TEXT, owner_id TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(benchmark_id, task_id, arm, seed))")
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(benchmark_task_runs)").fetchall()}
+            if "owner_id" not in columns:
+                conn.execute("ALTER TABLE benchmark_task_runs ADD COLUMN owner_id TEXT")
+            conn.execute("CREATE TABLE IF NOT EXISTS benchmark_plans (benchmark_id TEXT NOT NULL, partition TEXT NOT NULL, fingerprint TEXT NOT NULL, panel_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(benchmark_id, partition))")
             conn.commit()
 
     def run(self, benchmark_id: str, partition: Partition, *, base_hash: str = "", candidate_hash: str = "") -> BenchmarkSummary:
@@ -84,7 +94,7 @@ class ResumableEvaluationDriver:
         partition = Partition(partition)
         if partition is not Partition.DEVELOPMENT and not self._development_smoke_complete(benchmark_id):
             raise EvaluationError("development smoke with trusted evidence is required before held-out panels")
-        tasks_by_env = self._tasks_for_partition(benchmark_id, partition, base_hash, candidate_hash)
+        tasks_by_env = self._tasks_for_partition(benchmark_id, partition, base_hash, candidate_hash, frozen)
         arms = (Arm.B0, Arm.L) if partition is not Partition.FINAL else (Arm.B0, Arm.L, Arm.A)
         statuses: list[BenchmarkTaskStatus] = []
         for environment_id, tasks in tasks_by_env.items():
@@ -94,9 +104,15 @@ class ResumableEvaluationDriver:
                     for arm in arms:
                         prior = self._load(benchmark_id, task.task_id, arm, seed)
                         if prior is not None and prior.status == "complete":
-                            statuses.append(prior)
+                            if prior.observation is not None and self.evidence_store.verify(prior.observation, frozen, package):
+                                statuses.append(prior)
+                                continue
+                            self._save(benchmark_id, task, arm, seed, "failed", "persisted evidence no longer verifies", None)
+                        if not self._claim(benchmark_id, task, arm, seed):
+                            existing = self._load(benchmark_id, task.task_id, arm, seed)
+                            if existing is not None:
+                                statuses.append(existing)
                             continue
-                        self._save(benchmark_id, task, arm, seed, "running", None, None)
                         try:
                             observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed), self.bundle)
                             self._validate_observation(observation, task, environment_id, partition, seed, arm)
@@ -107,7 +123,8 @@ class ResumableEvaluationDriver:
                         except Exception as exc:
                             self._save(benchmark_id, task, arm, seed, "failed", str(exc), None)
                             statuses.append(BenchmarkTaskStatus(task.task_id, environment_id, partition, arm, seed, "failed", error=str(exc)))
-        return BenchmarkSummary(benchmark_id, partition, tuple(statuses))
+        expected_count = sum(len(tasks) for tasks in tasks_by_env.values()) * len(self.protocol.seeds) * len(arms)
+        return BenchmarkSummary(benchmark_id, partition, tuple(statuses), expected_count)
 
     def _development_smoke_complete(self, benchmark_id: str) -> bool:
         with self.store._connect() as conn:
@@ -118,21 +135,38 @@ class ResumableEvaluationDriver:
                 return True
         return False
 
-    def _tasks_for_partition(self, benchmark_id: str, partition: Partition, base_hash: str, candidate_hash: str) -> dict[str, tuple[TaskInput, ...]]:
+    def _tasks_for_partition(self, benchmark_id: str, partition: Partition, base_hash: str, candidate_hash: str, frozen: FrozenProtocol) -> dict[str, tuple[TaskInput, ...]]:
+        bundle_value = self.bundle.to_dict() if hasattr(self.bundle, "to_dict") else (self.bundle if isinstance(self.bundle, Mapping) else getattr(self.bundle, "bundle_id", self.bundle.__class__.__qualname__))
+        plan_fingerprint = sha256_json({"protocol": frozen.protocol_hash, "partition": partition.value, "base": base_hash, "candidate": candidate_hash, "bundle": sha256_json(bundle_value)})
+        with self.store._connect() as conn:
+            plan = conn.execute("SELECT * FROM benchmark_plans WHERE benchmark_id = ? AND partition = ?", (benchmark_id, partition.value)).fetchone()
+        if plan is not None:
+            if plan["fingerprint"] != plan_fingerprint or plan["partition"] != partition.value:
+                raise EvaluationError("benchmark id is already bound to different frozen inputs")
+            task_ids = json.loads(plan["panel_json"])
+            return {name: tuple(task for task in self.packages[name].tasks_for_partition(partition) if task.task_id in task_ids) for name in (self.protocol.known_environments if partition is not Partition.FINAL else (*self.protocol.known_environments, self.protocol.sealed_environment))}
         if partition is Partition.VALIDATION:
             if not base_hash or not candidate_hash:
                 raise EvaluationError("validation requires base and candidate hashes")
-            with self.store._connect() as conn:
-                existing = [row["task_id"] for row in conn.execute("SELECT task_id FROM benchmark_task_runs WHERE benchmark_id = ? AND partition = ?", (benchmark_id, partition.value)).fetchall()]
-            if existing:
-                return {name: tuple(task for task in self.packages[name].tasks_for_partition(partition) if task.task_id in existing) for name in self.protocol.known_environments}
             panels = [tuple(task.task_id for name in self.protocol.known_environments for task in self.packages[name].tasks_for_partition(partition)[index * self.protocol.tasks_per_environment:(index + 1) * self.protocol.tasks_per_environment]) for index in range(self.protocol.validation_candidate_limit)]
             index = self.allocation_store.reserve_next(base_hash, f"{base_hash}:{candidate_hash}", panels, self.protocol.validation_candidate_limit)
             if index is None:
                 raise EvaluationError("validation panel unavailable or already reserved")
-            return {name: self.packages[name].tasks_for_partition(partition)[index * self.protocol.tasks_per_environment:(index + 1) * self.protocol.tasks_per_environment] for name in self.protocol.known_environments}
-        names = self.protocol.known_environments if partition is not Partition.FINAL else (*self.protocol.known_environments, self.protocol.sealed_environment)
-        return {name: self.packages[name].tasks_for_partition(partition) for name in names}
+            tasks_by_env = {name: self.packages[name].tasks_for_partition(partition)[index * self.protocol.tasks_per_environment:(index + 1) * self.protocol.tasks_per_environment] for name in self.protocol.known_environments}
+        else:
+            names = self.protocol.known_environments if partition is not Partition.FINAL else (*self.protocol.known_environments, self.protocol.sealed_environment)
+            tasks_by_env = {name: self.packages[name].tasks_for_partition(partition) for name in names}
+        panel = [task.task_id for tasks in tasks_by_env.values() for task in tasks]
+        with self.store._connect() as conn:
+            conn.execute("INSERT INTO benchmark_plans(benchmark_id, partition, fingerprint, panel_json, created_at) VALUES (?, ?, ?, ?, datetime('now'))", (benchmark_id, partition.value, plan_fingerprint, json.dumps(panel, sort_keys=True)))
+            conn.commit()
+        return tasks_by_env
+
+    def _claim(self, benchmark_id: str, task: TaskInput, arm: Arm, seed: int) -> bool:
+        with self.store._connect() as conn:
+            cursor = conn.execute("INSERT INTO benchmark_task_runs(benchmark_id, task_id, environment_id, partition, arm, seed, status, error, observation_json, owner_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, NULL, ?, datetime('now')) ON CONFLICT(benchmark_id, task_id, arm, seed) DO UPDATE SET status='running', error=NULL, owner_id=?, updated_at=datetime('now') WHERE benchmark_task_runs.status IN ('failed') OR (benchmark_task_runs.status = 'running' AND benchmark_task_runs.owner_id != ?)", (benchmark_id, task.task_id, task.environment_ref.id, task.partition.value, arm.value, seed, self.owner_id, self.owner_id, self.owner_id))
+            conn.commit()
+            return cursor.rowcount == 1
 
     def _load(self, benchmark_id: str, task_id: str, arm: Arm, seed: int) -> BenchmarkTaskStatus | None:
         with self.store._connect() as conn:
@@ -144,8 +178,8 @@ class ResumableEvaluationDriver:
             payload = json.loads(row["observation_json"])
             payload["partition"] = Partition(payload["partition"])
             payload["arm"] = Arm(payload["arm"])
-            payload["provenance"] = payload.get("provenance", "deterministic_simulation")
-            payload["model_provenance"] = payload.get("model_provenance", "synthetic_model")
+            payload["provenance"] = Provenance(payload.get("provenance", "deterministic_simulation"))
+            payload["model_provenance"] = ModelProvenance(payload.get("model_provenance", "synthetic_model"))
             payload["budget"] = BudgetSpec(**payload["budget"])
             observation = RunObservation(**payload)
         return BenchmarkTaskStatus(row["task_id"], row["environment_id"], Partition(row["partition"]), Arm(row["arm"]), int(row["seed"]), row["status"], row["error"], observation)
