@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
 from adaptive_agent.learning_store import LearningStoreError
+from adaptive_agent.models import canonical_usage
 
 
 JsonObject = dict[str, Any]
@@ -272,8 +273,12 @@ def make_authenticated_model_runner(client: AuthenticatedModelClient, evidence_s
         usage = raw.get("usage")
         if not all(isinstance(value, str) and value.strip() for value in (provider, model, response_id, text)) or not isinstance(usage, Mapping) or not usage:
             raise ModelUnavailableError("authenticated model response requires provider, model, response id, text, and usage")
-        evidence_sink.record_model_observation({"provider": provider, "model": model, "responseId": response_id, "usage": dict(usage)}, trusted_parent=True)
-        return AuthenticatedInvocation(text, provider, model, response_id, dict(usage))
+        try:
+            normalized_usage = canonical_usage(usage)
+        except ValueError as exc:
+            raise ModelUnavailableError(str(exc)) from exc
+        evidence_sink.record_model_observation({"provider": provider, "model": model, "responseId": response_id, "usage": normalized_usage}, trusted_parent=True)
+        return AuthenticatedInvocation(text, provider, model, response_id, normalized_usage)
 
     return runner
 
@@ -555,8 +560,10 @@ class ControlPlane:
     @staticmethod
     def _model_response_evidence(run: JsonObject, invocation: ModelInvocation, environment: JsonObject) -> JsonObject:
         response_id = invocation.response_id
+        usage = canonical_usage(invocation.usage)
         version_refs = {
             "policy": run["policyRef"]["sha256"],
+            "schema": _hash(environment.get("toolSchemas", [])),
             "budget": run["budgetRef"]["sha256"],
             "planner": run["skillBundleRef"]["sha256"],
             "image": environment.get("imageDigest", "image-unpinned"),
@@ -567,8 +574,10 @@ class ControlPlane:
             "runId": run["runId"],
             "taskId": run["taskRef"]["id"],
             "environmentId": run["environmentId"],
-            "usage": dict(invocation.usage),
+            "usage": usage,
             "versionRefs": version_refs,
+            "costMicrounits": 0,
+            "durationSeconds": 0.0,
         }
         return {
             "runId": run["runId"],
@@ -578,7 +587,7 @@ class ControlPlane:
             "model": invocation.model,
             "modelProfile": invocation.model,
             "responseId": response_id,
-            "usage": dict(invocation.usage),
+            "usage": usage,
             "budgetRef": run["budgetRef"],
             "imageDigest": version_refs["image"],
             "corePlannerHash": run["skillBundleRef"]["sha256"],
@@ -620,7 +629,16 @@ class ControlPlane:
                     return
                 run["outcomeRef"] = _ref(f"outcome_{run_id}", "1", outcome)
                 run["status"] = "succeeded" if outcome.get("passed") is True else "failed"
-            self._emit(run_id, "evidence", "Trusted evaluator recorded outcome.", json.dumps(outcome, sort_keys=True))
+            trusted_outcome = {
+                "responseId": invocation.response_id,
+                "runId": run_id,
+                "taskId": run["taskRef"]["id"],
+                "environmentId": run["environmentId"],
+                "passed": outcome.get("passed") is True,
+                "reliable": bool(outcome.get("reliable", outcome.get("passed") is True)),
+                "safetyViolations": int(outcome.get("safetyViolations", 0) or 0),
+            }
+            self._emit_evidence(run_id, "trusted_outcome", "Trusted evaluator recorded outcome.", trusted_outcome)
             self._emit(run_id, "status", "Run succeeded." if outcome.get("passed") is True else "Run failed.")
         except ModelUnavailableError as exc:
             with self._lock:
@@ -1012,6 +1030,27 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
             if runtime is not None:
                 return runtime.queue_evaluation(payload)
             return plane.queue_evaluation(payload)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"code": "VERSION_CONFLICT", "message": str(exc), "correlationId": uuid.uuid4().hex, "retry": "never"}) from exc
+
+    @app.post("/evaluations/launch", status_code=202)
+    def launch_evaluation(payload: EvaluationRequest, background: BackgroundTasks) -> JsonObject:
+        """Queue and execute one trusted evaluation task in the background."""
+        try:
+            if runtime is None:
+                return plane.queue_evaluation(payload)
+            evaluation = runtime.queue_evaluation(payload)
+            candidate = runtime.controller.get_candidate(payload.candidate_id)
+            if candidate is None:
+                raise KeyError("candidate not found")
+            candidate_hash = candidate.get("candidate_bundle_hash")
+            bundle = runtime.controller.store.get_bundle_by_hash(candidate_hash) if isinstance(candidate_hash, str) else None
+            frozen = runtime.controller.store.get_frozen_protocol(payload.protocol_hash)
+            task = {**evaluation, "candidateId": payload.candidate_id}
+            background.add_task(runtime.run_evaluation_job, task, frozen, bundle)
+            return {**evaluation, "state": "accepted"}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

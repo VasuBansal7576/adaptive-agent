@@ -11,6 +11,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pydantic import BaseModel as _BaseModel, Field, field_validator, model_validator
@@ -39,6 +40,43 @@ def sha256_json(data: Any) -> str:
 
     canonical = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=default)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def canonical_usage(value: Any) -> dict[str, int]:
+    """Normalize provider usage into the persisted evidence contract.
+
+    Providers occasionally omit prompt or total counts, or use snake-case
+    names.  The trusted parent fills only derivable values and rejects
+    contradictory or non-integral counts so response and accounting artifacts
+    can share one exact usage object.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError("model usage must be an object")
+
+    def count(*keys: str) -> int | None:
+        for key in keys:
+            candidate = value.get(key)
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+                return candidate
+            if candidate is not None:
+                raise ValueError(f"model usage field {key} must be a non-negative integer")
+        return None
+
+    input_tokens = count("inputTokens", "input_tokens", "promptTokens", "prompt_tokens", "input")
+    output_tokens = count("outputTokens", "output_tokens", "completionTokens", "completion_tokens", "output")
+    total_tokens = count("totalTokens", "total_tokens")
+    if input_tokens is None:
+        input_tokens = 0
+    if output_tokens is None:
+        output_tokens = 0 if total_tokens is None else total_tokens - input_tokens
+        if output_tokens < 0:
+            raise ValueError("model usage totalTokens is smaller than inputTokens")
+    expected_total = input_tokens + output_tokens
+    if total_tokens is None:
+        total_tokens = expected_total
+    if total_tokens != expected_total:
+        raise ValueError("model usage totalTokens must equal inputTokens + outputTokens")
+    return {"inputTokens": input_tokens, "outputTokens": output_tokens, "totalTokens": total_tokens}
 
 
 def new_id(prefix: str = "") -> str:
@@ -227,6 +265,10 @@ class RunRecord(BaseModel):
     outcome_ref: ArtifactRef | None = Field(None, alias="outcomeRef")
     created_at: datetime = Field(default_factory=now_utc, alias="createdAt")
     completed_at: datetime | None = Field(None, alias="completedAt")
+    # Benchmark execution identity, present only for evaluator-owned runs.
+    arm: str | None = None
+    seed: int | None = None
+    bundle_hash: str | None = Field(None, alias="bundleHash")
 
 
 class StepRecord(BaseModel):

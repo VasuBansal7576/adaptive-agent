@@ -42,10 +42,22 @@ class DurableLearningSourceAdapter:
     def records(self, *, environment_id: str, run_id: str) -> tuple[SourceRecord, ...]:
         list_records = getattr(self.store, "list_learning_records", None)
         raw_records = list_records(environment_id=environment_id, run_id=run_id) if callable(list_records) else self._legacy_records(environment_id=environment_id, run_id=run_id)
+        return self.records_from_raw(raw_records, environment_id=environment_id, run_id=run_id)
+
+    def records_from_raw(self, raw_records: Sequence[Mapping[str, Any]], *, environment_id: str, run_id: str) -> tuple[SourceRecord, ...]:
         sources: list[SourceRecord] = []
         for raw in raw_records:
             if not isinstance(raw, Mapping):
                 raise LearningStoreError("Store returned a non-object learning record")
+            envelope = raw.get("record_json")
+            if isinstance(envelope, str):
+                try:
+                    decoded = json.loads(envelope)
+                except json.JSONDecodeError as exc:
+                    raise LearningStoreError("Store learning record is not JSON") from exc
+                if not isinstance(decoded, Mapping):
+                    raise LearningStoreError("Store learning record payload is not an object")
+                raw = {**decoded, "environmentId": raw.get("environment_id", decoded.get("environmentId")), "runId": raw.get("run_id", decoded.get("runId"))}
             kind = raw.get("kind")
             if kind == SourceKind.PUBLIC_DOC.value:
                 if raw.get("environmentId") != environment_id or raw.get("visibility") != "public":
@@ -114,6 +126,9 @@ class DurableLearningSourceAdapter:
     def retriever(self, *, environment_id: str, run_id: str) -> AccessFilteredRetriever:
         return AccessFilteredRetriever(InMemorySourceProvider(self.records(environment_id=environment_id, run_id=run_id)))
 
+    def retriever_from_raw(self, raw_records: Sequence[Mapping[str, Any]], *, environment_id: str, run_id: str) -> AccessFilteredRetriever:
+        return AccessFilteredRetriever(InMemorySourceProvider(self.records_from_raw(raw_records, environment_id=environment_id, run_id=run_id)))
+
     @staticmethod
     def _source(raw: Mapping[str, Any], *, kind: SourceKind, run_id: str | None, partition: str | None, visibility: str, trust_class: str) -> SourceRecord:
         source_id = raw.get("sourceId")
@@ -152,6 +167,13 @@ class CandidateManagerLearningAdapter:
         put_bytes = getattr(self.store, "put_immutable_bytes", None)
         if callable(put_bytes):
             persisted = put_bytes(bytes(patch_bytes))
+            try:
+                patch_value = json.loads(bytes(patch_bytes).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise LearningStoreError("canonical patch bytes are not JSON") from exc
+            json_ref = self.store.put_artifact(patch_value)
+            if json_ref.sha256 != content_hash_value:
+                raise LearningStoreError("Store JSON artifact hash differs from immutable patch hash")
         else:
             try:
                 patch_value = json.loads(bytes(patch_bytes).decode("utf-8"))
@@ -159,7 +181,10 @@ class CandidateManagerLearningAdapter:
                 raise LearningStoreError("canonical patch bytes are not JSON") from exc
             ref = self.store.put_artifact(patch_value)
             persisted = {"sha256": ref.sha256, "size": len(patch_bytes), "immutable": True}
-        if not isinstance(persisted, Mapping) or persisted.get("sha256") != content_hash_value or persisted.get("size") != len(patch_bytes) or persisted.get("immutable") is not True:
+        persisted_hash = persisted.get("sha256") if isinstance(persisted, Mapping) else getattr(persisted, "sha256", None)
+        persisted_size = persisted.get("size") if isinstance(persisted, Mapping) else len(patch_bytes)
+        persisted_immutable = persisted.get("immutable") if isinstance(persisted, Mapping) else True
+        if persisted_hash != content_hash_value or persisted_size != len(patch_bytes) or persisted_immutable is not True:
             raise LearningStoreError("Store did not attest exact immutable patch bytes")
         return {"sha256": content_hash_value, "size": len(patch_bytes), "stored": True, "immutable": True}
 

@@ -570,6 +570,44 @@ class Store:
             row = conn.execute("SELECT 1 FROM outcomes WHERE run_id = ?", (run_id,)).fetchone()
             return row is not None
 
+    # ------------------------------------------------------------------ narrow learning projections
+    def get_public_docs(self, environment_id: str) -> list[dict[str, Any]]:
+        """Return manifest documents that are safe for learner context."""
+        row = self.get_environment(environment_id)
+        if not row:
+            return []
+        manifest_ref = ArtifactRef.model_validate_json(row["manifest_ref"])
+        manifest = self.get_artifact(manifest_ref)
+        output: list[dict[str, Any]] = []
+        for raw in manifest.get("docs", []):
+            if not isinstance(raw, dict):
+                continue
+            sha = raw.get("sha256")
+            if not isinstance(sha, str) or not self.has_artifact(sha):
+                continue
+            payload = self.get_artifact(sha)
+            if isinstance(payload, dict) and payload.get("classification") in {"operator", "evaluator_only"}:
+                continue
+            output.append({"id": raw.get("id"), "version": raw.get("version"), "sha256": sha, "content": payload})
+        return output
+
+    def list_learner_evidence(self, environment_id: str | None = None, run_id: str | None = None) -> list[dict[str, Any]]:
+        """Join redacted learner evidence to DEVELOPMENT provenance."""
+        query = ("SELECT e.evidence_id, e.run_id, e.sequence, e.event_type, e.content_hash, "
+                 "e.trust_class, e.visibility, e.redacted, r.task_id, r.environment_id, t.partition "
+                 "FROM evidence e JOIN runs r ON r.run_id=e.run_id JOIN tasks t ON t.id=r.task_id "
+                 "WHERE e.visibility='learner' AND e.redacted=1 AND t.partition='development'")
+        params: list[Any] = []
+        if environment_id is not None:
+            query += " AND r.environment_id=?"
+            params.append(environment_id)
+        if run_id is not None:
+            query += " AND e.run_id=?"
+            params.append(run_id)
+        query += " ORDER BY e.run_id, e.sequence"
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
+
     # ------------------------------------------------------------------ tool calls / approvals
     def prepare_tool_call(self, data: dict[str, Any]) -> bool:
         """Insert a prepared (no-result) tool call. Returns False on (run_id,

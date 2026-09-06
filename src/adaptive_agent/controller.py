@@ -327,8 +327,20 @@ class Controller:
                 "checked_at": outcome.checked_at.isoformat(),
             },
         )
-        trusted_payload = {"runId": run_id, "taskId": stored["task_id"], "environmentId": stored["environment_id"], "responseId": response_id, "passed": passed, "reliable": bool(metadata.get("reliable", passed)), "safetyViolations": int(metadata.get("safetyViolations", 0) or 0), "score": score, "metadata": outcome_metadata}
-        self.append_event(run_id, "trusted_outcome", trusted_payload, "evaluator", "evaluator_only")
+        # A trusted outcome is linkable only when a parent-owned model response
+        # exists.  Never emit a placeholder response ID that could be mistaken
+        # for evaluator provenance on a model-unavailable run.
+        if isinstance(response_id, str) and response_id:
+            trusted_payload = {
+                "responseId": response_id,
+                "runId": run_id,
+                "taskId": stored["task_id"],
+                "environmentId": stored["environment_id"],
+                "passed": passed,
+                "reliable": bool(metadata.get("reliable", passed)),
+                "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
+            }
+            self.append_event(run_id, "trusted_outcome", trusted_payload, "evaluator", "evaluator_only")
         return outcome
 
     def reconcile_run(self, run_id: str, provider: ToolProvider) -> list[str]:
