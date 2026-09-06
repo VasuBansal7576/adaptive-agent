@@ -4,6 +4,7 @@ from .prime_child_planner import ChildObservationSink, LunaChildPlanner, SharedL
 from .prime_runtime import (
     AdapterError, ArtifactRef, Capability, CapabilityBroker, CapabilitySet,
     ChildPlan, ChildPlanRequest, ChildPlannerBudget, ExecutionMode, ExecutionResult, ModelObservation,
+    ParsedModelUsage, parse_model_usage,
     PrimeRuntimeAdapter, PrimeRuntimeConfig, SharedBudget,
     SecurityViolation,
 )
@@ -11,6 +12,6 @@ from .prime_runtime import (
 __all__ = [
     "AdapterError", "ArtifactRef", "Capability", "CapabilityBroker", "ChildObservationSink", "LunaChildPlanner", "SharedLedgerModelClient",
     "CapabilitySet", "ChildPlan", "ChildPlanRequest", "ChildPlannerBudget", "ExecutionMode",
-    "ExecutionResult", "ModelObservation", "PrimeRuntimeAdapter", "PrimeRuntimeConfig",
+    "ExecutionResult", "ModelObservation", "ParsedModelUsage", "parse_model_usage", "PrimeRuntimeAdapter", "PrimeRuntimeConfig",
     "SecurityViolation", "SharedBudget",
 ]

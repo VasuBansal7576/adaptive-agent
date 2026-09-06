@@ -11,6 +11,7 @@ from adaptive_agent import (  # noqa: E402
     ChildPlannerBudget,
     SecurityViolation,
     SharedBudget,
+    parse_model_usage,
 )
 from adaptive_agent.prime_child_planner import LunaChildPlanner, _usage_tokens  # noqa: E402
 
@@ -63,6 +64,68 @@ class UsageNormalizationTests(unittest.TestCase):
         ):
             with self.assertRaises(AdapterError):
                 _usage_tokens(usage)
+
+
+class CostGuardTests(unittest.TestCase):
+    def test_sdk_nominal_cost_is_canonical_microunits(self):
+        receipt = parse_model_usage({"inputTokens": 9, "outputTokens": 1, "cost": {"total": 0.00001}}, require_cost=True)
+        self.assertEqual((receipt.tokens, receipt.cost_microunits, receipt.currency), (10, 10, "USD"))
+        with self.assertRaises(AdapterError):
+            parse_model_usage({"totalTokens": 10, "inputTokens": 9, "outputTokens": 1, "cost": {"total": 0.00001}, "costMicrounits": 11}, require_cost=True)
+        with self.assertRaises(AdapterError):
+            parse_model_usage({"inputTokens": 9, "outputTokens": 1, "cost": {"total": 0.00001, "currency": "EUR"}}, require_cost=True)
+
+    def test_unknown_cost_is_rejected_when_cost_guard_is_configured(self):
+        ledger = SharedBudget(30, 1000, 4, 1, 100, max_model_cost_microunits=10)
+        observations = []
+        with self.assertRaises(AdapterError):
+            LunaChildPlanner(FakeClient(usage={"inputTokens": 1, "outputTokens": 1}), observation_sink=observations.append)(request(ledger))
+        self.assertEqual(observations, [])
+        self.assertEqual((ledger.model_tokens_used, ledger.model_cost_microunits_used), (0, 0))
+
+    def test_zero_cost_budget_blocks_parent_and_child_preflight(self):
+        ledger = SharedBudget(30, 1000, 4, 1, 100, max_model_cost_microunits=0)
+        client = FakeClient(usage={"inputTokens": 1, "outputTokens": 1, "cost": {"total": 0.000001}})
+        planner = LunaChildPlanner(client, budget=ChildPlannerBudget(ledger))
+        with self.assertRaises(SecurityViolation):
+            planner.parent_model_client().invoke(goal="blocked", environment={}, messages=[], remaining_deadline=5)
+        with self.assertRaises(SecurityViolation):
+            planner(request(ledger))
+        self.assertEqual(client.calls, 0)
+
+    def test_shared_cost_ledger_is_atomic_under_concurrent_child_usage(self):
+        from concurrent.futures import ThreadPoolExecutor
+        ledger = SharedBudget(30, 1000, 4, 4, 100, max_model_cost_microunits=10)
+        def charge(_index):
+            try:
+                ledger.record_model_usage(1, 4, "USD")
+                return "ok"
+            except SecurityViolation:
+                return "exhausted"
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(charge, range(4)))
+        self.assertEqual(ledger.model_cost_microunits_used, 16)
+        self.assertEqual(ledger.model_tokens_used, 4)
+        self.assertIn("exhausted", results)
+        self.assertEqual(ledger.max_model_cost_microunits - ledger.model_cost_microunits_used, -6)
+
+    def test_parent_child_cumulative_nominal_cost_retains_overage_and_blocks(self):
+        ledger = SharedBudget(30, 1000, 4, 1, 100, max_model_cost_microunits=10)
+        observations = []
+        client = FakeClient(usage={"inputTokens": 1, "outputTokens": 1, "cost": {"total": 0.000007}})
+        planner = LunaChildPlanner(client, budget=ChildPlannerBudget(ledger), observation_sink=observations.append)
+        parent = planner.parent_model_client(observation_sink=observations.append)
+        parent.invoke(goal="parent", environment={}, messages=[], remaining_deadline=5)
+        client.usage = {"input_tokens": 1, "output_tokens": 1, "cost": {"total": 0.000004}}
+        with self.assertRaises(SecurityViolation):
+            planner(request(ledger))
+        self.assertEqual(ledger.model_cost_microunits_used, 11)
+        self.assertEqual(len(observations), 2)
+        with self.assertRaises(SecurityViolation):
+            parent.invoke(goal="blocked", environment={}, messages=[], remaining_deadline=5)
+        with self.assertRaises(SecurityViolation):
+            planner(request(ledger))
+        self.assertEqual(client.calls, 2)
 
 
 class ChildPlannerTests(unittest.TestCase):
