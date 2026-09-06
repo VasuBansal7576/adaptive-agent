@@ -728,6 +728,23 @@ class Controller:
             raise KeyError(f"run {run_id!r} not found")
         return row
 
+    def _require_recorded_response(self, run_id: str, response_id: Any) -> None:
+        """Attestation binding: a responseId claim must reference a
+        model_response evidence row already recorded for this run."""
+        if not isinstance(response_id, str) or not response_id:
+            raise ValueError("responseId is required")
+        for row in self.store.list_evidence(run_id):
+            if row["event_type"] != "model_response":
+                continue
+            try:
+                ref = json.loads(row["source_ref"])
+                payload = self.store.get_artifact(ref["sha256"])
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and payload.get("responseId") == response_id:
+                return
+        raise ValueError(f"responseId {response_id!r} is not a recorded model_response for run {run_id!r}")
+
     def record_model_response(self, run_id: str, response: Mapping[str, Any]) -> EvidenceRecord:
         """Record a trusted parent model observation (responseId + usage pinned)."""
         self._run_row(run_id)
@@ -747,6 +764,7 @@ class Controller:
         for key in ("responseId", "runId", "taskId", "environmentId"):
             if not accounting.get(key):
                 raise ValueError(f"accounting.{key} is required")
+        self._require_recorded_response(run_id, accounting["responseId"])
         if accounting["responseId"] != model_response.get("responseId"):
             raise ValueError("accounting.responseId does not match model response")
         if accounting["runId"] != run_id or accounting["taskId"] != row["task_id"] or accounting["environmentId"] != row["environment_id"]:
@@ -850,6 +868,7 @@ class Controller:
         for key in ("responseId", "runId", "taskId", "environmentId"):
             if not outcome.get(key):
                 raise ValueError(f"outcome.{key} is required")
+        self._require_recorded_response(run_id, outcome["responseId"])
         if outcome["runId"] != run_id or outcome["taskId"] != row["task_id"] or outcome["environmentId"] != row["environment_id"]:
             raise ValueError("outcome run/task/environment pins do not match the run")
         if not isinstance(outcome.get("passed"), bool) or not isinstance(outcome.get("reliable"), bool):

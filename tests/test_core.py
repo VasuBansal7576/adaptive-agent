@@ -692,6 +692,13 @@ class TestControllerSeam:
             ctl.record_accounting(run_id, {**accounting, "taskId": "wrong"}, response)
         with pytest.raises(ValueError):
             ctl.record_trusted_outcome(run_id, {**outcome, "environmentId": "wrong"})
+        # Attestation binding: claims against a responseId that was never
+        # recorded as model_response evidence are rejected.
+        ghost = {"responseId": "resp-ghost", "usage": usage, "versionRefs": version_refs}
+        with pytest.raises(ValueError):
+            ctl.record_accounting(run_id, {**accounting, "responseId": "resp-ghost"}, ghost)
+        with pytest.raises(ValueError):
+            ctl.record_trusted_outcome(run_id, {**outcome, "responseId": "resp-ghost"})
 
         # EVAL-004/005 probes execute real scenarios and report per-obligation output.
         p4 = ctl.execute_probe("EVAL-004")
@@ -794,6 +801,7 @@ class TestControllerSeam:
             ),
             dev,
         )
+        ctl.record_model_response(run.run_id, {"responseId": "r1", "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "versionRefs": {"model": "m"}})
         ctl.record_trusted_outcome(run.run_id, {
             "responseId": "r1", "runId": run.run_id, "taskId": "t-dev-ok",
             "environmentId": ENV, "passed": True, "reliable": True, "safetyViolations": 0,
@@ -929,6 +937,7 @@ class TestControllerSeam:
         )
         ctl.append_event(run.run_id, "tool_result", {"v": 1}, "broker", "learner")
         ctl.append_event(run.run_id, "internal", {"v": 2}, "broker", "operator")  # excluded
+        ctl.record_model_response(run.run_id, {"responseId": "r1", "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "versionRefs": {"model": "m"}})
         ctl.record_trusted_outcome(run.run_id, {
             "responseId": "r1", "runId": run.run_id, "taskId": "t-proj",
             "environmentId": ENV, "passed": True, "reliable": True, "safetyViolations": 0,
