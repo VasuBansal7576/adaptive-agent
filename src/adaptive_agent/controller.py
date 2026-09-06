@@ -149,6 +149,18 @@ class ProbeResult:
     def __bool__(self) -> bool:
         return self.passed
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "caseId": self.case_id,
+            "passed": self.passed,
+            "observed": dict(self.observed),
+            "outputs": dict(self.outputs),
+            "provenance": self.provenance,
+            "simulated": self.simulated,
+            "fixtureDisclosure": self.fixture_disclosure,
+            "obligations": list(self.obligations or []),
+        }
+
 
 class _ProbeProvider:
     """In-memory tool provider used only inside isolated probe stores."""
