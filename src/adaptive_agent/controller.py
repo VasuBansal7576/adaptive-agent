@@ -763,6 +763,9 @@ class Controller:
             raise ValueError("accounting.nominalCostUsd must be null or a finite non-negative number")
         if "billingBasis" in accounting and not isinstance(accounting["billingBasis"], str):
             raise ValueError("accounting.billingBasis must be a string")
+        inference = accounting.get("inferenceDurationSeconds")
+        if inference is not None and (not isinstance(inference, (int, float)) or isinstance(inference, bool) or inference < 0 or inference != inference):
+            raise ValueError("accounting.inferenceDurationSeconds must be null or a finite non-negative number")
         # Cumulative aggregates sum EVERY receipt for the run (including
         # retries); this record's own `usage`/`costMicrounits`/`durationSeconds`
         # remain the exact per-response values.
@@ -776,6 +779,8 @@ class Controller:
         agg_econ = float(economic["microunits"]) if isinstance(economic, Mapping) else 0.0
         eco_statuses: set[str] = {economic["status"]} if isinstance(economic, Mapping) else set()
         econ_seen = isinstance(economic, Mapping)
+        agg_inference = float(inference) if inference is not None else 0.0
+        inference_seen = inference is not None
         count = 1
         for row in self.store.list_evidence(run_id):
             if row["event_type"] != "accounting_recorded":
@@ -799,14 +804,24 @@ class Controller:
                 agg_econ += float(prior_eco["microunits"])
                 eco_statuses.add(prior_eco.get("status"))
                 econ_seen = True
+            if isinstance(prior.get("inferenceDurationSeconds"), (int, float)):
+                agg_inference += float(prior["inferenceDurationSeconds"])
+                inference_seen = True
             count += 1
         payload = dict(accounting)
+        # A caller-claimed aggregateUsage must equal the sum of every exact
+        # per-response receipt (retries included); recomputed value wins.
+        claimed = payload.get("aggregateUsage")
+        if claimed is not None and claimed != agg:
+            raise ValueError("accounting.aggregateUsage does not equal the sum of per-response receipt usage")
         payload.update({
             "aggregateUsage": agg,
             "aggregateCostMicrounits": agg_cost,
             "aggregateDurationSeconds": agg_duration,
             "responseCount": count,
         })
+        if inference_seen:
+            payload["aggregateInferenceDurationSeconds"] = agg_inference
         if econ_seen:
             payload["aggregateEconomicCostMicrounits"] = agg_econ
             payload["economicCostStatuses"] = sorted(s for s in eco_statuses if isinstance(s, str))

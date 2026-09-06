@@ -625,12 +625,25 @@ class TestControllerSeam:
         assert second["aggregateEconomicCostMicrounits"] == 100.0
         assert second["economicCostStatuses"] == ["measured"]
 
+        # A caller-claimed aggregateUsage that doesn't equal the exact sum is
+        # rejected; inference duration aggregates separately from wall time.
+        response3 = {"responseId": "resp-3", "usage": usage2, "versionRefs": version_refs}
+        ctl.record_model_response(run_id, response3)
+        with pytest.raises(ValueError):
+            ctl.record_accounting(run_id, {"responseId": "resp-3", "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
+                                           "usage": usage2, "costMicrounits": 1, "durationSeconds": 0.1, "versionRefs": version_refs,
+                                           "aggregateUsage": {"inputTokens": 999, "outputTokens": 0, "totalTokens": 999}}, response3)
+        acct3 = ctl.record_accounting(run_id, {"responseId": "resp-3", "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
+                                               "usage": usage2, "costMicrounits": 1, "durationSeconds": 10.0, "inferenceDurationSeconds": 2.5, "versionRefs": version_refs}, response3)
+        third = store.get_artifact(acct3)
+        assert third["aggregateInferenceDurationSeconds"] == 2.5 and third["aggregateDurationSeconds"] == 12.0
+
         # Exact receipts for EvaluationJob: both responses, both accountings,
         # trusted outcome row, run/task/env binding.
         receipts = store.get_run_receipts(run_id)
         assert receipts["runId"] == run_id and receipts["taskId"] == "t-ev"
-        assert [r["responseId"] for r in receipts["modelResponses"]] == ["resp-1", "resp-2"]
-        assert [a["responseId"] for a in receipts["accounting"]] == ["resp-1", "resp-2"]
+        assert [r["responseId"] for r in receipts["modelResponses"]] == ["resp-1", "resp-2", "resp-3"]
+        assert [a["responseId"] for a in receipts["accounting"]] == ["resp-1", "resp-2", "resp-3"]
         assert receipts["accounting"][1]["aggregateUsage"]["totalTokens"] == 21
 
         outcome = {
