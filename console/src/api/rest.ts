@@ -1,4 +1,4 @@
-import type { RunEvent, RunRecord, SkillVersionSummary, CandidateDiff, EnvironmentPackageSummary } from "./types";
+import type { RunEvent, RunRecord, SkillVersionSummary, CandidateDiff, EnvironmentPackageSummary, RunOptions, TaskOption } from "./types";
 import type {
   ConsoleTransport,
   CreateRunInput,
@@ -6,17 +6,7 @@ import type {
   EnvironmentRegistration,
   LearningCycleInput,
 } from "./transport";
-import { validatePackageFields, formToStringPayload, formToRegistration, sha256Hex, type CanonicalRef } from "./transport";
-
-/**
- * Authoritative trusted-plane reference for the seeded entries. The control
- * plane resolves (id, version, sha256) against its trusted-ref sets, so the
- * console cannot invent profile or budget ids; it sends the seeded
- * "model-profile"/"budget-default" refs with the canonical-JSON hash.
- */
-export async function trustedRef(id: "model-profile" | "budget-default"): Promise<CanonicalRef> {
-  return { id, version: "1", sha256: await sha256Hex(JSON.stringify(id)) };
-}
+import { validatePackageFields, formToStringPayload, formToRegistration } from "./transport";
 import {
   SchemaError,
   parseCandidates,
@@ -25,6 +15,9 @@ import {
   parseRunEvent,
   parseRuns,
   parseSkills,
+  normalizeSseEvent,
+  parseRunOptions,
+  parseTasks,
 } from "./validate";
 
 /** Structured API error carrying the SPEC error envelope for UI surfacing. */
@@ -33,34 +26,27 @@ export class ApiError extends Error {
   correlationId: string | null;
   retry: string | null;
   constructor(payload: Record<string, unknown>, status: number) {
-    // FastAPI wraps structured envelopes in `detail` (409/403); plain 422s use a string detail
-    const detail = payload.detail;
-    // FastAPI validation errors use an array of {loc, msg, type} objects.
-    // Normalize the first actionable message into the same envelope used by
-    // structured control-plane errors so callers can render one error path.
-    const arrayMessage = Array.isArray(detail)
-      ? detail.find(
-          (entry): entry is Record<string, unknown> =>
-            typeof entry === "object" && entry !== null && typeof (entry as Record<string, unknown>).msg === "string",
-        )
-      : null;
-    const envelope = detail && typeof detail === "object" && !Array.isArray(detail)
-      ? (detail as Record<string, unknown>)
-      : payload;
-    const code = typeof envelope.code === "string"
-      ? envelope.code
-      : typeof payload.code === "string"
-        ? payload.code
-        : status === 422
-          ? "INVALID_INPUT"
-          : "UNKNOWN";
-    const message = typeof envelope.message === "string" && envelope.message
-      ? envelope.message
-      : arrayMessage && typeof arrayMessage.msg === "string" && arrayMessage.msg
-        ? arrayMessage.msg
-      : typeof payload.detail === "string" && payload.detail
-        ? payload.detail
-        : `HTTP ${status}`;
+    // FastAPI failure shapes: structured envelope in `detail` (409/403),
+    // string `detail` (plain HTTPException), or array `detail` (validation).
+    const raw = payload.detail;
+    const envelope: Record<string, unknown> =
+      raw && typeof raw === "object" && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>)
+        : payload; // synthetic envelopes carry code/message at the top level
+    let message: string;
+    if (typeof envelope.message === "string" && envelope.message) {
+      message = envelope.message;
+    } else if (typeof raw === "string" && raw) {
+      message = raw;
+    } else if (Array.isArray(raw)) {
+      // validation array: join the human-readable msgs
+      message = raw
+        .map((item) => (item && typeof item === "object" && "msg" in (item as Record<string, unknown>) ? String((item as Record<string, unknown>).msg) : String(item)))
+        .join("; ");
+    } else {
+      message = `HTTP ${status}`;
+    }
+    const code = typeof envelope.code === "string" ? envelope.code : typeof payload.code === "string" ? payload.code : "UNKNOWN";
     super(message);
     this.name = "ApiError";
     this.code = code;
@@ -123,6 +109,21 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
     } catch {
       throw new ApiError({ code: "DISCONNECTED", message: DISCONNECTED_MESSAGE }, 0);
     }
+    if (res.status === 401) {
+      // the HttpOnly cookie may have expired across a server restart: reset the
+      // cached session and re-authenticate once (safe GET bootstrap) before
+      // failing
+      sessionPromise = null;
+      await ensureSession();
+      try {
+        res = await fetch(`${baseUrl}${path}`, {
+          headers: { "content-type": "application/json" },
+          ...init,
+        });
+      } catch {
+        throw new ApiError({ code: "DISCONNECTED", message: DISCONNECTED_MESSAGE }, 0);
+      }
+    }
     if (!res.ok) {
       throw new ApiError(await safeJson(res), res.status);
     }
@@ -155,6 +156,9 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
     mode: "live",
 
     listEnvironments: () => validated(json("/environments"), parseEnvironments),
+    getRunOptions: () => validated(json("/run-options"), parseRunOptions),
+    getEnvironmentTasks: (environmentId: string) =>
+      validated(json(`/environments/${encodeURIComponent(environmentId)}/tasks`), parseTasks),
     listRuns: () => validated(json("/runs"), parseRuns),
     listSkills: () => validated(json("/skills"), parseSkills),
     listCandidates: () => validated(json("/candidates"), parseCandidates),
@@ -169,6 +173,7 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       let retryTimer: ReturnType<typeof setTimeout> | null = null;
       let closed = false;
       let lastSequence = fromCursor;
+      let consecutiveFailures = 0;
 
       const start = () => {
         if (closed) return;
@@ -181,10 +186,13 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
         es = new EventSource(`${baseUrl}/runs/${encodeURIComponent(runId)}/events?cursor=${lastSequence}`);
         es.onmessage = (message) => {
           try {
-            // boundary validation before the event enters reducer state
-            const event = parseRunEvent(JSON.parse(message.data), "sse.data");
+            // boundary validation before the event enters reducer state; both
+            // wire shapes are accepted (plane RunEvent and durable evidence
+            // envelope {id, event, data})
+            const event = normalizeSseEvent(JSON.parse(message.data), "sse.data");
             if (event.sequence > lastSequence) {
               lastSequence = event.sequence;
+              consecutiveFailures = 0;
               onEvent(event);
             }
             // stale duplicates (sequence <= cursor) are dropped client-side too
@@ -194,12 +202,38 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
         };
         es.onerror = () => {
           es?.close();
-          onState("stale");
-          retryTimer = setTimeout(() => {
-            ensureSession()
-              .then(start)
-              .catch(() => onState("disconnected"));
-          }, 1500);
+          // EOF handling: a terminal run's stream closes server-side. Check the
+          // run's status once; close normally when terminal, otherwise bounded
+          // retry with a fresh session (server restart invalidates the cookie)
+          void (async () => {
+            let terminal = false;
+            try {
+              const run = (await json(`/runs/${encodeURIComponent(runId)}`)) as { status?: unknown };
+              terminal =
+                run?.status === "succeeded" ||
+                run?.status === "failed" ||
+                run?.status === "cancelled" ||
+                run?.status === "timed_out";
+            } catch {
+              terminal = false; // unreachable -> bounded retry path below
+            }
+            if (terminal) {
+              onState("closed");
+              return;
+            }
+            if (consecutiveFailures >= 5) {
+              onState("stale");
+              return;
+            }
+            consecutiveFailures += 1;
+            onState("reconnecting");
+            retryTimer = setTimeout(() => {
+              sessionPromise = null; // server restart may have rotated the cookie
+              ensureSession()
+                .then(start)
+                .catch(() => onState("disconnected"));
+            }, 1500);
+          })();
         };
       };
 
@@ -231,28 +265,33 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       }).then(() => undefined),
 
     async createRun(input: CreateRunInput) {
-      // direct projection accepted by the control API. Profile/budget refs are
-      // AUTHORITATIVE trusted-plane references: the plane rejects unknown
-      // (id, version, sha256) tuples, and a ref without sha256 is malformed
-      // and would poison every subsequent list refresh (SchemaError). The
-      // seeded trusted entries are "model-profile" and "budget-default"; their
-      // sha256 is the hash of the canonical JSON encoding of the identifier.
-      const modelProfileRef = await trustedRef("model-profile");
-      const budgetRef = await trustedRef("budget-default");
+      // Refs are authoritative and NEVER computed in the browser: the model
+      // ref comes from the server's /run-options projection. The budget is
+      // sent as the validated object from the operator's controls; the
+      // backend hashes and stores it as the run's budget artifact.
+      if (!input.modelProfileRef || !input.modelProfileRef.sha256) {
+        throw new SchemaError("run modelProfileRef must come from the /run-options projection");
+      }
+      const taskRef: Record<string, unknown> = { goal: input.goal, environmentId: input.environmentId };
+      if (input.taskId) taskRef.id = input.taskId;
       const body = {
-        goal: input.goal,
-        environmentId: input.environmentId,
-        modelProfileRef,
-        budgetRef,
+        taskRef,
+        modelProfileRef: input.modelProfileRef,
+        budget: {
+          modelTokens: input.budget.modelTokenCeiling,
+          toolCalls: input.budget.toolCallCeiling,
+          childRuns: 0,
+          wallTimeSeconds: input.budget.wallSecondsCeiling,
+          costMicrounits: 100000,
+          currency: "USD",
+        },
         idempotencyKey: input.idempotencyKey,
         executionMode: input.executionMode,
       };
       const run = await validated(json("/runs", { method: "POST", body: JSON.stringify(body) }), (value) =>
         parseRun(value, "run"),
       );
-      // Creation is a two-phase control-plane operation. Launch only after
-      // the response has crossed the validation boundary so malformed data
-      // can never dispatch work accidentally.
+      // explicit launch step: a created run must not remain queued
       await json(`/runs/${encodeURIComponent(run.runId)}/launch`, { method: "POST", body: "{}" });
       return run;
     },

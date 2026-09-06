@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ConsoleTransport, CreateRunInput } from "../api/transport";
 import { newIdempotencyKey } from "../api/transport";
 import { describeToolError } from "../api/errors";
-import type { ApprovalRequest, EnvironmentPackageSummary, RunEvent, RunRecord } from "../api/types";
+import type { ApprovalRequest, EnvironmentPackageSummary, RunEvent, RunRecord, TaskOption } from "../api/types";
 import type { ConnectionState } from "../state/consoleStore";
 import { StatusBadge } from "../components/StatusBadge";
 import { Banner, EmptyState, LoadingState, Modal } from "../components/ui";
@@ -29,6 +29,7 @@ export function RunView({
   onCancel,
   onCreateRun,
   onActionError,
+  onReconnect,
 }: {
   transport: ConsoleTransport;
   runs: RunRecord[];
@@ -42,6 +43,7 @@ export function RunView({
   onCancel: (run: RunRecord) => void;
   onCreateRun: (input: CreateRunInput) => Promise<boolean>;
   onActionError: (message: string, correlationId?: string | null) => void;
+  onReconnect: () => void;
 }) {
   const selected = runs.find((r) => r.runId === selectedRunId) ?? null;
   const [approval, setApproval] = useState<{ request: ApprovalRequest } | null>(null);
@@ -80,6 +82,7 @@ export function RunView({
           open={newRunOpen}
           onClose={() => setNewRunOpen(false)}
           environments={environments}
+          transport={transport}
           onCreateRun={onCreateRun}
         />
       </div>
@@ -154,7 +157,14 @@ export function RunView({
 
             {connection === "stale" && (
               <Banner tone="warn" title="Event stream stale — reconnecting from the last acknowledged cursor" role="alert">
-                Status shown may be behind. Events resume from cursor {cursor}; no duplicates will be introduced.
+                Status shown may be behind. Events resume from cursor {cursor}; no duplicates will be introduced.{" "}
+                <button
+                  type="button"
+                  onClick={() => onReconnect()}
+                  className="underline underline-offset-2"
+                >
+                  Reconnect now
+                </button>
               </Banner>
             )}
             {connection === "reconnecting" && (
@@ -236,6 +246,7 @@ export function RunView({
         open={newRunOpen}
         onClose={() => setNewRunOpen(false)}
         environments={environments}
+        transport={transport}
         onCreateRun={onCreateRun}
       />
 
@@ -283,31 +294,38 @@ function BudgetBar({ label, used, ceiling, unit }: { label: string; used: number
   );
 }
 
-/** Model profiles offered by the control plane. The id is the AUTHORITATIVE
- *  trusted-plane model reference ("model-profile"); the Luna label reflects
- *  the configured planner (openai-codex/gpt-5.6-luna via subscription). */
+/** Fallback model profiles when /run-options is unavailable. The id is the
+ *  AUTHORITATIVE trusted-plane model reference ("model-profile"); the Luna
+ *  label reflects the configured planner (openai-codex/gpt-5.6-luna). */
 export const MODEL_PROFILES = [
-  { id: "model-profile", label: "GPT-5.6 Luna (subscription)" },
+  { ref: { id: "model-profile", version: "1", sha256: "" }, label: "GPT-5.6 Luna (subscription)" },
 ];
+
+const BUDGET_FALLBACK = { modelTokens: 4000, toolCalls: 32, wallTimeSeconds: 90 };
 
 function NewRunDialog({
   open,
   onClose,
   environments,
+  transport,
   onCreateRun,
 }: {
   open: boolean;
   onClose: () => void;
   environments: EnvironmentPackageSummary[];
+  transport: ConsoleTransport;
   onCreateRun: (input: CreateRunInput) => Promise<boolean>;
 }) {
   const [goal, setGoal] = useState("");
   const [environmentId, setEnvironmentId] = useState("");
-  const [modelProfile, setModelProfile] = useState(MODEL_PROFILES[0].id);
+  const [taskId, setTaskId] = useState("");
+  const [tasks, setTasks] = useState<TaskOption[]>([]);
+  const [modelProfile, setModelProfile] = useState(MODEL_PROFILES[0].label);
+  const [modelProfiles, setModelProfiles] = useState<Array<{ ref: { id: string; version: string; sha256: string }; label: string }>>(MODEL_PROFILES);
   const [executionMode, setExecutionMode] = useState<CreateRunInput["executionMode"]>("interactive");
-  const [toolCallCeiling, setToolCallCeiling] = useState("100");
-  const [wallSecondsCeiling, setWallSecondsCeiling] = useState("900");
-  const [modelTokenCeiling, setModelTokenCeiling] = useState("20000");
+  const [toolCallCeiling, setToolCallCeiling] = useState(String(BUDGET_FALLBACK.toolCalls));
+  const [wallSecondsCeiling, setWallSecondsCeiling] = useState(String(BUDGET_FALLBACK.wallTimeSeconds));
+  const [modelTokenCeiling, setModelTokenCeiling] = useState(String(BUDGET_FALLBACK.modelTokens));
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   // one idempotency key per dialog session: reused across recovery retries so a
   // transient failure can never produce a duplicate run
@@ -315,24 +333,75 @@ function NewRunDialog({
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const goalRef = useRef<HTMLTextAreaElement>(null);
+  // run-options defaults must never clobber operator edits that land while the
+  // options request is in flight
+  const budgetTouched = useRef(false);
 
   const selectedEnv = environments.find((e) => e.environmentId === environmentId);
-  // only modes the selected environment's manifest declares; when the summary
-  // does not project modes, all four remain selectable
-  const supportedModes = (
-    selectedEnv?.executionModes ?? ["dry_run", "interactive", "batch", "replay"]
-  ).filter((m): m is CreateRunInput["executionMode"] =>
+  const selectedTask = tasks.find((t) => t.taskId === taskId);
+  // mode support resolution: intersect the selected task's declared modes with
+  // the environment summary's modes when both are projected
+  const declared = selectedTask?.executionModes ?? selectedEnv?.executionModes ?? ["dry_run", "interactive", "batch", "replay"];
+  const envModes = selectedEnv?.executionModes;
+  const modeSource = envModes ? declared.filter((m) => envModes.includes(m)) : declared;
+  const supportedModes = (modeSource.length > 0 ? modeSource : declared).filter((m): m is CreateRunInput["executionMode"] =>
     ["dry_run", "interactive", "batch", "replay"].includes(m),
   );
 
   useEffect(() => {
-    if (open) {
-      setEnvironmentId((prev) => prev || environments[0]?.environmentId || "");
-      // focus the goal field: it is the only decision the operator must make
-      const t = setTimeout(() => goalRef.current?.focus(), 30);
-      return () => clearTimeout(t);
-    }
-  }, [open, environments]);
+    if (!open) return;
+    setEnvironmentId((prev) => prev || environments[0]?.environmentId || "");
+    let cancelled = false;
+    // authoritative model profiles and bounded budget defaults from the API
+    transport
+      .getRunOptions()
+      .then((options) => {
+        if (cancelled) return;
+        if (options.modelProfiles.length > 0 && modelProfile === MODEL_PROFILES[0].label) {
+          setModelProfiles(options.modelProfiles.map((p) => ({ ref: p.ref, label: p.label })));
+          setModelProfile(options.modelProfiles[0].label);
+        }
+        if (!budgetTouched.current) {
+          setToolCallCeiling(String(options.budgetDefaults.toolCalls));
+          setWallSecondsCeiling(String(options.budgetDefaults.wallTimeSeconds));
+          setModelTokenCeiling(String(options.budgetDefaults.modelTokens));
+        }
+      })
+      .catch(() => {
+        /* fallback constants remain; never block the dialog on this */
+      });
+    // the Modal's initial-focus handler places focus on the first field (the
+    // goal textarea); no aggressive polling that could steal focus mid-typing
+    return () => {
+      cancelled = true;
+    };
+  }, [open, environments, transport]);
+
+  // registered tasks for the selected environment; durable runs must match one
+  useEffect(() => {
+    if (!open || !environmentId) return;
+    let cancelled = false;
+    setTaskId("");
+    setTasks([]);
+    transport
+      .getEnvironmentTasks(environmentId)
+      .then((registered) => {
+        if (!cancelled) {
+          setTasks(registered);
+          // registered tasks are required when the environment declares them
+          if (registered.length > 0) {
+            setTaskId((prev) => prev || registered[0].taskId);
+            setGoal((prev) => prev || registered[0].goal);
+          }
+        }
+      })
+      .catch(() => {
+        /* free-form goal remains available when the environment has no tasks */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, environmentId, transport]);
 
   // keep the chosen mode within the environment's declared modes
   useEffect(() => {
@@ -346,6 +415,7 @@ function NewRunDialog({
     const errors: Record<string, string> = {};
     if (!goal.trim()) errors.goal = "Goal is required";
     if (!environmentId) errors.environmentId = "Environment is required";
+    if (tasks.length > 0 && !taskId) errors.taskId = "A registered task is required for this environment";
     if (!modelProfile.trim()) errors.modelProfile = "Model profile is required";
     const calls = Number(toolCallCeiling);
     if (!Number.isFinite(calls) || calls <= 0) errors.toolCallCeiling = "Tool-call ceiling must be a positive number";
@@ -365,7 +435,9 @@ function NewRunDialog({
     const ok = await onCreateRun({
       environmentId,
       goal: goal.trim(),
-      modelProfile: modelProfile.trim(),
+      taskId: taskId || undefined,
+      modelProfileRef: modelProfiles.find((p) => p.label === modelProfile)?.ref,
+      modelProfile: modelProfile,
       // same key across recovery retries within this dialog session
       idempotencyKey,
       budget: {
@@ -436,28 +508,54 @@ function NewRunDialog({
               onChange={(e) => setModelProfile(e.target.value)}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
             >
-              {MODEL_PROFILES.map((profile) => (
-                <option key={profile.id} value={profile.id}>{profile.label}</option>
+              {modelProfiles.map((profile) => (
+                <option key={profile.label} value={profile.label}>{profile.label}</option>
               ))}
             </select>
           </div>
         </div>
+        {tasks.length > 0 && (
+          <div>
+            <label htmlFor="newrun-task" className="block text-xs font-medium text-slate-400">Registered task (required)</label>
+            <select
+              id="newrun-task"
+              value={taskId}
+              onChange={(e) => {
+                setTaskId(e.target.value);
+                const chosen = tasks.find((t) => t.taskId === e.target.value);
+                if (chosen) setGoal(chosen.goal);
+              }}
+              aria-describedby={taskId ? undefined : "newrun-task-hint"}
+              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
+            >
+              {tasks.map((task) => (
+                <option key={task.taskId} value={task.taskId}>{task.goal}</option>
+              ))}
+            </select>
+            {/* free-form goals are not accepted by the durable runtime yet */}
+            {fieldErrors.taskId && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.taskId}</p>}
+            <p id="newrun-task-hint" className="mt-1 text-[11px] text-slate-500">
+              This environment has registered tasks; the control plane currently requires one of them — free-form
+              goals are disabled until arbitrary task registration ships.
+            </p>
+          </div>
+        )}
         <div className="grid gap-3 sm:grid-cols-3">
           <div>
             <label htmlFor="newrun-calls" className="block text-xs font-medium text-slate-400">Tool-call limit</label>
-            <input id="newrun-calls" type="number" min="1" value={toolCallCeiling} onChange={(e) => setToolCallCeiling(e.target.value)}
+            <input id="newrun-calls" type="number" min="1" value={toolCallCeiling} onChange={(e) => { budgetTouched.current = true; setToolCallCeiling(e.target.value); }}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
             {fieldErrors.toolCallCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.toolCallCeiling}</p>}
           </div>
           <div>
             <label htmlFor="newrun-wall" className="block text-xs font-medium text-slate-400">Time limit (s)</label>
-            <input id="newrun-wall" type="number" min="1" value={wallSecondsCeiling} onChange={(e) => setWallSecondsCeiling(e.target.value)}
+            <input id="newrun-wall" type="number" min="1" value={wallSecondsCeiling} onChange={(e) => { budgetTouched.current = true; setWallSecondsCeiling(e.target.value); }}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
             {fieldErrors.wallSecondsCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.wallSecondsCeiling}</p>}
           </div>
           <div>
             <label htmlFor="newrun-tokens" className="block text-xs font-medium text-slate-400">Token budget</label>
-            <input id="newrun-tokens" type="number" min="1" value={modelTokenCeiling} onChange={(e) => setModelTokenCeiling(e.target.value)}
+            <input id="newrun-tokens" type="number" min="1" value={modelTokenCeiling} onChange={(e) => { budgetTouched.current = true; setModelTokenCeiling(e.target.value); }}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
             {fieldErrors.modelTokenCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.modelTokenCeiling}</p>}
           </div>
