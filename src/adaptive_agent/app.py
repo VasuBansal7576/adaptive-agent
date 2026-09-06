@@ -1705,6 +1705,70 @@ class DurableRuntime:
                 return trusted_result
         return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
 
+    def _prepare_launch_identity(self, run_id: str, stored: Mapping[str, Any], run_record: Any, arm: str, seed: int, bundle_hash: str | None) -> tuple[str, int, str]:
+        """Bind ordinary launches to the persisted immutable run bundle."""
+        try:
+            artifact = self.controller.store.get_artifact(run_record.skill_bundle_ref)
+            from adaptive_agent.models import SkillBundle
+            pinned_bundle = SkillBundle.model_validate(artifact)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LearningRuntimeError("run skill bundle is missing or malformed") from exc
+        pinned_hash = pinned_bundle.content_hash
+        if stored.get("bundle_hash") != pinned_hash:
+            raise LearningRuntimeError("run skill bundle hash does not match its persisted content")
+        if bundle_hash is not None and bundle_hash != pinned_hash:
+            raise LearningRuntimeError("launch bundle hash does not match the persisted run bundle")
+        try:
+            payload = json.loads(stored.get("run_json", "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LearningRuntimeError("run identity is malformed") from exc
+        if not isinstance(payload, dict):
+            raise LearningRuntimeError("run identity is malformed")
+        if arm == "B0" and isinstance(payload.get("arm"), str):
+            arm = payload["arm"]
+        if seed == 0 and isinstance(payload.get("seed"), int) and not isinstance(payload.get("seed"), bool):
+            seed = payload["seed"]
+        resolved_hash = bundle_hash or pinned_hash
+        payload.update({"arm": arm, "seed": seed, "bundleHash": resolved_hash})
+        row = dict(stored)
+        row["run_json"] = json.dumps(payload, sort_keys=True)
+        self.controller.store.save_run(run_id, {key: value for key, value in row.items() if key != "run_id"})
+        return arm, seed, resolved_hash
+
+    def _bind_terminal_accounting(self, run_id: str, execution_started: float) -> None:
+        """Persist one terminal receipt for ordinary runtime launches."""
+        stored = self.controller.store.get_run(run_id)
+        if stored is None:
+            return
+        try:
+            run_payload = json.loads(stored.get("run_json", "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if isinstance(run_payload, dict) and isinstance(run_payload.get("finalAccountingRef"), str):
+            return
+        rows = self.controller.store.list_evidence(run_id)
+        models = [row for row in rows if row.get("event_type") == "model_response"]
+        if not models:
+            return
+        try:
+            model = self.controller.store.get_artifact(json.loads(models[-1]["source_ref"])["sha256"])
+            source = model.get("accountingRef") if isinstance(model, Mapping) else None
+            source_ref = source.get("sha256") if isinstance(source, Mapping) else None
+            accounting = self.controller.store.get_artifact(source_ref) if isinstance(source_ref, str) else None
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(accounting, Mapping):
+            return
+        final = dict(accounting)
+        final["toolCalls"] = sum(row.get("event_type") == "tool_result" for row in rows)
+        final["durationSeconds"] = max(float(accounting.get("durationSeconds", 0) or 0), time.monotonic() - execution_started)
+        final["inferenceDurationSeconds"] = float(accounting.get("inferenceDurationSeconds", 0) or 0)
+        ref = self.controller.store.put_artifact(final).sha256
+        run_payload["finalAccountingRef"] = ref
+        row = dict(stored)
+        row["run_json"] = json.dumps(run_payload, sort_keys=True)
+        self.controller.store.save_run(run_id, {key: value for key, value in row.items() if key != "run_id"})
+
     def _durable_evaluator_evidence(self, run_id: str) -> list[dict[str, Any]]:
         """Return immutable model/kernel event payloads to the trusted evaluator."""
         events: list[dict[str, Any]] = []
@@ -1809,6 +1873,8 @@ class DurableRuntime:
             max_cost = int(budget_data.get("costMicrounits", 100000))
             if max_tokens <= 0 or max_cost <= 0 or wall_seconds <= 0:
                 raise RuntimeError("model, cost, and wall-time budgets must be positive before dispatch")
+        arm, seed, bundle_hash = self._prepare_launch_identity(run_id, stored, run_record, arm, seed, bundle_hash)
+        execution_started = time.monotonic()
         claimed, current = self._claim_run(run_id)
         if current is None:
             raise KeyError("run not found")
@@ -1848,6 +1914,7 @@ class DurableRuntime:
                 close = getattr(provider, "close", None)
                 if callable(close):
                     close()
+                self._bind_terminal_accounting(run_id, execution_started)
             self._cancel_events.pop(run_id, None)
             self._run_started_at.pop(run_id, None)
             self._run_last_receipt_at.pop(run_id, None)
@@ -1913,6 +1980,7 @@ class DurableRuntime:
             self._cancel_events.pop(run_id, None)
             self._run_started_at.pop(run_id, None)
             self._run_last_receipt_at.pop(run_id, None)
+            self._bind_terminal_accounting(run_id, execution_started)
             if prime is not None:
                 prime.close(remove_workspace=True)
             return
@@ -1988,6 +2056,7 @@ class DurableRuntime:
                 close()
             if prime is not None:
                 prime.close(remove_workspace=True)
+            self._bind_terminal_accounting(run_id, execution_started)
             self._cancel_events.pop(run_id, None)
             self._run_started_at.pop(run_id, None)
             self._run_last_receipt_at.pop(run_id, None)
