@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { createSimulationTransport } from "../api/simulation";
+import type { ConsoleTransport } from "../api/transport";
 import { normalizeSseEvent, SchemaError } from "../api/validate";
 
 beforeEach(() => {
@@ -145,6 +146,20 @@ describe("run-options and registered tasks in the new-run dialog", () => {
     await waitFor(() => expect(within(dialog).getByLabelText("Tool-call limit")).toHaveValue(32));
     await waitFor(() => expect(within(dialog).getByLabelText("Time limit (s)")).toHaveValue(90));
     await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000));
+  });
+
+  it("consumes executionModes advertised on environment summaries (51d476c)", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const envs = await sim.listEnvironments();
+    envs[0].executionModes = ["dry_run"];
+    const transport: ConsoleTransport = { ...sim, listEnvironments: async () => envs };
+    render(<App transport={transport} />);
+    await screen.findAllByRole("button", { name: /run-sim-1001/ });
+    await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
+    const dialog = await screen.findByRole("dialog", { name: "Create run" });
+    await waitFor(() => expect(within(dialog).getByLabelText("Mode")).toHaveValue("dry_run"));
+    expect(within(within(dialog).getByLabelText("Mode")).getAllByRole("option")).toHaveLength(1);
   });
 
   it("accepts the top-level budgetRef from /run-options (01f2462 shape)", async () => {

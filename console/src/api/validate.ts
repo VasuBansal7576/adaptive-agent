@@ -360,6 +360,14 @@ export function parseEnvironments(value: unknown): EnvironmentPackageSummary[] {
     if (o.missingFields !== undefined) {
       env.missingFields = arr(o.missingFields, `environments[${i}].missingFields`).map((f) => str(f, "missingFields[]"));
     }
+    // advertised by the durable runtime (51d476c): the console mode filter
+    // consumes these instead of offering undeclared modes
+    if (o.executionModes !== undefined) {
+      env.executionModes = arr(o.executionModes, `environments[${i}].executionModes`).map((m) => str(m, `environments[${i}].executionModes[]`));
+    }
+    if (o.capabilities !== undefined) {
+      env.capabilities = arr(o.capabilities, `environments[${i}].capabilities`).map((c) => str(c, `environments[${i}].capabilities[]`));
+    }
     return env;
   });
 }

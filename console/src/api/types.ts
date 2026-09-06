@@ -140,6 +140,8 @@ export type EnvironmentPackageSummary = {
   policyScope: string;
   /** declared execution modes projected from the manifest (optional) */
   executionModes?: string[];
+  /** manifest capability metadata projected for the operator (optional) */
+  capabilities?: string[];
   missingFields?: string[];
 };
 
