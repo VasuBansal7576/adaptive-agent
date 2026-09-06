@@ -229,6 +229,19 @@ class LearningRuntime:
             content = f"Broker development observation: eventType={event['event_type']}; details={canonical_json(safe)}"
             record = {"kind": "live_evidence", "sourceId": event["evidence_id"], "content": content, "contentHash": content_hash(content), "sourceContentHash": event["content_hash"], "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": event.get("trust_class", "broker"), "trustedOutcome": True, "outcomePassed": outcome_passed}
             persist(f"learning-evidence-{event['evidence_id']}", record)
+        # A run may already contain the narrow broker projection written by a
+        # prior process.  Reuse those immutable records on restart when the
+        # source event rows are no longer available as raw tool_result rows.
+        if not any(record.get("kind") == "live_evidence" for record in raw_records):
+            existing_reader = getattr(self.store, "list_learning_records", None)
+            existing = existing_reader(environment_id=environment_id, run_id=run_id) if callable(existing_reader) else ()
+            for record in existing:
+                if not isinstance(record, Mapping) or record.get("kind") != "live_evidence":
+                    continue
+                source_id = record.get("sourceId")
+                if not isinstance(source_id, str) or not source_id.startswith("broker:"):
+                    continue
+                persist(f"learning-evidence-{source_id}", record)
         outcome_content = f"A trusted evaluator outcome is recorded for this completed development run; passed={str(outcome_passed).lower()}."
         outcome_record = {"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": outcome_content, "contentHash": content_hash(outcome_content), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True, "outcomePassed": outcome_passed}
         persist(f"learning-outcome-{run_id}", outcome_record)
