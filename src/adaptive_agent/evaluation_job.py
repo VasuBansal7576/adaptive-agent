@@ -108,6 +108,9 @@ class EvaluationJob:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS evaluation_lifecycle_bindings (job_id TEXT PRIMARY KEY, binding_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS evaluation_lifecycle_subcalls (admission_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, stage TEXT NOT NULL, cell_key TEXT NOT NULL, subcall_key TEXT NOT NULL, status TEXT NOT NULL, estimated_input_tokens INTEGER NOT NULL, estimated_output_tokens INTEGER NOT NULL, estimated_tool_calls INTEGER NOT NULL, estimated_wall_micros INTEGER NOT NULL, estimated_cost_microunits INTEGER NOT NULL, result_json TEXT NOT NULL DEFAULT '{}', error TEXT, updated_at TEXT NOT NULL, UNIQUE(job_id, stage, cell_key, subcall_key))"
+            )
             conn.commit()
 
     def _lifecycle_budget(self, job_id: str, limits: Mapping[str, int]) -> None:
@@ -215,7 +218,67 @@ class EvaluationJob:
             row = conn.execute("SELECT * FROM evaluation_lifecycle_budget WHERE job_id = ?", (job_id,)).fetchone()
         if row is None:
             return {}
-        return {"attempts": row["attempts"], "inputTokens": row["input_tokens"], "outputTokens": row["output_tokens"], "toolCalls": row["tool_calls"], "wallSeconds": row["wall_micros"] / 1_000_000, "costMicrounits": row["cost_microunits"], "blocked": bool(row["blocked"]), "maxAttempts": row["max_attempts"], "maxInputTokens": row["max_input_tokens"], "maxOutputTokens": row["max_output_tokens"], "maxToolCalls": row["max_tool_calls"], "maxWallSeconds": row["max_wall_micros"] / 1_000_000, "maxCostMicrounits": row["max_cost_microunits"]}
+        with self.store.connect() as conn:
+            subcalls = conn.execute("SELECT COUNT(*) AS count FROM evaluation_lifecycle_subcalls WHERE job_id = ?", (job_id,)).fetchone()["count"]
+        return {"attempts": row["attempts"], "subcalls": subcalls, "inputTokens": row["input_tokens"], "outputTokens": row["output_tokens"], "toolCalls": row["tool_calls"], "wallSeconds": row["wall_micros"] / 1_000_000, "costMicrounits": row["cost_microunits"], "blocked": bool(row["blocked"]), "maxAttempts": row["max_attempts"], "maxInputTokens": row["max_input_tokens"], "maxOutputTokens": row["max_output_tokens"], "maxToolCalls": row["max_tool_calls"], "maxWallSeconds": row["max_wall_micros"] / 1_000_000, "maxCostMicrounits": row["max_cost_microunits"]}
+
+    def admit_lifecycle_subcall(self, job_id: str, stage: str, cell_key: str, subcall_key: str, *, estimated_input_tokens: int = 0, estimated_output_tokens: int = 0, estimated_tool_calls: int = 1, estimated_wall_seconds: float = 0.0, estimated_cost_microunits: int = 0) -> dict[str, Any]:
+        """Reserve one nested runtime call before dispatch, atomically."""
+        values = (estimated_input_tokens, estimated_output_tokens, estimated_tool_calls, estimated_cost_microunits)
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values) or not isinstance(estimated_wall_seconds, (int, float)) or isinstance(estimated_wall_seconds, bool) or not math.isfinite(estimated_wall_seconds) or estimated_wall_seconds < 0:
+            raise EvaluationError("subcall admission estimates are malformed")
+        admission_id = f"{job_id}:{stage}:{cell_key}:{subcall_key}"
+        with self.store.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM evaluation_lifecycle_subcalls WHERE job_id = ? AND stage = ? AND cell_key = ? AND subcall_key = ?", (job_id, stage, cell_key, subcall_key)).fetchone()
+            if existing is not None:
+                conn.commit()
+                return {"admissionId": existing["admission_id"], "status": existing["status"], "reused": True}
+            budget = conn.execute("SELECT * FROM evaluation_lifecycle_budget WHERE job_id = ?", (job_id,)).fetchone()
+            if budget is None:
+                conn.rollback()
+                raise EvaluationError("lifecycle budget is not initialized")
+            reserved = conn.execute("SELECT COALESCE(SUM(estimated_input_tokens), 0) AS input, COALESCE(SUM(estimated_output_tokens), 0) AS output, COALESCE(SUM(estimated_tool_calls), 0) AS tools, COALESCE(SUM(estimated_wall_micros), 0) AS wall, COALESCE(SUM(estimated_cost_microunits), 0) AS cost FROM evaluation_lifecycle_subcalls WHERE job_id = ? AND status = 'reserved'", (job_id,)).fetchone()
+            estimates = (estimated_input_tokens, estimated_output_tokens, estimated_tool_calls, int(estimated_wall_seconds * 1_000_000), estimated_cost_microunits)
+            totals = (budget["input_tokens"] + reserved["input"] + estimates[0], budget["output_tokens"] + reserved["output"] + estimates[1], budget["tool_calls"] + reserved["tools"] + estimates[2], budget["wall_micros"] + reserved["wall"] + estimates[3], budget["cost_microunits"] + reserved["cost"] + estimates[4])
+            caps = (budget["max_input_tokens"], budget["max_output_tokens"], budget["max_tool_calls"], budget["max_wall_micros"], budget["max_cost_microunits"])
+            if budget["blocked"] or any(total > cap for total, cap in zip(totals, caps)):
+                conn.execute("UPDATE evaluation_lifecycle_budget SET blocked = 1, updated_at = datetime('now') WHERE job_id = ?", (job_id,))
+                conn.commit()
+                raise EvaluationError("lifecycle subcall budget exhausted")
+            conn.execute("INSERT INTO evaluation_lifecycle_subcalls(admission_id, job_id, stage, cell_key, subcall_key, status, estimated_input_tokens, estimated_output_tokens, estimated_tool_calls, estimated_wall_micros, estimated_cost_microunits, updated_at) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, datetime('now'))", (admission_id, job_id, stage, cell_key, subcall_key, *estimates))
+            conn.commit()
+        return {"admissionId": admission_id, "status": "reserved", "reused": False}
+
+    def record_lifecycle_subcall(self, admission_id: str, *, result: Mapping[str, Any] | None = None, error: str | None = None) -> dict[str, Any]:
+        """Persist nested-call receipt exactly once, including failed usage."""
+        payload = dict(result or {})
+        with self.store.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM evaluation_lifecycle_subcalls WHERE admission_id = ?", (admission_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                raise EvaluationError("unknown lifecycle subcall admission")
+            if row["status"] in {"complete", "failed"}:
+                conn.commit()
+                return {"admissionId": admission_id, "status": row["status"], "reused": True}
+            usage = payload.get("usage")
+            malformed = not isinstance(usage, Mapping) or any(not isinstance(usage.get(key), int) or isinstance(usage.get(key), bool) or usage[key] < 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]
+            cost = payload.get("costMicrounits")
+            unknown_cost = cost is None and payload.get("economicCostStatus") == "unknown"
+            tool_calls = payload.get("toolCalls", 0)
+            wall_seconds = payload.get("wallSeconds", 0)
+            malformed = malformed or not isinstance(tool_calls, int) or isinstance(tool_calls, bool) or tool_calls < 0 or isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float)) or not math.isfinite(wall_seconds) or wall_seconds < 0 or (cost is None and not unknown_cost) or (cost is not None and (isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0))
+            if malformed:
+                conn.execute("UPDATE evaluation_lifecycle_subcalls SET status = 'failed', error = ?, updated_at = datetime('now') WHERE admission_id = ?", (error or "malformed subcall accounting", admission_id))
+                conn.commit()
+                raise EvaluationError("lifecycle subcall accounting is malformed")
+            status = "failed" if error else "complete"
+            cost_value = int(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else 0
+            conn.execute("UPDATE evaluation_lifecycle_subcalls SET status = ?, result_json = ?, error = ?, updated_at = datetime('now') WHERE admission_id = ?", (status, json.dumps(payload, sort_keys=True, default=str), error, admission_id))
+            conn.execute("UPDATE evaluation_lifecycle_budget SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, tool_calls = tool_calls + ?, wall_micros = wall_micros + ?, cost_microunits = cost_microunits + ?, blocked = CASE WHEN ? THEN 1 ELSE blocked END, updated_at = datetime('now') WHERE job_id = ?", (usage["inputTokens"], usage["outputTokens"], tool_calls, int(float(wall_seconds or 0) * 1_000_000), cost_value, unknown_cost, row["job_id"]))
+            conn.commit()
+        return {"admissionId": admission_id, "status": status, "reused": False}
 
     def run_experiment(self, job_id: str, stages: Sequence[LifecycleStage], *, limits: Mapping[str, int] | None = None, context: Mapping[str, Any] | None = None) -> EvaluationJobResult:
         """Run the complete ordered lifecycle with durable per-cell resume.
@@ -293,7 +356,14 @@ class EvaluationJob:
                                 self._validate_lifecycle_receipt(stage.name, cell_key, prior[1])
                                 result = prior[1]
                                 break
-                            result = stage.callback(cell_key, {**state, "stage": stage.name, "attempt": attempt})
+                            callback_context = {
+                                **state,
+                                "stage": stage.name,
+                                "attempt": attempt,
+                                "admitSubcall": lambda subcall_key, **estimates: self.admit_lifecycle_subcall(job_id, stage.name, cell_key, subcall_key, **estimates),
+                                "recordSubcall": self.record_lifecycle_subcall,
+                            }
+                            result = stage.callback(cell_key, callback_context)
                             if not isinstance(result, Mapping):
                                 raise EvaluationError("lifecycle callback must return an object")
                             self._validate_lifecycle_receipt(stage.name, cell_key, result)
