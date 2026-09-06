@@ -125,8 +125,18 @@ class AppWorldRuntimeManifest:
             "datasetSha256": self.dataset_sha256,
             "splitCounts": dict(self.split_counts),
             "splitIds": {name: list(ids) for name, ids in self.split_ids.items()},
-            "testGroundTruthLoaded": False,
-            "taskReportsLoaded": False,
+            "catalog": {
+                "publicTaskSpecsLoaded": True,
+                "testTaskSpecsLoaded": False,
+                "groundTruthLoaded": False,
+                "taskReportsLoaded": False,
+            },
+            "isolatedEvaluator": {
+                "groundTruthLoaded": True,
+                "groundTruthMode": "minimal",
+                "groundTruthVisibility": "evaluator_only",
+                "taskReportsLoaded": False,
+            },
         }
 
 

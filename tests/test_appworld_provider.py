@@ -54,7 +54,21 @@ def test_catalog_reads_exact_public_split_ids_and_seals_test(tmp_path: Path):
     root = _public_root(tmp_path)
     catalog = AppWorldCatalog(AppWorldConfig(root, python=sys.executable))
     assert catalog.split_ids("train") == ("train-1",)
-    assert catalog.runtime_manifest().split_counts == {"train": 1, "dev": 1, "test_normal": 1, "test_challenge": 1}
+    manifest = catalog.runtime_manifest().to_dict()
+    assert manifest["splitCounts"] == {"train": 1, "dev": 1, "test_normal": 1, "test_challenge": 1}
+    assert manifest["catalog"] == {
+        "publicTaskSpecsLoaded": True,
+        "testTaskSpecsLoaded": False,
+        "groundTruthLoaded": False,
+        "taskReportsLoaded": False,
+    }
+    assert manifest["isolatedEvaluator"] == {
+        "groundTruthLoaded": True,
+        "groundTruthMode": "minimal",
+        "groundTruthVisibility": "evaluator_only",
+        "taskReportsLoaded": False,
+    }
+    assert "testGroundTruthLoaded" not in manifest
     assert catalog.task("train-1", "train").instruction == "read the clock"
     with pytest.raises(AppWorldError, match="sealed"):
         catalog.task("test-1", "test_normal")
