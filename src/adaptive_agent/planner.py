@@ -519,7 +519,17 @@ class LunaPlanner:
                 return PlannerResult("timed_out", None, turn, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
             kernel_steps += 1
             publish("execute", "Generated Python submitted to Prime kernel.")
-            result = self.kernel.execute(value, timeout=min(remaining_after_model, self.limits.max_wall_seconds), cancel=cancel)
+            try:
+                result = self.kernel.execute(value, timeout=min(remaining_after_model, self.limits.max_wall_seconds), cancel=cancel)
+            except Exception as exc:
+                # Policy and kernel boundary errors are model feedback.  Keep
+                # the authenticated conversation alive so Luna can revise the
+                # generated cell instead of converting a recoverable mistake
+                # into a failed control-plane run.
+                feedback = self._sanitize_execution(type("KernelError", (), {"status": "error", "error": str(exc), "result": None, "stdout": "", "stderr": ""})())
+                messages.append({"role": "user", "content": "Prime execution feedback:\n" + feedback})
+                publish("kernel", "Prime execution rejected; feedback returned to planner.", feedback)
+                continue
             status = getattr(result, "status", "error")
             feedback = self._sanitize_execution(result)
             messages.append({"role": "user", "content": "Prime execution feedback:\n" + feedback})

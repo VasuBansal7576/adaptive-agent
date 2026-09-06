@@ -118,6 +118,15 @@ class EnvironmentFormRegistration(ApiModel):
         )
 
 
+class BudgetRequest(ApiModel):
+    model_tokens: int = Field(alias="modelTokens", ge=0)
+    tool_calls: int = Field(alias="toolCalls", ge=0)
+    child_runs: int = Field(alias="childRuns", ge=0)
+    wall_time_seconds: int = Field(alias="wallTimeSeconds", ge=0)
+    cost_microunits: int = Field(alias="costMicrounits", ge=0)
+    currency: str = Field("USD", min_length=1)
+
+
 class CreateRunRequest(ApiModel):
     # The console may send the convenient goal/environment projection, while
     # external clients can submit the canonical SPEC task reference.
@@ -128,6 +137,8 @@ class CreateRunRequest(ApiModel):
     budget_ref: JsonObject | None = Field(default=None, alias="budgetRef")
     idempotency_key: str = Field(alias="idempotencyKey", min_length=1, max_length=256)
     execution_mode: str = Field("interactive", alias="executionMode")
+    active_skill_refs: list[JsonObject] = Field(default_factory=list, alias="activeSkillRefs")
+    budget: BudgetRequest | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -145,10 +156,17 @@ class CreateRunRequest(ApiModel):
                     env = task["environmentRef"].get("id")
                 if isinstance(env, str):
                     normalized["environmentId"] = env
+        task_has_identity = isinstance(task, dict) and isinstance(task.get("id"), str) and isinstance(task.get("sha256"), str)
         if not isinstance(normalized.get("goal"), str) or not normalized["goal"].strip():
-            raise ValueError("goal or taskRef.goal is required")
+            if task_has_identity:
+                normalized["goal"] = None
+            else:
+                raise ValueError("goal or taskRef.goal is required")
         if not isinstance(normalized.get("environmentId"), str) or not normalized["environmentId"].strip():
-            raise ValueError("environmentId or taskRef.environmentId is required")
+            if task_has_identity:
+                normalized["environmentId"] = None
+            else:
+                raise ValueError("environmentId or taskRef.environmentId is required")
         return normalized
 
 
@@ -453,7 +471,7 @@ class ControlPlane:
             summary = {
                 "environmentId": payload.environment_id,
                 "version": payload.version,
-                "validationState": "ready",
+                "validationState": "valid",
                 "evaluatorReady": True,
                 "toolCount": len(payload.tool_schemas),
                 "policyScope": str(payload.policy_ref.get("id", "")),
@@ -660,6 +678,28 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
             return runtime.list_environments()
         return plane.list_environments()
 
+    @app.get("/environments/{environment_id}/tasks")
+    def environment_tasks(environment_id: str) -> list[JsonObject]:
+        if runtime is not None:
+            return runtime.list_tasks(environment_id)
+        return []
+
+    @app.get("/run-options")
+    def run_options() -> JsonObject:
+        """Return the registered model profile and bounded budget controls."""
+        model = plane.default_model_ref
+        return {
+            "modelProfiles": [{"ref": model, "label": "Luna", "provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna"}],
+            "budgetDefaults": {
+                "modelTokens": 4000,
+                "toolCalls": 32,
+                "childRuns": 0,
+                "wallTimeSeconds": 90,
+                "costMicrounits": 100000,
+                "currency": "USD",
+            },
+        }
+
     @app.post("/environments/validate")
     async def validate_environment(request: Request) -> JsonObject:
         """Validate the browser's registration form without registering it.
@@ -845,6 +885,11 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
 
     @app.post("/runs/{run_id}/approvals/{approval_id}")
     def submit_approval(run_id: str, approval_id: str, payload: ApprovalRequest) -> JsonObject:
+        if runtime is not None:
+            try:
+                return runtime.submit_approval(run_id, approval_id, payload.approve)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
         with plane._lock:
             if run_id not in plane.runs:
                 raise HTTPException(status_code=404, detail="run not found")

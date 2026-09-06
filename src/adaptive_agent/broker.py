@@ -175,6 +175,11 @@ class ToolBroker:
         self.store = store
         self.registry = registry
 
+    def _error_result(self, call_id: str, tool_version: str, error: ToolError) -> ToolResult:
+        result = _error_result(call_id, tool_version, error)
+        evidence_ref = self.store.put_artifact(result.model_dump(mode="json", by_alias=True))
+        return result.model_copy(update={"broker_evidence_ref": evidence_ref})
+
     # ------------------------------------------------------------------ approvals
     def issue_approval(
         self,
@@ -211,7 +216,7 @@ class ToolBroker:
         """Validate, authorize, and dispatch (or replay) a tool call."""
         schema = self.registry.get_tool_schema(env_id, request.tool)
         if schema is None:
-            return _error_result(
+            return self._error_result(
                 request.call_id,
                 "unknown",
                 ToolError(
@@ -224,13 +229,13 @@ class ToolBroker:
         # Capability: run/env/tool/effect/scope/expiry
         cap_err = capability.covers(env_id, request, schema)
         if cap_err is not None:
-            return _error_result(request.call_id, schema.version, cap_err)
+            return self._error_result(request.call_id, schema.version, cap_err)
 
         # Argument schema validation
         try:
             validate_arguments(schema, request.arguments)
         except SchemaValidationError as exc:
-            return _error_result(
+            return self._error_result(
                 request.call_id,
                 schema.version,
                 ToolError(
@@ -242,7 +247,7 @@ class ToolBroker:
 
         # Budget
         if budget_remaining is not None and budget_remaining.get("tool_calls", 0) <= 0:
-            return _error_result(
+            return self._error_result(
                 request.call_id,
                 schema.version,
                 ToolError(
@@ -258,7 +263,7 @@ class ToolBroker:
         existing = self.store.get_tool_call_by_idempotency(request.run_id, request.idempotency_key)
         if existing is not None:
             if existing["arguments_json"] != canonical_args or existing["tool"] != request.tool:
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -272,7 +277,7 @@ class ToolBroker:
                 return prior.model_copy(update={"call_id": request.call_id})
             # Prepared but unresolved: do not redispatch.
             if provider.effect(request.tool) == "write":
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -295,7 +300,7 @@ class ToolBroker:
         }
         if schema.effect == "write":
             if not request.approval_token:
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -313,7 +318,7 @@ class ToolBroker:
                 canonical_args,
             )
             if status == "conflict":
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -323,7 +328,7 @@ class ToolBroker:
                     ),
                 )
             if status != "ok":
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -342,7 +347,7 @@ class ToolBroker:
                 if existing and existing["result_json"]:
                     prior = ToolResult.model_validate_json(existing["result_json"])
                     return prior.model_copy(update={"call_id": request.call_id})
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(

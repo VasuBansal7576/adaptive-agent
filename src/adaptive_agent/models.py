@@ -122,6 +122,8 @@ class RunRequest(BaseModel):
     budget_ref: ArtifactRef = Field(..., alias="budgetRef")
     idempotency_key: str = Field(..., alias="idempotencyKey")
     parent_run_id: str | None = Field(None, alias="parentRunId")
+    execution_mode: str = Field("interactive", alias="executionMode")
+    active_skill_refs: list[ArtifactRef] = Field(default_factory=list, alias="activeSkillRefs")
 
 
 class ModelProfile(BaseModel):
@@ -217,6 +219,8 @@ class RunRecord(BaseModel):
     model_profile_ref: ArtifactRef = Field(..., alias="modelProfileRef")
     skill_bundle_ref: ArtifactRef = Field(..., alias="skillBundleRef")
     budget_ref: ArtifactRef = Field(..., alias="budgetRef")
+    execution_mode: str = Field("interactive", alias="executionMode")
+    active_skill_refs: list[ArtifactRef] = Field(default_factory=list, alias="activeSkillRefs")
     parent_run_id: str | None = Field(None, alias="parentRunId")
     status: RunStatus = RunStatus.queued
     last_event_sequence: int = Field(0, alias="lastEventSequence")

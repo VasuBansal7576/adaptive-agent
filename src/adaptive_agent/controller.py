@@ -131,6 +131,8 @@ class Controller:
             modelProfileRef=request.model_profile_ref,
             skillBundleRef=bundle_ref,
             budgetRef=request.budget_ref,
+            executionMode=request.execution_mode,
+            activeSkillRefs=request.active_skill_refs,
             parentRunId=request.parent_run_id,
             status=RunStatus.queued,
         )
@@ -211,12 +213,12 @@ class Controller:
         return step
 
     # ------------------------------------------------------------------ tool dispatch (broker-only)
-    def dispatch_tool(self, env_id: str, request: ToolRequest, capability: Capability, provider: ToolProvider) -> ToolResult:
+    def dispatch_tool(self, env_id: str, request: ToolRequest, capability: Capability, provider: ToolProvider, budget_remaining: dict[str, Any] | None = None) -> ToolResult:
         if request.approval_token is None and self.approval_provider is not None:
             schema = self.registry.get_tool_schema(env_id, request.tool)
             if schema is not None and schema.effect == "write":
                 request.approval_token = self.approval_provider(request)
-        return self.broker.request_tool_call(env_id, request, capability, provider)
+        return self.broker.request_tool_call(env_id, request, capability, provider, budget_remaining=budget_remaining)
 
     # ------------------------------------------------------------------ evidence / SSE
     def append_event(self, run_id: str, event_type: str, payload: dict[str, Any], trust_class: str, visibility: str) -> EvidenceRecord:
@@ -298,8 +300,15 @@ class Controller:
         return self.broker.reconcile_run(run_id, provider)
 
     # ------------------------------------------------------------------ execution loop
-    def execute_run(self, run_id: str, env_id: str, provider: ToolProvider, driver: RunDriver) -> RunRecord:
-        """Run lifecycle wrapper: running -> driver -> succeeded/failed.
+    def execute_run(
+        self,
+        run_id: str,
+        env_id: str,
+        provider: ToolProvider,
+        driver: RunDriver,
+        evaluate: Callable[[], Outcome] | None = None,
+    ) -> RunRecord:
+        """Run lifecycle wrapper: running -> driver -> evaluator-derived terminal state.
 
         The driver sees only a DriverContext; provider errors surface as
         OUTCOME_UNKNOWN evidence, never a crash of the control plane.
@@ -308,10 +317,24 @@ class Controller:
         ctx = DriverContext(self, run_id, env_id, provider)
         try:
             driver.act(ctx)
-            self._set_run_status(run_id, RunStatus.succeeded)
+            current = self.get_run(run_id)
+            if current is None or current.status == RunStatus.cancelled:
+                return current
+            if evaluate is None:
+                # Keep the low-level controller compatible with synthetic unit
+                # drivers.  Production runtimes pass an evaluator and therefore
+                # never infer success from driver completion.
+                self._set_run_status(run_id, RunStatus.succeeded)
+            else:
+                outcome = evaluate()
+                self.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
+                self._set_run_status(run_id, RunStatus.succeeded if outcome.passed else RunStatus.failed)
         except Exception as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             self.append_event(run_id, "run_failed", {"error": str(exc)}, "system", "operator")
-            self._set_run_status(run_id, RunStatus.failed)
+            if (current := self.get_run(run_id)) is not None and current.status != RunStatus.cancelled:
+                self._set_run_status(run_id, RunStatus.failed)
         return self.get_run(run_id)
 
     # ------------------------------------------------------------------ candidate/promotion seam
