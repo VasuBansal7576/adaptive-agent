@@ -90,6 +90,7 @@ class LifecycleStage:
 
 
 LIFECYCLE_STAGE_ORDER = ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final")
+LIFECYCLE_NESTED_SUBCALLS = {"learning": 1, "transfer": 2, "adaptation": 3}
 _LIFECYCLE_OPERATIONAL_CONTEXT_KEYS = frozenset({"resume"})
 
 
@@ -399,14 +400,24 @@ class EvaluationJob:
         if names != LIFECYCLE_STAGE_ORDER:
             raise EvaluationError(f"lifecycle stages must be ordered as {LIFECYCLE_STAGE_ORDER}")
         default_budget = self.protocol.run_budget
-        bound_limits = dict(limits or {
-            "attempts": sum(len(stage.cells) * (stage.retries + 1) for stage in stages),
-            "inputTokens": default_budget.model_tokens * sum(len(stage.cells) for stage in stages),
-            "outputTokens": default_budget.model_tokens * sum(len(stage.cells) for stage in stages),
-            "toolCalls": default_budget.tool_calls * sum(len(stage.cells) for stage in stages),
-            "wallMicros": default_budget.wall_time_seconds * 1_000_000 * sum(len(stage.cells) for stage in stages),
-            "costMicrounits": default_budget.cost_microunits * sum(len(stage.cells) for stage in stages),
-        })
+        if limits is None:
+            # A lifecycle cell can admit runtime-owned child calls.  Reserve
+            # capacity for every retry of both the parent and its children so
+            # the default is a real upper bound, not just the top-level count.
+            admissions = sum(
+                (len(stage.cells) * (1 + LIFECYCLE_NESTED_SUBCALLS.get(stage.name, 0)))
+                * (stage.retries + 1)
+                for stage in stages
+            )
+            limits = {
+                "attempts": admissions,
+                "inputTokens": default_budget.model_tokens * admissions,
+                "outputTokens": default_budget.model_tokens * admissions,
+                "toolCalls": default_budget.tool_calls * admissions,
+                "wallMicros": default_budget.wall_time_seconds * 1_000_000 * admissions,
+                "costMicrounits": default_budget.cost_microunits * admissions,
+            }
+        bound_limits = dict(limits)
         required = {"attempts", "inputTokens", "outputTokens", "toolCalls", "wallMicros", "costMicrounits"}
         if set(bound_limits) != required or any(not isinstance(value, int) or value < 0 for value in bound_limits.values()):
             raise EvaluationError("lifecycle limits must be non-negative integer totals")
@@ -784,7 +795,9 @@ class EvaluationJob:
                 wall_duration_seconds=accounting["wallDurationSeconds"],
                 billing_basis=accounting["billingBasis"],
             )
-            if summary.complete and report.validity_status == "valid" and report.promotion_eligible and candidate_id is not None:
+            # Final is an immutable measurement panel.  Only validation may
+            # advance the active candidate pointer.
+            if comparison == "validation" and summary.complete and report.validity_status == "valid" and report.promotion_eligible and candidate_id is not None:
                 report.require_promotion_evidence(self.protocol, self.packages)
                 decision = self.controller.candidates.promote(candidate_id, {**report.to_dict(), "reportId": f"{job_id}:{comparison}"})
                 self._save(job_id, comparison, "decided", report, runtime_accounting=accounting)

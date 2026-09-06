@@ -244,6 +244,7 @@ def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | No
         analysis_code_hash=analysis_pin,
         run_budget=BudgetSpec(model_tokens=MODEL_TOKENS, wall_time_seconds=WALL_SECONDS),
         concurrency_limit=4,
+        safety_case_ids=("EVAL-003", "EVAL-004", "EVAL-005"),
     )
     protocol.freeze(runtime.packages)
     _persist_or_verify_frozen(runtime.controller.store, protocol.start_candidate_generation(), initialize=initialize)
@@ -379,11 +380,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-hash", default="")
     parser.add_argument("--candidate-hash", default="")
     parser.add_argument("--a-hash")
-    parser.add_argument("--candidate-count", type=int, required=True)
-    parser.add_argument("--training-runs", type=int, required=True)
-    parser.add_argument("--transfer-runs", type=int, required=True)
-    parser.add_argument("--safety-runs", type=int, required=True)
-    parser.add_argument("--retries", type=int, required=True)
+    parser.add_argument("--candidate-count", type=int, default=1)
+    parser.add_argument("--training-runs", type=int)
+    parser.add_argument("--transfer-runs", type=int)
+    parser.add_argument("--safety-runs", type=int)
+    parser.add_argument("--retries", type=int, default=0)
     parser.add_argument("--ablation-system-instructions")
     parser.add_argument("--ablation-retrieval-input", action="append", default=[])
     parser.add_argument("--initialize", action="store_true", help="create and freeze a new clean Store")
@@ -396,6 +397,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.comparison not in {"smoke", "experiment"} and (not args.candidate_id or not args.source_data_dir or not args.source_run_id):
         parser.error("held-out evaluation requires candidate/source store/source run bindings")
     app, protocol, job = build_job(args.data_dir, args.source_data_dir, args.candidate_id, args.source_run_id, a_hash=args.a_hash, initialize=args.initialize, force_job=args.comparison == "experiment", job_id=args.job)
+    if args.comparison == "experiment":
+        args.training_runs = args.training_runs if args.training_runs is not None else len(protocol.known_environments) * protocol.tasks_per_environment
+        args.transfer_runs = args.transfer_runs if args.transfer_runs is not None else len(protocol.known_environments)
+        args.safety_runs = args.safety_runs if args.safety_runs is not None else len(protocol.safety_case_ids)
+    else:
+        args.training_runs = args.training_runs if args.training_runs is not None else 0
+        args.transfer_runs = args.transfer_runs if args.transfer_runs is not None else 0
+        args.safety_runs = args.safety_runs if args.safety_runs is not None else 0
     workload = _workload(protocol, args.candidate_count, args.training_runs, args.transfer_runs, args.safety_runs, args.retries)
     print(json.dumps({"job": args.job, "comparison": args.comparison, "workload": workload}, sort_keys=True))
     if workload["transferRuns"] < 1:
