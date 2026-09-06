@@ -645,6 +645,11 @@ class TestControllerSeam:
         # Bad pins fail closed.
         with pytest.raises(ValueError):
             ctl.record_model_response(run_id, {"responseId": "", "usage": usage, "versionRefs": version_refs})
+        # Conflicting direct imageDigest against pinned versionRefs.image rejected;
+        # unpinned receipts remain valid.
+        with pytest.raises(ValueError):
+            ctl.record_model_response(run_id, {"responseId": "resp-x", "usage": usage, "versionRefs": {"image": "sha256:aaa"}, "imageDigest": "sha256:bbb"})
+        ctl.record_model_response(run_id, {"responseId": "resp-ok", "usage": usage, "versionRefs": {"image": "sha256:aaa"}, "imageDigest": "sha256:aaa"})
         with pytest.raises(ValueError):
             ctl.record_accounting(run_id, {**accounting, "taskId": "wrong"}, response)
         with pytest.raises(ValueError):

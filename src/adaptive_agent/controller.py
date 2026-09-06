@@ -675,6 +675,19 @@ class Controller:
     #     environmentId, passed, reliable, safetyViolations}.
 
     @staticmethod
+    def _check_image_pin(payload: Mapping[str, Any]) -> None:
+        """An explicit imageDigest must equal the pinned versionRefs.image.
+
+        Mirrors the evaluator rule: conflicting pins are rejected; unpinned
+        receipts (no imageDigest and/or no versionRefs.image) remain valid.
+        """
+        version_refs = payload.get("versionRefs")
+        expected = version_refs.get("image") if isinstance(version_refs, Mapping) else None
+        direct = payload.get("imageDigest")
+        if direct is not None and isinstance(expected, str) and direct != expected:
+            raise ValueError("payload imageDigest conflicts with pinned versionRefs.image")
+
+    @staticmethod
     def _require_usage(usage: Any) -> dict[str, int]:
         if not isinstance(usage, dict):
             raise ValueError("usage must be an object")
@@ -700,6 +713,7 @@ class Controller:
         self._require_usage(response.get("usage"))
         if not isinstance(response.get("versionRefs"), dict) or not response["versionRefs"]:
             raise ValueError("response.versionRefs must be a non-empty object")
+        self._check_image_pin(response)
         return self.append_event(
             run_id, "model_response", dict(response), "system", "operator"
         )
@@ -718,6 +732,7 @@ class Controller:
             raise ValueError("accounting.usage does not match model response usage")
         if accounting.get("versionRefs") != model_response.get("versionRefs"):
             raise ValueError("accounting.versionRefs does not match model response")
+        self._check_image_pin(accounting)
         for key in ("costMicrounits", "durationSeconds"):
             v = accounting.get(key)
             if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0 or v != v or v == float("inf"):
