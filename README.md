@@ -23,9 +23,15 @@ Core and API verification recorded 64 passing checks, and the corrected evaluato
 An earlier retained backend report recorded 240 passing checks.
 These are synthetic or bounded integration evidence, not a measured generalization result.
 
+A separate retained real product run reached the production UI, authenticated Luna, Docker, the broker, and the trusted evaluator.
+It is identified by run `run_a1662f700a9a400b9e0f80b87a52f76e` and evidence-linked candidate proposal `cand_a095170f9c6d4f58943deb7539270de0`.
+That candidate was not promoted and this successful product path is distinct from the later failed full benchmark.
+
 A real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC and failed before the held-out phase after one successful task and five development budget exhaustions.
 It produced no learning result, validation result, final metrics, or measured improvement.
 M4 is therefore not complete.
+
+Current active work is split across the required EVAL-003 binding, final gate, transfer/adaptation reporting, and default budgets in session 6; fresh reads and enum-error effects in session 7; and the failed-attempt ledger in session 2.
 
 The accepted Luna-through-ChatGPT subscription path does not expose an API-key or provider switch.
 The trusted parent accounts actual model usage and rejects after aggregate token exhaustion.
