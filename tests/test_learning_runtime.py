@@ -113,7 +113,7 @@ def test_rich_broker_projection_keeps_diagnostics_without_secrets(tmp_path: Path
     store.append_evidence(evidence_id, event)
     LearningRuntime.build(store=store, manager=manager, model_client=FakeClient())._materialize_run_records(environment_id=ENVIRONMENT, run_id=RUN)
     records = store.list_learning_records(environment_id=ENVIRONMENT, run_id=RUN)
-    content = next(json.loads(row["record_json"])["content"] for row in records if row["record_id"] == f"learning-evidence-{evidence_id}")
+    content = next(json.loads(row["record_json"])["content"] for row in records if row["record_id"] in {f"learning-evidence-{evidence_id}", f"learning-broker-{evidence_id}"} and '"tool":"read"' in json.loads(row["record_json"])["content"])
     assert '"tool":"read"' in content
     assert '"code":"VERSION_CONFLICT"' in content
     assert '"retry":"after_refresh"' in content

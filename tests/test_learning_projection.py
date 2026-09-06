@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from adaptive_agent.learning_projection import DurableBrokerLearningProjection
+from test_learning_store_integration import ENVIRONMENT, RUN, _setup_store
+
+
+def _broker_event(store, *, evidence_id: str, call_id: str, run_id: str = RUN):
+    payload = {
+        "callId": call_id, "toolVersion": "7", "status": "error", "effect": "none",
+        "output": {"status": "open", "expectedAnswer": "hidden-answer", "detail": "version mismatch", "apiKey": "sk-secret"},
+        "error": {"code": "VERSION_CONFLICT", "retry": "after_refresh", "message": "password=hunter2"},
+    }
+    ref = store.put_artifact(payload)
+    store.append_evidence(evidence_id, {"run_id": run_id, "sequence": 8, "event_type": "tool_result", "content_hash": ref.sha256, "source_ref": ref.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
+    return payload
+
+
+def test_projection_joins_call_and_redacts_hidden_values(tmp_path: Path):
+    store, _, _ = _setup_store(tmp_path)
+    call_id = "call-projection"
+    store.prepare_tool_call({"call_id": call_id, "run_id": RUN, "step_id": "step-1", "environment_id": ENVIRONMENT, "tool": "read", "arguments_json": json.dumps({"invoice_id": "INV-DEV-000", "apiKey": "sk-secret"}), "idempotency_key": "projection-1"})
+    result = _broker_event(store, evidence_id="ev-projection", call_id=call_id)
+    store.save_tool_result(call_id, json.dumps(result, sort_keys=True, separators=(",", ":")), "none")
+    records = DurableBrokerLearningProjection(store).project(environment_id=ENVIRONMENT, run_id=RUN, task_id="task-durable")
+    assert len(records) == 1
+    record = records[0][1]
+    assert '"tool":"read"' in record["content"]
+    assert '"code":"VERSION_CONFLICT"' in record["content"]
+    assert '"retry":"after_refresh"' in record["content"]
+    assert "expectedAnswer" not in record["content"]
+    assert "hidden-answer" not in record["content"]
+    assert "sk-secret" not in record["content"]
+    assert "hunter2" not in record["content"]
+    assert record["sourceEvidenceId"] == "ev-projection"
+    assert record["sourceCallId"] == call_id
+    derived = store.get_evidence("broker:ev-projection")
+    assert derived["event_type"] == "learning_evidence_projection"
+    assert store.evidence_provenance("broker:ev-projection")["partition"] == "development"
+
+
+def test_projection_drops_call_from_other_run(tmp_path: Path):
+    store, _, _ = _setup_store(tmp_path)
+    call_id = "call-wrong-run"
+    store.prepare_tool_call({"call_id": call_id, "run_id": "other-run", "step_id": "step-1", "environment_id": ENVIRONMENT, "tool": "read", "arguments_json": json.dumps({"invoice_id": "INV-DEV-000"}), "idempotency_key": "projection-wrong"})
+    _broker_event(store, evidence_id="ev-wrong-run", call_id=call_id)
+    assert DurableBrokerLearningProjection(store).project(environment_id=ENVIRONMENT, run_id=RUN, task_id="task-durable") == []
+    assert store.get_evidence("broker:ev-wrong-run") is None

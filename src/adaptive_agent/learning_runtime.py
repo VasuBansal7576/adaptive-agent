@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 from .learning import LearningProposal, LearningService, PlannerLearningAdapter
 from .learning_store import CandidateManagerLearningAdapter, DurableLearningSourceAdapter, LearningStoreError
+from .learning_projection import DurableBrokerLearningProjection
 from .retrieval import AccessFilteredRetriever, InMemorySourceProvider, canonical_json, content_hash
 
 
@@ -173,9 +174,17 @@ class LearningRuntime:
         if not isinstance(trusted_outcome, Mapping) or "passed" not in trusted_outcome or not isinstance(trusted_outcome.get("passed"), (bool, int)):
             raise LearningRuntimeError("completed development run lacks a trusted evaluator outcome")
         outcome_passed = bool(trusted_outcome["passed"])
+        run_row = self.store.get_run(run_id)
+        projected = DurableBrokerLearningProjection(self.store).project(
+            environment_id=environment_id,
+            run_id=run_id,
+            task_id=run_row["task_id"] if isinstance(run_row, Mapping) else "",
+        )
+        for record_id, record in projected:
+            persist(record_id, record)
         joined_reader = getattr(self.store, "list_learning_evidence", None) or getattr(self.store, "list_learner_evidence", None)
         events = joined_reader(environment_id=environment_id, run_id=run_id) if callable(joined_reader) else self.store.list_evidence(run_id)
-        for event in events:
+        for event in events if not projected else ():
             if callable(joined_reader):
                 if event.get("partition") != "development" or event.get("environment_id") != environment_id or event.get("run_id") != run_id:
                     continue
