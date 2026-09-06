@@ -248,6 +248,9 @@ class DurableRuntime:
         self._run_receipts: dict[str, list[dict[str, Any]]] = {}
         self._approvals: dict[tuple[str, str], bool] = {}
         self._evaluation_arm_bundles: dict[str, str] = {}
+        from adaptive_agent.diagnostics import DevelopmentDiagnosticManager
+
+        self.diagnostics = DevelopmentDiagnosticManager(self)
         # The canonical Controller seam owns lifecycle persistence.  Older
         # adapters exposed an atomic claim helper; keep a process-local guard
         # only for the canonical seam, which intentionally leaves claiming to
@@ -625,7 +628,9 @@ class DurableRuntime:
             raise LearningRuntimeError("evaluation arm bundle has no content hash")
         if expected_bundle_hash and bundle_hash != expected_bundle_hash:
             raise LearningRuntimeError("evaluation bundle hash does not match supplied bundle")
-        expected_arm_bundle = self._evaluation_arm_bundles.get(arm_value)
+        configured_arm_bundles = getattr(frozen_config, "arm_bundles", None)
+        expected_mapping = configured_arm_bundles if isinstance(configured_arm_bundles, Mapping) else self._evaluation_arm_bundles
+        expected_arm_bundle = expected_mapping.get(arm_value)
         if expected_arm_bundle is not None and expected_arm_bundle != bundle_hash:
             raise LearningRuntimeError("evaluation arm bundle does not match the frozen arm mapping")
 
@@ -653,7 +658,7 @@ class DurableRuntime:
         if row:
             persisted = {key: value for key, value in row.items() if key != "run_id"}
             run_payload = json.loads(row.get("run_json", "{}"))
-            arm_bundles = dict(self._evaluation_arm_bundles) if self._evaluation_arm_bundles else {arm_value: bundle_hash}
+            arm_bundles = dict(configured_arm_bundles) if isinstance(configured_arm_bundles, Mapping) else (dict(self._evaluation_arm_bundles) if self._evaluation_arm_bundles else {arm_value: bundle_hash})
             arm_bundles.setdefault(arm_value, bundle_hash)
             run_payload.update({"arm": arm_value, "seed": seed, "bundleHash": bundle_hash, "armBundles": arm_bundles})
             persisted["run_json"] = json.dumps(run_payload, sort_keys=True)
