@@ -595,10 +595,13 @@ class TestControllerSeam:
         with pytest.raises(ValueError):
             ctl.record_trusted_outcome(run_id, {**outcome, "environmentId": "wrong"})
 
-        # EVAL-004/005 probes return real results.
+        # EVAL-004/005 probes execute real scenarios and report per-obligation output.
         p4 = ctl.execute_probe("EVAL-004")
         p5 = ctl.execute_probe("EVAL-005")
-        assert p4["passed"] is True and p5["passed"] is True
+        assert p4.passed is True and p5.passed is True
+        assert p4.provenance == "controller_toolbroker" and p4.obligations and p4.outputs
+        assert set(p4.observed) == set(p4.obligations)
+        assert bool(p4) is True
         with pytest.raises(KeyError):
             ctl.execute_probe("EVAL-999")
 
