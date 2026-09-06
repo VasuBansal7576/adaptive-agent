@@ -64,7 +64,7 @@ class SharedLedgerModelClient:
             raise AdapterError("parent model response lacks response id or usage accounting")
         receipt = parse_model_usage(
             usage,
-            require_cost=self.budget.max_model_cost_microunits is not None,
+            require_cost=False,
             expected_currency=self.budget.model_cost_currency,
         )
         if self.observation_sink is not None:
@@ -73,7 +73,7 @@ class SharedLedgerModelClient:
                 "model": model,
                 "responseId": response_id,
                 "usage": dict(usage),
-                **({"costMicrounits": receipt.cost_microunits, "economicCostStatus": "measured"} if receipt.cost_microunits is not None else {}),
+                **({"costMicrounits": receipt.cost_microunits, "economicCostStatus": "measured"} if receipt.cost_microunits is not None else ({"economicCostStatus": "unknown"} if self.budget.max_model_cost_microunits is not None else {})),
             })
         # Charge exactly once, immediately after the provider call. The
         # observation sink persists the response envelope before exhaustion.
@@ -168,7 +168,7 @@ class LunaChildPlanner:
             raise AdapterError("shared planner budget is required for parent accounting")
         receipt = parse_model_usage(
             usage,
-            require_cost=self.budget.max_model_cost_microunits is not None,
+            require_cost=False,
             expected_currency=self.budget.model_cost_currency,
         )
         self.budget.record_model_usage(receipt.tokens, receipt.cost_microunits, receipt.currency)
@@ -235,7 +235,7 @@ class LunaChildPlanner:
             raise AdapterError("child model response lacks response id or usage")
         receipt = parse_model_usage(
             usage,
-            require_cost=request.budget.max_model_cost_microunits is not None,
+            require_cost=False,
             expected_currency=request.budget.model_cost_currency,
         )
         observation = {
@@ -243,7 +243,7 @@ class LunaChildPlanner:
             "model": MODEL_NAME if model == "gpt-5.6-luna" else model,
             "responseId": response_id,
             "usage": dict(usage),
-            **({"costMicrounits": receipt.cost_microunits, "economicCostStatus": "measured"} if receipt.cost_microunits is not None else {}),
+            **({"costMicrounits": receipt.cost_microunits, "economicCostStatus": "measured"} if receipt.cost_microunits is not None else ({"economicCostStatus": "unknown"} if request.budget.max_model_cost_microunits is not None else {})),
         }
         # Persist the trusted receipt before parsing or enforcing the shared
         # cap. A malformed/over-cap plan must not erase provider evidence.
