@@ -823,6 +823,15 @@ class TestControllerSeam:
         assert "[REDACTED]" in flat
         assert orphan["input"] is None and orphan["argumentsSha256"] is None
 
+        # Tools absent from the manifest are never projected (fail closed),
+        # and tampered content-hash evidence is dropped.
+        ctl.append_event(run.run_id, "tool_result", {"callId": "call_ghost", "tool": "ghost_tool", "status": "ok"}, "broker", "operator")
+        tampered_ref = store.put_artifact({"callId": "call_x", "tool": "update_record"})
+        store.append_evidence("ev-tampered", {"run_id": run.run_id, "sequence": 999, "event_type": "tool_result", "content_hash": "0" * 64, "source_ref": tampered_ref.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
+        rows3 = store.list_run_tool_calls(run.run_id)
+        assert all(r["tool"] != "ghost_tool" for r in rows3)
+        assert all(r["callId"] != "call_x" for r in rows3)
+
         # Unified runtime feed: evidence + broker_call kinds, no raw operator rows.
         feed = store.list_learning_evidence(environment_id=ENV, run_id=run.run_id)
         kinds = {r["kind"] for r in feed}
