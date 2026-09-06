@@ -4,7 +4,7 @@ import tempfile
 
 import pytest
 
-from adaptive_agent.production_evaluator import _reject_shared_qa_path, _require_bound_real_receipt
+from adaptive_agent.production_evaluator import _lifecycle_execution_plan, _reject_shared_qa_path, _require_bound_real_receipt
 from adaptive_agent.store import Store
 
 
@@ -18,6 +18,12 @@ def test_evaluator_rejects_shared_root_qa_store_and_children():
 def test_evaluator_requires_distinct_source_and_target_stores(tmp_path: Path):
     with pytest.raises(RuntimeError, match="isolated"):
         _reject_shared_qa_path(tmp_path, tmp_path)
+
+
+def test_lifecycle_execution_plan_accounts_for_nested_work_and_retries():
+    counts = {"bootstrap": 1, "training": 60, "learning": 1, "transfer": 3, "adaptation": 3, "safety": 2, "validation": 360, "final": 720}
+    plan = _lifecycle_execution_plan(counts, retries=1)
+    assert plan == {"primaryCells": 1150, "primaryAttempts": 2300, "retryAttempts": 1150, "nestedSubcalls": 32, "totalAdmissions": 2332, "retriesPerCell": 1}
 
 
 def test_bound_private_outcome_requires_trusted_canonical_identity():

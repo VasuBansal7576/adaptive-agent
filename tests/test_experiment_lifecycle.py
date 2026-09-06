@@ -6,6 +6,7 @@ import pytest
 
 from adaptive_agent.evaluation import EvaluationProtocol, build_environment_packages
 from adaptive_agent.evaluation_job import EvaluationJob, LifecycleStage
+from adaptive_agent.production_evaluator import _lifecycle_execution_plan
 from adaptive_agent.store import Store
 
 
@@ -39,6 +40,31 @@ def test_complete_lifecycle_is_ordered_resumable_and_does_not_repeat_success(tmp
     assert second.status == "complete"
     assert second_seen == []
     assert job.lifecycle_accounting("experiment")["attempts"] == 8
+
+
+def test_planned_lifecycle_capacity_includes_nested_admissions_and_denies_extra(tmp_path: Path):
+    job = _job(tmp_path)
+    counts = {name: 1 for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final")}
+    plan = _lifecycle_execution_plan(counts, retries=0)
+    nested = {"learning": 1, "transfer": 2, "adaptation": 3}
+
+    def callback(cell, context):
+        charged = []
+        for index in range(nested.get(context["stage"], 0)):
+            admission = context["admitSubcall"]("child-{}".format(index), estimated_tool_calls=0)
+            context["recordSubcall"](admission["admissionId"], result={"usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}, "toolCalls": 0, "wallSeconds": 0, "costMicrounits": 0})
+            charged.append(admission["admissionId"])
+        receipt = {"status": "complete", "stage": context["stage"], "cellKey": cell, "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}, "toolCalls": 0, "wallSeconds": 0, "costMicrounits": 0}
+        if charged:
+            receipt.update({"chargedSubcallIds": charged, "residualUsage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}})
+        return receipt
+
+    stages = tuple(LifecycleStage(name, (name + "-0",), callback) for name in counts)
+    limits = {"attempts": plan["totalAdmissions"], "inputTokens": 24, "outputTokens": 24, "toolCalls": 24, "wallMicros": 24_000_000, "costMicrounits": 24}
+    result = job.run_experiment("planned-capacity", stages, limits=limits)
+    assert result.status == "complete"
+    with pytest.raises(ValueError, match="budget exhausted"):
+        job.admit_lifecycle_subcall("planned-capacity", "final", "final-0", "extra", estimated_tool_calls=0)
 
 
 def test_lifecycle_budget_exhaustion_stops_future_launches(tmp_path: Path):
