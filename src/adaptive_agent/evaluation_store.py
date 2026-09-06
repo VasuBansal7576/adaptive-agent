@@ -18,6 +18,7 @@ from adaptive_agent.evaluation import (
     FrozenProtocol,
     RunEvidenceStore,
     RunObservation,
+    SafetyProbeResult,
     TrustedAttestationLedger,
     TrustedEvaluatorRegistry,
     sha256_json,
@@ -42,11 +43,34 @@ class ControllerSafetyProbeAdapter:
     def __init__(self, executor: ControllerProbeExecutor) -> None:
         self.executor = executor
 
+    def _run(self, case_id: str) -> SafetyProbeResult:
+        """Accept only complete, transcript-backed controller probe results."""
+        raw = self.executor.execute_probe(case_id)
+        if not isinstance(raw, dict):
+            raise TypeError("controller probe must return an object")
+        outputs = raw.get("outputs")
+        provenance = raw.get("provenance")
+        obligations = raw.get("obligations")
+        if (
+            not isinstance(raw.get("passed"), bool)
+            or not isinstance(outputs, (list, tuple))
+            or not outputs
+            or not all(isinstance(value, dict) for value in outputs)
+            or not isinstance(provenance, (list, tuple))
+            or not provenance
+            or not all(isinstance(value, str) and value for value in provenance)
+            or not isinstance(obligations, (list, tuple))
+            or not obligations
+            or not all(isinstance(value, str) and value for value in obligations)
+        ):
+            raise ValueError(f"controller probe {case_id} returned incomplete evidence")
+        return SafetyProbeResult(bool(raw["passed"]), tuple(outputs), tuple(provenance), tuple(obligations))
+
     def eval_004(self):
-        return self.executor.execute_probe("EVAL-004")
+        return self._run("EVAL-004")
 
     def eval_005(self):
-        return self.executor.execute_probe("EVAL-005")
+        return self._run("EVAL-005")
 
     def register(self, registry: Any) -> None:
         registry.register_safety_probe("EVAL-004", self.eval_004)
@@ -83,28 +107,11 @@ class SQLiteAllocationStore:
 
     def __init__(self, store: Store) -> None:
         self.store = store
-        with store.connect() as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS evaluator_allocations (scope_id TEXT NOT NULL, allocation_id TEXT PRIMARY KEY, panel_index INTEGER NOT NULL, panel_hash TEXT NOT NULL, task_ids_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(scope_id, panel_index))")
-            conn.commit()
 
     def reserve_next(self, scope_id: str, allocation_id: str, panels: Sequence[Sequence[str]], limit: int) -> int | None:
         if not panels or len(panels) < limit:
             raise ValueError("allocation panels must cover the configured limit")
-        with self.store.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute("SELECT panel_index FROM evaluator_allocations WHERE allocation_id = ?", (allocation_id,)).fetchone()
-            if existing:
-                conn.rollback()
-                return None
-            used = {int(row["panel_index"]) for row in conn.execute("SELECT panel_index FROM evaluator_allocations WHERE scope_id = ?", (scope_id,)).fetchall()}
-            index = next((candidate for candidate in range(limit) if candidate not in used), None)
-            if index is None:
-                conn.rollback()
-                return None
-            task_ids = list(panels[index])
-            conn.execute("INSERT INTO evaluator_allocations(scope_id, allocation_id, panel_index, panel_hash, task_ids_json, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))", (scope_id, allocation_id, index, sha256_json(task_ids), json.dumps(task_ids, sort_keys=True)))
-            conn.commit()
-            return index
+        return self.store.reserve_allocation(scope_id, allocation_id, [list(panel) for panel in panels], limit)
 
 
 class SQLiteRunEvidenceStore:
