@@ -8,6 +8,7 @@ from adaptive_agent.experiment_runtime import (
     DefaultExperimentStageRunner,
     ExperimentRuntimeError,
 )
+import adaptive_agent.experiment_runtime as experiment_runtime
 
 
 class Bundle:
@@ -44,6 +45,9 @@ class Store:
 
     def get_outcome_by_run_id(self, run_id):
         return {"passed": 1} if run_id == "dev-run" else None
+
+    def list_evidence(self, _run_id):
+        return []
 
 
 class Package:
@@ -93,6 +97,12 @@ class Runtime:
             response_id=f"response-{len(self.calls)}",
             model_provenance="real_model",
         )
+
+    def verify_evaluation_observation(self, observation, config, task):
+        return True
+
+    def establish_clean_experiment(self, protocol):
+        return {"clean": True, "provenanceRef": "clean-provenance"}
 
 
 class Protocol:
@@ -155,3 +165,102 @@ def test_sealed_environment_is_rejected_before_final():
 
     with pytest.raises(ExperimentRuntimeError, match="sealed environment"):
         runner(cell_key="leave-out:sealed", context={"stage": "transfer", "results": {}})
+
+
+def test_rotation_candidate_does_not_replace_primary_candidate(monkeypatch):
+    runtime = Runtime()
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    runner._candidate_hash = "primary"
+    monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, ["learning-ref"]))
+
+    runner._learning_receipt(
+        "leave-out:known-a",
+        "dev-run",
+        {"candidate": {"candidateId": "rotation", "candidateBundleHash": "rotation", "baseBundleHash": "base"}},
+        bind_primary=False,
+    )
+
+    assert runner._candidate_hash == "primary"
+
+
+def test_adaptation_learns_from_support_before_query(monkeypatch):
+    runtime = Runtime()
+    runtime.launch_learning = lambda payload: {"candidate": {"candidateId": "adapted", "candidateBundleHash": "adapted", "baseBundleHash": "base"}}
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    runtime.controller.store.get_run = lambda _run_id: {"status": "succeeded"}
+    runtime.controller.store.get_outcome_by_run_id = lambda _run_id: {"passed": True}
+    monkeypatch.setattr(runner, "_candidate", lambda _context: Bundle("primary"))
+    monkeypatch.setattr(experiment_runtime, "_load_bundle", lambda _runtime, content_hash: Bundle(content_hash))
+    monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, ["learning-ref"]))
+    context = {"results": {"learning": {"candidate-generation": {"candidateBundleHash": "primary"}}}}
+
+    runner._adaptation("adapt:known-a", context, 0)
+
+    assert runtime.calls[-2:] == [
+        ("known-a-development-0", "L", 17, "primary"),
+        ("known-a-validation-0", "L", 23, "adapted"),
+    ]
+
+
+def test_partial_known_cost_remains_unknown():
+    runtime = Runtime()
+    runtime.controller.store.artifacts["acct-unknown"] = {
+        "usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5},
+        "toolCalls": 1,
+        "durationSeconds": 0.25,
+        "economicCost": {"status": "unknown", "microunits": 7},
+    }
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    first = SimpleNamespace(run_id="one", evidence_ref="model-1", outcome_ref="outcome-1", accounting_ref="acct-1")
+    second = SimpleNamespace(run_id="two", evidence_ref="model-1", outcome_ref="outcome-1", accounting_ref="acct-unknown")
+
+    receipt = experiment_runtime._observation_receipt(runtime, "transfer", "leave-out:known-a", [first, second], runner.pins)
+
+    assert receipt["economicCostStatus"] == "unknown"
+    assert "costMicrounits" not in receipt
+
+
+def test_event_type_only_evidence_is_not_accepted():
+    runtime = Runtime()
+    runtime.verify_evaluation_observation = lambda *_args: False
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+
+    with pytest.raises(ExperimentRuntimeError, match="strict verifier"):
+        runner(cell_key="known-a-development-0", context={"stage": "training", "attempt": 0})
+
+
+def test_bootstrap_requires_clean_provenance_receipt():
+    runtime = Runtime()
+    runtime.establish_clean_experiment = lambda _protocol: {"clean": False, "provenanceRef": "dirty"}
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+
+    with pytest.raises(ExperimentRuntimeError, match="provenance"):
+        runner(cell_key="bootstrap", context={"stage": "bootstrap", "attempt": 0})
+
+
+def test_nested_learning_is_admitted_and_checkpointed(monkeypatch):
+    runtime = Runtime()
+    runtime.launch_learning = lambda payload: {"candidate": {"candidateId": "nested", "candidateBundleHash": "nested", "baseBundleHash": "base"}}
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, ["learning-ref"]))
+    admissions = []
+    checkpoints = []
+
+    def admit(key, **estimates):
+        admissions.append((key, estimates))
+        return {"admissionId": "admission-1", "status": "reserved", "reused": False}
+
+    def record(admission_id, *, result=None, error=None):
+        checkpoints.append((admission_id, result, error))
+
+    runner._candidate_from_run(
+        "dev-run",
+        "transfer:known-a",
+        bind_primary=False,
+        context={"admitSubcall": admit, "recordSubcall": record},
+    )
+
+    assert admissions[0][0] == "learning:transfer:known-a:dev-run"
+    assert admissions[0][1]["estimated_cost_microunits"] == 0
+    assert checkpoints[0][0] == "admission-1"
+    assert checkpoints[0][1]["candidateBundleHash"] == "nested"
