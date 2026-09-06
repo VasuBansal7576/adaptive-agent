@@ -285,8 +285,8 @@ class DefaultExperimentStageRunner:
         value = _mapping(receipt, "lifecycle receipt")
         receipt_stage = stage or value.get("stage")
         receipt_cell = cell_key or value.get("cellKey")
-        if receipt_stage not in {"validation", "final"} or not isinstance(receipt_cell, str) or not receipt_cell:
-            raise ExperimentRuntimeError("observation recovery requires a validation/final cell")
+        if receipt_stage not in {"transfer", "adaptation", "validation", "final"} or not isinstance(receipt_cell, str) or not receipt_cell:
+            raise ExperimentRuntimeError("observation recovery requires an evaluation lifecycle cell")
         run_ids = value.get("runIds")
         if not isinstance(run_ids, list) or not run_ids or any(not isinstance(run_id, str) or not run_id for run_id in run_ids):
             raise ExperimentRuntimeError("lifecycle receipt lacks durable observation run IDs")
@@ -328,7 +328,8 @@ class DefaultExperimentStageRunner:
             environment_id = run.get("environment_id")
             task_row = store.get_task(task_id) if isinstance(task_id, str) else None
             partition = task_row.get("partition") if isinstance(task_row, Mapping) else None
-            if not isinstance(task_id, str) or not isinstance(environment_id, str) or partition != receipt_stage:
+            allowed_partitions = {"development", "validation"} if receipt_stage == "adaptation" else {"validation"} if receipt_stage == "transfer" else {receipt_stage}
+            if not isinstance(task_id, str) or not isinstance(environment_id, str) or partition not in allowed_partitions:
                 raise ExperimentRuntimeError(f"observation run {run_id!r} is not bound to {receipt_stage}")
             if task_ids is not None and task_ids[index] != task_id:
                 raise ExperimentRuntimeError("receipt task IDs do not match durable runs")
@@ -929,7 +930,7 @@ class DefaultExperimentStageRunner:
             cell_key,
             [observation],
             self.pins,
-            extra={"environmentId": environment_id, "partition": "final", "resetBefore": True, "exposed": False, "heldoutAccess": False, "disjointDevelopmentEnvironments": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": list(candidate_receipt["sourceRunIds"]), "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"], "learningReceipt": dict(candidate_receipt)},
+            extra={"environmentId": environment_id, "partition": "validation", "purpose": "transfer_query", "resetBefore": True, "exposed": False, "heldoutAccess": False, "disjointDevelopmentEnvironments": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": list(candidate_receipt["sourceRunIds"]), "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"], "learningReceipt": dict(candidate_receipt)},
         )
         return self._merge_receipts(
             receipt,

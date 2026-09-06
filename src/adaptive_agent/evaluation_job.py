@@ -28,6 +28,7 @@ from adaptive_agent.evaluation import (
     EvaluationRunner,
     Partition,
     RunObservation,
+    _summary,
 )
 from adaptive_agent.evaluation_store import SQLiteRunEvidenceStore, build_durable_evaluation_runner
 from adaptive_agent.store import Store
@@ -630,6 +631,7 @@ class EvaluationJob:
         if not isinstance(candidate_hash, str) or not candidate_hash:
             raise EvaluationError("lifecycle report lacks pinned candidate bundle hash")
         evaluator = build_durable_evaluation_runner(self.protocol, self.packages, self.store, probe_executor=self.controller)
+        auxiliary_evidence = self._auxiliary_evidence(stages, state, recover)
         ablation_audit = None
         if selected.name == "final":
             ablation = self.arm_bundles.get(Arm.A, self.arm_bundles.get(Arm.A.value))
@@ -664,6 +666,7 @@ class EvaluationJob:
             observations=observations,
             expected_partitions=frozen.partition_hashes,
             ablation_audit=ablation_audit,
+            auxiliary_evidence=auxiliary_evidence,
         )
         # Keep the report seam compatible with evaluator-owned test doubles
         # and alternate concrete report implementations.  Persistence only
@@ -672,6 +675,45 @@ class EvaluationJob:
         if report is None or not callable(getattr(report, "to_dict", None)):
             raise EvaluationError("durable evaluator returned a malformed lifecycle report")
         return report
+
+    def _auxiliary_evidence(self, stages: Sequence[LifecycleStage], state: Mapping[str, Any], recover: Callable[..., Sequence[Any]]) -> dict[str, Any]:
+        """Rebuild transfer/adaptation evidence from durable receipts on every report assembly."""
+        results = state.get("results")
+        if not isinstance(results, Mapping):
+            return {}
+        summaries: dict[str, Any] = {}
+        overhead: dict[str, Any] = {}
+        exposure: dict[str, Any] = {}
+        for name in ("transfer", "adaptation"):
+            stage = next((item for item in stages if item.name == name), None)
+            stage_results = results.get(name)
+            if stage is None or not isinstance(stage_results, Mapping):
+                continue
+            query_rows: list[Any] = []
+            source_ids: list[str] = []
+            task_ids: list[str] = []
+            input_tokens = output_tokens = total_tokens = cost = 0
+            for cell_key in stage.cells:
+                receipt = stage_results.get(cell_key)
+                if not isinstance(receipt, Mapping):
+                    continue
+                recovered = recover(receipt, stage=name, cell_key=cell_key)
+                wanted = set(receipt.get("queryRunIds", receipt.get("runIds", ())))
+                query_rows.extend(row for row in recovered if getattr(row, "run_id", None) in wanted)
+                source_ids.extend(value for value in receipt.get("sourceRunIds", receipt.get("supportRunIds", ())) if isinstance(value, str))
+                task_ids.extend(value for value in receipt.get("queryTaskIds", receipt.get("supportTaskIds", ())) if isinstance(value, str))
+                usage = receipt.get("usage")
+                if isinstance(usage, Mapping):
+                    input_tokens += int(usage.get("inputTokens", 0) or 0)
+                    output_tokens += int(usage.get("outputTokens", 0) or 0)
+                    total_tokens += int(usage.get("totalTokens", 0) or 0)
+                if isinstance(receipt.get("costMicrounits"), (int, float)):
+                    cost += int(receipt["costMicrounits"])
+            metric = _summary(query_rows)
+            summaries[name] = {"query": metric.to_dict(), "queryCount": metric.count, "exact": True}
+            overhead[name] = {"inputTokens": input_tokens, "outputTokens": output_tokens, "totalTokens": total_tokens, "costMicrounits": cost, "supportAndLearningIncluded": name == "adaptation"}
+            exposure[name] = {"taskIds": sorted(set(task_ids)), "sourceRunIds": sorted(set(source_ids)), "queryRunIds": sorted({getattr(row, "run_id", "") for row in query_rows if getattr(row, "run_id", None)}), "exact": True}
+        return {"summaries": summaries, "overhead": overhead, "exposure": exposure, "limitations": ("Transfer and adaptation are small-sample auxiliary measurements, not primary promotion panels.",)}
 
     def planned_workload(self, candidate_count: int = 1, *, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0):
         return self.protocol.workload(candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)

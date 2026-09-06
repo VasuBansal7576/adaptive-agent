@@ -895,6 +895,10 @@ class DurableRuntime:
                 "metricCellsComplete": report.get("metricCellsComplete"),
                 "safetyCellsComplete": report.get("safetyCellsComplete"),
                 "modelProvenanceComplete": report.get("modelProvenanceComplete"),
+                "auxiliarySummaries": report.get("auxiliarySummaries"),
+                "auxiliaryOverhead": report.get("auxiliaryOverhead"),
+                "auxiliaryExposure": report.get("auxiliaryExposure"),
+                "auxiliaryLimitations": report.get("auxiliaryLimitations"),
             }
             required = tuple(attestation_payload)
             if any(key not in report for key in required):
