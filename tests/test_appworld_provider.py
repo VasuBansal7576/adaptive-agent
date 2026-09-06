@@ -78,6 +78,29 @@ def test_public_hash_excludes_ground_truth(tmp_path: Path):
     assert catalog.public_data_hash() == first
 
 
+def test_dataset_hash_ignores_python_cache_but_binds_evaluator_and_db_bytes(tmp_path: Path):
+    root = _public_root(tmp_path)
+    catalog = AppWorldCatalog(AppWorldConfig(root, python=sys.executable))
+    first = catalog.dataset_hash()
+    cache = root / "data" / "tasks" / "train-1" / "__pycache__"
+    cache.mkdir()
+    (cache / "generated.pyc").write_bytes(b"cache-one")
+    (cache / "generated.pyo").write_bytes(b"cache-two")
+    assert catalog.dataset_hash() == first
+
+    evaluator = root / "data" / "tasks" / "train-1" / "ground_truth" / "evaluator.py"
+    evaluator.parent.mkdir()
+    evaluator.write_bytes(b"evaluator-one")
+    assert catalog.dataset_hash() != first
+    second = catalog.dataset_hash()
+    evaluator.write_bytes(b"evaluator-two")
+    assert catalog.dataset_hash() != second
+
+    db = root / "data" / "base_dbs" / "phone.db"
+    db.write_bytes(b"database-changed")
+    assert catalog.dataset_hash() != second
+
+
 def test_manifest_contains_public_tool_schemas(tmp_path: Path):
     root = _public_root(tmp_path)
     manifest = build_manifest(AppWorldConfig(root, python=sys.executable))
