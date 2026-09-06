@@ -269,6 +269,7 @@ class RunRecord(BaseModel):
     arm: str | None = None
     seed: int | None = None
     bundle_hash: str | None = Field(None, alias="bundleHash")
+    arm_bundles: dict[str, str] = Field(default_factory=dict, alias="armBundles")
 
 
 class StepRecord(BaseModel):

@@ -137,7 +137,7 @@ def test_durable_model_accounting_payloads_keep_arm_seed_and_bundle_identity(tmp
     stored = store.get_run(run["runId"])
     assert stored is not None
     run_payload = json.loads(stored["run_json"])
-    run_payload.update({"arm": "L", "seed": 23, "bundleHash": bundle_hash})
+    run_payload.update({"arm": "L", "seed": 23, "bundleHash": bundle_hash, "armBundles": {"B0": bundle_hash, "L": bundle_hash}})
     stored["run_json"] = json.dumps(run_payload, sort_keys=True)
     store.save_run(run["runId"], {key: value for key, value in stored.items() if key != "run_id"})
 
@@ -153,6 +153,7 @@ def test_durable_model_accounting_payloads_keep_arm_seed_and_bundle_identity(tmp
         assert artifact["arm"] == "L"
         assert artifact["seed"] == 23
         assert artifact["bundleHash"] == bundle_hash
+    assert json.loads(store.get_run(run["runId"])["run_json"])["armBundles"]["L"] == bundle_hash
 
 
 def test_fixture_provider_reset_uses_executor_seed():

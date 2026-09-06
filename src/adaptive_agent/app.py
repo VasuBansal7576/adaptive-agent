@@ -295,7 +295,9 @@ class DurableRuntime:
         if row:
             persisted = {key: value for key, value in row.items() if key != "run_id"}
             run_payload = json.loads(row.get("run_json", "{}"))
-            run_payload.update({"arm": arm_value, "seed": seed, "bundleHash": bundle_hash})
+            arm_bundles = dict(self._evaluation_arm_bundles) if self._evaluation_arm_bundles else {arm_value: bundle_hash}
+            arm_bundles.setdefault(arm_value, bundle_hash)
+            run_payload.update({"arm": arm_value, "seed": seed, "bundleHash": bundle_hash, "armBundles": arm_bundles})
             persisted["run_json"] = json.dumps(run_payload, sort_keys=True)
             self.controller.store.save_run(run.run_id, persisted)
 
