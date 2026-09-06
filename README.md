@@ -12,8 +12,8 @@ This is procedural adaptation, not model-weight training or a promise of univers
 - [SPEC.md](SPEC.md) defines requirements, contracts, architecture, learning, evaluation, security, and acceptance.
 - [MILESTONES.md](MILESTONES.md) defines the runnable vertical slice, full delivery gates, AO ownership, and submission traceability.
 
-Implementation is active in parallel AO worktrees, but the implementation branches are not yet integrated into this documentation branch.
-The Python control-plane package, Prime adapter, Luna planner, durable learning and evaluation seams, and React console are present on those branches.
+Implementation is active in parallel AO worktrees, but implementation code is not integrated into this documentation branch.
+This update records the root-verified current checkpoint beyond `d8e9293` without changing active workers or claiming a merge.
 The exact branch refs, dirty-worktree status, and component ownership are tracked in [MILESTONES.md](MILESTONES.md).
 
 The Python package is configured through `pyproject.toml` on the implementation branches.
@@ -28,13 +28,54 @@ The bounded Prime runtime adapter also recorded persistent kernel results `42` a
 Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
 The console worker reported a live FastAPI session, registration, create/launch, SSE cursor, and cancellation smoke as passing.
 That smoke used a synthetic neutral environment and does not establish a real model-to-tool-to-evaluator product run.
+It remains historical transport evidence only until its Store and data target are proven isolated from root QAdata.
 
 Tests and fixture runs are not interchangeable with those real-run checks.
 The backend and benchmark tests use synthetic providers, drivers, and deterministic fixtures, while console tests use simulation fixtures and captured wire frames.
-The implementation branches have not produced a sealed four-environment evaluation, a measured performance result, or a complete behavioral acceptance result.
+The current checkpoint has not produced a sealed four-environment evaluation, a measured performance result, or a complete behavioral acceptance result.
 
-The documentation phase and its local `main` integration are complete.
-Implementation, local verification, and M2-M4 coordination are active across the worker branches.
+Root-verified current evidence beyond `d8e9293` is bounded integration and safety evidence only.
+The current session-2 probe and integration lineage is committed at `f3785f0` with a dirty overlay still requiring review before assembly.
+The final2 integration reports 171 backend tests passed.
+Actual Docker-backed EVAL-003 passed all 7 obligations on isolated temporary Store and data paths.
+The EVAL-003 safety path was further hardened at commit `3261afc` atop `f423fac`.
+It now uses attacker-controlled public-document output to attempt forged write approval, verifies that no provider write occurs, and exercises `broker.call` escalation, `evaluator.write`, `harness.write`, and filesystem access through `run_prime_runtime_safety_probe`.
+The full safety pass requires an injected `PrimeRuntimeAdapter` whose provenance contains Docker, while `Controller.execute_probe` fails closed when that adapter is absent.
+The `require_runtime=False` option is reserved for control-plane unit mode and is not a full EVAL-003 result.
+Default probe results include self-contained evidence receipts with payload and content hash, and do not expose the hidden answer.
+The focused safety, core, and lifecycle test report was 39 passed with no services or paid calls.
+Actual Docker-backed EVAL-005 passed its two runtime cases, `child_failure_recovery_and_cap` and `shared_model_cost_token_cap`, using the deterministic probe model rather than a paid model call.
+The current session-4 Controller probe at `83d2e01` passed EVAL-004 8/8 and EVAL-005 8/8 on an isolated temporary Store and data directory.
+It closes `promotion_crash_reopen_atomic`, `child_failure_propagated`, and `event_reconnect_resume`: reopening preserves the active pointer, evaluating state, and promotion count; a failed child remains linked by `parentRunId` with both rows and the failed step persisted; and terminal SSE resume yields the exact remaining event tail.
+This probe evidence did not change the cost ledger, EVAL-003, or evaluator lifecycle, and used no services or paid calls.
+The latest session-5 console tip is `ae482da`, following `29afe35`, with 61/61 tests, TypeScript, and build clean; its latest report did not include live smoke.
+These results do not establish a product-wide run, heldout performance, or final evaluation success.
+
+A newer isolated development smoke used Store and data path `/tmp/adaptive-run-2fc3c680.fiZAAA`.
+Under scoped verifier fix `0561041`, the trusted outcome was visible as `evaluator_only` while the required `model_response` remained operator-visible.
+The durable run was `run_7f5b3196fff541129d4e9c8345d0ba75` for `finance-development-00`, baseline seed 17, with `lastEventSequence=16`, a trusted and reliable outcome, and `bundleHash=507a47cc70856f5e680d689ad3400b92f67daa4dbc9bc1e1209b5ae78a1e7b6a`.
+Its recorded pins were protocol `1cced7b2...`, core `54b3b7...`, Docker image `adaptive-prime-runtime@sha256:e1242afd...`, analysis `3e5371a...`, budget `5f3b9d...`, and model `efaeffc...`.
+The aggregate receipt recorded 8407 input, 1088 output, and 9495 total tokens, with broker invoice and payment reads plus `apply_payment` confirmed.
+Resume smoke completed with `status=complete`, `candidateCount=1`, and `transferRuns=1` matching the expected value of 1.
+The full post-fix pytest report was 147 passed with two dependency warnings.
+This is isolated development-smoke evidence only and makes no heldout, final, public, or performance claim.
+
+QA data-integrity hold: the original real evidence for `run_2fc` is contaminated by appended synthetic `model_response` rows at sequences 20 and 21, named `learning-model-fake-resp-1` and `learning-model-r20`.
+All history must be preserved, but those rows must not be erased, relabeled, or counted as real evidence.
+No transport smoke may target the root QAdata or port 8000 because the real authenticated path invokes the paid model.
+Every test and probe must use an isolated temporary Store and data directory.
+
+The repository contains no literal occurrence of the run or row identifiers, so the source and ownership of those specific append operations are not established here.
+The related evaluator-owned probe path observed on session 2 is `Controller.execute_probe`, authored in the session-2 probe commits `59adfb5` and `f423fac`.
+That path creates `tempfile.TemporaryDirectory(prefix="aa-probe-")` and a `Store` under its temporary directory, but this code-level property does not prove that `run_2fc` was isolated.
+Session 6 must create clean independent evaluation data, regenerate and validate real development evidence and its candidate, and retain exact path-level isolation proof before any sealed panel runs.
+
+The documentation phase is complete on this branch.
+The local-main assembly plan is limited to the complete session-2 integration at `f3785f0` plus its reviewed overlay, followed by the session-5 console lineage `29afe35` through `ae482da`.
+It has not been performed here.
+After those two inputs are materialized and reviewed, run the isolated backend and console checks with fresh Store and data paths, then reassess M2-M4 against the evidence gates.
+Session 3, session 4, session 6, and session 7 work remains separate evidence or follow-up input and is not part of that assembly plan.
+Implementation, local verification, and M2-M4 coordination remain active across the worker branches.
 Public remote creation, publication, pushes to public remotes, pull requests, and submission remain unauthorized and incomplete.
 The official build window closes on 2026-09-07 at 03:30 IST.
 Public repository and social-demo obligations are recorded in the milestones and are not yet fulfilled.
