@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 adaptive-agent-appworld = "adaptive_agent.appworld_provider:main"
+adaptive-agent-appworld-experiment = "adaptive_agent.appworld_experiment:main"
 adaptive-agent-plan = "adaptive_agent.planner:main"
 adaptive-agent = "adaptive_agent.app:main"
 

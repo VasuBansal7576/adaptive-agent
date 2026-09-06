@@ -44,6 +44,16 @@ def test_freeze_selects_official_final_subset_without_inspecting_answers():
     assert set(protocol.split_by_task_id) <= {(task, split) for split in ("test_normal", "test_challenge") for task in Package().catalog.split_ids(split)}
 
 
+def test_train_protocol_and_b0_only_panel_are_supported(tmp_path):
+    protocol = AppWorldProtocol.freeze(Package(), model_profile="model", core_planner_hash="core", official_split="train", image_digest="sha256:test", source_revision="test-revision", published_count=2)
+    assert set(protocol.split_by_task_id) <= {(task, "train") for task in Package().catalog.split_ids("train")}
+    runtime = Runtime()
+    report = AppWorldBenchmarkRunner(tmp_path, Package(), protocol, runtime)
+    result = report.run("train-only", {Arm.B0: "b0", Arm.L: "l", Arm.A: "a"}, arms=(Arm.B0,))
+    assert len(runtime.calls) == 2 and result.provenance_complete
+    assert result.arm_summaries["L"]["count"] == 0
+
+
 def test_runner_is_durable_and_reports_measured_usage(tmp_path):
     protocol = AppWorldProtocol.freeze(Package(), model_profile="model", core_planner_hash="core", official_split="test_normal", image_digest="sha256:test", source_revision="test-revision", published_count=2)
     runtime = Runtime()

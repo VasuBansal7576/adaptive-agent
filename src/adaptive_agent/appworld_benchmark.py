@@ -86,7 +86,7 @@ class DurableAppWorldAdapter:
         return FrozenProtocol(self.protocol.protocol_hash, {}, {}, inputs)
 
     def _task(self, task: Any) -> Any:
-        partition = Partition.VALIDATION if self.protocol.official_split == "dev" else Partition.FINAL
+        partition = Partition.DEVELOPMENT if self.protocol.official_split == "train" else (Partition.VALIDATION if self.protocol.official_split == "dev" else Partition.FINAL)
         return SimpleNamespace(task_id=task.task_id, environment_id="appworld", goal=task.instruction, partition=partition, environment_ref=SimpleNamespace(id="appworld", version=APPWORLD_VERSION))
 
     def _bundle(self, bundle_hash: str) -> Any:
@@ -184,7 +184,7 @@ class AppWorldProtocol:
 
     @classmethod
     def freeze(cls, package: AppWorldPackage, *, model_profile: str, core_planner_hash: str, official_split: str, image_digest: str, provider: str = "openai-codex", source_revision: str, dataset_content_hash: str | None = None, published_count: int = DEFAULT_PUBLISHED_COUNT, sampling_seed: int = DEFAULT_SEED, seeds: tuple[int, ...] = (0,), budget: BudgetSpec | None = None) -> "AppWorldProtocol":
-        if official_split not in ("dev", *FINAL_SPLITS) or not model_profile or not core_planner_hash or not image_digest or image_digest == "image-unpinned" or provider != "openai-codex" or not source_revision or published_count < 1 or not seeds or any(isinstance(s, bool) or not isinstance(s, int) for s in seeds):
+        if official_split not in ("train", "dev", *FINAL_SPLITS) or not model_profile or not core_planner_hash or not image_digest or image_digest == "image-unpinned" or provider != "openai-codex" or not source_revision or published_count < 1 or not seeds or any(isinstance(s, bool) or not isinstance(s, int) for s in seeds):
             raise ValueError("invalid AppWorld protocol pins")
         catalog = package.catalog
         content_hash = dataset_content_hash or catalog.dataset_hash()
@@ -193,10 +193,10 @@ class AppWorldProtocol:
         split_ids = {split: tuple(str(x) for x in catalog.split_ids(split)) for split in ("train", "dev", *FINAL_SPLITS)}
         if any(len(ids) != len(set(ids)) for ids in split_ids.values()):
             raise ValueError("duplicate AppWorld task IDs")
-        final_ids = split_ids[official_split]
-        if published_count > len(final_ids):
-            raise ValueError("published subset exceeds official final task pool")
-        sampled = tuple(sorted(random.Random(sampling_seed).sample(final_ids, published_count)))
+        selected_ids = split_ids[official_split]
+        if published_count > len(selected_ids):
+            raise ValueError("published subset exceeds official task pool")
+        sampled = tuple(sorted(random.Random(sampling_seed).sample(selected_ids, published_count)))
         split_by_id = tuple((task_id, split) for split, ids in split_ids.items() for task_id in ids if task_id in sampled)
         selected_budget = budget or BudgetSpec()
         payload = {"source": "appworld", "version": APPWORLD_VERSION, "modelProfile": model_profile, "corePlannerHash": core_planner_hash, "datasetContentHash": content_hash, "imageDigest": image_digest, "provider": provider, "sourceRevision": source_revision, "officialSplit": official_split, "seeds": list(seeds), "publishedCount": published_count, "samplingSeed": sampling_seed, "budget": selected_budget.to_dict(), "officialSplitCounts": {k: len(v) for k, v in split_ids.items()}, "sampledTaskIds": list(sampled), "splitByTaskId": dict(split_by_id)}
@@ -271,13 +271,17 @@ class AppWorldBenchmarkRunner:
             if result.usage["totalTokens"] != result.usage["inputTokens"] + result.usage["outputTokens"]:
                 raise ValueError("runtime usage receipt does not reconcile")
 
-    def run(self, benchmark_id: str, bundles: Mapping[Arm | str, str]) -> AppWorldReport:
+    def run(self, benchmark_id: str, bundles: Mapping[Arm | str, str], *, arms: Sequence[Arm] = (Arm.B0, Arm.L, Arm.A)) -> AppWorldReport:
         bundle_hashes = self._plan(benchmark_id, bundles)
+        selected_arms = tuple(arms)
+        if not selected_arms or any(arm not in (Arm.B0, Arm.L, Arm.A) for arm in selected_arms) or len(set(selected_arms)) != len(selected_arms):
+            raise ValueError("AppWorld arms must be a non-empty subset of B0, L, and A")
+        self._selected_arms = selected_arms
         split_by_id, results = dict(self.protocol.split_by_task_id), []
         for task_id in self.protocol.sampled_task_ids:
             task = self.package.catalog.task(task_id, split_by_id[task_id], allow_test=split_by_id[task_id] in FINAL_SPLITS)
             for seed in self.protocol.seeds:
-                for arm in (Arm.B0, Arm.L, Arm.A):
+                for arm in selected_arms:
                     run_id = f"appworld:{benchmark_id}:{task_id}:{arm.value}:{seed}"
                     with sqlite3.connect(self.db) as conn: prior = conn.execute("SELECT status, run_id, result_json FROM appworld_cells WHERE benchmark_id=? AND task_id=? AND arm=? AND seed=?", (benchmark_id, task_id, arm.value, seed)).fetchone()
                     result = None
@@ -315,8 +319,8 @@ class AppWorldBenchmarkRunner:
         for arm in (Arm.B0, Arm.L, Arm.A):
             selected = [c for c in cells if c.observation.arm == arm]; usages = [c.usage for c in selected if c.usage is not None]
             summaries[arm.value] = {"accuracy": sum(r.observation.passed for r in selected) / len(selected) if selected else 0.0, "reliability": sum(r.observation.reliable for r in selected) / len(selected) if selected else 0.0, "inputTokens": sum(int(u.get("inputTokens", 0)) for u in usages) if len(usages) == len(selected) else None, "outputTokens": sum(int(u.get("outputTokens", 0)) for u in usages) if len(usages) == len(selected) else None, "totalTokens": sum(int(u.get("totalTokens", 0)) for u in usages) if len(usages) == len(selected) else None, "costMicrounits": sum(r.observation.cost_microunits for r in selected), "latencySeconds": sum(r.observation.latency_seconds for r in selected), "count": len(selected)}
-        base, candidate = [r for r in rows if r.arm == Arm.B0], [r for r in rows if r.arm == Arm.L]; keys = {(r.task_id, r.seed) for r in base} & {(r.task_id, r.seed) for r in candidate}; expected = len(self.protocol.sampled_task_ids) * len(self.protocol.seeds) * 3
-        intervals = clustered_paired_bootstrap(base, candidate) if len(rows) == expected else ()
+        base, candidate = [r for r in rows if r.arm == Arm.B0], [r for r in rows if r.arm == Arm.L]; keys = {(r.task_id, r.seed) for r in base} & {(r.task_id, r.seed) for r in candidate}; expected = len(self.protocol.sampled_task_ids) * len(self.protocol.seeds) * len(getattr(self, "_selected_arms", (Arm.B0, Arm.L, Arm.A)))
+        intervals = clustered_paired_bootstrap(base, candidate) if len(rows) == expected and {Arm.B0, Arm.L}.issubset(getattr(self, "_selected_arms", ())) else ()
         audit = getattr(self.runtime, "ablation_audit", lambda: None)()
         audit_value = audit.to_dict() if audit is not None and hasattr(audit, "to_dict") else (asdict(audit) if audit is not None else None)
         return AppWorldReport(self.protocol, summaries, tuple(x.to_dict() for x in intervals), len(keys), expected - len(rows), bool(rows) and len(rows) == expected and all(r.model_provenance is ModelProvenance.REAL_MODEL for r in rows), ("Published AppWorld subset; not the full benchmark.", "Only aggregate outcomes and measured usage are exported; task answers and traces remain private."), audit_value)
