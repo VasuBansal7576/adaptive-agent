@@ -147,7 +147,7 @@ class DurableRuntime:
             tasks.append(task)
         self.packages[payload.environment_id] = _RegisteredPackage(manifest, tasks)
         self._tasks.update({task.task_id: task for task in tasks})
-        return {"environmentId": payload.environment_id, "version": payload.version, "validationState": "valid", "evaluatorReady": self.evaluator is not None, "toolCount": len(manifest.tool_schemas), "policyScope": manifest.policy_ref.id}
+        return {"environmentId": payload.environment_id, "version": payload.version, "validationState": "valid", "evaluatorReady": self.evaluator is not None, "toolCount": len(manifest.tool_schemas), "policyScope": manifest.policy_ref.id, "executionModes": list(manifest.execution_modes), "capabilities": list(manifest.capabilities)}
 
     def list_candidates(self) -> list[dict[str, Any]]:
         out = []
@@ -247,7 +247,7 @@ class DurableRuntime:
 
     def list_environments(self) -> list[dict[str, Any]]:
         registered = {task.environment_ref.id for task in self._tasks.values()}
-        return [{"environmentId": name, "version": package.manifest.version, "validationState": "valid", "evaluatorReady": True, "toolCount": len(package.manifest.tool_schemas), "policyScope": package.manifest.policy_ref.id} for name, package in self.packages.items() if name in registered]
+        return [{"environmentId": name, "version": package.manifest.version, "validationState": "valid", "evaluatorReady": True, "toolCount": len(package.manifest.tool_schemas), "policyScope": package.manifest.policy_ref.id, "executionModes": list(package.manifest.execution_modes), "capabilities": list(package.manifest.capabilities)} for name, package in self.packages.items() if name in registered]
 
     def list_tasks(self, environment_id: str) -> list[dict[str, Any]]:
         package = self.packages.get(environment_id)

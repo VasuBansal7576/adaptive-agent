@@ -478,6 +478,8 @@ class ControlPlane:
                 "evaluatorReady": True,
                 "toolCount": len(payload.tool_schemas),
                 "policyScope": str(payload.policy_ref.get("id", "")),
+                "executionModes": list(payload.execution_modes),
+                "capabilities": list(payload.capabilities),
             }
             self.environments[key] = {"manifest": manifest, "summary": summary}
             return summary
