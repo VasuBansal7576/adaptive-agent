@@ -362,10 +362,13 @@ class ControlPlane:
                 raise TypeError("trusted evaluation report must serialize to an object")
             protocol_hash = payload.get("protocolHash")
             base_hash = payload.get("baseHash")
+            candidate_hash = payload.get("candidateHash")
             if protocol_hash != evaluation["protocolHash"]:
                 raise ValueError("evaluation report protocol hash does not match request")
             if base_hash != evaluation["baseBundleHash"]:
                 raise ValueError("evaluation report base hash does not match request")
+            if candidate_hash != evaluation["candidateId"]:
+                raise ValueError("evaluation report candidate hash does not match request")
             candidate = self.candidates.get(evaluation["candidateId"])
             if candidate is None:
                 raise KeyError("candidate not found")

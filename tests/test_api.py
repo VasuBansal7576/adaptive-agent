@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 from threading import Event, Thread
+import pytest
 
 from adaptive_agent.api import CandidateProposalRequest, ControlPlane, EvaluationRequest, create_app, make_authenticated_model_runner
 from adaptive_agent.evaluation import Arm, EvaluationProtocol, EvaluationRunner, ModelProvenance, Partition, RunObservation, build_environment_packages
@@ -169,19 +170,27 @@ def test_trusted_evaluation_runner_report_is_pinned_before_decision():
 
     plane = ControlPlane()
     base_hash = plane.active_bundle_hash
-    report = runner.run_validation(base_hash=base_hash, candidate_hash="candidate", execute=execute)
-    serialized = report.to_dict()
-    assert serialized["promotionEligible"] is True
-    assert serialized["exposure"][0]["environment_id"] == "finance"
-
     candidate = plane.create_candidate(CandidateProposalRequest(
         baseBundleHash=base_hash, editOperations=["bounded change"], changedArtifactHashes=["artifact"],
         supportingEvidenceIds=["evidence"], predictedEffect="improves accuracy", proposerVersion="test",
     ))
+    report = runner.run_validation(base_hash=base_hash, candidate_hash=candidate["candidateId"], execute=execute)
+    serialized = report.to_dict()
+    assert serialized["promotionEligible"] is True
+    assert serialized["exposure"][0]["environment_id"] == "finance"
+
     evaluation = plane.queue_evaluation(EvaluationRequest(
         candidateId=candidate["candidateId"], baseBundleHash=base_hash, protocolHash=report.protocol_hash,
         partitionRef={"id": "validation", "version": "1", "sha256": "partition"},
     ))
+    class ForgedCandidateReport:
+        def to_dict(self):
+            value = dict(serialized)
+            value["candidateHash"] = "another-candidate"
+            return value
+
+    with pytest.raises(ValueError, match="candidate hash"):
+        plane.record_trusted_evaluation(evaluation["evaluationId"], ForgedCandidateReport())
     recorded = plane.record_trusted_evaluation(evaluation["evaluationId"], report)
     assert recorded["state"] == "valid"
     assert recorded["report"]["evaluatorTrusted"] is True
