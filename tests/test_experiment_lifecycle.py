@@ -28,9 +28,12 @@ def _stages(seen: list[tuple[str, str]]) -> tuple[LifecycleStage, ...]:
 
 
 def test_effective_cost_prefers_explicit_and_uses_finite_nominal_proxy():
+    complete = {"knownReceipts": 1, "totalReceipts": 1}
+    partial = {"knownReceipts": 1, "totalReceipts": 2}
     assert _effective_cost_microunits(17, 0.000021) == 17
-    assert _effective_cost_microunits(None, 0.000021) == 21
-    assert _effective_cost_microunits(None, float("nan")) is None
+    assert _effective_cost_microunits(None, 0.000021, nominal_status="complete", nominal_coverage=complete) == 21
+    assert _effective_cost_microunits(None, 0.000021, nominal_status="partial", nominal_coverage=partial) is None
+    assert _effective_cost_microunits(None, float("nan"), nominal_status="complete", nominal_coverage=complete) is None
 
 
 def test_complete_lifecycle_is_ordered_resumable_and_does_not_repeat_success(tmp_path: Path):

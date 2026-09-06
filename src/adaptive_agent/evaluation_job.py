@@ -31,11 +31,21 @@ from adaptive_agent.evaluation import (
 )
 
 
-def _effective_cost_microunits(explicit_cost: object, nominal_cost_usd: object) -> int | None:
+def _effective_cost_microunits(explicit_cost: object, nominal_cost_usd: object, *, nominal_status: object = None, nominal_coverage: object = None) -> int | None:
     """Normalize measured cost, falling back to a clearly labeled nominal proxy."""
     if isinstance(explicit_cost, (int, float)) and not isinstance(explicit_cost, bool) and math.isfinite(float(explicit_cost)) and explicit_cost >= 0:
         return int(round(float(explicit_cost)))
-    if isinstance(nominal_cost_usd, (int, float)) and not isinstance(nominal_cost_usd, bool) and math.isfinite(float(nominal_cost_usd)) and nominal_cost_usd >= 0:
+    complete_coverage = (
+        isinstance(nominal_coverage, Mapping)
+        and isinstance(nominal_coverage.get("knownReceipts"), int)
+        and not isinstance(nominal_coverage.get("knownReceipts"), bool)
+        and isinstance(nominal_coverage.get("totalReceipts"), int)
+        and not isinstance(nominal_coverage.get("totalReceipts"), bool)
+        and nominal_coverage["totalReceipts"] > 0
+        and nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"]
+        and nominal_status == "complete"
+    )
+    if complete_coverage and isinstance(nominal_cost_usd, (int, float)) and not isinstance(nominal_cost_usd, bool) and math.isfinite(float(nominal_cost_usd)) and nominal_cost_usd >= 0:
         return int(round(float(nominal_cost_usd) * 1_000_000))
     return None
 from adaptive_agent.evaluation_store import SQLiteRunEvidenceStore, build_durable_evaluation_runner
@@ -748,6 +758,8 @@ class EvaluationJob:
         effective_cost_microunits = 0
         effective_cost_seen = False
         nominal_proxy_seen = False
+        nominal_coverage_complete = True
+        nominal_coverage_seen = False
         inference_duration_seconds = 0.0
         inference_duration_seen = False
         economic_statuses: set[str] = set()
@@ -764,6 +776,18 @@ class EvaluationJob:
             output_tokens += int(usage.get("outputTokens", 0) or 0)
             explicit_cost: object = None
             if isinstance(accounting, dict):
+                nominal_status = accounting.get("nominalCostStatus")
+                nominal_coverage = accounting.get("nominalCostCoverage")
+                if nominal_status is not None or nominal_coverage is not None:
+                    nominal_coverage_seen = True
+                    if not (
+                        nominal_status == "complete"
+                        and isinstance(nominal_coverage, Mapping)
+                        and nominal_coverage.get("knownReceipts") == nominal_coverage.get("totalReceipts")
+                        and isinstance(nominal_coverage.get("totalReceipts"), int)
+                        and nominal_coverage["totalReceipts"] > 0
+                    ):
+                        nominal_coverage_complete = False
                 economic = accounting.get("economicCost")
                 if isinstance(economic, dict):
                     status = economic.get("status")
@@ -798,7 +822,12 @@ class EvaluationJob:
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     nominal_cost += float(value)
                     nominal_seen = True
-            effective = _effective_cost_microunits(explicit_cost, nominal_value)
+            effective = _effective_cost_microunits(
+                explicit_cost,
+                nominal_value,
+                nominal_status=accounting.get("nominalCostStatus") if isinstance(accounting, dict) else None,
+                nominal_coverage=accounting.get("nominalCostCoverage") if isinstance(accounting, dict) else None,
+            )
             if effective is not None:
                 effective_cost_microunits += effective
                 effective_cost_seen = True
@@ -819,6 +848,7 @@ class EvaluationJob:
             "totalTokens": input_tokens + output_tokens,
             "nominalCostUsd": nominal_cost if nominal_seen else None,
             "effectiveCostMicrounits": effective_cost_microunits if effective_cost_seen else None,
+            "nominalCostStatus": "complete" if nominal_coverage_seen and nominal_coverage_complete else "partial" if nominal_coverage_seen else None,
             "economicCostMicrounits": economic_cost_microunits if economic_cost_seen else None,
             "economicCostStatuses": sorted(economic_statuses),
             "inferenceDurationSeconds": inference_duration_seconds if inference_duration_seen else None,

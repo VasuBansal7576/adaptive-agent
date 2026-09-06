@@ -100,7 +100,8 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             response = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "provider": "openai-codex", "modelProfile": protocol.model_profile, "status": "complete", "usage": usage, "versionRefs": version_refs, "arm": "L", "seed": 17, "bundleHash": bundle.content_hash}
             response_ref = store.put_artifact(response)
             store.append_evidence("evidence-1", {"run_id": run_id, "sequence": 1, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
-            accounting_ref = store.put_artifact({"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "usage": usage, "costMicrounits": 1, "durationSeconds": 1.0, "versionRefs": version_refs, "arm": "L", "seed": 17, "bundleHash": bundle.content_hash})
+            accounting = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "usage": usage, "costMicrounits": 1, "durationSeconds": 1.0, "versionRefs": version_refs, "arm": "L", "seed": 17, "bundleHash": bundle.content_hash}
+            accounting_ref = store.put_artifact(accounting)
             outcome = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "arm": "L", "seed": 17, "bundleHash": bundle.content_hash, "passed": True, "reliable": True, "safetyViolations": 0}
             outcome_ref = store.put_artifact(outcome)
             # A fresh evaluator store must verify a private trusted outcome;
@@ -110,6 +111,13 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             row = RunObservation(task.task_id, "finance", Partition.VALIDATION, 17, Arm.L, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, response_id=response_id, accounting_ref=accounting_ref.sha256, evidence_ref="evidence-1", outcome_ref="outcome-1", config_hashes=expected, run_id=run_id, bundle_hash=bundle.content_hash)
             verifier = SQLiteRunEvidenceStore(store)
             self.assertTrue(verifier.verify(row, frozen, package))
+            nominal = {**accounting, "costMicrounits": None, "nominalCostUsd": 0.000001, "economicCost": {"status": "unknown"}, "nominalCostCoverage": {"knownReceipts": 1, "totalReceipts": 1}, "nominalCostStatus": "complete"}
+            nominal_ref = store.put_artifact(nominal)
+            nominal_row = dataclasses.replace(row, accounting_ref=nominal_ref.sha256, cost_microunits=1)
+            self.assertTrue(verifier.verify(nominal_row, frozen, package))
+            partial = {**nominal, "nominalCostCoverage": {"knownReceipts": 1, "totalReceipts": 2}, "nominalCostStatus": "partial"}
+            partial_ref = store.put_artifact(partial)
+            self.assertFalse(verifier.verify(dataclasses.replace(nominal_row, accounting_ref=partial_ref.sha256), frozen, package))
             with store.connect() as conn:
                 conn.execute("UPDATE evidence SET visibility = 'operator' WHERE evidence_id = ?", ("outcome-1",))
                 conn.commit()
