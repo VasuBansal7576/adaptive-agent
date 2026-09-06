@@ -359,7 +359,12 @@ class AppWorldCatalog:
         this digest only binds evaluator and task artifacts to one installation.
         """
         digest = hashlib.sha256()
-        for path in sorted(path for path in self.data_root.rglob("*") if path.is_file()):
+        generated = {"__pycache__"}
+        for path in sorted(
+            path
+            for path in self.data_root.rglob("*")
+            if path.is_file() and path.suffix not in {".pyc", ".pyo"} and not generated.intersection(path.parts)
+        ):
             digest.update(str(path.relative_to(self.config.root)).encode())
             digest.update(hashlib.sha256(path.read_bytes()).digest())
         return digest.hexdigest()
