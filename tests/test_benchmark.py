@@ -75,6 +75,7 @@ class BenchmarkDriverTests(unittest.TestCase):
         protocol.freeze(packages)
         active = peak = 0
         guard = threading.Lock()
+        overlap = threading.Barrier(2)
 
         class TrustedEvidence:
             durable = True
@@ -88,7 +89,8 @@ class BenchmarkDriverTests(unittest.TestCase):
                 active += 1
                 peak = max(peak, active)
             try:
-                time.sleep(0.002)
+                overlap.wait(timeout=2)
+                time.sleep(0.12)
                 return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, bundle_hash=frozen_config.bundle_hash)
             finally:
                 with guard:
@@ -97,7 +99,8 @@ class BenchmarkDriverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = ResumableEvaluationDriver(Store(Path(directory)), protocol, packages, execute, object(), evidence_store=TrustedEvidence(), arm_bundles=_arm_bundles()).run("parallel", Partition.DEVELOPMENT)
         self.assertTrue(result.complete)
-        self.assertEqual(result.expected_count, 180)
+        self.assertEqual(result.expected_count, 60)
+        self.assertGreaterEqual(peak, 2)
         self.assertLessEqual(peak, 4)
 
     def test_smoke_identity_authorizes_held_out_run_after_reopen(self):
