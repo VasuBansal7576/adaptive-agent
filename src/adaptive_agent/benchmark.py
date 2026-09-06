@@ -39,7 +39,9 @@ class FrozenExecutionConfig:
     protocol: FrozenProtocol
     arm: Arm
     seed: int
-    bundle_hash: str
+    # Kept optional for legacy callback callers.  The benchmark driver always
+    # supplies and validates the selected arm's trusted content hash.
+    bundle_hash: str = ""
 
 
 TrustedTaskExecutor = Callable[[TaskInput, FrozenExecutionConfig, object], RunObservation]
