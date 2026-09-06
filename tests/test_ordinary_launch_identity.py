@@ -136,6 +136,36 @@ def test_terminal_replay_rejects_conflicting_identity_without_mutation(tmp_path,
     assert _snapshot(runtime, run_id) == before
 
 
+def test_terminal_L_seed7_omitted_replay_is_noop_and_defaults_conflict(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "PrimeRuntimeAdapter", FakePrime)
+    client = ScriptedClient([{"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": "ordinary-L7", "text": '{"action":"finish","answer":"done"}', "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}}])
+    app = create_runtime_app(data_dir=tmp_path, evaluator=lambda **_: {"passed": True}, model_runner=None)
+    runtime, run_id, _ = _create_run(app, "ordinary-L7")
+    runtime.launch(run_id, model_client_override=client, arm="L", seed=7)
+    before = _snapshot(runtime, run_id)
+
+    # Omitted identity is resolved from the persisted terminal binding and is
+    # an exact replay no-op, including no model dispatch.
+    runtime.launch(run_id, model_client_override=ForbiddenClient())
+    assert _snapshot(runtime, run_id) == before
+
+    for kwargs in ({"arm": "B0"}, {"seed": 0}):
+        with pytest.raises(LearningRuntimeError, match="conflicts with persisted"):
+            runtime.launch(run_id, model_client_override=ForbiddenClient(), **kwargs)
+        assert _snapshot(runtime, run_id) == before
+
+
+def test_already_running_launch_with_omitted_identity_is_an_exact_noop(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path, model_runner=None)
+    runtime, run_id, _ = _create_run(app, "ordinary-running")
+    runtime.controller.store.update_run_status(run_id, "running")
+    before = _snapshot(runtime, run_id)
+    forbidden = ForbiddenClient()
+    runtime.launch(run_id, model_client_override=forbidden)
+    assert forbidden.calls == 0
+    assert _snapshot(runtime, run_id) == before
+
+
 def test_malformed_pinned_bundle_hash_is_rejected_before_dispatch(tmp_path):
     app = create_runtime_app(data_dir=tmp_path, model_runner=None)
     runtime, run_id, bundle_hash = _create_run(app, "ordinary-malformed-bundle")

@@ -1705,7 +1705,7 @@ class DurableRuntime:
                 return trusted_result
         return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
 
-    def _resolve_launch_identity(self, stored: Mapping[str, Any], run_record: Any, arm: str, seed: int, bundle_hash: str | None) -> tuple[str, int, str]:
+    def _resolve_launch_identity(self, stored: Mapping[str, Any], run_record: Any, arm: str | None, seed: int | None, bundle_hash: str | None) -> tuple[str, int, str]:
         """Resolve launch identity without mutating the durable run row."""
         try:
             artifact = self.controller.store.get_artifact(run_record.skill_bundle_ref)
@@ -1729,19 +1729,23 @@ class DurableRuntime:
         if not isinstance(payload, dict):
             raise LearningRuntimeError("run identity is malformed")
         persisted_arm = payload.get("arm")
-        if persisted_arm is not None and persisted_arm not in {"B0", "L", "A"}:
+        if persisted_arm is not None and (not isinstance(persisted_arm, str) or persisted_arm not in {"B0", "L", "A"}):
             raise LearningRuntimeError("persisted launch arm is invalid")
-        if persisted_arm is not None and arm != "B0" and arm != persisted_arm:
+        if arm is not None and not isinstance(arm, str):
+            raise LearningRuntimeError("launch arm must be a string")
+        if arm is not None and arm not in {"B0", "L", "A"}:
+            raise LearningRuntimeError("launch arm is invalid")
+        if persisted_arm is not None and arm is not None and arm != persisted_arm:
             raise LearningRuntimeError("launch arm conflicts with persisted run identity")
-        if isinstance(persisted_arm, str) and arm == "B0":
-            arm = persisted_arm
+        arm = arm if arm is not None else (persisted_arm or "B0")
         persisted_seed = payload.get("seed")
         if persisted_seed is not None and (not isinstance(persisted_seed, int) or isinstance(persisted_seed, bool)):
             raise LearningRuntimeError("persisted launch seed is invalid")
-        if persisted_seed is not None and seed != 0 and seed != persisted_seed:
+        if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+            raise LearningRuntimeError("launch seed must be an integer")
+        if persisted_seed is not None and seed is not None and seed != persisted_seed:
             raise LearningRuntimeError("launch seed conflicts with persisted run identity")
-        if isinstance(persisted_seed, int) and seed == 0:
-            seed = persisted_seed
+        seed = seed if seed is not None else (persisted_seed if persisted_seed is not None else 0)
         persisted_hash = payload.get("bundleHash")
         if persisted_hash is not None and persisted_hash != pinned_hash:
             raise LearningRuntimeError("persisted launch bundle hash does not match the run bundle")
@@ -1879,7 +1883,7 @@ class DurableRuntime:
         # authority in the application adapter.
         return self.controller.append_event(run_id, "tool_result", payload, "broker", "operator")
 
-    def launch(self, run_id: str, *, task_override: Any | None = None, package_override: Any | None = None, model_client_override: Any | None = None, seed: int = 0, arm: str = "B0", bundle_hash: str | None = None, core_planner_hash: str | None = None, image_digest: str | None = None) -> None:
+    def launch(self, run_id: str, *, task_override: Any | None = None, package_override: Any | None = None, model_client_override: Any | None = None, seed: int | None = None, arm: str | None = None, bundle_hash: str | None = None, core_planner_hash: str | None = None, image_digest: str | None = None) -> None:
         stored = self.controller.store.get_run(run_id)
         if not stored:
             raise KeyError("run not found")
