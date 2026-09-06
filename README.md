@@ -14,11 +14,14 @@ Read [MILESTONES.md](MILESTONES.md) for implementation evidence and delivery gat
 ## Current status
 
 The public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent).
-The verified root-committed `main` checkpoint is `61e700b`, which includes the integrated backend and console evidence.
+The verified root-committed `main` checkpoint is `ccf3b3a`.
 The public repository and its `main` branch were verified at this checkpoint.
 
-Current verification records 123 focused backend checks passed, 71 console tests passed, clean TypeScript and production-build checks, and a real local API browser pass at 375, 768, and 1440 pixel widths with no overflow or page errors.
-These are scripted integration and browser checks, not a performance measurement.
+The current checkpoint records 86 focused tests passed.
+A full raw Prime scripted production lifecycle passed in 224.41 seconds across 60 training, 360 validation, and 720 final runs, including restart and tamper checks.
+This is lifecycle evidence, not an achieved improvement claim.
+
+Earlier backend and console checks remain historical evidence, including 123 focused backend checks, 71 console tests, clean TypeScript and production-build checks, and a real local API browser pass at 375, 768, and 1440 pixel widths with no overflow or page errors.
 
 Retained root evidence at `a882641` records the full synthetic 1,080-case run, restart coverage, and two authenticated reports passing in 48.25 seconds.
 The combined production bytes at `2a54cf9` reproduced that same full synthetic pass.
@@ -30,12 +33,20 @@ A separate retained real product run reached the production UI, authenticated Lu
 It is identified by run `run_a1662f700a9a400b9e0f80b87a52f76e` and evidence-linked candidate proposal `cand_a095170f9c6d4f58943deb7539270de0`.
 That candidate was not promoted and this successful product path is distinct from the later failed full benchmark.
 
-A real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC and failed before the held-out phase after one successful task and five development budget exhaustions.
+An earlier real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC and failed before the held-out phase after one successful task and five development budget exhaustions.
 It produced no learning result, validation result, final metrics, or measured improvement.
 M4 is therefore not complete.
 
-The AppWorld work remains in worker 2, where the full runtime integration still has a serialization failure and is not accepted or merged.
-Multi-run learning in worker 4 is still awaiting its fix and commit.
+The AppWorld adapter is integrated at `ccf3b3a` with installed AppWorld `0.1.3.post1`.
+A real TRAIN run produced a strict receipt but exhausted its 20,000-token task budget.
+The full AppWorld CLI workload of 8 train tasks, 20 dev tasks times 3, and 20 test tasks times 3 remains under review.
+
+Multi-run learning is integrated.
+Actual learning used a 15-run source set and 60 training attempts, with 48 successes and 12 budget failures.
+Learner usage of 6,678 input and 582 output tokens produced an unpromoted candidate; receipt accounting then failed, and that failure was fixed generically.
+
+A fresh actual original full experiment has been RUNNING against frozen source `ccf3b3a` since 2026-09-06 17:57 UTC.
+No new held-out report is available, so M4 remains unproven.
 
 The accepted Luna-through-ChatGPT subscription path does not expose an API-key or provider switch.
 The trusted parent accounts actual model usage and rejects after aggregate token exhaustion.
