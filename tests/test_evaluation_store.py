@@ -46,12 +46,17 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             frozen = protocol.freeze(build_environment_packages())
             run_id, response_id = "run-1", "provider-response-1"
             store.save_run(run_id, {"task_id": task.task_id, "environment_id": "finance", "bundle_id": "bundle", "status": "succeeded", "idempotency_key": "run-key", "last_event_sequence": 0, "created_at": "now", "run_json": "{}"})
-            response = {"responseId": response_id, "provider": "openai-codex", "status": "complete"}
+            version_refs = {"policy": package.manifest.policy_ref.sha256, "schema": sha256_json(package.manifest.tool_schemas), "planner": protocol.core_planner_hash, "budget": sha256_json(frozen.inputs["runBudget"]), "image": protocol.image_digest}
+            usage = {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
+            response = {"responseId": response_id, "provider": "openai-codex", "modelProfile": protocol.model_profile, "status": "complete", "usage": usage, "versionRefs": version_refs}
             response_ref = store.put_artifact(response)
             store.append_evidence("evidence-1", {"run_id": run_id, "sequence": 1, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
-            accounting_ref = store.put_artifact({"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "versionRefs": {"policy": package.manifest.policy_ref.sha256, "schema": sha256_json(package.manifest.tool_schemas), "planner": protocol.core_planner_hash, "budget": sha256_json(frozen.inputs["runBudget"]), "image": protocol.image_digest}})
+            accounting_ref = store.put_artifact({"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "usage": usage, "costMicrounits": 1, "durationSeconds": 1.0, "versionRefs": version_refs})
+            outcome = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "passed": True, "reliable": True, "safetyViolations": 0}
+            outcome_ref = store.put_artifact(outcome)
+            store.append_evidence("outcome-1", {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "operator", "redacted": 0})
             expected = {"model": sha256_json({"profile": protocol.model_profile, "provider": protocol.provider}), "planner": protocol.core_planner_hash, "budget": sha256_json(frozen.inputs["runBudget"]), "policy": sha256_json(package.manifest.policy_ref), "schema": sha256_json(package.manifest.tool_schemas), "image": protocol.image_digest}
-            row = RunObservation(task.task_id, "finance", Partition.VALIDATION, 17, Arm.L, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, response_id=response_id, accounting_ref=accounting_ref.sha256, evidence_ref="evidence-1", config_hashes=expected, run_id=run_id)
+            row = RunObservation(task.task_id, "finance", Partition.VALIDATION, 17, Arm.L, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, response_id=response_id, accounting_ref=accounting_ref.sha256, evidence_ref="evidence-1", outcome_ref="outcome-1", config_hashes=expected, run_id=run_id)
             verifier = SQLiteRunEvidenceStore(store)
             self.assertTrue(verifier.verify(row, frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, response_id="wrong"), frozen, package))
@@ -59,6 +64,13 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             self.assertFalse(verifier.verify(dataclasses.replace(row, accounting_ref="missing"), frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, config_hashes={**expected, "image": "sha256:changed"}), frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, config_hashes={**expected, "planner": "changed"}), frozen, package))
+            self.assertFalse(verifier.verify(dataclasses.replace(row, passed=False), frozen, package))
+            self.assertFalse(verifier.verify(dataclasses.replace(row, cost_microunits=99), frozen, package))
+            bad_response = store.put_artifact({**response, "provider": "untrusted", "usage": None})
+            store.append_evidence("bad-response", {"run_id": run_id, "sequence": 4, "event_type": "model_response", "content_hash": bad_response.sha256, "source_ref": bad_response.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
+            self.assertFalse(verifier.verify(dataclasses.replace(row, evidence_ref="bad-response"), frozen, package))
+            store.append_evidence("corrupt", {"run_id": run_id, "sequence": 3, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": store.put_artifact(["not", "object"]).model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
+            self.assertFalse(verifier.verify(dataclasses.replace(row, evidence_ref="corrupt"), frozen, package))
 
 
 if __name__ == "__main__":
