@@ -3,6 +3,9 @@ import { render, screen, waitFor, within, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { createRestTransport } from "../api/rest";
+
+const transportRef = { current: null as unknown as ReturnType<typeof createRestTransport> };
+const states: string[] = [];
 import { normalizeSseEvent } from "../api/validate";
 import { createSimulationTransport } from "../api/simulation";
 
@@ -96,6 +99,44 @@ afterEach(() => {
 });
 
 describe("captured ACTUAL wire through normalizeSseEvent and the live UI", () => {
+  beforeEach(() => {
+    transportRef.current = createRestTransport();
+    states.length = 0;
+  });
+
+  it("records a genuine terminal EOF as Closed, never Stale (QA run_a1662f idle diagnosis)", async () => {
+    // the run is terminal: EOF must settle Closed
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.includes("/session")) return new Response("{}", { status: 200 });
+        return new Response(JSON.stringify({ status: "succeeded", lastEventSequence: 2 }), { status: 200 });
+      }),
+    );
+    const { default: userEvent } = await import("@testing-library/user-event");
+    render(<div />);
+    FakeEventSource.frames = CAPTURED_WIRE;
+    FakeEventSource.dropOnConnections = 0;
+    FakeEventSource.connectionCount = 0;
+    let applied = 0;
+    const close = transportRef.current.openRunStream("run_873a94b0ce424e7699709663b461eb13", 0, {
+      onEvent: () => {
+        applied += 1;
+      },
+      onState: (state) => {
+        states.push(state);
+      },
+    });
+    await waitFor(() => expect(applied).toBe(2), { timeout: 4000 });
+    // server-side EOF surfaces as an EventSource error; the terminal status
+    // check resolves to closed, which the app must record (cleanup emits nothing)
+    FakeEventSource.instances.forEach((es) => es.onerror?.());
+    await waitFor(() => expect(states).toContain("closed"), { timeout: 4000 });
+    expect(states).not.toContain("stale");
+    close();
+  });
+
   it("advances the browser cursor over the captured durable frames with zero rejections", () => {
     render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
     const transport = createRestTransport();

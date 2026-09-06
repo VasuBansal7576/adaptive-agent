@@ -515,9 +515,9 @@ export function createSimulationTransport(options?: {
       });
 
       return () => {
+        // cleanup is not an EOF event; emit no connection state
         cancelled = true;
         timers.forEach(clearTimeout);
-        onState("closed");
       };
     },
 
