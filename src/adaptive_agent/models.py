@@ -270,6 +270,7 @@ class RunRecord(BaseModel):
     seed: int | None = None
     bundle_hash: str | None = Field(None, alias="bundleHash")
     arm_bundles: dict[str, str] = Field(default_factory=dict, alias="armBundles")
+    final_accounting_ref: ArtifactRef | str | None = Field(None, alias="finalAccountingRef")
 
 
 class StepRecord(BaseModel):

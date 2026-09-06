@@ -68,8 +68,10 @@ def test_manifest_contains_public_tool_schemas(tmp_path: Path):
     root = _public_root(tmp_path)
     manifest = build_manifest(AppWorldConfig(root, python=sys.executable))
     assert manifest.environment_id == "appworld"
-    assert [schema.name for schema in manifest.tool_schemas] == ["phone__get_current_date_and_time"]
-    assert manifest.tool_schemas[0].effect == "read"
+    assert [schema.name for schema in manifest.tool_schemas] == [
+        "appworld__search_api_docs", "appworld__get_api_doc", "appworld__call_read", "appworld__call_write"
+    ]
+    assert manifest.tool_schemas[2].effect == "read"
 
 
 def test_register_appworld_defaults_to_train_and_dev(tmp_path: Path):
@@ -111,9 +113,9 @@ for line in sys.stdin:
     command = [sys.executable, "-u", str(worker)]
     with AppWorldProvider(config, task, "run-1", worker_command=command) as provider:
         first_pid = provider.process_id
-        result = provider.execute("run-1", "phone__get_current_date_and_time", {})
+        result = provider.execute("run-1", "appworld__call_read", {"apiName": "phone__get_current_date_and_time", "arguments": {}})
         assert result.output == {"date": "Thursday, May 18, 2023"}
-        assert provider.effect("phone__get_current_date_and_time") == "read"
+        assert provider.effect("appworld__call_read") == "read"
         assert provider.evaluate_aggregate()["success"] is True
     with AppWorldProvider(config, task, "run-2", worker_command=command) as second:
         assert second.process_id != first_pid
@@ -126,7 +128,7 @@ def test_provider_rejects_wrong_run(tmp_path: Path):
     task = AppWorldCatalog(AppWorldConfig(root, python=sys.executable)).task("train-1", "train")
     with AppWorldProvider(AppWorldConfig(root, python=sys.executable), task, "run-1", worker_command=[sys.executable, "-u", str(worker)]) as provider:
         with pytest.raises(AppWorldError, match="different run"):
-            provider.execute("run-2", "phone__get_current_date_and_time", {})
+            provider.execute("run-2", "appworld__call_read", {"apiName": "phone__get_current_date_and_time", "arguments": {}})
 
 
 def test_appworld_call_crosses_authoritative_broker(tmp_path: Path):
@@ -149,8 +151,8 @@ def test_appworld_call_crosses_authoritative_broker(tmp_path: Path):
     with AppWorldProvider(config, task, "run-1", worker_command=[sys.executable, "-u", str(worker)]) as provider:
         result = broker.request_tool_call(
             "appworld",
-            ToolRequest(runId="run-1", stepId="step-1", tool="phone__get_current_date_and_time", arguments={}, idempotencyKey="read-1"),
-            Capability("run-1", "appworld", "phone__get_current_date_and_time", "read"),
+            ToolRequest(runId="run-1", stepId="step-1", tool="appworld__call_read", arguments={"apiName": "phone__get_current_date_and_time", "arguments": {}}, idempotencyKey="read-1"),
+            Capability("run-1", "appworld", "appworld__call_read", "read"),
             provider,
         )
         assert result.status == "ok"

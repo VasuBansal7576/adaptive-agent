@@ -610,6 +610,7 @@ class DurableRuntime:
         # trusted outcome persistence for both API and benchmark executions.
         core_hash = str(inputs.get("corePlannerHash", self.core_planner_hash))
         image_digest = str(inputs.get("imageDigest", self.image_digest))
+        execution_started = time.monotonic()
         self.launch(run.run_id, task_override=task, package_override=package, model_client_override=model_client, seed=seed, arm=arm_value, bundle_hash=durable_bundle.content_hash, core_planner_hash=core_hash, image_digest=image_digest)
         evidence_rows = self.controller.store.list_evidence(run.run_id)
         model_rows = [row for row in evidence_rows if row.get("event_type") == "model_response"]
@@ -1639,9 +1640,14 @@ class DurableRuntime:
         self._run_started_at[run_id] = time.monotonic()
         self._run_last_receipt_at[run_id] = self._run_started_at[run_id]
         cancel = self._cancel_events.setdefault(run_id, threading.Event())
-        provider: _FixtureProvider
+        provider: ToolProvider
+        provider_factory = getattr(package, "provider_factory", None)
+        def make_provider() -> ToolProvider:
+            if callable(provider_factory):
+                return provider_factory(task, run_id, seed)
+            return _FixtureProvider(package, task, run_id, seed=seed)
         if self.model_runner is not None and model_client_override is None:
-            provider = _FixtureProvider(package, task, run_id, seed=seed)
+            provider = make_provider()
             invocation: Any = None
             model_runner = self.model_runner
             runtime = self
@@ -1655,13 +1661,18 @@ class DurableRuntime:
                 outcome = outcome or {"passed": False}
                 outcome = {**outcome, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal}
                 return DurableOutcome(runId=run_id, passed=bool(outcome.get("passed") is True), metadata=outcome)
-            self._execute_run(run_id, package.environment_id, provider, DirectDriver(), evaluate)
+            try:
+                self._execute_run(run_id, package.environment_id, provider, DirectDriver(), evaluate)
+            finally:
+                close = getattr(provider, "close", None)
+                if callable(close):
+                    close()
             self._cancel_events.pop(run_id, None)
             self._run_started_at.pop(run_id, None)
             self._run_last_receipt_at.pop(run_id, None)
             return
         prime: PrimeRuntimeAdapter | None = None
-        provider = _FixtureProvider(package, task, run_id, seed=seed)
+        provider = make_provider()
         run_record = self.controller.get_run(run_id)
         try:
             budget_data = self.controller.store.get_artifact(run_record.budget_ref) if run_record is not None else {}
@@ -1782,11 +1793,18 @@ class DurableRuntime:
                 except (TypeError, ValueError):
                     score = 1.0 if passed else 0.0
                 return DurableOutcome(runId=run_id, passed=passed, score=score, metadata={**evaluated, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal})
+            external_evaluate = getattr(package, "evaluate_provider", None)
+            if callable(external_evaluate):
+                evaluated = dict(external_evaluate(provider))
+                return DurableOutcome(runId=run_id, passed=bool(evaluated.get("passed")), score=float(evaluated.get("score", 1.0 if evaluated.get("passed") else 0.0)), metadata={**evaluated, "plannerStatus": result.status, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal})
             fixture = package.evaluate(task.task_id, provider.session)
             return DurableOutcome(runId=run_id, passed=fixture.passed, score=1.0 if fixture.passed else 0.0, metadata={"reason": fixture.reason, "evaluatorVersion": fixture.evaluator_version, "plannerStatus": result.status, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal})
         try:
             self._execute_run(run_id, package.environment_id, provider, driver, evaluate)
         finally:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
             if prime is not None:
                 prime.close(remove_workspace=True)
             self._cancel_events.pop(run_id, None)
@@ -1813,7 +1831,7 @@ class DurableRuntime:
         return {"runId": run_id, "approvalId": approval_id, "approved": approved}
 
 
-def _seed_durable_stack(plane: ControlPlane, store_dir: Path) -> tuple[Controller, EnvironmentRegistry, dict[str, Any]]:
+def _seed_durable_stack(plane: ControlPlane, store_dir: Path, appworld_config: Any | None = None) -> tuple[Controller, EnvironmentRegistry, dict[str, Any]]:
     """Create the durable seam and register the public fixture projections."""
     store = Store(store_dir)
     registry = EnvironmentRegistry(store)
@@ -1889,6 +1907,16 @@ def _seed_durable_stack(plane: ControlPlane, store_dir: Path) -> tuple[Controlle
                 allowedInputRefs=[ArtifactRef(id=ref, version="1", sha256=hashlib.sha256(ref.encode("utf-8")).hexdigest()) for ref in task.allowed_input_refs],
                 partition=task.partition.value,
             ))
+    if appworld_config is not None:
+        from adaptive_agent.appworld_provider import AppWorldPackage, register_appworld
+
+        appworld_package = AppWorldPackage(appworld_config)
+        register_appworld(registry, appworld_config, runtime_partition="development")
+        for kind, ref in (("policy", appworld_package.manifest.policy_ref), ("evaluator", appworld_package.manifest.evaluator_ref), ("reset", appworld_package.manifest.reset_ref)):
+            plane.trust_reference(kind, ref.model_dump(mode="json", by_alias=True))
+        for ref in appworld_package.manifest.docs:
+            plane.trust_reference("docs", ref.model_dump(mode="json", by_alias=True))
+        packages[appworld_package.environment_id] = appworld_package
     controller = Controller(store, registry, ToolBroker(store, registry))
     # Construct evaluator-owned durable adapters on the same SQLite store so
     # trusted attestations, allocations, and evidence verification survive a
@@ -1914,6 +1942,8 @@ def create_runtime_app(
     experiment_stage_runner: Any | None = None,
     evaluation_protocol: Any | None = None,
     evaluation_arm_bundles: Mapping[Any, Any] | None = None,
+    appworld_root: str | os.PathLike[str] | None = None,
+    appworld_python: str | None = None,
 ):
     """Build the API, durable controller seam, and optional static console."""
     kwargs: dict[str, Any] = {}
@@ -1929,7 +1959,12 @@ def create_runtime_app(
     kwargs["default_model_ref"] = model_ref
     kwargs["default_budget_ref"] = budget_ref
     plane = ControlPlane(**kwargs)
-    controller, registry, packages = _seed_durable_stack(plane, Path(data_dir or os.environ.get("ADAPTIVE_AGENT_DATA", ".adaptive-agent")))
+    appworld_config = None
+    if appworld_root is not None:
+        from adaptive_agent.appworld_provider import AppWorldConfig
+
+        appworld_config = AppWorldConfig(Path(appworld_root), python=appworld_python or "")
+    controller, registry, packages = _seed_durable_stack(plane, Path(data_dir or os.environ.get("ADAPTIVE_AGENT_DATA", ".adaptive-agent")), appworld_config)
     # Materialize the built-in budget profile under its trusted content hash so
     # every RunRecord budgetRef resolves to immutable bytes, just like custom
     # UI budgets.
@@ -1960,10 +1995,12 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--data-dir", default=os.environ.get("ADAPTIVE_AGENT_DATA", ".adaptive-agent"))
     parser.add_argument("--console-dist", default=os.environ.get("ADAPTIVE_AGENT_CONSOLE_DIST"))
+    parser.add_argument("--appworld-root", default=os.environ.get("APPWORLD_ROOT"))
+    parser.add_argument("--appworld-python", default=os.environ.get("APPWORLD_PYTHON"))
     args = parser.parse_args()
     import uvicorn
 
-    uvicorn.run(create_runtime_app(data_dir=args.data_dir, console_dist=args.console_dist), host=args.host, port=args.port)
+    uvicorn.run(create_runtime_app(data_dir=args.data_dir, console_dist=args.console_dist, appworld_root=args.appworld_root, appworld_python=args.appworld_python), host=args.host, port=args.port)
     return 0
 
 

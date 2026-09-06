@@ -22,13 +22,14 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from adaptive_agent.broker import ProviderExecutionOutcome, ToolProvider
-from adaptive_agent.evaluation import sha256_json
+from adaptive_agent.evaluation import ArtifactRef as EvaluationArtifactRef, Partition, TaskInput as EvaluationTaskInput, sha256_json
 from adaptive_agent.models import (
     ArtifactRef,
     EnvironmentManifest,
     TaskInput as DurableTaskInput,
     ToolSchema,
 )
+from adaptive_agent.environment import validate_arguments, SchemaValidationError
 
 
 APPWORLD_ENVIRONMENT_ID = "appworld"
@@ -36,6 +37,10 @@ PUBLISHED_APPWORLD_VERSION = "0.1.3.post1"
 _PUBLIC_DATA_FILES = ("data/version.txt", "data/LICENSE", "data/base_dbs/version.txt")
 _ALLOWED_SPLITS = ("train", "dev", "test_normal", "test_challenge")
 _TEST_SPLITS = {"test_normal", "test_challenge"}
+_BROKER_DOC_SEARCH = "appworld__search_api_docs"
+_BROKER_DOC_GET = "appworld__get_api_doc"
+_BROKER_READ = "appworld__call_read"
+_BROKER_WRITE = "appworld__call_write"
 
 
 class AppWorldError(RuntimeError):
@@ -59,6 +64,11 @@ class AppWorldConfig:
     experiment_name: str = "adaptive-agent"
     timeout_seconds: float = 30.0
     allow_test: bool = False
+
+    def __post_init__(self) -> None:
+        # Accept path-like values at the public boundary while keeping all
+        # internal path operations typed and deterministic.
+        object.__setattr__(self, "root", Path(self.root))
 
     def resolved_python(self) -> str:
         return self.python.strip() or os.environ.get("APPWORLD_PYTHON", "appworld")
@@ -328,6 +338,18 @@ def public_tool_schemas(config: AppWorldConfig) -> tuple[ToolSchema, ...]:
     return tuple(schemas)
 
 
+def broker_tool_schemas(version: str) -> tuple[ToolSchema, ...]:
+    """Small learner-facing surface; full API schemas are retrieved lazily."""
+    api_name = {"type": "string", "minLength": 1}
+    arguments = {"type": "object", "additionalProperties": True}
+    return (
+        ToolSchema(name=_BROKER_DOC_SEARCH, version=version, inputSchema={"type": "object", "properties": {"query": {"type": "string"}}, "additionalProperties": False}, outputSchema={"type": "object"}, effect="read"),
+        ToolSchema(name=_BROKER_DOC_GET, version=version, inputSchema={"type": "object", "required": ["apiName"], "properties": {"apiName": api_name}, "additionalProperties": False}, outputSchema={"type": "object"}, effect="read"),
+        ToolSchema(name=_BROKER_READ, version=version, inputSchema={"type": "object", "required": ["apiName", "arguments"], "properties": {"apiName": api_name, "arguments": arguments}, "additionalProperties": False}, outputSchema={"type": "object"}, effect="read"),
+        ToolSchema(name=_BROKER_WRITE, version=version, inputSchema={"type": "object", "required": ["apiName", "arguments"], "properties": {"apiName": api_name, "arguments": arguments}, "additionalProperties": False}, outputSchema={"type": "object"}, effect="write"),
+    )
+
+
 def build_manifest(config: AppWorldConfig) -> EnvironmentManifest:
     catalog = AppWorldCatalog(config)
     data_hash = catalog.public_data_hash()
@@ -337,7 +359,7 @@ def build_manifest(config: AppWorldConfig) -> EnvironmentManifest:
         environmentId=config.environment_id,
         version=config.package_version,
         docs=[docs_ref],
-        toolSchemas=list(public_tool_schemas(config)),
+        toolSchemas=list(broker_tool_schemas(config.package_version)),
         policyRef=ref("appworld-policy"),
         evaluatorRef=ref("appworld-evaluator"),
         resetRef=ref("appworld-reset"),
@@ -346,7 +368,7 @@ def build_manifest(config: AppWorldConfig) -> EnvironmentManifest:
     )
 
 
-def register_appworld(registry: Any, config: AppWorldConfig, splits: Iterable[str] = ("train", "dev")) -> tuple[ArtifactRef, tuple[ArtifactRef, ...]]:
+def register_appworld(registry: Any, config: AppWorldConfig, splits: Iterable[str] = ("train", "dev"), *, runtime_partition: str | None = None) -> tuple[ArtifactRef, tuple[ArtifactRef, ...]]:
     """Register public AppWorld task metadata, defaulting to train and dev."""
     manifest = build_manifest(config)
     manifest_ref = registry.register(manifest)
@@ -362,7 +384,7 @@ def register_appworld(registry: Any, config: AppWorldConfig, splits: Iterable[st
             environmentRef=environment_ref,
             goal=task.instruction,
             allowedInputRefs=[],
-            partition=task.split,
+            partition=runtime_partition or task.split,
         )
         task_refs.append(registry.register_task(durable_task))
     return manifest_ref, tuple(task_refs)
@@ -472,7 +494,8 @@ class AppWorldProvider(ToolProvider):
         self.task = task
         self.run_id = run_id
         self.seed = seed
-        self._schemas = {schema.name: schema for schema in public_tool_schemas(config)}
+        self._api_schemas = {schema.name: schema for schema in public_tool_schemas(config)}
+        self._schemas = {schema.name: schema for schema in broker_tool_schemas(config.package_version)}
         worker_script = Path(__file__).with_name("appworld_worker.py")
         launcher = "import runpy,sys; script=sys.argv[1]; root=sys.argv[2]; sys.argv=[script, '--root', root]; runpy.run_path(script, run_name='__main__')"
         command = list(worker_command or [config.resolved_python(), "-u", "-c", launcher, str(worker_script), str(config.root)])
@@ -500,7 +523,7 @@ class AppWorldProvider(ToolProvider):
         allowed_apps = self._reset.get("allowedApps") if isinstance(self._reset, dict) else None
         if not isinstance(allowed_apps, list):
             allowed_apps = list(self.task.allowed_apps)
-        schemas = [schema for schema in self._schemas.values() if not self._allowed_apps or schema.name.split("__", 1)[0] in self._allowed_apps or schema.name.split("__", 1)[0] in {"api_docs", "supervisor"}]
+        schemas = list(self._schemas.values())
         return {
             "taskId": self.task.task_id,
             "split": self.task.split,
@@ -515,10 +538,35 @@ class AppWorldProvider(ToolProvider):
         schema = self._schemas.get(tool)
         if schema is None:
             raise AppWorldError(f"unknown AppWorld API: {tool}")
-        app = tool.split("__", 1)[0]
+        if tool == _BROKER_DOC_SEARCH:
+            query = str(arguments.get("query", "")).lower()
+            hits = [{"apiName": name, "description": "AppWorld API"} for name in sorted(self._api_schemas) if not query or query in name.lower()]
+            return ProviderExecutionOutcome(output={"results": hits[:20]}, effect="none")
+        if tool == _BROKER_DOC_GET:
+            api_name = arguments.get("apiName")
+            api_schema = self._api_schemas.get(api_name) if isinstance(api_name, str) else None
+            if api_schema is None:
+                raise AppWorldError("unknown AppWorld API documentation name")
+            return ProviderExecutionOutcome(output={"apiName": api_name, "schema": api_schema.model_dump(mode="json", by_alias=True)}, effect="none")
+        api_name = arguments.get("apiName")
+        api_arguments = arguments.get("arguments")
+        if not isinstance(api_name, str) or not isinstance(api_arguments, dict):
+            raise AppWorldError("dynamic AppWorld calls require apiName and arguments")
+        api_schema = self._api_schemas.get(api_name)
+        if api_schema is None:
+            raise AppWorldError("unknown AppWorld API")
+        app = api_name.split("__", 1)[0]
         if self._allowed_apps and app not in self._allowed_apps and app not in {"api_docs", "supervisor"}:
             raise AppWorldError(f"AppWorld API app is not allowed for task: {app}")
-        result = self._process.request("call", {"tool": tool, "arguments": dict(arguments)})
+        try:
+            validate_arguments(api_schema, api_arguments)
+        except SchemaValidationError as exc:
+            raise AppWorldError(f"invalid arguments for {api_name}: {exc}") from exc
+        if tool == _BROKER_READ and api_schema.effect != "read":
+            raise AppWorldError("write API must use appworld__call_write")
+        if tool == _BROKER_WRITE and api_schema.effect != "write":
+            raise AppWorldError("read API must use appworld__call_read")
+        result = self._process.request("call", {"tool": api_name, "arguments": api_arguments})
         return ProviderExecutionOutcome(output=result if isinstance(result, dict) else {"value": result}, effect="confirmed" if schema.effect == "write" else "none")
 
     def effect(self, tool: str) -> str:
@@ -548,6 +596,60 @@ class AppWorldProvider(ToolProvider):
     def __exit__(self, *_: Any) -> None:
         self.close()
 
+
+class AppWorldPackage:
+    """Runtime package binding AppWorld metadata to the provider factory."""
+
+    def __init__(self, config: AppWorldConfig) -> None:
+        self.config = config
+        self.catalog = AppWorldCatalog(config)
+        self.manifest = build_manifest(config)
+        self.environment_id = config.environment_id
+
+    def learner_tasks(self) -> tuple[AppWorldTask, ...]:
+        return self.catalog.tasks(("train", "dev"))
+
+    def _evaluation_tasks(self) -> tuple[EvaluationTaskInput, ...]:
+        ref = EvaluationArtifactRef(self.environment_id, self.config.package_version, sha256_json(self.manifest.model_dump(mode="json", by_alias=True)))
+        return tuple(EvaluationTaskInput(task.task_id, ref, task.instruction, (), Partition.DEVELOPMENT, f"appworld:{task.split}") for task in self.catalog.tasks(("train", "dev")))
+
+    def tasks_for_partition(self, partition: Partition | str) -> tuple[EvaluationTaskInput, ...]:
+        return self._evaluation_tasks() if Partition(partition) is Partition.DEVELOPMENT else ()
+
+    def task_families(self, partition: Partition | str) -> tuple[str, ...]:
+        return tuple(sorted({task.family for task in self.tasks_for_partition(partition)}))
+
+    def partition_hash(self, partition: Partition | str) -> str:
+        tasks = self.tasks_for_partition(partition)
+        return sha256_json({"environmentId": self.environment_id, "partition": Partition(partition).value, "taskIds": [task.task_id for task in tasks], "publicData": self.catalog.public_data_hash()})
+
+    def structural_signature(self, partition: Partition | str) -> str:
+        return sha256_json({"family": self.task_families(partition), "count": len(self.tasks_for_partition(partition))})
+
+    def public_fixture_hash(self) -> str:
+        return sha256_json({"manifest": self.manifest.model_dump(mode="json", by_alias=True), "publicData": self.catalog.public_data_hash()})
+
+    def learner_documents(self) -> tuple[Any, ...]:
+        return ()
+
+    def reset(self, task_id: str, seed: int = 0) -> None:
+        raise AppWorldError("AppWorld episodes are created through provider_factory")
+
+    def evaluate(self, task_id: str, session: Any) -> Mapping[str, Any]:
+        raise AppWorldError("AppWorld evaluation is owned by evaluate_provider")
+
+    def provider_factory(self, task: Any, run_id: str, seed: int = 0) -> AppWorldProvider:
+        task_id = getattr(task, "task_id", None) or getattr(task, "taskId", None)
+        if not isinstance(task_id, str):
+            raise AppWorldError("AppWorld provider factory requires a task ID")
+        split = next((candidate for candidate in ("train", "dev") if task_id in self.catalog.split_ids(candidate)), None)
+        if split is None:
+            raise AppWorldError("AppWorld runtime only exposes train/dev tasks")
+        return AppWorldProvider(self.config, self.catalog.task(task_id, split), run_id, seed)
+
+    def evaluate_provider(self, provider: AppWorldProvider) -> Mapping[str, Any]:
+        result = provider.evaluate_aggregate()
+        return {"passed": bool(result.get("success", False)), "score": 1.0 if result.get("success") else 0.0, "reliable": True, "aggregateEvaluation": result, "provenance": "AppWorld external published simulated benchmark"}
 
 def setup_manifest(config: AppWorldConfig, output: Path | None = None) -> dict[str, Any]:
     """Verify the isolated package and write a public run manifest."""
