@@ -8,6 +8,22 @@ from types import SimpleNamespace
 import pytest
 
 
+def _raw_prime_usage(input_tokens: int = 11, output_tokens: int = 7) -> dict[str, object]:
+    total_tokens = input_tokens + output_tokens
+    return {
+        "input": input_tokens,
+        "output": output_tokens,
+        "totalTokens": total_tokens,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "cost": {
+            "input": input_tokens / 1_000_000,
+            "output": output_tokens / 1_000_000,
+            "total": total_tokens / 1_000_000,
+        },
+    }
+
+
 def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypatch):
     """Exercise the real lifecycle, evaluator, Store, and promotion gate.
 
@@ -70,7 +86,7 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
                 json.dumps({"action": "execute", "code": f"result = host_request({json.dumps(request, separators=(',', ':'))})"}, separators=(",", ":"))
                 if turn == 1 else '{"action":"finish","answer":"applied"}'
             )
-            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"synthetic-task-{self.turn}", "text": action, "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2, "economicCost": {"status": "measured", "microunits": 0}}}
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"synthetic-task-{self.turn}", "text": action, "usage": _raw_prime_usage()}
 
     class FakePrime:
         def __init__(self, config, broker):
@@ -125,7 +141,7 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
                 "proposerVersion": "synthetic-test-model",
                 "skill": {"procedure": "Use the verified workflow."},
             }
-            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"synthetic-learning-{self.calls}", "text": json.dumps(proposal), "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "costMicrounits": 0, "economicCostStatus": "measured"}
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"synthetic-learning-{self.calls}", "text": json.dumps(proposal), "usage": _raw_prime_usage()}
 
     task_model = TaskModel()
     learning_model = LearningModel()
