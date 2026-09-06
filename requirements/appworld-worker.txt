@@ -1,0 +1,4 @@
+# Install only in the isolated AppWorld worker environment (Python >=3.11).
+# Do not add this package to adaptive-agent's dependency graph: AppWorld pins
+# Pydantic 1.x while adaptive-agent uses Pydantic 2.x.
+appworld==0.1.3.post1

@@ -575,7 +575,9 @@ class DurableRuntime:
 
         version = str(getattr(getattr(task, "environment_ref", None), "version", "1"))
         environment_ref = ArtifactRef(id=env_id, version=version, sha256=sha256_json({"environmentId": env_id, "version": version}))
-        durable_task = DurableTask(taskId=task_id, environmentRef=environment_ref, goal=goal, partition=getattr(getattr(task, "partition", None), "value", getattr(task, "partition", "development")))
+        task_provenance = getattr(package, "task_provenance", None)
+        provenance = task_provenance(task_id) if callable(task_provenance) else {}
+        durable_task = DurableTask(taskId=task_id, environmentRef=environment_ref, goal=goal, partition=getattr(getattr(task, "partition", None), "value", getattr(task, "partition", "development")), provenance=provenance)
         self.registry.register_task(durable_task)
         task_ref = self.controller.store.put_artifact(durable_task.model_dump(mode="json", by_alias=True))
         provider_name = str(inputs.get("provider", "openai-codex"))

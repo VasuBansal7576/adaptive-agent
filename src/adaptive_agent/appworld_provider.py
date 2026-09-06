@@ -14,6 +14,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -132,14 +133,14 @@ class _JsonLineProcess:
     def __init__(self, command: Sequence[str], env: Mapping[str, str], timeout_seconds: float) -> None:
         self._timeout = timeout_seconds
         self._next_id = 0
+        self._stdout_buffer = b""
         try:
             self._proc = subprocess.Popen(
                 list(command),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+                text=False,
                 env=dict(env),
             )
         except OSError as exc:
@@ -149,28 +150,57 @@ class _JsonLineProcess:
     def pid(self) -> int:
         return int(self._proc.pid)
 
+    def _stderr_tail(self) -> str:
+        if self._proc.stderr is None:
+            return ""
+        try:
+            return self._proc.stderr.read()[-2000:].decode("utf-8", "replace")
+        except (OSError, ValueError):
+            return ""
+
+    def _readline_until(self, deadline: float) -> bytes:
+        """Read one complete frame without ever blocking past deadline."""
+        if self._proc.stdout is None:
+            raise AppWorldProtocolError("AppWorld worker pipes are unavailable")
+        fd = self._proc.stdout.fileno()
+        while True:
+            newline = self._stdout_buffer.find(b"\n")
+            if newline >= 0:
+                line, self._stdout_buffer = self._stdout_buffer[:newline], self._stdout_buffer[newline + 1 :]
+                return line
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                raise TimeoutError
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                if self._stdout_buffer:
+                    line, self._stdout_buffer = self._stdout_buffer, b""
+                    return line
+                raise AppWorldProtocolError(f"AppWorld worker closed: {self._stderr_tail()}")
+            self._stdout_buffer += chunk
+
     def request(self, operation: str, payload: Mapping[str, Any] | None = None) -> Any:
         if self._proc.poll() is not None:
-            stderr = self._proc.stderr.read()[-2000:] if self._proc.stderr is not None else ""
-            raise AppWorldProtocolError(f"AppWorld worker exited ({self._proc.returncode}): {stderr}")
+            raise AppWorldProtocolError(f"AppWorld worker exited ({self._proc.returncode}): {self._stderr_tail()}")
         if self._proc.stdin is None or self._proc.stdout is None:
             raise AppWorldProtocolError("AppWorld worker pipes are unavailable")
         self._next_id += 1
         request_id = self._next_id
         frame = {"id": request_id, "operation": operation, "payload": dict(payload or {})}
-        self._proc.stdin.write(json.dumps(frame, separators=(",", ":")) + "\n")
+        self._proc.stdin.write((json.dumps(frame, separators=(",", ":")) + "\n").encode("utf-8"))
         self._proc.stdin.flush()
         deadline = time.monotonic() + self._timeout
         while True:
-            if time.monotonic() > deadline:
-                self.close(force=True)
-                raise AppWorldProtocolError(f"AppWorld worker timed out during {operation}")
-            line = self._proc.stdout.readline()
-            if not line:
-                stderr = self._proc.stderr.read()[-2000:] if self._proc.stderr is not None else ""
-                raise AppWorldProtocolError(f"AppWorld worker closed during {operation}: {stderr}")
             try:
-                response = json.loads(line)
+                line = self._readline_until(deadline)
+            except TimeoutError:
+                self.close(force=True)
+                raise AppWorldProtocolError(f"AppWorld worker timed out during {operation}") from None
+            try:
+                response = json.loads(line.decode("utf-8"))
             except json.JSONDecodeError as exc:
                 raise AppWorldProtocolError("AppWorld worker emitted invalid JSON") from exc
             if not isinstance(response, dict) or response.get("id") != request_id:
@@ -185,10 +215,10 @@ class _JsonLineProcess:
         try:
             if not force and self._proc.stdin is not None:
                 self._next_id += 1
-                self._proc.stdin.write(json.dumps({"id": self._next_id, "operation": "close", "payload": {}}) + "\n")
+                self._proc.stdin.write((json.dumps({"id": self._next_id, "operation": "close", "payload": {}}) + "\n").encode("utf-8"))
                 self._proc.stdin.flush()
-                self._proc.stdout.readline() if self._proc.stdout is not None else None
-        except (BrokenPipeError, OSError):
+                self._readline_until(time.monotonic() + min(self._timeout, 1.0))
+        except (BrokenPipeError, OSError, TimeoutError, AppWorldProtocolError):
             pass
         finally:
             if self._proc.poll() is None:
@@ -298,17 +328,20 @@ def _schema_from_function_doc(doc: Mapping[str, Any], version: str) -> ToolSchem
     parameters = function.get("parameters")
     if not isinstance(parameters, dict):
         parameters = {"type": "object", "properties": {}, "additionalProperties": False}
-    app, _, api = name.partition("__")
-    method = "GET"
+    _, _, api = name.partition("__")
+    method: str | None = None
     standard_path = Path(str(doc.get("_standard_path", "")))
     if standard_path.is_file():
         try:
             standard = json.loads(standard_path.read_text())
             entry = standard.get(api, {}) if isinstance(standard, dict) else {}
-            method = str(entry.get("method", "GET")).upper()
+            if isinstance(entry, Mapping) and isinstance(entry.get("method"), str):
+                method = entry["method"].upper()
         except (OSError, json.JSONDecodeError):
-            pass
-    effect = "read" if method in {"GET", "HEAD"} or api.startswith(("show_", "search_", "get_")) else "write"
+            method = None
+    if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}:
+        raise AppWorldUnavailable(f"missing authoritative HTTP method for AppWorld API: {name or '<unnamed>'}")
+    effect = "read" if method in {"GET", "HEAD"} else "write"
     return ToolSchema(name=name, version=version, inputSchema=parameters, outputSchema={"type": "object"}, effect=effect)
 
 
@@ -385,6 +418,12 @@ def register_appworld(registry: Any, config: AppWorldConfig, splits: Iterable[st
             goal=task.instruction,
             allowedInputRefs=[],
             partition=runtime_partition or task.split,
+            provenance={
+                "benchmark": "AppWorld",
+                "dataClass": "external_published_simulated_benchmark",
+                "officialSplit": task.split,
+                "runtimePartition": runtime_partition or task.split,
+            },
         )
         task_refs.append(registry.register_task(durable_task))
     return manifest_ref, tuple(task_refs)
@@ -405,83 +444,6 @@ def _jsonable(value: Any) -> Any:
             except TypeError:
                 continue
     return str(value)
-
-
-def _worker_main(root: Path) -> int:
-    """Run AppWorld in a process that is never imported by the main runtime."""
-    try:
-        from appworld.environment import AppWorld  # type: ignore[import-not-found]
-    except Exception as exc:
-        raise SystemExit(f"AppWorld package is unavailable: {exc}")
-    world: Any | None = None
-    for raw in sys.stdin:
-        try:
-            frame = json.loads(raw)
-            if not isinstance(frame, dict) or not isinstance(frame.get("id"), int):
-                raise AppWorldProtocolError("request frame requires integer id")
-            operation = frame.get("operation")
-            payload = frame.get("payload") or {}
-            if not isinstance(payload, dict):
-                raise AppWorldProtocolError("request payload must be an object")
-            if operation == "reset":
-                if world is not None:
-                    world.close()
-                task_id = str(payload["taskId"])
-                world = AppWorld(
-                    task_id,
-                    experiment_name=str(payload.get("experimentName", "adaptive-agent")),
-                    random_seed=int(payload.get("seed", 0)),
-                    load_ground_truth=True,
-                    ground_truth_mode="minimal",
-                    raise_on_failure=False,
-                    show_api_response_schemas=False,
-                )
-                result = {
-                    "taskId": task_id,
-                    "instruction": str(world.task.instruction),
-                    "allowedApps": list(getattr(world.task, "allowed_apps", ())),
-                }
-            elif operation == "call":
-                if world is None:
-                    raise AppWorldProtocolError("worker has not been reset")
-                tool = str(payload["tool"])
-                app, sep, api = tool.partition("__")
-                if not sep or not app or not api or app.startswith("_") or api.startswith("_"):
-                    raise AppWorldProtocolError("invalid AppWorld API name")
-                app_obj = getattr(world.apis, app, None)
-                fn = getattr(app_obj, api, None) if app_obj is not None else None
-                if not callable(fn):
-                    raise AppWorldProtocolError(f"unknown AppWorld API: {tool}")
-                arguments = payload.get("arguments", {})
-                if not isinstance(arguments, dict):
-                    raise AppWorldProtocolError("API arguments must be an object")
-                result = _jsonable(fn(**arguments))
-            elif operation == "evaluate":
-                if world is None:
-                    raise AppWorldProtocolError("worker has not been reset")
-                tracker = world.evaluate()
-                result = {
-                    "success": bool(getattr(tracker, "success", False)),
-                    "numTests": int(getattr(tracker, "num_tests", 0) or 0),
-                    "passCount": int(getattr(tracker, "pass_count", 0) or 0),
-                    "failCount": int(getattr(tracker, "fail_count", 0) or 0),
-                    "taskCompleted": bool(world.task_completed()),
-                }
-            elif operation == "close":
-                if world is not None:
-                    world.close()
-                response = {"id": frame["id"], "ok": True, "result": {"closed": True}}
-                print(json.dumps(response, separators=(",", ":")), flush=True)
-                return 0
-            else:
-                raise AppWorldProtocolError(f"unknown worker operation: {operation}")
-            response = {"id": frame["id"], "ok": True, "result": result}
-        except Exception as exc:
-            response = {"id": frame.get("id"), "ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        print(json.dumps(response, separators=(",", ":")), flush=True)
-    if world is not None:
-        world.close()
-    return 0
 
 
 class AppWorldProvider(ToolProvider):
@@ -609,12 +571,19 @@ class AppWorldPackage:
     def learner_tasks(self) -> tuple[AppWorldTask, ...]:
         return self.catalog.tasks(("train", "dev"))
 
-    def _evaluation_tasks(self) -> tuple[EvaluationTaskInput, ...]:
+    def _evaluation_tasks(self, splits: Iterable[str]) -> tuple[EvaluationTaskInput, ...]:
+        split_tuple = tuple(splits)
         ref = EvaluationArtifactRef(self.environment_id, self.config.package_version, sha256_json(self.manifest.model_dump(mode="json", by_alias=True)))
-        return tuple(EvaluationTaskInput(task.task_id, ref, task.instruction, (), Partition.DEVELOPMENT, f"appworld:{task.split}") for task in self.catalog.tasks(("train", "dev")))
+        partition = Partition.DEVELOPMENT if set(split_tuple) == {"train", "dev"} else Partition.VALIDATION if split_tuple == ("test_normal",) else Partition.FINAL
+        return tuple(EvaluationTaskInput(task.task_id, ref, task.instruction, (), partition, f"appworld:{task.split}") for task in self.catalog.tasks(split_tuple, allow_test=self.config.allow_test))
 
     def tasks_for_partition(self, partition: Partition | str) -> tuple[EvaluationTaskInput, ...]:
-        return self._evaluation_tasks() if Partition(partition) is Partition.DEVELOPMENT else ()
+        selected = {
+            Partition.DEVELOPMENT: ("train", "dev"),
+            Partition.VALIDATION: ("test_normal",),
+            Partition.FINAL: ("test_challenge",),
+        }.get(Partition(partition), ())
+        return self._evaluation_tasks(selected) if selected else ()
 
     def task_families(self, partition: Partition | str) -> tuple[str, ...]:
         return tuple(sorted({task.family for task in self.tasks_for_partition(partition)}))
@@ -632,6 +601,17 @@ class AppWorldPackage:
     def learner_documents(self) -> tuple[Any, ...]:
         return ()
 
+    def task_provenance(self, task_id: str) -> dict[str, Any]:
+        for split in ("train", "dev", "test_normal", "test_challenge"):
+            if task_id in self.catalog.split_ids(split):
+                return {
+                    "benchmark": "AppWorld",
+                    "dataClass": "external_published_simulated_benchmark",
+                    "officialSplit": split,
+                    "runtimePartition": "development",
+                }
+        raise AppWorldError(f"unknown AppWorld task: {task_id}")
+
     def reset(self, task_id: str, seed: int = 0) -> None:
         raise AppWorldError("AppWorld episodes are created through provider_factory")
 
@@ -642,9 +622,11 @@ class AppWorldPackage:
         task_id = getattr(task, "task_id", None) or getattr(task, "taskId", None)
         if not isinstance(task_id, str):
             raise AppWorldError("AppWorld provider factory requires a task ID")
-        split = next((candidate for candidate in ("train", "dev") if task_id in self.catalog.split_ids(candidate)), None)
+        split = next((candidate for candidate in _ALLOWED_SPLITS if task_id in self.catalog.split_ids(candidate)), None)
         if split is None:
-            raise AppWorldError("AppWorld runtime only exposes train/dev tasks")
+            raise AppWorldError("AppWorld task is not in a published split")
+        if split in _TEST_SPLITS and not self.config.allow_test:
+            raise AppWorldError("test AppWorld tasks are sealed until protocol freeze")
         return AppWorldProvider(self.config, self.catalog.task(task_id, split), run_id, seed)
 
     def evaluate_provider(self, provider: AppWorldProvider) -> Mapping[str, Any]:
@@ -677,12 +659,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     setup.add_argument("--package-version", default=PUBLISHED_APPWORLD_VERSION)
     setup.add_argument("--output", default="")
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    if raw_argv and raw_argv[0] == "--worker":
-        worker_parser = argparse.ArgumentParser(description="AppWorld worker protocol")
-        worker_parser.add_argument("--worker", action="store_true")
-        worker_parser.add_argument("--root", required=True)
-        worker_args = worker_parser.parse_args(raw_argv)
-        return _worker_main(Path(worker_args.root))
     args = parser.parse_args(raw_argv)
     config = AppWorldConfig(Path(args.root), python=args.python, package_version=args.package_version)
     manifest = setup_manifest(config, Path(args.output) if args.output else None)

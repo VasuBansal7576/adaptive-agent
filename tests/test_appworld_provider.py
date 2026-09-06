@@ -11,8 +11,12 @@ from adaptive_agent.appworld_provider import (
     AppWorldCatalog,
     AppWorldConfig,
     AppWorldError,
+    AppWorldProtocolError,
+    AppWorldUnavailable,
     AppWorldProvider,
+    _JsonLineProcess,
     build_manifest,
+    public_tool_schemas,
     register_appworld,
 )
 from adaptive_agent.broker import Capability, ToolBroker
@@ -74,6 +78,13 @@ def test_manifest_contains_public_tool_schemas(tmp_path: Path):
     assert manifest.tool_schemas[2].effect == "read"
 
 
+def test_missing_authoritative_method_fails_closed(tmp_path: Path):
+    root = _public_root(tmp_path)
+    (root / "data" / "api_docs" / "standard" / "phone.json").write_text(json.dumps({"get_current_date_and_time": {}}))
+    with pytest.raises(AppWorldUnavailable, match="authoritative HTTP method"):
+        public_tool_schemas(AppWorldConfig(root, python=sys.executable))
+
+
 def test_register_appworld_defaults_to_train_and_dev(tmp_path: Path):
     root = _public_root(tmp_path)
     store = Store(tmp_path / "store")
@@ -119,6 +130,16 @@ for line in sys.stdin:
         assert provider.evaluate_aggregate()["success"] is True
     with AppWorldProvider(config, task, "run-2", worker_command=command) as second:
         assert second.process_id != first_pid
+
+
+def test_hung_worker_timeout_is_bounded_and_cleaned_up(tmp_path: Path):
+    worker = tmp_path / "hung_worker.py"
+    worker.write_text("import time\ntime.sleep(10)\n")
+    process = _JsonLineProcess([sys.executable, "-u", str(worker)], os.environ, 0.05)
+    with pytest.raises(AppWorldProtocolError, match="timed out"):
+        process.request("reset", {"taskId": "train-1"})
+    assert process._proc.poll() is not None
+    process.close(force=True)
 
 
 def test_provider_rejects_wrong_run(tmp_path: Path):
