@@ -1586,29 +1586,32 @@ class DurableRuntime:
             stored = self.controller.store.get_run(run_id)
             if stored is not None:
                 metadata = outcome.metadata if isinstance(outcome.metadata, Mapping) else {}
-                trusted_result = trusted(
-                    run_id,
-                    {
-                        "runId": run_id,
-                        "taskId": stored["task_id"],
-                        "environmentId": stored["environment_id"],
-                        "passed": bool(outcome.passed),
-                        "reliable": bool(metadata.get("reliable", outcome.passed)),
-                        "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
-                        **({"arm": metadata["arm"]} if isinstance(metadata.get("arm"), str) else {}),
-                        **({"seed": metadata["seed"]} if isinstance(metadata.get("seed"), int) and not isinstance(metadata.get("seed"), bool) else {}),
-                        **({"bundleHash": metadata["bundleHash"]} if isinstance(metadata.get("bundleHash"), str) else {}),
-                        **({"goal": metadata["goal"]} if isinstance(metadata.get("goal"), str) else {}),
-                    },
-                )
+                fixture_reset_ok = metadata.get("fixtureResetOk", metadata.get("fixtureResetPassed", True))
+                trusted_metadata = {
+                    "runId": run_id,
+                    "taskId": stored["task_id"],
+                    "environmentId": stored["environment_id"],
+                    "passed": bool(outcome.passed),
+                    "reliable": bool(metadata.get("reliable", outcome.passed)),
+                    "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
+                    "fixtureResetOk": bool(fixture_reset_ok),
+                    **({"arm": metadata["arm"]} if isinstance(metadata.get("arm"), str) else {}),
+                    **({"seed": metadata["seed"]} if isinstance(metadata.get("seed"), int) and not isinstance(metadata.get("seed"), bool) else {}),
+                    **({"bundleHash": metadata["bundleHash"]} if isinstance(metadata.get("bundleHash"), str) else {}),
+                    **({"goal": metadata["goal"]} if isinstance(metadata.get("goal"), str) else {}),
+                }
+                trusted_result = trusted(run_id, trusted_metadata)
                 # Keep evaluator diagnostics such as planner status and
                 # timeout classification in the private outcome row.  The
                 # trusted evidence event remains sanitized by the controller.
+                # Canonical metrics win over private diagnostics, while any
+                # evaluator-specific fields remain durably available.
+                merged_metadata = {**dict(metadata), **trusted_metadata, "runId": run_id}
                 self.controller.record_outcome(
                     run_id,
                     bool(outcome.passed),
                     score=outcome.score,
-                    metadata={**dict(metadata), "runId": run_id},
+                    metadata=merged_metadata,
                 )
                 return trusted_result
         return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)

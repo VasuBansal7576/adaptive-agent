@@ -4,11 +4,45 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 
 import adaptive_agent.app as app_module
 from adaptive_agent.evaluation import Arm, BudgetSpec, EvaluationProtocol
 from adaptive_agent.production_evaluator import _lifecycle_stages
 from adaptive_agent.prime_runtime import ChildPlannerBudget, SharedBudget
+
+
+def test_evaluated_outcome_merge_preserves_canonical_metrics_and_custom_diagnostics(tmp_path):
+    app = app_module.create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run_id = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "metadata-merge"}).json()["runId"]
+    runtime.controller.record_model_response(run_id, {"responseId": "metadata-response"})
+
+    runtime._record_evaluated_outcome(
+        run_id,
+        app_module.DurableOutcome(
+            runId=run_id,
+            passed=False,
+            metadata={
+                "status": "budget_exhausted",
+                "reliable": True,
+                "safetyViolations": 4,
+                "fixtureResetPassed": False,
+                "customEvaluator": "retained",
+            },
+        ),
+    )
+    row = runtime.controller.store.get_outcome_by_run_id(run_id)
+    metadata = json.loads(row["metadata_json"])
+    assert metadata["reliable"] is True
+    assert metadata["safetyViolations"] == 4
+    assert metadata["fixtureResetOk"] is False
+    assert metadata["fixtureResetPassed"] is False
+    assert metadata["status"] == "budget_exhausted"
+    assert metadata["customEvaluator"] == "retained"
 
 
 def test_evaluation_replay_reuses_terminal_accounting_and_strict_verifier(tmp_path, monkeypatch):
@@ -95,9 +129,14 @@ def test_evaluation_replay_reuses_terminal_accounting_and_strict_verifier(tmp_pa
     first_ref = run_payload["finalAccountingRef"]
     first_accounting = runtime.controller.store.get_artifact(first_ref)
     assert first_accounting["toolCalls"] == 1
-    assert first_accounting["durationSeconds"] >= 0
+    assert first_accounting["durationSeconds"] >= 1
     outcome_before = runtime.controller.store.get_outcome_by_run_id(run_id)
     assert outcome_before is not None
+    outcome_metadata = json.loads(outcome_before["metadata_json"])
+    assert outcome_metadata["status"] == "budget_exhausted"
+    assert outcome_metadata["reliable"] is False
+    assert outcome_metadata["safetyViolations"] == 0
+    assert outcome_metadata["fixtureResetOk"] is True
     tool_events_before = [row for row in runtime.controller.store.list_evidence(run_id) if row["event_type"] == "tool_result"]
     status_before = run["status"]
 
@@ -117,11 +156,30 @@ def test_evaluation_replay_reuses_terminal_accounting_and_strict_verifier(tmp_pa
     assert fresh.controller.store.get_outcome_by_run_id(run_id) == outcome_before
     assert [row for row in fresh.controller.store.list_evidence(run_id) if row["event_type"] == "tool_result"] == tool_events_before
 
+    from adaptive_agent.experiment_runtime import DefaultExperimentStageRunner
+
+    model_row = next(row for row in fresh.controller.store.list_evidence(run_id) if row["event_type"] == "model_response")
+    outcome_row = next(row for row in fresh.controller.store.list_evidence(run_id) if row["event_type"] == "trusted_outcome")
+    task_row = fresh.controller.store.get_task(task.task_id)
+    fresh.controller.store.register_task(task.task_id, task_row["environment_id"], task_row["version"], task_row["task_ref"], "validation", task_row["goal"])
+    recovered = DefaultExperimentStageRunner(fresh, protocol).recover_evaluation_observations({
+        "stage": "validation",
+        "cellKey": "validation:0",
+        "runIds": [run_id],
+        "taskIds": [task.task_id],
+        "evidenceRefs": [model_row["evidence_id"]],
+        "outcomeRefs": [outcome_row["evidence_id"]],
+    })
+    assert len(recovered) == 1
+    assert recovered[0].accounting_ref == first_ref
+    assert recovered[0].latency_seconds >= 1
+
     with fresh.controller.store.connect() as connection:
         assert dict(connection.execute("SELECT * FROM evaluation_lifecycle_budget").fetchone()) == ledger_before
 
     verifier = fresh.controller.evaluator_adapters[2]
     assert verifier.verify(replayed, config.protocol, fresh.packages["finance"])
+    assert verifier.verify(recovered[0], config.protocol, fresh.packages["finance"])
 
     tampered = dict(first_accounting)
     tampered["durationSeconds"] = first_accounting["durationSeconds"] + 1
