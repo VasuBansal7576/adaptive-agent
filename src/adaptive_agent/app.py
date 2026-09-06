@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 from adaptive_agent.api import ControlPlane, ModelRunner, OutcomeEvaluator, create_app, _ref, IdempotencyConflict
 from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
-from adaptive_agent.broker import Capability, ToolBroker, ToolProvider
+from adaptive_agent.broker import Capability, ProviderExecutionOutcome, ToolBroker, ToolProvider
 from adaptive_agent.controller import Controller
 from adaptive_agent.environment import EnvironmentRegistry
 from adaptive_agent.evaluation import build_environment_packages, sha256_json, FixtureSession, Outcome as FixtureOutcome, TrustedEvaluatorRegistry
@@ -94,11 +94,15 @@ def _freeze_image_digest() -> str:
 class _FixtureProvider(ToolProvider):
     """Prime host-request provider backed by one reset, trusted fixture task."""
 
-    def execute(self, run_id: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def execute(self, run_id: str, tool: str, arguments: dict[str, Any]) -> ProviderExecutionOutcome:
         if run_id != self.session.task_id and run_id != self._run_id:
             raise RuntimeError("provider is bound to a different run")
         result = self.package.invoke(self.session, tool, arguments)
-        return dict(result.output)
+        return ProviderExecutionOutcome(
+            output=dict(result.output),
+            status="ok" if result.status == "ok" else "error",
+            effect=result.side_effect if result.side_effect in {"none", "confirmed", "unknown"} else "unknown",
+        )
 
     def effect(self, tool: str) -> str:
         schema = next((item for item in self.package.manifest.tool_schemas if item.name == tool), None)
