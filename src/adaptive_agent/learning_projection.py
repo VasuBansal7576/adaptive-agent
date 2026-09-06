@@ -83,13 +83,18 @@ class DurableBrokerLearningProjection:
             raise LearningProjectionError("broker history is not bound to the requested run")
         if not isinstance(task, Mapping) or task.get("environment_id") != environment_id or task.get("partition") != "development":
             raise LearningProjectionError("broker history requires a DEVELOPMENT task")
-        list_run_tool_calls = getattr(self.store, "list_run_tool_calls", None)
-        if not callable(list_run_tool_calls):
-            raise LearningProjectionError("Store lacks canonical tool-call projection seam")
+        list_learning_evidence = getattr(self.store, "list_learning_evidence", None)
+        if not callable(list_learning_evidence):
+            raise LearningProjectionError("Store lacks unified learning evidence seam")
         try:
-            joined_rows = list_run_tool_calls(run_id)
+            feed = list_learning_evidence(
+                environment_id=environment_id,
+                run_id=run_id,
+                include_broker_projection=True,
+            )
         except (KeyError, PermissionError) as exc:
             raise LearningProjectionError("broker history is not readable for this run") from exc
+        joined_rows = [row for row in feed if isinstance(row, Mapping) and row.get("kind") == "broker_call"]
         schemas = self._tool_schemas(environment_id)
         source_events = {
             event.get("evidence_id"): event
