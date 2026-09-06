@@ -745,6 +745,19 @@ class Controller:
             return {}
         if not isinstance(payload, Mapping):
             return {}
+        if row.get("trust_class") == "system" and row.get("visibility") == "operator":
+            captions = {
+                "execute": "Generated Python submitted to Prime kernel.",
+                "kernel": "Prime execution feedback recorded.",
+                "model": "Authenticated model response received.",
+                "learning_model_observation": "Learning model response recorded.",
+            }
+            caption = captions.get(event_type)
+            if caption is not None:
+                # These captions are derived from the trusted event kind.  Do
+                # not forward the planner's summary/detail, which may contain
+                # generated code, model text, or private learning diagnostics.
+                return {"summary": caption}
         if event_type == "run_failed":
             error = payload.get("error")
             return {"summary": "Runtime failure recorded", "detail": str(error)} if isinstance(error, str) and error else {"summary": "Runtime failure recorded"}

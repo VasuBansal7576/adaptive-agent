@@ -1109,6 +1109,43 @@ def test_durable_event_projection_exposes_safe_failure_summary_and_hides_evaluat
     assert "hidden evaluator answer" not in response.text
 
 
+def test_durable_event_projection_adds_trusted_runtime_captions_without_payload_details(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "trusted-runtime-captions"}).json()
+    controller = app.state.controller
+    private_payload = {
+        "summary": "attacker-controlled summary",
+        "detail": "generated code, raw model text, and private diagnostics",
+        "code": "secret = True",
+    }
+    for event_type in ("execute", "kernel", "model", "learning_model_observation"):
+        controller.append_event(run["runId"], event_type, private_payload, "system", "operator")
+    controller.append_event(run["runId"], "execute", private_payload, "broker", "operator")
+    controller.append_event(run["runId"], "trusted_outcome", {"reason": "hidden answer"}, "evaluator", "evaluator_only")
+
+    response = api.get(f"/runs/{run['runId']}/evidence")
+    events = response.json()
+    captions = {event["event"]: event["data"]["summary"] for event in events if event["event"] in {"kernel", "model", "learning_model_observation"}}
+    captions["execute"] = next(event["data"]["summary"] for event in events if event["event"] == "execute" and "summary" in event["data"])
+    assert captions == {
+        "execute": "Generated Python submitted to Prime kernel.",
+        "kernel": "Prime execution feedback recorded.",
+        "model": "Authenticated model response received.",
+        "learning_model_observation": "Learning model response recorded.",
+    }
+    assert sum(event["event"] == "execute" for event in events) == 2
+    untrusted_execute = [event for event in events if event["event"] == "execute"][1]
+    assert "summary" not in untrusted_execute["data"]
+    assert "generated code" not in response.text
+    assert "raw model text" not in response.text
+    assert "private diagnostics" not in response.text
+    assert "hidden answer" not in response.text
+    assert all(event["data"].get("visibility") != "evaluator_only" for event in events)
+
+
 def test_learning_runtime_does_not_use_legacy_learner_feed(tmp_path):
     app = create_runtime_app(data_dir=tmp_path)
     api = TestClient(app, base_url="http://127.0.0.1")
