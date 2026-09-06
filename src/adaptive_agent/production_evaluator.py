@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +70,16 @@ def _require_bound_real_receipt(source_dir: str, run_id: str) -> None:
         raise RuntimeError(f"bound source run is not a succeeded durable run: {run_id}")
     evidence = source.list_evidence(run_id)
     model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("visibility") == "operator"]
-    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("visibility") == "operator"]
+    # Older durable runs keep evaluator attestations evaluator-only so they
+    # never enter the operator/SSE projection.  They are still canonical
+    # evaluator receipts and may seed a fresh production Store; newly created
+    # benchmark runs are verified by SQLiteRunEvidenceStore independently.
+    trusted = [
+        row
+        for row in evidence
+        if row.get("event_type") == "trusted_outcome"
+        and row.get("visibility") in {"operator", "evaluator_only"}
+    ]
     if not model or not trusted:
         raise RuntimeError(
             f"bound source run lacks canonical operator-visible model/trusted outcome evidence: {run_id}"
