@@ -133,13 +133,24 @@ class LearningRuntime:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(decoded, Mapping):
-                    key = (decoded.get("kind"), decoded.get("sourceId"))
+                    environment_binding = row.get("environment_id")
+                    if not isinstance(environment_binding, str):
+                        environment_binding = decoded.get("environmentId")
+                    run_binding = row.get("run_id")
+                    if not isinstance(run_binding, str):
+                        run_binding = decoded.get("runId")
+                    record = {
+                        **decoded,
+                        "environmentId": environment_binding,
+                        "runId": run_binding,
+                    }
+                    key = (record.get("kind"), record.get("sourceId"))
                     if key not in existing_keys:
                         existing_keys.add(key)
                         existing_indexes[key] = len(existing_records)
-                        existing_records.append(decoded)
+                        existing_records.append(record)
                     elif key not in encoded_keys:
-                        existing_records[existing_indexes[key]] = decoded
+                        existing_records[existing_indexes[key]] = record
                     encoded_keys.add(key)
             elif isinstance(row.get("kind"), str):
                 key = (row.get("kind"), row.get("sourceId"))

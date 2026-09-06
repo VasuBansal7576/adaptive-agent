@@ -60,6 +60,38 @@ def test_runtime_composes_durable_learning_and_restart_readback(tmp_path: Path):
     assert restarted.reload_candidate(result.authoritative_candidate["candidate_id"])["state"] == "validated"
 
 
+def test_restart_projection_uses_row_bindings_when_json_omits_them(tmp_path: Path):
+    import json
+    from adaptive_agent.retrieval import content_hash
+
+    store, manager, evidence_id = _setup_store(tmp_path)
+    content = "Persisted broker projection with row-level bindings."
+    store.save_learning_record(
+        f"learning-evidence-{evidence_id}",
+        ENVIRONMENT,
+        RUN,
+        json.dumps({
+            "kind": "live_evidence",
+            "sourceId": evidence_id,
+            "content": content,
+            "contentHash": content_hash(content),
+            "partition": "development",
+            "visibility": "learner",
+            "trustClass": "broker",
+            "trustedOutcome": True,
+        }),
+    )
+
+    records = LearningRuntime.build(store=store, manager=manager, model_client=FakeClient())._materialize_run_records(
+        environment_id=ENVIRONMENT,
+        run_id=RUN,
+    )
+
+    persisted = next(record for record in records if record.get("sourceId") == evidence_id)
+    assert persisted["environmentId"] == ENVIRONMENT
+    assert persisted["runId"] == RUN
+
+
 def _mark_run(store, *, status: str, passed: object = 0, save_outcome: bool = True):
     row = store.get_run(RUN)
     row["status"] = status
