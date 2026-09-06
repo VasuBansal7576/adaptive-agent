@@ -128,11 +128,11 @@ class EvaluationJob:
             if existing is not None:
                 conn.commit()
                 return False
-            budget = conn.execute("SELECT attempts, max_attempts, blocked FROM evaluation_lifecycle_budget WHERE job_id = ?", (job_id,)).fetchone()
+            budget = conn.execute("SELECT * FROM evaluation_lifecycle_budget WHERE job_id = ?", (job_id,)).fetchone()
             if budget is None:
                 conn.rollback()
                 raise EvaluationError("lifecycle budget is not initialized")
-            if budget["blocked"] or budget["attempts"] >= budget["max_attempts"]:
+            if budget["blocked"] or budget["attempts"] >= budget["max_attempts"] or budget["input_tokens"] >= budget["max_input_tokens"] or budget["output_tokens"] >= budget["max_output_tokens"] or budget["tool_calls"] >= budget["max_tool_calls"] or budget["wall_micros"] >= budget["max_wall_micros"] or budget["cost_microunits"] >= budget["max_cost_microunits"]:
                 conn.execute("UPDATE evaluation_lifecycle_budget SET blocked = 1, updated_at = datetime('now') WHERE job_id = ?", (job_id,))
                 conn.commit()
                 raise EvaluationError("lifecycle launch budget exhausted")
@@ -159,6 +159,7 @@ class EvaluationJob:
                 or budget["tool_calls"] > budget["max_tool_calls"]
                 or budget["wall_micros"] > budget["max_wall_micros"]
                 or budget["cost_microunits"] > budget["max_cost_microunits"]
+                or payload.get("economicCostStatus") == "unknown"
             ):
                 conn.execute("UPDATE evaluation_lifecycle_budget SET blocked = 1, updated_at = datetime('now') WHERE job_id = ?", (job_id,))
             conn.commit()
