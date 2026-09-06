@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,7 +56,7 @@ class _Model:
             evidence = environment["learningContext"]["developmentEvidence"][0]["sourceId"]
             procedure = "Reuse the observed date-reading procedure."
             payload = {"predictedEffect": "reuse procedure", "editOperations": [{"path": "skills/appworld/procedure", "operation": "add", "value": procedure}], "supportingEvidenceIds": [evidence], "proposerVersion": "test", "skill": {"procedure": procedure}}
-            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"learn-{self.calls}", "text": json.dumps(payload), "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5}}
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"learn-{self.calls}", "text": json.dumps(payload), "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5, "cacheReadInputTokens": 1, "cost": {"total": 0.001}}}
         type(self).evaluation_calls += 1
         capability = next(item for item in environment["capabilities"] if item.endswith("appworld__call_read"))
         if type(self).evaluation_calls % 2:
@@ -63,7 +64,7 @@ class _Model:
             text = json.dumps({"action": "execute", "code": code})
         else:
             text = json.dumps({"action": "finish", "answer": "date read"})
-        return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"eval-{self.calls}", "text": text, "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5, "economicCost": {"status": "measured", "microunits": 1}}, "costMicrounits": 1}
+        return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"eval-{self.calls}", "text": text, "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5, "cacheReadInputTokens": 1, "cost": {"total": 0.001}}}
 
 
 def _prime(monkeypatch):
@@ -108,16 +109,58 @@ def test_cli_runs_and_resumes_real_runtime_panels(tmp_path, monkeypatch):
             summary = report["armSummaries"][arm]
             assert summary["totalTokens"] == summary["inputTokens"] + summary["outputTokens"]
     assert _Model.evaluation_calls == 2 * (8 + 20 * 3 + 20 * 3)
+    from adaptive_agent.store import Store
+    durable_store = Store(tmp_path / "run")
+    first_run = durable_store.get_run(json.loads((tmp_path / "run" / "appworld-experiment-state.json").read_text())["trainingRunIds"][0])
+    accounting = durable_store.get_artifact(json.loads(first_run["run_json"])["finalAccountingRef"])
+    assert accounting["nominalCostStatus"] == "complete"
+    assert accounting.get("economicCostStatus", "unknown") == "unknown"
+    experiment_state = json.loads((tmp_path / "run" / "appworld-experiment-state.json").read_text())
+    ablation = durable_store.get_bundle_by_hash(experiment_state["ablationBundleHash"])
+    ablation_payload = json.loads(ablation["bundle_json"])
+    assert ablation["parent"] == experiment_state["learnedBundleHash"]
+    assert ablation_payload["skills"] == []
+    assert ablation_payload["executionConfig"]["skill_refs"] == []
+    assert ablation_payload["executionConfig"]["instruction_variant"] == "default"
     calls = _Model.calls
-    resume = build_parser().parse_args(["--resume", "--data-dir", str(tmp_path / "run"), "--appworld-root", str(root), "--appworld-python", sys.executable, "--source-revision", "source", "--image-digest", "sha256:image", "--core-planner-hash", "core"])
+    state_path = tmp_path / "run" / "appworld-experiment-state.json"
+    dev_db = tmp_path / "run" / "dev" / "appworld-benchmark.sqlite3"
+    with sqlite3.connect(dev_db) as conn:
+        rowid, cached = conn.execute("SELECT rowid,result_json FROM appworld_cells LIMIT 1").fetchone()
+        tampered = json.loads(cached)
+        tampered["usage"]["inputTokens"] += 1
+        conn.execute("UPDATE appworld_cells SET result_json=? WHERE rowid=?", (json.dumps(tampered), rowid))
+        conn.commit()
+    resume_args = ["--resume", "--data-dir", str(tmp_path / "run"), "--appworld-root", str(root), "--appworld-python", sys.executable, "--source-revision", "source", "--image-digest", "sha256:image", "--core-planner-hash", "core"]
+    with pytest.raises(ValueError, match="runtime usage receipt does not reconcile"):
+        run_experiment(build_parser().parse_args(resume_args))
+    assert _Model.calls == calls
+    with sqlite3.connect(dev_db) as conn:
+        conn.execute("UPDATE appworld_cells SET result_json=? WHERE rowid=?", (cached, rowid))
+        conn.commit()
+    resume = build_parser().parse_args(resume_args)
     second = run_experiment(resume)
     assert _Model.calls == calls
     assert len(second["reports"]) == 2
+    checkpoint = json.loads(state_path.read_text())
+    checkpoint["ablationBundleHash"] = "tampered"
+    state_path.write_text(json.dumps(checkpoint))
+    with pytest.raises(RuntimeError, match="deterministic L-derived ablation"):
+        run_experiment(resume)
+    assert _Model.calls == calls
+    checkpoint["ablationBundleHash"] = experiment_state["ablationBundleHash"]
+    state_path.write_text(json.dumps(checkpoint))
+    checkpoint = json.loads(state_path.read_text())
+    checkpoint["learningStatus"] = "in_flight"
+    (tmp_path / "run" / "appworld-experiment-state.json").write_text(json.dumps(checkpoint))
+    with pytest.raises(RuntimeError, match="authenticated recoverable receipt"):
+        run_experiment(resume)
+    assert _Model.calls == calls
+    (tmp_path / "run" / "appworld-experiment-state.json").write_text(json.dumps({**checkpoint, "learningStatus": "complete"}))
     bad = build_parser().parse_args(["--resume", "--data-dir", str(tmp_path / "run"), "--appworld-root", str(root), "--appworld-python", sys.executable, "--source-revision", "changed", "--image-digest", "sha256:image", "--core-planner-hash", "core"])
     with pytest.raises(RuntimeError, match="SOURCE_REVISION"):
         run_experiment(bad)
     assert _Model.calls == calls
-    state_path = tmp_path / "run" / "appworld-experiment-state.json"
     state = json.loads(state_path.read_text())
     state["trainingStatus"] = "failed"
     state_path.write_text(json.dumps(state))
