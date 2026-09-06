@@ -16,6 +16,7 @@ from adaptive_agent.appworld_provider import (
     AppWorldUnavailable,
     AppWorldProvider,
     _JsonLineProcess,
+    _response_schema,
     build_manifest,
     public_tool_schemas,
     register_appworld,
@@ -134,6 +135,30 @@ def test_public_docs_merge_required_parameters_and_response_schema(tmp_path: Pat
     assert alarm.effect == "write"
 
 
+@pytest.mark.parametrize(
+    ("example", "shape"),
+    [
+        ([{"id": 1}], {"type": "array"}),
+        ({"id": 1}, {"type": "object"}),
+        ("ok", {"type": "string"}),
+        (7, {"type": "integer"}),
+        (True, {"type": "boolean"}),
+        (None, {"type": "null"}),
+    ],
+)
+def test_response_schema_preserves_public_example_shape(example, shape):
+    schema = _response_schema({"response_schemas": {"200": example}})
+    assert {key: schema[key] for key in shape} == shape
+    assert schema["examples"] == [example]
+
+
+def test_response_schema_exposes_mixed_public_array_and_error_object_shapes():
+    examples = [[{"id": 1}], {"message": "failed"}]
+    schema = _response_schema({"response_schemas": {"200": examples[0], "400": examples[1]}})
+    assert schema["anyOf"] == [{"type": "array", "items": {}}, {"type": "object", "additionalProperties": True}]
+    assert schema["examples"] == examples
+
+
 def test_search_ranks_multiword_descriptions_and_discovers_supervisor_with_pagination(tmp_path: Path):
     root = _public_root(tmp_path)
     (root / "data" / "api_docs" / "function_calling" / "supervisor.json").write_text(json.dumps([
@@ -211,6 +236,33 @@ for line in sys.stdin:
         assert provider.evaluate_aggregate()["success"] is True
     with AppWorldProvider(config, task, "run-2", worker_command=command) as second:
         assert second.process_id != first_pid
+
+
+def test_public_context_keeps_auth_discovery_metadata_but_no_secrets(tmp_path: Path):
+    root = _public_root(tmp_path)
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        '''import json, sys
+for line in sys.stdin:
+    f = json.loads(line)
+    op = f["operation"]
+    if op == "reset":
+        r = {"taskId": "train-1", "allowedApps": ["phone"], "supervisor": {"firstName": "Ada", "email": "ada@example.com", "password": "secret"}, "appDescriptions": {"phone": "Phone app", "private": {"secret": True}}}
+    elif op == "close":
+        print(json.dumps({"id": f["id"], "ok": True, "result": {"closed": True}}), flush=True)
+        break
+    else:
+        r = {}
+    print(json.dumps({"id": f["id"], "ok": True, "result": r}), flush=True)
+'''
+    )
+    config = AppWorldConfig(root, python=sys.executable)
+    task = AppWorldCatalog(config).task("train-1", "train")
+    with AppWorldProvider(config, task, "run-1", worker_command=[sys.executable, "-u", str(worker)]) as provider:
+        context = provider.public_context()
+    assert context["allowedApps"] == ["phone"]
+    assert context["supervisor"] == {"firstName": "Ada", "email": "ada@example.com"}
+    assert context["appDescriptions"] == {"phone": "Phone app"}
 
 
 def test_hung_worker_timeout_is_bounded_and_cleaned_up(tmp_path: Path):

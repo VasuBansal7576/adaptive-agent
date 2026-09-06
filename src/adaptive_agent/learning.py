@@ -205,19 +205,39 @@ class PlannerLearningAdapter:
         self.client = client
         self.evidence_sink = evidence_sink
 
-    def __call__(self, *, goal: str, environment: dict[str, Any], emit: Callable[[str, str, str | None], None], remaining_deadline: float | None = None, cancel: Event | None = None, token_cap: int | None = None) -> ModelInvocation:
-        messages = [
+    @staticmethod
+    def messages_for(goal: str) -> list[dict[str, str]]:
+        # The environment is already a first-class field in the planner
+        # request.  Repeating it inside a message doubled large learning
+        # contexts and made the parent token cap unenforceable.
+        return [
             {
                 "role": "system",
                 "content": (
                     "Propose one generic bounded learning patch from verified development evidence. "
-                    "Return exactly one JSON object matching the PROPOSAL_CONTRACT included in the user message. "
-                    "Predicted effects are hypotheses, not outcomes. Only patch the bounded skill/config paths; "
-                    "do not emit fixture IDs, hidden evaluator material, or authority-bearing fields."
+                    "Return exactly one JSON object matching the proposalContract in the authoritative "
+                    "environment payload. Predicted effects are hypotheses, not outcomes. Only patch the "
+                    "bounded skill/config paths; do not emit fixture IDs, hidden evaluator material, or "
+                    "authority-bearing fields."
                 ),
             },
-            {"role": "user", "content": json.dumps({"goal": goal, "environment": environment, "PROPOSAL_CONTRACT": PROPOSAL_CONTRACT}, sort_keys=True, ensure_ascii=False)},
+            {
+                "role": "user",
+                "content": (
+                    "Use the authoritative environment payload. Read its learningContext, proposalContract, "
+                    "sourceRuns, baseBundleHash, proposalLimits, and sanitizedFeedback. Cite only evidence "
+                    "IDs present in learningContext.developmentEvidence and return the required JSON object."
+                ),
+            },
         ]
+
+    def __call__(self, *, goal: str, environment: dict[str, Any], emit: Callable[[str, str, str | None], None], remaining_deadline: float | None = None, cancel: Event | None = None, token_cap: int | None = None) -> ModelInvocation:
+        messages = self.messages_for(goal)
+        prompt_budget = environment.get("promptBudgetBytes")
+        if isinstance(prompt_budget, int) and not isinstance(prompt_budget, bool) and prompt_budget > 0:
+            serialized_size = _serialized_planner_request_bytes(goal, environment, token_cap=token_cap)
+            if serialized_size > prompt_budget:
+                raise LearningError("learning request exceeds the deterministic serialized prompt budget")
         invoke = self.client.invoke
         parameters = inspect.signature(invoke).parameters
         accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
@@ -270,6 +290,173 @@ _HIDDEN_LITERAL = re.compile(r"(?i)(expected\s*answer|hidden\s*answer|answer\s*k
 _SKILL_FIELDS = {"procedure", "applicability", "preconditions", "failureHandling"}
 _MAX_PATCH_BYTES = 32_768
 _MAX_CHANGED_LINES = 200
+
+# The provider reports token usage, while the request boundary only exposes a
+# serialized string.  This is a byte ceiling, not a tokenization guarantee:
+# one UTF-8 byte is allowed per available token, with explicit space reserved
+# for output and provider/request framing.  Measured provider usage remains
+# authoritative after dispatch.
+_PROMPT_OUTPUT_HEADROOM_TOKENS = 1_024
+_PROMPT_PROVIDER_HEADROOM_BYTES = 1_024
+_PROMPT_FRAMING_HEADROOM_BYTES = 1_024
+_MIN_USEFUL_EXCERPT_BYTES = 32
+
+
+def _prompt_budget_bytes(token_cap: int | None) -> int | None:
+    if token_cap is None:
+        return None
+    reserved = _PROMPT_OUTPUT_HEADROOM_TOKENS + _PROMPT_PROVIDER_HEADROOM_BYTES + _PROMPT_FRAMING_HEADROOM_BYTES
+    budget = token_cap - reserved
+    if budget <= 0:
+        raise LearningError("learning proposal token cap is below the minimum serialized prompt budget")
+    return budget
+
+
+def _serialized_planner_request_bytes(goal: str, environment: Mapping[str, Any], *, token_cap: int | None = None) -> int:
+    messages = PlannerLearningAdapter.messages_for(goal)
+    request = json.dumps(
+        {"goal": goal, "environment": environment, "messages": messages},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    if token_cap is not None:
+        request = f"A hard parent token cap of {max(0, token_cap)} applies to this call.\n" + request
+    return len(request.encode("utf-8"))
+
+
+def _pack_learning_context(
+    result: RetrievalResult,
+    *,
+    goal: str,
+    base_environment: Mapping[str, Any],
+    feedback: Mapping[str, Any],
+    active_bundle_hash: str,
+    source_runs: frozenset[tuple[str, str]] | None,
+    token_cap: int | None,
+) -> tuple[RetrievalResult, dict[str, Any]]:
+    """Select a deterministic, serialized-size-bounded learner context.
+
+    Evidence is admitted per selected source run before optional documents,
+    task state, or skills.  Long excerpts may be shortened, but their
+    citations always retain the original source hash.  This keeps provenance
+    verifiable while preventing a single durable artifact from consuming the
+    whole model request.
+    """
+    budget = _prompt_budget_bytes(token_cap)
+    source_keys = frozenset(source_runs or ())
+    available_keys = frozenset((item.environment_id or "", item.run_id or "") for item in result.evidence)
+    ordered_evidence = sorted(result.evidence, key=lambda item: (not item.failure, item.environment_id or "", item.run_id or "", -item.score, item.source_id))
+    required_keys = list(dict.fromkeys((item.environment_id or "", item.run_id or "") for item in ordered_evidence))
+    if source_keys:
+        required_keys = [key for key in required_keys if key in source_keys]
+    if source_keys and not source_keys.issubset(available_keys):
+        missing = sorted(source_keys - available_keys)[0]
+        raise LearningError(f"selected learning source run lacks verified development evidence: {missing[1]}")
+    if not result.evidence:
+        raise LearningError("learning requires verified development evidence")
+
+    evidence = ordered_evidence
+    mandatory: list[Any] = []
+    for key in required_keys:
+        item = next((candidate for candidate in evidence if (candidate.environment_id or "", candidate.run_id or "") == key), None)
+        if item is not None and item not in mandatory:
+            mandatory.append(item)
+    if not mandatory:
+        mandatory = [evidence[0]]
+    unique_mandatory: list[Any] = []
+    mandatory_ids: dict[str, tuple[str, str]] = {}
+    for item in mandatory:
+        key = (item.environment_id or "", item.run_id or "")
+        previous_key = mandatory_ids.get(item.source_id)
+        if previous_key is not None:
+            if previous_key != key:
+                raise LearningError("selected learning source runs do not have unique evidence IDs")
+            continue
+        mandatory_ids[item.source_id] = key
+        unique_mandatory.append(item)
+    mandatory = unique_mandatory
+    if budget is not None and mandatory:
+        # Reserve room for every selected source before filling optional
+        # context.  A greedy full-size first item would otherwise crowd out a
+        # later run and make coverage depend on source ordering.
+        excerpt_reserve = max(_MIN_USEFUL_EXCERPT_BYTES, budget // (2 * len(mandatory)))
+        mandatory = [item.with_excerpt(item.excerpt[:excerpt_reserve]) for item in mandatory]
+    candidates = [(item, True) for item in mandatory]
+    candidate_source_ids = {item.source_id for item in mandatory}
+    for item in (*evidence, *result.docs, *result.task_state, *result.skills):
+        # A mandatory item may be an excerpted copy of the source record, so
+        # dataclass equality cannot be used for deduplication here.
+        if item.source_id in candidate_source_ids:
+            continue
+        candidate_source_ids.add(item.source_id)
+        candidates.append((item, False))
+
+    selected: dict[str, list[Any]] = {"publicDocs": [], "developmentEvidence": [], "taskState": [], "activeSkills": []}
+    key_for_kind = {
+        "public_doc": "publicDocs",
+        "live_evidence": "developmentEvidence",
+        "task_state": "taskState",
+        "skill": "activeSkills",
+    }
+
+    def current_result() -> RetrievalResult:
+        return result.with_items(
+            docs=selected["publicDocs"],
+            evidence=selected["developmentEvidence"],
+            task_state=selected["taskState"],
+            skills=selected["activeSkills"],
+        )
+
+    def environment_for(candidate: RetrievalResult) -> dict[str, Any]:
+        environment = dict(base_environment)
+        environment["learningContext"] = candidate.prompt_payload()
+        environment["sanitizedFeedback"] = dict(feedback)
+        environment["baseBundleHash"] = active_bundle_hash
+        ids = [item.source_id for item in candidate.evidence]
+        environment["proposalContract"] = proposal_contract(ids)
+        environment["proposalLimits"] = {"maxChangedArtifacts": 3, "maxChangedLogicalLines": _MAX_CHANGED_LINES, "maxPatchBytes": _MAX_PATCH_BYTES}
+        if source_keys:
+            environment["sourceRuns"] = [{"environmentId": env, "runId": run} for env, run in sorted(source_keys)]
+        if budget is not None:
+            environment["promptBudgetBytes"] = budget
+        return environment
+
+    def fits(candidate: RetrievalResult) -> bool:
+        environment = environment_for(candidate)
+        return budget is None or _serialized_planner_request_bytes(goal, environment, token_cap=token_cap) <= budget
+
+    for item, required in candidates:
+        bucket = selected[key_for_kind[item.kind.value]]
+        candidate_bucket = [*bucket, item]
+        selected[key_for_kind[item.kind.value]] = candidate_bucket
+        if fits(current_result()):
+            continue
+        selected[key_for_kind[item.kind.value]] = bucket
+        # Preserve a useful prefix of a required source even when its durable
+        # record is larger than the remaining request budget.
+        low, high = 0, len(item.excerpt)
+        best: Any | None = None
+        while low <= high:
+            middle = (low + high) // 2
+            shortened = item.with_excerpt(item.excerpt[:middle])
+            selected[key_for_kind[item.kind.value]] = [*bucket, shortened]
+            if fits(current_result()):
+                best = shortened
+                low = middle + 1
+            else:
+                high = middle - 1
+        selected[key_for_kind[item.kind.value]] = bucket
+        if best is not None and len(best.excerpt.encode("utf-8")) >= min(_MIN_USEFUL_EXCERPT_BYTES, len(item.excerpt.encode("utf-8"))):
+            selected[key_for_kind[item.kind.value]] = [*bucket, best]
+        elif required:
+            raise LearningError("selected learning source evidence cannot fit the serialized model prompt")
+
+    packed = current_result()
+    environment = environment_for(packed)
+    if budget is not None and _serialized_planner_request_bytes(goal, environment, token_cap=token_cap) > budget:
+        raise LearningError("learning request exceeds the deterministic serialized prompt budget")
+    return packed, environment
 
 
 def _parse_model_json(text: str) -> dict[str, Any]:
@@ -377,6 +564,7 @@ def _validate_proposal_payload(
     environment_id: str,
     run_id: str,
     allowed_source_runs: frozenset[tuple[str, str]] | None = None,
+    exposed_evidence_ids: frozenset[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], str, str, tuple[SourceRecord, ...], dict[str, Any], dict[str, Any]]:
     operations = _canonical_operations(parsed["editOperations"])
     skill = _validate_skill(parsed["skill"])
@@ -391,6 +579,8 @@ def _validate_proposal_payload(
         evidence = retriever.require_development_evidence(evidence_ids, environment_id=environment_id, run_id=run_id, allowed_source_runs=allowed_source_runs)
     except RetrievalError as exc:
         raise LearningError(str(exc)) from exc
+    if exposed_evidence_ids is not None and not set(evidence_ids).issubset(exposed_evidence_ids):
+        raise LearningError("supporting evidence must be selected from the exposed learning context")
     config_patch = parsed.get("executionConfigPatch", {})
     if config_patch and (not isinstance(config_patch, Mapping) or set(config_patch) - {"instructionVariant"}):
         raise LearningError("execution configuration patch is outside the bounded learner surface")
@@ -434,13 +624,7 @@ class LearningService:
             result = self.retriever.search(goal, environment_id=environment_id, run_id=run_id, allowed_skill_ids=allowed_skill_ids)
         if not result.evidence:
             raise LearningError("learning requires verified development evidence")
-        safe_environment = {key: environment[key] for key in ("environmentId", "version", "toolSchemas", "executionModes", "capabilities") if environment and key in environment}
-        safe_environment["learningContext"] = result.prompt_payload()
-        safe_environment["sanitizedFeedback"] = sanitize_feedback(feedback)
-        safe_environment["baseBundleHash"] = active
-        allowed_evidence_ids = [item.source_id for item in result.evidence]
-        safe_environment["proposalContract"] = proposal_contract(allowed_evidence_ids)
-        safe_environment["proposalLimits"] = {"maxChangedArtifacts": 3, "maxChangedLogicalLines": _MAX_CHANGED_LINES, "maxPatchBytes": _MAX_PATCH_BYTES}
+        base_environment = {key: environment[key] for key in ("environmentId", "version", "toolSchemas", "executionModes", "capabilities") if environment and key in environment}
         runner = self.model_runner
         parameters = inspect.signature(runner).parameters
         accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
@@ -453,8 +637,15 @@ class LearningService:
             remaining_tokens = None if token_cap is None else token_cap - total_used_tokens
             if remaining_tokens is not None and remaining_tokens <= 0:
                 raise LearningError("learning proposal token cap exhausted before repair")
-            attempt_environment = dict(safe_environment)
-            attempt_environment["sanitizedFeedback"] = attempt_feedback
+            attempt_result, attempt_environment = _pack_learning_context(
+                result,
+                goal=goal,
+                base_environment=base_environment,
+                feedback=attempt_feedback,
+                active_bundle_hash=active,
+                source_runs=source_runs,
+                token_cap=remaining_tokens,
+            )
             attempt_deadline = remaining_deadline
             if remaining_deadline is not None:
                 attempt_deadline = remaining_deadline - (time.monotonic() - deadline_started)
@@ -481,7 +672,14 @@ class LearningService:
                         total_used_tokens += used_tokens
                     try:
                         parsed = _parse_model_json(invocation.text)
-                        operations, skill, predicted, proposer_version, evidence, config_patch, bundle_patch = _validate_proposal_payload(parsed, retriever=self.retriever, environment_id=environment_id, run_id=run_id, allowed_source_runs=source_runs)
+                        operations, skill, predicted, proposer_version, evidence, config_patch, bundle_patch = _validate_proposal_payload(
+                            parsed,
+                            retriever=self.retriever,
+                            environment_id=environment_id,
+                            run_id=run_id,
+                            allowed_source_runs=source_runs,
+                            exposed_evidence_ids=frozenset(item.source_id for item in attempt_result.evidence),
+                        )
                         break
                     except LearningError as exc:
                         error = exc

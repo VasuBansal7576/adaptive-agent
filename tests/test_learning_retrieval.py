@@ -218,14 +218,106 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(client.messages[0]["role"], "system")
         self.assertIn("bounded learning patch", client.messages[0]["content"])
 
+    def test_planner_adapter_does_not_repeat_authoritative_environment(self):
+        client = PlannerClient(self.valid_payload())
+        environment = {"learningContext": {"developmentEvidence": [{"excerpt": "UNIQUE-LARGE-EVIDENCE"}]}}
+        PlannerLearningAdapter(client, EvidenceSink())(goal="learn", environment=environment, emit=lambda *_args: None)
+        rendered_messages = json.dumps(client.messages, ensure_ascii=False)
+        self.assertNotIn("UNIQUE-LARGE-EVIDENCE", rendered_messages)
+        self.assertNotIn('"environment":', rendered_messages)
+
+    def test_prompt_packing_preserves_each_selected_run_and_cites_only_exposed_evidence(self):
+        sources = [
+            source("ev-a", SourceKind.LIVE_EVIDENCE, "failure observation " + "a" * 20_000, environment_id="env-a", run_id="run-a", partition="development", trust_class="broker", metadata={"outcomePassed": False}),
+            source("ev-b", SourceKind.LIVE_EVIDENCE, "success observation " + "b" * 20_000, environment_id="env-b", run_id="run-b", partition="development", trust_class="broker"),
+            source("doc-large", SourceKind.PUBLIC_DOC, "documentation " + "d" * 20_000, environment_id="env-a", trust_class="operator"),
+        ]
+        retriever = AccessFilteredRetriever(InMemorySourceProvider(sources))
+        captured = {}
+
+        def runner(*, goal, environment, emit, **_kwargs):
+            captured["environment"] = environment
+            payload = self.valid_payload()
+            payload["supportingEvidenceIds"] = ["ev-b"]
+            return Invocation(payload)
+
+        service = LearningService(retriever, runner, self.sink, lambda: "a" * 64)
+        service.propose(
+            run_id="run-a",
+            environment_id="env-a",
+            goal="learn",
+            environment={},
+            token_cap=20_000,
+            source_runs=frozenset({("env-a", "run-a"), ("env-b", "run-b")}),
+        )
+        evidence = captured["environment"]["learningContext"]["developmentEvidence"]
+        self.assertEqual({item["sourceId"] for item in evidence}, {"ev-a", "ev-b"})
+        self.assertEqual(len(evidence), len({item["sourceId"] for item in evidence}))
+        self.assertEqual(evidence[0]["sourceId"], "ev-a")
+        self.assertLess(len(evidence[0]["excerpt"]), 20_000)
+        self.assertEqual(captured["environment"]["proposalContract"]["properties"]["supportingEvidenceIds"]["items"], {"enum": ["ev-a", "ev-b"]})
+
+    def test_prompt_packing_fails_before_dispatch_when_mandatory_context_cannot_fit(self):
+        called = []
+
+        def runner(*, goal, environment, emit, **_kwargs):
+            called.append(True)
+            return Invocation(self.valid_payload())
+
+        service = LearningService(self.retriever, runner, self.sink, lambda: "a" * 64)
+        with self.assertRaisesRegex(LearningError, "below the minimum"):
+            service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, token_cap=512)
+        self.assertEqual(called, [])
+
+    def test_prompt_budget_counts_utf8_bytes_and_exact_request_framing(self):
+        unicode_text = "Unicode evidence: café 東京 😀 " + "界" * 5_000
+        unicode_evidence = source("ev-unicode", SourceKind.LIVE_EVIDENCE, unicode_text, environment_id="env", run_id="run-a", partition="development", trust_class="broker")
+        captured = {}
+
+        def runner(*, goal, environment, emit, **_kwargs):
+            captured["environment"] = environment
+            payload = self.valid_payload()
+            payload["supportingEvidenceIds"] = ["ev-unicode"]
+            return Invocation(payload)
+
+        service = LearningService(AccessFilteredRetriever(InMemorySourceProvider([unicode_evidence])), runner, self.sink, lambda: "a" * 64)
+        service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, token_cap=20_000)
+        environment = captured["environment"]
+        serialized = json.dumps(
+            {"goal": "learn", "environment": environment, "messages": PlannerLearningAdapter.messages_for("learn")},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        serialized = f"A hard parent token cap of 20000 applies to this call.\n" + serialized
+        self.assertLessEqual(len(serialized.encode("utf-8")), environment["promptBudgetBytes"])
+        self.assertIn("東京", environment["learningContext"]["developmentEvidence"][0]["excerpt"])
+
+    def test_repair_feedback_is_repacked_inside_remaining_prompt_budget(self):
+        calls = []
+        payload = self.valid_payload()
+
+        class RepairRunner:
+            def __call__(self, *, goal, environment, emit, remaining_deadline=None, cancel=None, token_cap=None):
+                calls.append((environment, token_cap))
+                if len(calls) == 1:
+                    return Invocation({"unexpected": True})
+                return Invocation(payload)
+
+        service = LearningService(self.retriever, RepairRunner(), self.sink, lambda: "a" * 64)
+        service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, token_cap=20_000, max_repair_attempts=1)
+        self.assertEqual(calls[0][0]["sanitizedFeedback"], {})
+        self.assertEqual(calls[1][0]["sanitizedFeedback"]["failureClass"], "malformed_proposal")
+        self.assertLessEqual(calls[1][0]["promptBudgetBytes"], calls[0][0]["promptBudgetBytes"])
+
     def test_planner_budget_deadline_and_cancel_are_forwarded(self):
         client = PlannerClient(self.valid_payload())
         service = LearningService(self.retriever, PlannerLearningAdapter(client, EvidenceSink()), self.sink, lambda: "a" * 64)
         cancel = Event()
-        service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, remaining_deadline=12.5, cancel=cancel, token_cap=321)
+        service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, remaining_deadline=12.5, cancel=cancel, token_cap=20_000)
         self.assertAlmostEqual(client.forwarded["remaining_deadline"], 12.5, delta=0.1)
         self.assertIs(client.forwarded["cancel"], cancel)
-        self.assertEqual(client.forwarded["token_cap"], 321)
+        self.assertEqual(client.forwarded["token_cap"], 20_000)
 
     def test_model_usage_over_token_cap_is_rejected(self):
         class OverCapInvocation(Invocation):
@@ -256,12 +348,12 @@ class LearningTests(unittest.TestCase):
                 return Invocation(payload)
 
         service = LearningService(self.retriever, RepairRunner(), self.sink, lambda: "a" * 64)
-        result = service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, remaining_deadline=12.5, token_cap=50, max_repair_attempts=1)
+        result = service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, remaining_deadline=12.5, token_cap=20_000, max_repair_attempts=1)
         self.assertEqual(result.authoritative_candidate["state"], "validated")
         self.assertAlmostEqual(calls[0][1], 12.5, delta=0.1)
         self.assertLess(calls[1][1], calls[0][1])
-        self.assertEqual(calls[0][2], 50)
-        self.assertEqual(calls[1][2], 30)
+        self.assertEqual(calls[0][2], 20_000)
+        self.assertEqual(calls[1][2], 19_980)
         self.assertEqual(calls[1][0]["failureClass"], "malformed_proposal")
 
 

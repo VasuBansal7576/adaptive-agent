@@ -38,6 +38,10 @@ from adaptive_agent.store import Store
 from adaptive_agent.evaluation_store import build_durable_adapters
 
 
+_MAX_PROVIDER_CONTEXT_BYTES = 64 * 1024
+_MAX_PROVIDER_CONTEXT_DEPTH = 8
+
+
 def _manifest_value(value: Any) -> Any:
     """Serialize manifest boundary objects independent of their implementation."""
     model_dump = getattr(value, "model_dump", None)
@@ -50,6 +54,44 @@ def _manifest_value(value: Any) -> Any:
     if callable(to_dict):
         return to_dict()
     return value
+
+
+def _provider_public_context(provider: ToolProvider) -> dict[str, Any] | None:
+    """Validate optional provider metadata before exposing it to a model."""
+    public_context = getattr(provider, "public_context", None)
+    if not callable(public_context):
+        return None
+    context = public_context()
+    if not isinstance(context, dict):
+        raise RuntimeError("provider public context must be a dictionary")
+
+    def validate_json(value: Any, depth: int = 0) -> None:
+        if depth > _MAX_PROVIDER_CONTEXT_DEPTH:
+            raise RuntimeError("provider public context exceeds the nesting limit")
+        if isinstance(value, dict):
+            if any(not isinstance(key, str) for key in value):
+                raise RuntimeError("provider public context keys must be strings")
+            for child in value.values():
+                validate_json(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                validate_json(child, depth + 1)
+        elif value is None or isinstance(value, (str, int, float, bool)):
+            return
+        else:
+            raise RuntimeError("provider public context must contain JSON values")
+
+    validate_json(context)
+    try:
+        encoded = json.dumps(context, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        normalized = json.loads(encoded)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("provider public context must be valid JSON") from exc
+    if len(encoded.encode("utf-8")) > _MAX_PROVIDER_CONTEXT_BYTES:
+        raise RuntimeError("provider public context exceeds the size limit")
+    if not isinstance(normalized, dict):
+        raise RuntimeError("provider public context must be a dictionary")
+    return normalized
 
 
 def _effective_observation_cost(accounting: Mapping[str, Any]) -> int:
@@ -1356,9 +1398,9 @@ class DurableRuntime:
         selected = {ref.id for ref in run.active_skill_refs}
         return [skill.model_dump(mode="json", by_alias=True) for skill in bundle.skills if not selected or skill.skill_id in selected]
 
-    def _planner_environment(self, package: Any, run_id: str) -> dict[str, Any]:
+    def _planner_environment(self, package: Any, run_id: str, *, provider: ToolProvider | None = None) -> dict[str, Any]:
         run = self.controller.get_run(run_id)
-        return {
+        environment = {
             "environmentId": package.environment_id,
             "version": package.manifest.version,
             "docs": [_manifest_value(ref) for ref in package.manifest.docs],
@@ -1370,6 +1412,13 @@ class DurableRuntime:
             "activeSkills": self._active_skills(run_id),
             "budgetRef": run.budget_ref.model_dump(mode="json", by_alias=True) if run else None,
         }
+        if provider is not None:
+            context = _provider_public_context(provider)
+            if context is not None:
+                # Provider metadata is deliberately namespaced so it cannot
+                # shadow controller-owned capabilities, schemas, or pins.
+                environment["taskContext"] = context
+        return environment
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         run = self.controller.get_run(run_id)
@@ -1705,6 +1754,102 @@ class DurableRuntime:
                 return trusted_result
         return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
 
+    def _resolve_launch_identity(self, stored: Mapping[str, Any], run_record: Any, arm: str | None, seed: int | None, bundle_hash: str | None) -> tuple[str, int, str]:
+        """Resolve launch identity without mutating the durable run row."""
+        try:
+            artifact = self.controller.store.get_artifact(run_record.skill_bundle_ref)
+            from adaptive_agent.models import SkillBundle
+            pinned_bundle = SkillBundle.model_validate(artifact)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LearningRuntimeError("run skill bundle is missing or malformed") from exc
+        bundle_payload = pinned_bundle.model_dump(mode="json", by_alias=True, exclude={"content_hash"})
+        pinned_hash = sha256_json(bundle_payload)
+        supplied_hash = artifact.get("contentHash", artifact.get("content_hash")) if isinstance(artifact, Mapping) else None
+        if not isinstance(supplied_hash, str) or supplied_hash != pinned_hash:
+            raise LearningRuntimeError("pinned skill bundle hash does not match its persisted content")
+        if stored.get("bundle_hash") != pinned_hash:
+            raise LearningRuntimeError("run skill bundle hash does not match its persisted content")
+        if bundle_hash is not None and bundle_hash != pinned_hash:
+            raise LearningRuntimeError("launch bundle hash does not match the persisted run bundle")
+        try:
+            payload = json.loads(stored.get("run_json", "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LearningRuntimeError("run identity is malformed") from exc
+        if not isinstance(payload, dict):
+            raise LearningRuntimeError("run identity is malformed")
+        persisted_arm = payload.get("arm")
+        if persisted_arm is not None and (not isinstance(persisted_arm, str) or persisted_arm not in {"B0", "L", "A"}):
+            raise LearningRuntimeError("persisted launch arm is invalid")
+        if arm is not None and not isinstance(arm, str):
+            raise LearningRuntimeError("launch arm must be a string")
+        if arm is not None and arm not in {"B0", "L", "A"}:
+            raise LearningRuntimeError("launch arm is invalid")
+        if persisted_arm is not None and arm is not None and arm != persisted_arm:
+            raise LearningRuntimeError("launch arm conflicts with persisted run identity")
+        arm = arm if arm is not None else (persisted_arm or "B0")
+        persisted_seed = payload.get("seed")
+        if persisted_seed is not None and (not isinstance(persisted_seed, int) or isinstance(persisted_seed, bool)):
+            raise LearningRuntimeError("persisted launch seed is invalid")
+        if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+            raise LearningRuntimeError("launch seed must be an integer")
+        if persisted_seed is not None and seed is not None and seed != persisted_seed:
+            raise LearningRuntimeError("launch seed conflicts with persisted run identity")
+        seed = seed if seed is not None else (persisted_seed if persisted_seed is not None else 0)
+        persisted_hash = payload.get("bundleHash")
+        if persisted_hash is not None and persisted_hash != pinned_hash:
+            raise LearningRuntimeError("persisted launch bundle hash does not match the run bundle")
+        if bundle_hash is not None and persisted_hash is not None and bundle_hash != persisted_hash:
+            raise LearningRuntimeError("launch bundle hash conflicts with persisted run identity")
+        resolved_hash = persisted_hash or bundle_hash or pinned_hash
+        return arm, seed, resolved_hash
+
+    def _bind_launch_identity(self, run_id: str, stored: Mapping[str, Any], arm: str, seed: int, bundle_hash: str) -> None:
+        """Bind resolved launch identity after this caller successfully claims."""
+        try:
+            payload = json.loads(stored.get("run_json", "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LearningRuntimeError("run identity is malformed") from exc
+        if not isinstance(payload, dict):
+            raise LearningRuntimeError("run identity is malformed")
+        payload.update({"arm": arm, "seed": seed, "bundleHash": bundle_hash})
+        row = dict(stored)
+        row["run_json"] = json.dumps(payload, sort_keys=True)
+        self.controller.store.save_run(run_id, {key: value for key, value in row.items() if key != "run_id"})
+
+    def _bind_terminal_accounting(self, run_id: str, execution_started: float) -> None:
+        """Persist one terminal receipt for ordinary runtime launches."""
+        stored = self.controller.store.get_run(run_id)
+        if stored is None:
+            return
+        try:
+            run_payload = json.loads(stored.get("run_json", "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if isinstance(run_payload, dict) and isinstance(run_payload.get("finalAccountingRef"), str):
+            return
+        rows = self.controller.store.list_evidence(run_id)
+        models = [row for row in rows if row.get("event_type") == "model_response"]
+        if not models:
+            return
+        try:
+            model = self.controller.store.get_artifact(json.loads(models[-1]["source_ref"])["sha256"])
+            source = model.get("accountingRef") if isinstance(model, Mapping) else None
+            source_ref = source.get("sha256") if isinstance(source, Mapping) else None
+            accounting = self.controller.store.get_artifact(source_ref) if isinstance(source_ref, str) else None
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(accounting, Mapping):
+            return
+        final = dict(accounting)
+        final["toolCalls"] = sum(row.get("event_type") == "tool_result" for row in rows)
+        final["durationSeconds"] = max(float(accounting.get("durationSeconds", 0) or 0), time.monotonic() - execution_started)
+        final["inferenceDurationSeconds"] = float(accounting.get("inferenceDurationSeconds", 0) or 0)
+        ref = self.controller.store.put_artifact(final).sha256
+        run_payload["finalAccountingRef"] = ref
+        row = dict(stored)
+        row["run_json"] = json.dumps(run_payload, sort_keys=True)
+        self.controller.store.save_run(run_id, {key: value for key, value in row.items() if key != "run_id"})
+
     def _durable_evaluator_evidence(self, run_id: str) -> list[dict[str, Any]]:
         """Return immutable model/kernel event payloads to the trusted evaluator."""
         events: list[dict[str, Any]] = []
@@ -1787,7 +1932,7 @@ class DurableRuntime:
         # authority in the application adapter.
         return self.controller.append_event(run_id, "tool_result", payload, "broker", "operator")
 
-    def launch(self, run_id: str, *, task_override: Any | None = None, package_override: Any | None = None, model_client_override: Any | None = None, seed: int = 0, arm: str = "B0", bundle_hash: str | None = None, core_planner_hash: str | None = None, image_digest: str | None = None) -> None:
+    def launch(self, run_id: str, *, task_override: Any | None = None, package_override: Any | None = None, model_client_override: Any | None = None, seed: int | None = None, arm: str | None = None, bundle_hash: str | None = None, core_planner_hash: str | None = None, image_digest: str | None = None) -> None:
         stored = self.controller.store.get_run(run_id)
         if not stored:
             raise KeyError("run not found")
@@ -1809,11 +1954,19 @@ class DurableRuntime:
             max_cost = int(budget_data.get("costMicrounits", 100000))
             if max_tokens <= 0 or max_cost <= 0 or wall_seconds <= 0:
                 raise RuntimeError("model, cost, and wall-time budgets must be positive before dispatch")
+        arm, seed, bundle_hash = self._resolve_launch_identity(stored, run_record, arm, seed, bundle_hash)
+        execution_started = time.monotonic()
         claimed, current = self._claim_run(run_id)
         if current is None:
             raise KeyError("run not found")
         if not claimed:
             return
+        latest_stored = self.controller.store.get_run(run_id)
+        latest_record = self.controller.get_run(run_id)
+        if latest_stored is None or latest_record is None:
+            raise KeyError("run not found after claim")
+        arm, seed, bundle_hash = self._resolve_launch_identity(latest_stored, latest_record, arm, seed, bundle_hash)
+        self._bind_launch_identity(run_id, latest_stored, arm, seed, bundle_hash)
         self._run_started_at[run_id] = time.monotonic()
         self._run_last_receipt_at[run_id] = self._run_started_at[run_id]
         cancel = self._cancel_events.setdefault(run_id, threading.Event())
@@ -1831,7 +1984,7 @@ class DurableRuntime:
             class DirectDriver:
                 def act(self, _ctx: Any) -> None:
                     nonlocal invocation
-                    invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
+                    invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id, provider=provider), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
                     runtime._record_model_response(run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest, **({"nominalCostUsd": invocation.nominalCostUsd} if hasattr(invocation, "nominalCostUsd") else {}), **({"costMicrounits": invocation.costMicrounits} if hasattr(invocation, "costMicrounits") else ({"costMicrounits": invocation.cost_microunits} if hasattr(invocation, "cost_microunits") else {})), **({"economicCostStatus": invocation.economicCostStatus} if hasattr(invocation, "economicCostStatus") else {})})
             def evaluate() -> DurableOutcome:
                 outcome = runtime._invoke_evaluator(run_id=run_id, goal=task.goal, model_output=invocation.text, environment=runtime._planner_environment(package, run_id)) if invocation is not None and runtime.evaluator is not None else None
@@ -1848,6 +2001,7 @@ class DurableRuntime:
                 close = getattr(provider, "close", None)
                 if callable(close):
                     close()
+                self._bind_terminal_accounting(run_id, execution_started)
             self._cancel_events.pop(run_id, None)
             self._run_started_at.pop(run_id, None)
             self._run_last_receipt_at.pop(run_id, None)
@@ -1913,6 +2067,7 @@ class DurableRuntime:
             self._cancel_events.pop(run_id, None)
             self._run_started_at.pop(run_id, None)
             self._run_last_receipt_at.pop(run_id, None)
+            self._bind_terminal_accounting(run_id, execution_started)
             if prime is not None:
                 prime.close(remove_workspace=True)
             return
@@ -1955,7 +2110,7 @@ class DurableRuntime:
                     self.result = PlannerResult("timed_out", None, 0, 0, 0, (), ())
                     return
                 planner = LunaPlanner(parent_client, prime, Sink(self._controller), limits=PlannerLimits(max_model_tokens=max_tokens, max_wall_seconds=wall_seconds), emit=lambda event: self._controller.append_event(run_id, event.kind, {"summary": event.summary, "detail": event.detail}, "system", "operator"))
-                self.result = planner.run(goal=task.goal, environment=runtime._planner_environment(package, run_id), active_skills=runtime._active_skills(run_id), cancel=cancel)
+                self.result = planner.run(goal=task.goal, environment=runtime._planner_environment(package, run_id, provider=provider), active_skills=runtime._active_skills(run_id), cancel=cancel)
         driver = Driver(self.controller)
         def evaluate() -> DurableOutcome:
             result = driver.result
@@ -1988,6 +2143,7 @@ class DurableRuntime:
                 close()
             if prime is not None:
                 prime.close(remove_workspace=True)
+            self._bind_terminal_accounting(run_id, execution_started)
             self._cancel_events.pop(run_id, None)
             self._run_started_at.pop(run_id, None)
             self._run_last_receipt_at.pop(run_id, None)
