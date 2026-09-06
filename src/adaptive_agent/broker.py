@@ -15,7 +15,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from adaptive_agent.environment import (
     EnvironmentRegistry,
@@ -31,6 +31,9 @@ from adaptive_agent.models import (
     ToolSchema,
 )
 from adaptive_agent.store import Store
+
+
+Authorizer = Callable[[str, ToolRequest, ToolSchema], ToolError | None]
 
 
 class ToolProvider(ABC):
