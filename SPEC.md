@@ -3,7 +3,7 @@
 Status: implementable specification with product scope and local commit authorization confirmed on 2026-09-06.
 Numerical defaults are proposed engineering targets, not measured results.
 This is an implementation design for Syndicate Track 1 only.
-No application has been implemented, evaluated, published, or submitted.
+Implementation is active; application evaluation, public publication, and submission are not complete.
 
 ## Purpose and authorization
 
@@ -13,9 +13,9 @@ The same core discovers a solution, records evidence, proposes reusable procedur
 Finance, customer support, and IT are evaluation environments, not separate products or handwritten workflows.
 Results on these environments cannot establish success in arbitrary domains.
 
-The authorized work is limited to `SPEC.md`, `MILESTONES.md`, and `README.md`, their verification, local specification commits, fast-forward integration into local `main`, and synchronization to the filesystem-only origin.
+The active authorization covers implementation, local verification, M2-M4 coordination, local specification commits, fast-forward integration into local `main`, and synchronization to the filesystem-only origin.
 The initial repository is empty at `a09b012` and has a local filesystem origin.
-Implementation, dependency installation, public remote creation, publication, pushes to public remotes, pull requests, and submission are outside this phase.
+Public remote creation, publication, pushes to public remotes, pull requests, and submission are outside this phase.
 The local `main` fast-forward and filesystem-only `origin/main` synchronization are authorized and complete.
 Later implementation and submission gates are specified so the documentation can support the full objective.
 
@@ -648,7 +648,7 @@ Keyboard navigation, semantic labels, focus restoration, non-color status indica
 
 ## Verification and unresolved gates
 
-The documentation phase checks sources, traceability, links, contradictions, and commit scope.
+The implementation phase checks sources, traceability, links, contradictions, contracts, runtime behavior, and commit scope.
 It cannot establish any product acceptance scenario as passed.
 Future verification starts with real local environment fixtures and direct runtime boundary tests.
 Browser inspection covers the rendered console and its interactions after implementation exists.

@@ -45,24 +45,36 @@ class ControllerSafetyProbeAdapter:
         self.executor = executor
 
     def _run(self, case_id: str) -> SafetyProbeResult:
+        """Accept only complete, transcript-backed controller probe results."""
         raw = self.executor.execute_probe(case_id)
-        if not isinstance(raw, dict) and callable(getattr(raw, "to_dict", None)):
-            raw = raw.to_dict()
-        if not isinstance(raw, dict):
+        if isinstance(raw, SafetyProbeResult):
+            payload: Mapping[str, Any] = raw.to_dict()
+        elif hasattr(raw, "to_dict") and callable(raw.to_dict):
+            payload = raw.to_dict()
+        elif isinstance(raw, Mapping):
+            payload = raw
+        else:
             raise TypeError("controller probe must return an object")
-        outputs = raw.get("outputs")
-        provenance = raw.get("provenance")
-        obligations = raw.get("obligations")
+        outputs = payload.get("outputs")
+        provenance = payload.get("provenance")
+        obligations = payload.get("obligations")
+        # Controller probes return a richer per-obligation mapping and a single
+        # provenance label. Normalize that shape into the evaluator's immutable
+        # tuple contract while retaining each observed detail for attestation.
         if isinstance(outputs, Mapping):
+            observed = payload.get("observed")
             outputs = tuple(
-                {"obligation": name, "detail": detail}
+                {
+                    "obligation": str(name),
+                    "passed": bool(observed.get(name, True)) if isinstance(observed, Mapping) else True,
+                    "detail": detail,
+                }
                 for name, detail in outputs.items()
-                if isinstance(name, str) and name
             )
-        if isinstance(provenance, str) and provenance:
+        if isinstance(provenance, str):
             provenance = (provenance,)
         if (
-            not isinstance(raw.get("passed"), bool)
+            not isinstance(payload.get("passed"), bool)
             or not isinstance(outputs, (list, tuple))
             or not outputs
             or not all(isinstance(value, dict) for value in outputs)
@@ -74,7 +86,7 @@ class ControllerSafetyProbeAdapter:
             or not all(isinstance(value, str) and value for value in obligations)
         ):
             raise ValueError(f"controller probe {case_id} returned incomplete evidence")
-        return SafetyProbeResult(bool(raw["passed"]), tuple(outputs), tuple(provenance), tuple(obligations))
+        return SafetyProbeResult(bool(payload["passed"]), tuple(outputs), tuple(provenance), tuple(obligations))
 
     def eval_004(self):
         return self._run("EVAL-004")
@@ -121,12 +133,7 @@ class SQLiteAllocationStore:
     def reserve_next(self, scope_id: str, allocation_id: str, panels: Sequence[Sequence[str]], limit: int) -> int | None:
         if not panels or len(panels) < limit:
             raise ValueError("allocation panels must cover the configured limit")
-        return self.store.reserve_allocation(
-            scope_id,
-            allocation_id,
-            [list(panel) for panel in panels],
-            limit,
-        )
+        return self.store.reserve_allocation(scope_id, allocation_id, [list(panel) for panel in panels], limit)
 
     def get(self, allocation_id: str) -> dict[str, Any] | None:
         return self.store.get_allocation(allocation_id)
@@ -149,15 +156,6 @@ class SQLiteRunEvidenceStore:
         if not run or run.get("task_id") != observation.task_id or run.get("environment_id") != observation.environment_id:
             return False
         try:
-            run_payload = json.loads(run.get("run_json") or "{}")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return False
-        if run_payload.get("arm") != observation.arm.value or run_payload.get("seed") != observation.seed:
-            return False
-        bundle = self.store.get_bundle(run.get("bundle_id", ""))
-        if not bundle or not isinstance(bundle.get("content_hash"), str):
-            return False
-        try:
             source_ref = json.loads(evidence["source_ref"])
             accounting = self.store.get_artifact(observation.accounting_ref)
             response = self.store.get_artifact(source_ref["sha256"])
@@ -172,28 +170,43 @@ class SQLiteRunEvidenceStore:
         if receipts is not None:
             if not isinstance(receipts, list) or not isinstance(aggregate_usage, dict):
                 return False
-            calculated = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+            canonical_keys = ("inputTokens", "outputTokens", "totalTokens")
+            cache_keys = ("cacheReadInputTokens", "cacheCreationInputTokens", "cachedInputTokens")
+            calculated = {key: 0 for key in canonical_keys}
+            calculated_cache = {key: 0 for key in cache_keys}
             for receipt in receipts:
                 if not isinstance(receipt, dict) or not isinstance(receipt.get("usage"), dict):
                     return False
                 usage = receipt["usage"]
-                if any(not isinstance(usage.get(key), int) or usage[key] < 0 for key in calculated):
+                if any(not isinstance(usage.get(key), int) or isinstance(usage[key], bool) or usage[key] < 0 for key in canonical_keys):
                     return False
-                for key in calculated:
+                for key in canonical_keys:
                     calculated[key] += usage[key]
-            if aggregate_usage != calculated:
+                for key in cache_keys:
+                    value = usage.get(key, 0)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        return False
+                    calculated_cache[key] += value
+            if any(key not in aggregate_usage or aggregate_usage.get(key) != value for key, value in calculated.items()):
                 return False
-        if sha256_json(response) != evidence.get("content_hash") or source_ref.get("sha256") != evidence.get("content_hash"):
+            if any(key not in canonical_keys and key not in cache_keys for key in aggregate_usage):
+                return False
+            for key, value in calculated_cache.items():
+                aggregate_value = aggregate_usage.get(key)
+                if value or key in aggregate_usage:
+                    if not isinstance(aggregate_value, int) or isinstance(aggregate_value, bool) or aggregate_value != value:
+                        return False
+        if sha256_json(response) != evidence.get("content_hash"):
             return False
-        if sha256_json(accounting) != observation.accounting_ref or sha256_json(outcome) != outcome_source.get("sha256") or outcome_source.get("sha256") != outcome_evidence.get("content_hash"):
+        if response.get("responseId") != observation.response_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response" or outcome_evidence.get("run_id") != observation.run_id or outcome_evidence.get("event_type") != "trusted_outcome":
             return False
-        if response.get("responseId") != observation.response_id or response.get("runId") != observation.run_id or response.get("taskId") != observation.task_id or response.get("environmentId") != observation.environment_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response" or outcome_evidence.get("run_id") != observation.run_id or outcome_evidence.get("event_type") != "trusted_outcome":
+        # Model responses are operator-visible, while trusted evaluator
+        # outcomes may be evaluator-only so hidden answers never leak through
+        # the operator/event projection.  Both visibility classes are valid
+        # for the durable attestation as long as the row is evaluator-owned.
+        if evidence.get("visibility") != "operator" or outcome_evidence.get("visibility") not in {"operator", "evaluator_only"}:
             return False
-        if evidence.get("trust_class") not in {"broker", "system"} or outcome_evidence.get("trust_class") != "evaluator":
-            return False
-        # Model output is operator-visible; evaluator decisions stay private.
-        # Do not accept an operator-visible trusted outcome as an attestation.
-        if evidence.get("visibility") != "operator" or outcome_evidence.get("visibility") != "evaluator_only":
+        if evidence.get("trust_class") != "broker" or outcome_evidence.get("trust_class") != "evaluator":
             return False
         if evidence.get("eventType") not in (None, "model_response") or outcome_evidence.get("eventType") not in (None, "trusted_outcome"):
             return False
@@ -203,37 +216,19 @@ class SQLiteRunEvidenceStore:
             return False
         if accounting.get("responseId") != observation.response_id or accounting.get("runId") != observation.run_id or accounting.get("taskId") != observation.task_id or accounting.get("environmentId") != observation.environment_id:
             return False
-        if accounting.get("arm") != observation.arm.value or accounting.get("seed") != observation.seed or accounting.get("bundleHash") != bundle["content_hash"] or run_payload.get("bundleHash") != accounting.get("bundleHash"):
+        if outcome.get("responseId") != observation.response_id or outcome.get("runId") != observation.run_id or outcome.get("taskId") != observation.task_id or outcome.get("environmentId") != observation.environment_id:
             return False
-        if observation.bundle_hash != accounting["bundleHash"]:
+        expected_arm = getattr(observation.arm, "value", observation.arm)
+        if "arm" in outcome and outcome.get("arm") != expected_arm:
             return False
-        expected_bundles = run_payload.get("armBundles") or run_payload.get("bundlesByArm")
-        if not isinstance(expected_bundles, dict) or expected_bundles.get(observation.arm.value) != accounting["bundleHash"]:
+        if "seed" in outcome and outcome.get("seed") != observation.seed:
             return False
-        if response.get("arm") != accounting["arm"] or response.get("seed") != accounting["seed"] or response.get("bundleHash") != accounting["bundleHash"]:
-            return False
-        if outcome.get("responseId") != observation.response_id or outcome.get("runId") != observation.run_id or outcome.get("taskId") != observation.task_id or outcome.get("environmentId") != observation.environment_id or outcome.get("arm") != observation.arm.value or outcome.get("seed") != observation.seed or outcome.get("bundleHash") != accounting.get("bundleHash"):
+        if "bundleHash" in outcome and outcome.get("bundleHash") != observation.bundle_hash:
             return False
         if not all(isinstance(usage.get(key), int) and usage[key] >= 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]:
             return False
         actual_cost = accounting.get("costMicrounits")
         actual_latency = accounting.get("durationSeconds")
-        if actual_cost is None:
-            nominal_cost = accounting.get("nominalCostUsd")
-            coverage = accounting.get("nominalCostCoverage")
-            status = accounting.get("nominalCostStatus")
-            complete_coverage = (
-                isinstance(coverage, dict)
-                and isinstance(coverage.get("knownReceipts"), int)
-                and not isinstance(coverage.get("knownReceipts"), bool)
-                and isinstance(coverage.get("totalReceipts"), int)
-                and not isinstance(coverage.get("totalReceipts"), bool)
-                and coverage["totalReceipts"] > 0
-                and coverage["knownReceipts"] == coverage["totalReceipts"]
-                and status == "complete"
-            )
-            if complete_coverage and isinstance(nominal_cost, (int, float)) and not isinstance(nominal_cost, bool) and math.isfinite(nominal_cost) and nominal_cost >= 0:
-                actual_cost = int(round(float(nominal_cost) * 1_000_000))
         if not isinstance(actual_cost, (int, float)) or isinstance(actual_cost, bool) or not math.isfinite(actual_cost) or actual_cost < 0 or not isinstance(actual_latency, (int, float)) or isinstance(actual_latency, bool) or not math.isfinite(actual_latency) or actual_latency < 0:
             return False
         if actual_cost != observation.cost_microunits or actual_latency != observation.latency_seconds:

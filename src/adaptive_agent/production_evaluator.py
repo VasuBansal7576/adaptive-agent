@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 
 MODEL_TOKENS = 20_000
@@ -52,6 +52,32 @@ def _candidate_bundle(store: Any, candidate_id: str) -> Any:
     return _bundle_by_hash(store, candidate_hash)
 
 
+def _import_candidate(source_dir: str, target_store: Any, candidate_id: str) -> None:
+    """Copy the bound candidate bundle into the evaluator Store.
+
+    The target Store is intentionally independent of the source run Store,
+    but its seeded base pointer must match the candidate's recorded base hash.
+    """
+    from adaptive_agent.store import Store
+
+    source = Store(source_dir)
+    candidate = source.get_candidate(candidate_id)
+    if candidate is None:
+        raise RuntimeError(f"candidate is not present in source store: {candidate_id}")
+    base_hash = candidate.get("base_bundle_hash", candidate.get("baseBundleHash"))
+    candidate_hash = candidate.get("candidate_bundle_hash", candidate.get("candidateBundleHash"))
+    if not isinstance(base_hash, str) or not isinstance(candidate_hash, str):
+        raise RuntimeError("candidate source record lacks base/candidate bundle hashes")
+    active = target_store.get_active_bundle()
+    if active is None or active.get("content_hash") != base_hash:
+        raise RuntimeError("evaluator Store base bundle does not match candidate base hash")
+    bundle = source.get_bundle_by_hash(candidate_hash)
+    if bundle is None:
+        raise RuntimeError(f"candidate bundle is not present in source store: {candidate_hash}")
+    target_store.save_bundle(bundle["bundle_id"], bundle.get("parent"), bundle["content_hash"], bundle["bundle_json"], False)
+    target_store.save_candidate(candidate_id, candidate)
+
+
 def _require_bound_real_receipt(source_dir: str, run_id: str) -> None:
     """Require the supplied run to have canonical trusted evidence already."""
     from adaptive_agent.store import Store
@@ -62,8 +88,8 @@ def _require_bound_real_receipt(source_dir: str, run_id: str) -> None:
     if run is None or run.get("status") != "succeeded":
         raise RuntimeError(f"bound source run is not a succeeded durable run: {run_id}")
     evidence = source_store.list_evidence(run_id)
-    model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("trust_class") in {"broker", "system"} and row.get("visibility") == "operator"]
-    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("trust_class") == "evaluator" and row.get("visibility") == "evaluator_only"]
+    model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("trust_class") in {"broker", "system"} and row.get("visibility") in {"operator", "evaluator_only"}]
+    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("trust_class") == "evaluator" and row.get("visibility") in {"operator", "evaluator_only"}]
     if not model or not trusted:
         raise RuntimeError(
             f"bound source run lacks canonical model/trusted outcome evidence: {run_id}"
@@ -182,6 +208,8 @@ def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | No
 
     app = create_runtime_app(data_dir=data_dir)
     runtime = app.state.durable_runtime
+    if source_data_dir and candidate_id:
+        _import_candidate(source_data_dir, runtime.controller.store, candidate_id)
     evaluation_module = __import__("adaptive_agent.evaluation", fromlist=["__file__"])
     analysis_hash = hashlib.sha256(Path(evaluation_module.__file__).read_bytes()).hexdigest()
     core_pin = _require_pin("core planner hash", runtime.core_planner_hash)
@@ -267,52 +295,7 @@ def _lifecycle_stages(runtime: Any, protocol: Any, declared_retries: int) -> tup
     def invoke(cell_key: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
         return callback(cell_key=cell_key, context={**dict(context), "declaredRetries": declared_retries, "sealedEnvironment": protocol.sealed_environment})
 
-    def recover(receipt: Mapping[str, Any], *, stage: str, cell_key: str) -> Sequence[Any]:
-        runner = getattr(runtime, "experiment_stage_runner", None)
-        recovery = getattr(runner, "recover_evaluation_observations", None)
-        if not callable(recovery):
-            recovery = getattr(runner, "recover_observations", None)
-        if not callable(recovery):
-            raise RuntimeError("runtime does not expose durable observation recovery")
-        return recovery(receipt, stage=stage, cell_key=cell_key)
-
-    def prepare_final(state: Mapping[str, Any]) -> Mapping[str, Any]:
-        bundles = getattr(runtime, "_evaluation_arm_bundles", None)
-        if isinstance(bundles, Mapping) and isinstance(bundles.get("A"), str) and bundles["A"]:
-            return {"ablationBundleHash": bundles["A"]}
-        learning = state.get("results", {}).get("learning", {}) if isinstance(state.get("results"), Mapping) else {}
-        candidate_hash = next((value.get("candidateBundleHash") for value in learning.values() if isinstance(value, Mapping) and isinstance(value.get("candidateBundleHash"), str)), None) if isinstance(learning, Mapping) else None
-        if not isinstance(candidate_hash, str) or not candidate_hash:
-            raise RuntimeError("cannot derive final ablation without a frozen learned bundle")
-        learned = _bundle_by_hash(runtime.controller.store, candidate_hash)
-        from adaptive_agent.models import SkillBundle
-
-        payload = learned.model_dump(mode="json", by_alias=True)
-        # The ablation is a separate durable lineage object.  A stable ID and
-        # inherited creation timestamp make preparation idempotent across
-        # process restarts without allowing INSERT OR REPLACE to overwrite L.
-        payload["bundle_id"] = f"{learned.bundle_id}:memory-disabled"
-        payload["parent"] = learned.content_hash
-        payload["skills"] = []
-        execution_config = payload.setdefault("executionConfig", {})
-        execution_config["skill_refs"] = []
-        execution_config["instruction_variant"] = "default"
-        payload["contentHash"] = ""
-        ablation = SkillBundle.model_validate(payload)
-        existing = runtime.controller.store.get_bundle(ablation.bundle_id)
-        if existing is None:
-            runtime.controller.store.save_bundle(ablation.bundle_id, ablation.parent, ablation.content_hash, ablation.model_dump_json(by_alias=True), False)
-        elif existing.get("content_hash") != ablation.content_hash:
-            raise RuntimeError("durable memory-disabled ablation binding conflicts with existing bundle")
-        if not isinstance(bundles, dict):
-            bundles = {}
-            setattr(runtime, "_evaluation_arm_bundles", bundles)
-        # The actual runtime task executor consumes the arm map as hashes.
-        # EvaluationJob receives its own object-valued arm map at construction.
-        bundles["A"] = ablation.content_hash
-        return {"ablationBundleHash": ablation.content_hash}
-
-    return tuple(LifecycleStage(name, cells[name], invoke, retries=declared_retries, observation_recoverer=recover if name in {"validation", "final"} else None, final_preparer=prepare_final if name == "final" else None, report_required=name in {"validation", "final"}) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final"))
+    return tuple(LifecycleStage(name, cells[name], invoke) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final"))
 
 
 def main(argv: list[str] | None = None) -> int:

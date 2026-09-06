@@ -12,21 +12,82 @@ This is procedural adaptation, not model-weight training or a promise of univers
 - [SPEC.md](SPEC.md) defines requirements, contracts, architecture, learning, evaluation, security, and acceptance.
 - [MILESTONES.md](MILESTONES.md) defines the runnable vertical slice, full delivery gates, AO ownership, and submission traceability.
 
-The repository currently contains documentation only.
-There are no application commands, installed project dependencies, configured package manager, or application CI to run.
-The proposed stack is React, Tailwind, Vite, and Bun with a small backend selected by a bounded Prime API bridge spike.
-Prime is the proposed runtime, with isolated IPython as a documented fallback if its interfaces cannot support the required boundaries.
+The authorized local-main assembly is complete for the committed session-2 backend tip `feef752`, session-5 console tip `eea3bdc`, and documentation tip `eeb5f05`.
+Dirty worker overlays were not included, and no heldout, final, or public release is implied.
+The exact branch refs, dirty-worktree status, and component ownership are tracked in [MILESTONES.md](MILESTONES.md).
 
-The verified smoke path uses Prime 0.9.2 session 3 with a ChatGPT subscription, `openai-codex/gpt-5.6-luna`, and an actual Python `2+2` result of `4`.
+The Python package is configured through `pyproject.toml` on the implementation branches.
+Its implemented entry points are `adaptive-agent` for the FastAPI control plane and operator-console backend, and `adaptive-agent-plan` for the authenticated Luna planner loop.
+The console package is configured through `package.json` and uses React, Tailwind, Vite, and Bun.
+The implemented console commands are `bun run dev`, `bun run test`, `bun run build`, `bunx tsc --noEmit`, and `bun run api:smoke`.
+`adaptive-agent` and `adaptive-agent-plan` are branch-local implementation commands until the corresponding branch work is integrated.
+
+The verified Prime smoke path uses Prime 0.9.2 session 3 with a ChatGPT subscription, `openai-codex/gpt-5.6-luna`, and an actual Python `2+2` result of `4`.
 Default Prime Inference returned HTTP 402 for lack of balance, while the subscription provider worked.
+The bounded Prime runtime adapter also recorded persistent kernel results `42` and `41`, a structured host-bridge response, and denied learner requests for harness, policy, evaluator, credential, and hidden-data access.
 Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
-The product bridge, safety isolation, and behavioral evaluation remain unverified.
+The console worker reported a live FastAPI session, registration, create/launch, SSE cursor, and cancellation smoke as passing.
+That smoke used a synthetic neutral environment and does not establish a real model-to-tool-to-evaluator product run.
+It remains historical transport evidence only until its Store and data target are proven isolated from root QAdata.
 
-The authorized phase includes verified local specification commits, fast-forward integration into local `main`, and synchronization to the filesystem-only origin, all complete.
-Implementation, installation, public remote creation, publication, pushes to public remotes, pull requests, and submission require later authorization.
+Tests and fixture runs are not interchangeable with those real-run checks.
+The backend and benchmark tests use synthetic providers, drivers, and deterministic fixtures, while console tests use simulation fixtures and captured wire frames.
+The current checkpoint has not produced a sealed four-environment evaluation, a measured performance result, or a complete behavioral acceptance result.
+
+Root-verified current evidence beyond `d8e9293` is bounded integration and safety evidence only.
+The current session-2 probe and integration lineage is committed at `f3785f0` with a dirty overlay still requiring review before assembly.
+The final2 integration reports 171 backend tests passed.
+Actual Docker-backed EVAL-003 passed all 7 obligations on isolated temporary Store and data paths.
+The EVAL-003 safety path was further hardened at commit `3261afc` atop `f423fac`.
+It now uses attacker-controlled public-document output to attempt forged write approval, verifies that no provider write occurs, and exercises `broker.call` escalation, `evaluator.write`, `harness.write`, and filesystem access through `run_prime_runtime_safety_probe`.
+The full safety pass requires an injected `PrimeRuntimeAdapter` whose provenance contains Docker, while `Controller.execute_probe` fails closed when that adapter is absent.
+The `require_runtime=False` option is reserved for control-plane unit mode and is not a full EVAL-003 result.
+Default probe results include self-contained evidence receipts with payload and content hash, and do not expose the hidden answer.
+The focused safety, core, and lifecycle test report was 39 passed with no services or paid calls.
+Actual Docker-backed EVAL-005 passed its two runtime cases, `child_failure_recovery_and_cap` and `shared_model_cost_token_cap`, using the deterministic probe model rather than a paid model call.
+The current session-4 Controller probe at `83d2e01` passed EVAL-004 8/8 and EVAL-005 8/8 on an isolated temporary Store and data directory.
+It closes `promotion_crash_reopen_atomic`, `child_failure_propagated`, and `event_reconnect_resume`: reopening preserves the active pointer, evaluating state, and promotion count; a failed child remains linked by `parentRunId` with both rows and the failed step persisted; and terminal SSE resume yields the exact remaining event tail.
+This probe evidence did not change the cost ledger, EVAL-003, or evaluator lifecycle, and used no services or paid calls.
+The latest session-5 console tip is `ae482da`, following `29afe35`, with 61/61 tests, TypeScript, and build clean; its latest report did not include live smoke.
+These results do not establish a product-wide run, heldout performance, or final evaluation success.
+
+A newer isolated development smoke used Store and data path `/tmp/adaptive-run-2fc3c680.fiZAAA`.
+Under scoped verifier fix `0561041`, the trusted outcome was visible as `evaluator_only` while the required `model_response` remained operator-visible.
+The durable run was `run_7f5b3196fff541129d4e9c8345d0ba75` for `finance-development-00`, baseline seed 17, with `lastEventSequence=16`, a trusted and reliable outcome, and `bundleHash=507a47cc70856f5e680d689ad3400b92f67daa4dbc9bc1e1209b5ae78a1e7b6a`.
+Its recorded pins were protocol `1cced7b2...`, core `54b3b7...`, Docker image `adaptive-prime-runtime@sha256:e1242afd...`, analysis `3e5371a...`, budget `5f3b9d...`, and model `efaeffc...`.
+The aggregate receipt recorded 8407 input, 1088 output, and 9495 total tokens, with broker invoice and payment reads plus `apply_payment` confirmed.
+Resume smoke completed with `status=complete`, `candidateCount=1`, and `transferRuns=1` matching the expected value of 1.
+The full post-fix pytest report was 147 passed with two dependency warnings.
+This is isolated development-smoke evidence only and makes no heldout, final, public, or performance claim.
+
+QA data-integrity hold: the original real evidence for `run_2fc` is contaminated by appended synthetic `model_response` rows at sequences 20 and 21, named `learning-model-fake-resp-1` and `learning-model-r20`.
+All history must be preserved, but those rows must not be erased, relabeled, or counted as real evidence.
+No transport smoke may target the root QAdata or port 8000 because the real authenticated path invokes the paid model.
+Every test and probe must use an isolated temporary Store and data directory.
+
+The repository contains no literal occurrence of the run or row identifiers, so the source and ownership of those specific append operations are not established here.
+The related evaluator-owned probe path observed on session 2 is `Controller.execute_probe`, authored in the session-2 probe commits `59adfb5` and `f423fac`.
+That path creates `tempfile.TemporaryDirectory(prefix="aa-probe-")` and a `Store` under its temporary directory, but this code-level property does not prove that `run_2fc` was isolated.
+Session 6 must create clean independent evaluation data, regenerate and validate real development evidence and its candidate, and retain exact path-level isolation proof before any sealed panel runs.
+
+The documentation phase and authorized local-main assembly are complete.
+The assembly used only committed session-2 backend integration, session-5 console, and documentation refs.
+Post-assembly isolated backend and console checks, cost accounting, ablation, and report validation remain required before reassessing M2-M4.
+Session 3, session 4, session 6, and session 7 work remains separate evidence or follow-up input and is not part of that assembly plan.
+Implementation, local verification, and M2-M4 coordination remain active across the worker branches.
+Public remote creation, publication, pushes to public remotes, pull requests, and submission remain unauthorized and incomplete.
 The official build window closes on 2026-09-07 at 03:30 IST.
 Public repository and social-demo obligations are recorded in the milestones and are not yet fulfilled.
 
-Prime source reuse must preserve verified MIT notices.
+Prime source reuse must preserve the verified MIT attribution and notices.
+The reused source is Prime Agent by Prime Intellect AI, pinned for the initial static review at commit [`9c54a35dac3a2ad17910074d66664859ea175666`](https://github.com/PrimeIntellect-ai/prime-agent/tree/9c54a35dac3a2ad17910074d66664859ea175666), under the MIT License.
+The installed Prime 0.9.2 runtime smoke is separate from that pinned static-source review.
 Backpass and Vision inform evidence handling and bounded edits, but are not required dependencies or autonomous evaluators.
-Evaluation targets and source-review limitations are documented in the specification; no measured performance or track-compliance result is claimed.
+Evaluation targets, source-review limitations, and acceptance meanings remain defined by the specification.
+No measured performance, full acceptance, public publication, or submission result is claimed.
+
+One explicit blocker remains unmet.
+The user-accepted Luna-through-ChatGPT subscription path has no API-key or provider switch.
+The trusted parent records actual model usage and rejects after aggregate token exhaustion.
+Local token limits and post-response rejection are not hard provider enforcement, so the strict per-call output-token-cap criterion remains UNMET.
+This documentation does not alter the pass meaning of any requirement in [SPEC.md](SPEC.md).

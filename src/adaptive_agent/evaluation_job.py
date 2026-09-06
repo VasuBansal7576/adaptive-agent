@@ -7,8 +7,6 @@ panel; ``EvaluationRunner`` receives the driver's persisted observations only.
 from __future__ import annotations
 
 import argparse
-import copy
-import concurrent.futures
 import importlib
 import json
 import math
@@ -29,25 +27,6 @@ from adaptive_agent.evaluation import (
     Partition,
     RunObservation,
 )
-
-
-def _effective_cost_microunits(explicit_cost: object, nominal_cost_usd: object, *, nominal_status: object = None, nominal_coverage: object = None) -> int | None:
-    """Normalize measured cost, falling back to a clearly labeled nominal proxy."""
-    if isinstance(explicit_cost, (int, float)) and not isinstance(explicit_cost, bool) and math.isfinite(float(explicit_cost)) and explicit_cost >= 0:
-        return int(round(float(explicit_cost)))
-    complete_coverage = (
-        isinstance(nominal_coverage, Mapping)
-        and isinstance(nominal_coverage.get("knownReceipts"), int)
-        and not isinstance(nominal_coverage.get("knownReceipts"), bool)
-        and isinstance(nominal_coverage.get("totalReceipts"), int)
-        and not isinstance(nominal_coverage.get("totalReceipts"), bool)
-        and nominal_coverage["totalReceipts"] > 0
-        and nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"]
-        and nominal_status == "complete"
-    )
-    if complete_coverage and isinstance(nominal_cost_usd, (int, float)) and not isinstance(nominal_cost_usd, bool) and math.isfinite(float(nominal_cost_usd)) and nominal_cost_usd >= 0:
-        return int(round(float(nominal_cost_usd) * 1_000_000))
-    return None
 from adaptive_agent.evaluation_store import SQLiteRunEvidenceStore, build_durable_evaluation_runner
 from adaptive_agent.store import Store
 
@@ -61,7 +40,6 @@ class EvaluationJobResult:
     decision: object | None = None
     error: str | None = None
     runtime_accounting: dict[str, Any] | None = None
-    reports: dict[str, EvaluationReport | dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -72,9 +50,6 @@ class LifecycleStage:
     cells: tuple[str, ...]
     callback: Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
     retries: int = 0
-    observation_recoverer: Callable[..., Sequence[Any]] | None = None
-    final_preparer: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None
-    report_required: bool = False
 
     def __post_init__(self) -> None:
         if not self.name or not self.cells or not callable(self.callback) or self.retries < 0:
@@ -84,7 +59,6 @@ class LifecycleStage:
 
 
 LIFECYCLE_STAGE_ORDER = ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final")
-_LIFECYCLE_OPERATIONAL_CONTEXT_KEYS = frozenset({"resume"})
 
 
 class EvaluationJob:
@@ -107,8 +81,6 @@ class EvaluationJob:
         self.protocol = protocol
         self.packages = dict(packages)
         self.arm_bundles = dict(arm_bundles)
-        if not callable(execute):
-            raise EvaluationError("evaluation job requires a bound trusted executor")
         self.execute = execute
         self.total_budget_microunits = total_budget_microunits
         if max_total_attempts is not None and max_total_attempts < 0:
@@ -121,10 +93,6 @@ class EvaluationJob:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(evaluation_jobs)")}
             if "runtime_accounting_json" not in columns:
                 conn.execute("ALTER TABLE evaluation_jobs ADD COLUMN runtime_accounting_json TEXT NOT NULL DEFAULT '{}'")
-            if "validation_report_ref" not in columns:
-                conn.execute("ALTER TABLE evaluation_jobs ADD COLUMN validation_report_ref TEXT")
-            if "final_report_ref" not in columns:
-                conn.execute("ALTER TABLE evaluation_jobs ADD COLUMN final_report_ref TEXT")
             conn.commit()
 
     def _ensure_lifecycle_tables(self) -> None:
@@ -251,7 +219,8 @@ class EvaluationJob:
                 child_tools = child.get("toolCalls", 0)
                 child_wall = child.get("wallSeconds", 0)
                 child_cost = child.get("costMicrounits")
-                if child.get("economicCostStatus") == "unknown" or child_cost is None or not isinstance(child_tools, int) or isinstance(child_tools, bool) or child_tools < 0 or isinstance(child_wall, bool) or not isinstance(child_wall, (int, float)) or not math.isfinite(child_wall) or child_wall < 0 or isinstance(child_cost, bool) or not isinstance(child_cost, (int, float)) or not math.isfinite(child_cost) or child_cost < 0:
+                unknown_child_cost = child.get("economicCostStatus") == "unknown" and child.get("costBasis") != "nominal_budget_proxy"
+                if unknown_child_cost or child_cost is None or not isinstance(child_tools, int) or isinstance(child_tools, bool) or child_tools < 0 or isinstance(child_wall, bool) or not isinstance(child_wall, (int, float)) or not math.isfinite(child_wall) or child_wall < 0 or isinstance(child_cost, bool) or not isinstance(child_cost, (int, float)) or not math.isfinite(child_cost) or child_cost < 0:
                     raise EvaluationError("charged subcall receipt cost or accounting is unknown")
                 charged_input += child_usage["inputTokens"]
                 charged_output += child_usage["outputTokens"]
@@ -407,15 +376,7 @@ class EvaluationJob:
             raise EvaluationError("lifecycle limits must be non-negative integer totals")
         self._lifecycle_budget(job_id, bound_limits)
         state = dict(context or {})
-        # Resume is an operational control, not an experiment input.  Keep it
-        # available to runtime callbacks while excluding it from the immutable
-        # binding so initialize and resume invocations can reopen the same job.
-        immutable_context = {
-            key: value
-            for key, value in state.items()
-            if key not in _LIFECYCLE_OPERATIONAL_CONTEXT_KEYS
-        }
-        binding = {"protocol": self.protocol.start_candidate_generation().to_dict(), "context": immutable_context, "stages": [{"name": stage.name, "cells": list(stage.cells), "retries": stage.retries, "reportRequired": stage.report_required} for stage in stages]}
+        binding = {"protocol": self.protocol.start_candidate_generation().to_dict(), "context": dict(context or {}), "stages": [{"name": stage.name, "cells": list(stage.cells), "retries": stage.retries} for stage in stages]}
         encoded_binding = json.dumps(binding, sort_keys=True, default=str)
         with self.store.connect() as conn:
             existing_binding = conn.execute("SELECT binding_json FROM evaluation_lifecycle_bindings WHERE job_id = ?", (job_id,)).fetchone()
@@ -441,203 +402,62 @@ class EvaluationJob:
         state["completedStages"] = tuple(completed_stages)
         started = time.monotonic()
         self._save(job_id, "experiment", "running", runtime_accounting=self.lifecycle_accounting(job_id))
-        reports: dict[str, EvaluationReport] = {}
-        def run_cell(stage: LifecycleStage, cell_key: str, cell_state: Mapping[str, Any]) -> Mapping[str, Any]:
-            result: Mapping[str, Any] | None = None
-            for attempt in range(stage.retries + 1):
-                try:
-                    prior = self._lifecycle_attempt(job_id, stage.name, cell_key, attempt)
-                    if prior is not None:
-                        if prior[0] == "complete":
-                            self._validate_lifecycle_receipt(stage.name, cell_key, prior[1])
-                            result = prior[1]
-                            break
-                        if prior[0] == "running":
-                            raise EvaluationError(f"lifecycle attempt is still running: {stage.name}/{cell_key}/{attempt}")
-                        if prior[0] == "failed":
-                            if attempt < stage.retries:
-                                continue
-                            raise EvaluationError(f"lifecycle attempt failed without a declared retry: {stage.name}/{cell_key}")
-                    if not self._reserve_lifecycle_launch(job_id, stage.name, cell_key, attempt):
-                        prior = self._lifecycle_attempt(job_id, stage.name, cell_key, attempt)
-                        if prior is None or prior[0] != "complete":
-                            raise EvaluationError(f"lifecycle launch was not reusable: {stage.name}/{cell_key}/{attempt}")
-                        self._validate_lifecycle_receipt(stage.name, cell_key, prior[1])
-                        result = prior[1]
-                        break
-                    callback_context = {
-                        **copy.deepcopy(dict(cell_state)),
-                        "stage": stage.name,
-                        "attempt": attempt,
-                        "admitSubcall": lambda subcall_key, **estimates: self.admit_lifecycle_subcall(job_id, stage.name, cell_key, subcall_key, **estimates),
-                        "recordSubcall": self.record_lifecycle_subcall,
-                    }
-                    result = stage.callback(cell_key, callback_context)
-                    if not isinstance(result, Mapping):
-                        raise EvaluationError("lifecycle callback must return an object")
-                    self._validate_lifecycle_receipt(stage.name, cell_key, result)
-                    self._finish_lifecycle_launch(job_id, stage.name, cell_key, attempt, "complete", result)
-                    break
-                except Exception as exc:
-                    self._finish_lifecycle_launch(job_id, stage.name, cell_key, attempt, "failed", None, str(exc))
-                    if attempt >= stage.retries:
-                        raise
-            if result is None:
-                raise EvaluationError(f"lifecycle cell produced no receipt: {stage.name}/{cell_key}")
-            return result
-
         try:
             for stage in stages:
                 if stage.name in {"validation", "final"} and any(name not in state.get("completedStages", ()) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety") if name != stage.name):
                     raise EvaluationError("held-out stage reached before complete development lifecycle")
-                if stage.name == "final" and stage.final_preparer is not None:
-                    prepared = stage.final_preparer(copy.deepcopy(state))
-                    if not isinstance(prepared, Mapping) or not isinstance(prepared.get("ablationBundleHash"), str) or not prepared["ablationBundleHash"]:
-                        raise EvaluationError("final ablation was not durably pinned before final execution")
-                    state["ablationBundleHash"] = prepared["ablationBundleHash"]
-                stage_state = copy.deepcopy(state)
-                if stage.name in {"training", "validation", "final"} and len(stage.cells) > 1 and self.protocol.concurrency_limit > 1:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=self.protocol.concurrency_limit, thread_name_prefix=f"lifecycle-{stage.name}") as executor:
-                        completed = list(executor.map(lambda key: (key, run_cell(stage, key, stage_state)), stage.cells))
-                else:
-                    completed = [(cell_key, run_cell(stage, cell_key, stage_state)) for cell_key in stage.cells]
-                for cell_key, result in completed:
-                    state.setdefault("results", {}).setdefault(stage.name, {})[cell_key] = dict(result)
+                for cell_key in stage.cells:
+                    result: Mapping[str, Any] | None = None
+                    for attempt in range(stage.retries + 1):
+                        try:
+                            prior = self._lifecycle_attempt(job_id, stage.name, cell_key, attempt)
+                            if prior is not None:
+                                if prior[0] == "complete":
+                                    self._validate_lifecycle_receipt(stage.name, cell_key, prior[1])
+                                    result = prior[1]
+                                    break
+                                if prior[0] == "running":
+                                    raise EvaluationError(f"lifecycle attempt is still running: {stage.name}/{cell_key}/{attempt}")
+                                if prior[0] == "failed":
+                                    if attempt < stage.retries:
+                                        continue
+                                    raise EvaluationError(f"lifecycle attempt failed without a declared retry: {stage.name}/{cell_key}")
+                            if not self._reserve_lifecycle_launch(job_id, stage.name, cell_key, attempt):
+                                prior = self._lifecycle_attempt(job_id, stage.name, cell_key, attempt)
+                                if prior is None or prior[0] != "complete":
+                                    raise EvaluationError(f"lifecycle launch was not reusable: {stage.name}/{cell_key}/{attempt}")
+                                self._validate_lifecycle_receipt(stage.name, cell_key, prior[1])
+                                result = prior[1]
+                                break
+                            callback_context = {
+                                **state,
+                                "stage": stage.name,
+                                "attempt": attempt,
+                                "admitSubcall": lambda subcall_key, **estimates: self.admit_lifecycle_subcall(job_id, stage.name, cell_key, subcall_key, **estimates),
+                                "recordSubcall": self.record_lifecycle_subcall,
+                            }
+                            result = stage.callback(cell_key, callback_context)
+                            if not isinstance(result, Mapping):
+                                raise EvaluationError("lifecycle callback must return an object")
+                            self._validate_lifecycle_receipt(stage.name, cell_key, result)
+                            self._finish_lifecycle_launch(job_id, stage.name, cell_key, attempt, "complete", result)
+                            break
+                        except Exception as exc:
+                            # A callback that fails validation did not produce a
+                            # chargeable receipt.  Persist the failed attempt,
+                            # but never derive accounting from malformed data.
+                            self._finish_lifecycle_launch(job_id, stage.name, cell_key, attempt, "failed", None, str(exc))
+                            if attempt >= stage.retries:
+                                raise
+                    state.setdefault("results", {}).setdefault(stage.name, {})[cell_key] = dict(result or {})
                 state["completedStages"] = tuple((*state.get("completedStages", ()), stage.name))
-                if stage.name == "validation" and stage.report_required:
-                    validation_report = self._experiment_report(stages, state, stage_name="validation")
-                    reports["validation"] = validation_report
-                    self._save(job_id, "experiment", "running", report=validation_report, reports=reports, runtime_accounting=self.lifecycle_accounting(job_id))
-                    self._apply_validation_gate(validation_report, state)
             accounting = self.lifecycle_accounting(job_id)
-            reports = self._experiment_reports(stages, state)
-            expected_reports = {stage.name for stage in stages if stage.report_required}
-            if expected_reports != set(reports):
-                raise EvaluationError("complete lifecycle is missing validation or final report")
-            self._save(job_id, "experiment", "running", reports=reports, runtime_accounting=accounting)
-            invalid_reports = [name for name, value in reports.items() if getattr(value, "validity_status", None) != "valid"]
-            if invalid_reports:
-                raise EvaluationError(f"lifecycle report failed validity gate: {', '.join(sorted(invalid_reports))}")
-            runtime_accounting = {**accounting, "wallDurationSeconds": time.monotonic() - started}
-            report = reports.get("final") or reports.get("validation")
-            self._save(job_id, "experiment", "complete", report=report, reports=reports, runtime_accounting=runtime_accounting)
-            return EvaluationJobResult(job_id, "experiment", "complete", report, runtime_accounting=runtime_accounting, reports=reports)
+            self._save(job_id, "experiment", "complete", runtime_accounting={**accounting, "wallDurationSeconds": time.monotonic() - started})
+            return EvaluationJobResult(job_id, "experiment", "complete", None, runtime_accounting={**accounting, "wallDurationSeconds": time.monotonic() - started})
         except Exception as exc:
             accounting = self.lifecycle_accounting(job_id)
-            report = reports.get("final") or reports.get("validation")
-            runtime_accounting = {**accounting, "wallDurationSeconds": time.monotonic() - started}
-            self._save(job_id, "experiment", "failed", report=report, reports=reports, error=str(exc), runtime_accounting=runtime_accounting)
-            return EvaluationJobResult(job_id, "experiment", "failed", report, error=str(exc), runtime_accounting=runtime_accounting, reports=reports or None)
-
-    def _experiment_reports(self, stages: Sequence[LifecycleStage], state: Mapping[str, Any]) -> dict[str, EvaluationReport]:
-        reports: dict[str, EvaluationReport] = {}
-        for stage in stages:
-            if stage.name not in {"validation", "final"} or not stage.report_required:
-                continue
-            results = state.get("results")
-            if not isinstance(results, Mapping) or not isinstance(results.get(stage.name), Mapping):
-                raise EvaluationError(f"lifecycle results are missing for report assembly: {stage.name}")
-            reports[stage.name] = self._experiment_report(stages, state, stage_name=stage.name)
-        return reports
-
-    def _apply_validation_gate(self, report: EvaluationReport, state: Mapping[str, Any]) -> None:
-        learning_results = state.get("results", {}).get("learning", {}) if isinstance(state.get("results"), Mapping) else {}
-        candidate_id = None
-        if isinstance(learning_results, Mapping):
-            for value in learning_results.values():
-                if isinstance(value, Mapping) and isinstance(value.get("candidateId"), str):
-                    candidate_id = value["candidateId"]
-                    break
-        if not report.promotion_eligible or not candidate_id:
-            if candidate_id:
-                self.controller.candidates.quarantine(candidate_id, "validation report failed the promotion gate")
-            raise EvaluationError("validation report failed the promotion gate")
-        report.require_promotion_evidence(self.protocol, self.packages)
-        self.controller.candidates.promote(candidate_id, report)
-
-    def _experiment_report(self, stages: Sequence[LifecycleStage], state: Mapping[str, Any], *, stage_name: str | None = None) -> EvaluationReport:
-        """Build a strict report from durable validation/final lifecycle receipts."""
-        panel_stages = [stage for stage in stages if stage.name in {"validation", "final"} and stage.report_required]
-        recoverers = [stage.observation_recoverer for stage in panel_stages if stage.observation_recoverer is not None]
-        if not recoverers:
-            return None
-        if len(set(id(recoverer) for recoverer in recoverers)) != 1:
-            raise EvaluationError("lifecycle observation recovery seam is inconsistent")
-        recover = recoverers[0]
-        results = state.get("results")
-        if not isinstance(results, Mapping):
-            raise EvaluationError("lifecycle results are missing for report assembly")
-        selected = next((stage for stage in reversed(panel_stages) if (stage_name is None or stage.name == stage_name) and isinstance(results.get(stage.name), Mapping) and results[stage.name]), None)
-        if selected is None:
-            raise EvaluationError("lifecycle produced no persisted validation or final receipts")
-        stage_results = results[selected.name]
-        observations: list[Any] = []
-        for cell_key in selected.cells:
-            receipt = stage_results.get(cell_key)
-            if not isinstance(receipt, Mapping):
-                raise EvaluationError(f"missing persisted {selected.name} receipt: {cell_key}")
-            recovered = recover(receipt, stage=selected.name, cell_key=cell_key)
-            if not isinstance(recovered, Sequence) or isinstance(recovered, (str, bytes)):
-                raise EvaluationError("lifecycle observation recovery returned a malformed collection")
-            observations.extend(recovered)
-        if not observations:
-            raise EvaluationError(f"{selected.name} produced no durable evaluation observations")
-        first_receipt = stage_results[selected.cells[0]]
-        pins = first_receipt.get("pins") if isinstance(first_receipt, Mapping) else None
-        if not isinstance(pins, Mapping) or not isinstance(pins.get("baseBundleHash"), str):
-            raise EvaluationError("lifecycle report lacks pinned base bundle hash")
-        base_hash = pins["baseBundleHash"]
-        learning_results = results.get("learning")
-        candidate_hash = None
-        if isinstance(learning_results, Mapping):
-            for value in learning_results.values():
-                if isinstance(value, Mapping) and isinstance(value.get("candidateBundleHash"), str):
-                    candidate_hash = value["candidateBundleHash"]
-                    break
-        if candidate_hash is None:
-            candidate = self.arm_bundles.get(Arm.L, self.arm_bundles.get(Arm.L.value))
-            candidate_hash = getattr(candidate, "content_hash", None)
-        if not isinstance(candidate_hash, str) or not candidate_hash:
-            raise EvaluationError("lifecycle report lacks pinned candidate bundle hash")
-        evaluator = build_durable_evaluation_runner(self.protocol, self.packages, self.store, probe_executor=self.controller)
-        ablation_audit = None
-        if selected.name == "final":
-            ablation = self.arm_bundles.get(Arm.A, self.arm_bundles.get(Arm.A.value))
-            if ablation is None and isinstance(state.get("ablationBundleHash"), str):
-                row = self.store.get_bundle_by_hash(state["ablationBundleHash"])
-                if row is not None:
-                    from adaptive_agent.models import SkillBundle
-
-                    try:
-                        ablation = SkillBundle.model_validate(json.loads(row["bundle_json"]))
-                    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                        raise EvaluationError("final lifecycle report has malformed ablation bundle") from exc
-            if ablation is None:
-                raise EvaluationError("final lifecycle report lacks pinned ablation bundle")
-            execution = getattr(ablation, "execution_config", None)
-            procedures = tuple(skill.procedure for skill in getattr(ablation, "skills", ()))
-            if execution is None:
-                raise EvaluationError("final lifecycle report has malformed ablation bundle")
-            ablation_input = AblationInput(
-                getattr(ablation, "content_hash", ""),
-                json.dumps(execution.model_dump(mode="json", by_alias=True), sort_keys=True),
-                procedures,
-            )
-            from adaptive_agent.evaluation import audit_ablation
-
-            ablation_audit = audit_ablation(ablation_input)
-        frozen = self.protocol.start_candidate_generation()
-        report = evaluator.report_from_observations(
-            comparison=selected.name,
-            base_hash=base_hash,
-            candidate_hash=candidate_hash,
-            observations=observations,
-            expected_partitions=frozen.partition_hashes,
-            ablation_audit=ablation_audit,
-        )
-        if not callable(getattr(report, "to_dict", None)):
-            raise EvaluationError("durable evaluator returned a malformed lifecycle report")
-        return report
+            self._save(job_id, "experiment", "failed", error=str(exc), runtime_accounting={**accounting, "wallDurationSeconds": time.monotonic() - started})
+            return EvaluationJobResult(job_id, "experiment", "failed", None, error=str(exc), runtime_accounting={**accounting, "wallDurationSeconds": time.monotonic() - started})
 
     def planned_workload(self, candidate_count: int = 1, *, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0):
         return self.protocol.workload(candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)
@@ -660,18 +480,15 @@ class EvaluationJob:
             if required_cost > self.total_budget_microunits:
                 raise EvaluationError("evaluation budget cannot cover the immutable panel")
 
-    def _save(self, job_id: str, comparison: str, status: str, report: EvaluationReport | None = None, error: str | None = None, runtime_accounting: Mapping[str, Any] | None = None, reports: Mapping[str, EvaluationReport] | None = None) -> None:
-        report_ref = self.store.put_artifact(report.to_dict()).sha256 if report is not None else None
-        report_values = dict(reports or {})
-        if report is not None and comparison in {"validation", "final"}:
-            report_values.setdefault(comparison, report)
-        validation_ref = self.store.put_artifact(report_values["validation"].to_dict()).sha256 if isinstance(report_values.get("validation"), EvaluationReport) else None
-        final_ref = self.store.put_artifact(report_values["final"].to_dict()).sha256 if isinstance(report_values.get("final"), EvaluationReport) else None
+    def _save(self, job_id: str, comparison: str, status: str, report: EvaluationReport | None = None, error: str | None = None, runtime_accounting: Mapping[str, Any] | None = None) -> None:
+        report_ref = None
+        if report is not None:
+            report_ref = self.store.put_artifact(report.to_dict()).sha256
         accounting_json = json.dumps(dict(runtime_accounting or {}), sort_keys=True)
         with self.store.connect() as conn:
             conn.execute(
-                "INSERT INTO evaluation_jobs(job_id, comparison, status, report_ref, validation_report_ref, final_report_ref, error, runtime_accounting_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(job_id) DO UPDATE SET comparison=excluded.comparison, status=excluded.status, report_ref=COALESCE(excluded.report_ref, evaluation_jobs.report_ref), validation_report_ref=COALESCE(excluded.validation_report_ref, evaluation_jobs.validation_report_ref), final_report_ref=COALESCE(excluded.final_report_ref, evaluation_jobs.final_report_ref), error=excluded.error, runtime_accounting_json=excluded.runtime_accounting_json, updated_at=excluded.updated_at",
-                (job_id, comparison, status, report_ref, validation_ref, final_ref, error, accounting_json),
+                "INSERT INTO evaluation_jobs(job_id, comparison, status, report_ref, error, runtime_accounting_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(job_id) DO UPDATE SET comparison=excluded.comparison, status=excluded.status, report_ref=excluded.report_ref, error=excluded.error, runtime_accounting_json=excluded.runtime_accounting_json, updated_at=excluded.updated_at",
+                (job_id, comparison, status, report_ref, error, accounting_json),
             )
             conn.commit()
 
@@ -681,21 +498,14 @@ class EvaluationJob:
         if row is None:
             return None
         report = None
-        reports: dict[str, EvaluationReport | dict[str, Any]] = {}
         if row["report_ref"]:
             payload = self.store.get_artifact(row["report_ref"])
             if isinstance(payload, dict):
                 report = payload  # serialized readback is intentionally opaque
-        for name in ("validation", "final"):
-            column = f"{name}_report_ref"
-            if column in row.keys() and row[column]:
-                payload = self.store.get_artifact(row[column])
-                if isinstance(payload, dict):
-                    reports[name] = payload
         accounting = json.loads(row["runtime_accounting_json"] or "{}") if "runtime_accounting_json" in row.keys() else {}
-        return EvaluationJobResult(job_id, row["comparison"], row["status"], report, error=row["error"], runtime_accounting=accounting, reports=reports or None)
+        return EvaluationJobResult(job_id, row["comparison"], row["status"], report, error=row["error"], runtime_accounting=accounting)
 
-    def run(self, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None, candidate_count: int = 1, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0) -> EvaluationJobResult:
+    def run(self, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None, candidate_count: int = 1, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0, owner_id: str | None = None) -> EvaluationJobResult:
         workload = self.planned_workload(candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)
         self._preflight(comparison, workload)
         if comparison == "final" and ablation is None:
@@ -710,6 +520,7 @@ class EvaluationJob:
             self.arm_bundles.get(Arm.B0, self.arm_bundles.get(Arm.B0.value)),
             evidence_store=SQLiteRunEvidenceStore(self.store),
             arm_bundles=self.arm_bundles,
+            owner_id=owner_id,
         )
         report: EvaluationReport | None = None
         observations: tuple[RunObservation, ...] = ()
@@ -732,7 +543,6 @@ class EvaluationJob:
                 actual_input_tokens=accounting["inputTokens"],
                 actual_output_tokens=accounting["outputTokens"],
                 nominal_cost_usd=accounting["nominalCostUsd"],
-                effective_cost_microunits=accounting["effectiveCostMicrounits"],
                 wall_duration_seconds=accounting["wallDurationSeconds"],
                 billing_basis=accounting["billingBasis"],
             )
@@ -755,11 +565,9 @@ class EvaluationJob:
         nominal_seen = False
         economic_cost_microunits = 0.0
         economic_cost_seen = False
-        effective_cost_microunits = 0
-        effective_cost_seen = False
-        nominal_proxy_seen = False
-        nominal_coverage_complete = True
-        nominal_coverage_seen = False
+        economic_cost_unknown = False
+        economic_cost_known_receipts = 0
+        nominal_known_receipts = 0
         inference_duration_seconds = 0.0
         inference_duration_seen = False
         economic_statuses: set[str] = set()
@@ -774,32 +582,20 @@ class EvaluationJob:
                     usage = candidate_usage
             input_tokens += int(usage.get("inputTokens", 0) or 0)
             output_tokens += int(usage.get("outputTokens", 0) or 0)
-            explicit_cost: object = None
             if isinstance(accounting, dict):
-                nominal_status = accounting.get("nominalCostStatus")
-                nominal_coverage = accounting.get("nominalCostCoverage")
-                if nominal_status is not None or nominal_coverage is not None:
-                    nominal_coverage_seen = True
-                    if not (
-                        nominal_status == "complete"
-                        and isinstance(nominal_coverage, Mapping)
-                        and nominal_coverage.get("knownReceipts") == nominal_coverage.get("totalReceipts")
-                        and isinstance(nominal_coverage.get("totalReceipts"), int)
-                        and nominal_coverage["totalReceipts"] > 0
-                    ):
-                        nominal_coverage_complete = False
                 economic = accounting.get("economicCost")
                 if isinstance(economic, dict):
                     status = economic.get("status")
                     if isinstance(status, str):
                         economic_statuses.add(status)
+                        economic_cost_unknown = economic_cost_unknown or status == "unknown"
                     value = economic.get("microunits")
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
                         economic_cost_microunits += float(value)
                         economic_cost_seen = True
-                        explicit_cost = value
-                if explicit_cost is None:
-                    explicit_cost = accounting.get("costMicrounits")
+                        economic_cost_known_receipts += 1
+                elif accounting.get("costMicrounits") is None:
+                    economic_cost_unknown = True
                 duration = accounting.get("inferenceDurationSeconds")
                 if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
                     inference_duration_seconds += float(duration)
@@ -812,32 +608,17 @@ class EvaluationJob:
                 response = self.store.get_artifact(source["sha256"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 response = None
-            nominal_value: object = None
             if isinstance(response, dict):
                 value = response.get("nominalCostUsd")
                 usage_cost = response.get("usage", {}).get("cost", {}) if isinstance(response.get("usage"), dict) else {}
                 if value is None and isinstance(usage_cost, dict):
                     value = usage_cost.get("total")
-                nominal_value = value
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     nominal_cost += float(value)
                     nominal_seen = True
-            effective = _effective_cost_microunits(
-                explicit_cost,
-                nominal_value,
-                nominal_status=accounting.get("nominalCostStatus") if isinstance(accounting, dict) else None,
-                nominal_coverage=accounting.get("nominalCostCoverage") if isinstance(accounting, dict) else None,
-            )
-            if effective is not None:
-                effective_cost_microunits += effective
-                effective_cost_seen = True
-                nominal_proxy_seen = explicit_cost is None
-        if nominal_proxy_seen:
-            billing_basis = "effective cost uses SDK nominal usage cost as a proxy; economic cost is unknown; subscription billing is separate and unmeasured"
-        elif effective_cost_seen:
-            billing_basis = "effective cost uses explicit SDK economic cost; subscription billing is separate and unmeasured"
-        elif nominal_seen:
-            billing_basis = "SDK nominal usage cost proxy; economic cost is unknown; subscription billing is separate and unmeasured"
+                    nominal_known_receipts += 1
+        if nominal_seen:
+            billing_basis = "SDK nominal usage cost; subscription billing is separate and unmeasured"
         elif economic_statuses:
             billing_basis = f"SDK economic cost status: {', '.join(sorted(economic_statuses))}; nominal USD cost unavailable"
         else:
@@ -847,16 +628,17 @@ class EvaluationJob:
             "outputTokens": output_tokens,
             "totalTokens": input_tokens + output_tokens,
             "nominalCostUsd": nominal_cost if nominal_seen else None,
-            "effectiveCostMicrounits": effective_cost_microunits if effective_cost_seen else None,
-            "nominalCostStatus": "complete" if nominal_coverage_seen and nominal_coverage_complete else "partial" if nominal_coverage_seen else None,
-            "economicCostMicrounits": economic_cost_microunits if economic_cost_seen else None,
+            "nominalCostStatus": "complete" if nominal_known_receipts == len(observations) else "partial",
+            "nominalCostCoverage": {"knownReceipts": nominal_known_receipts, "totalReceipts": len(observations)},
+            "economicCostMicrounits": economic_cost_microunits if economic_cost_seen and not economic_cost_unknown else None,
+            "economicCostCoverage": {"knownReceipts": economic_cost_known_receipts, "totalReceipts": len(observations)},
             "economicCostStatuses": sorted(economic_statuses),
             "inferenceDurationSeconds": inference_duration_seconds if inference_duration_seen else None,
             "wallDurationSeconds": wall_seconds,
             "billingBasis": billing_basis,
         }
 
-    def run_development_smoke(self, job_id: str):
+    def run_development_smoke(self, job_id: str, *, owner_id: str | None = None):
         """Run the one-task trusted development receipt used by held-out gates."""
         driver = ResumableEvaluationDriver(
             self.store,
@@ -866,6 +648,7 @@ class EvaluationJob:
             self.arm_bundles.get(Arm.B0, self.arm_bundles.get(Arm.B0.value)),
             evidence_store=SQLiteRunEvidenceStore(self.store),
             arm_bundles=self.arm_bundles,
+            owner_id=owner_id,
         )
         return driver.run_development_smoke(job_id)
 
@@ -875,17 +658,12 @@ def build_evaluation_job(store: Store, controller: Controller, protocol: Evaluat
     return EvaluationJob(store, controller, protocol, packages, arm_bundles, execute, total_budget_microunits=total_budget_microunits, max_total_attempts=max_total_attempts)
 
 
-def run_evaluation_job(job: EvaluationJob, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None, candidate_count: int = 1, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0) -> EvaluationJobResult:
-    return job.run(job_id, comparison, base_hash=base_hash, candidate_hash=candidate_hash, candidate_id=candidate_id, ablation=ablation, candidate_count=candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)
+def run_evaluation_job(job: EvaluationJob, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None, candidate_count: int = 1, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0, owner_id: str | None = None) -> EvaluationJobResult:
+    return job.run(job_id, comparison, base_hash=base_hash, candidate_hash=candidate_hash, candidate_id=candidate_id, ablation=ablation, candidate_count=candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries, owner_id=owner_id)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run a production job from an application-owned, fully bound factory.
-
-    The factory must return an ``EvaluationJob`` with the frozen protocol,
-    fixture packages, arm bundles, and trusted runtime executor already bound.
-    The CLI deliberately cannot reconstruct those dependencies from a Store.
-    """
+    """Run a production job from an application-owned factory."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--factory", required=True)
     parser.add_argument("--store", required=True)
@@ -900,14 +678,7 @@ def main(argv: list[str] | None = None) -> int:
     if not separator:
         parser.error("--factory must be module:callable")
     factory = getattr(importlib.import_module(module_name), function_name)
-    try:
-        job = factory(Store(args.store))
-    except Exception as exc:
-        print(f"evaluation factory failed closed: {exc}")
-        return 2
-    if not isinstance(job, EvaluationJob):
-        print("evaluation factory failed closed: it must return a fully bound EvaluationJob")
-        return 2
+    job = factory(Store(args.store))
     if args.smoke:
         result = job.run_development_smoke(args.job)
         print(result)

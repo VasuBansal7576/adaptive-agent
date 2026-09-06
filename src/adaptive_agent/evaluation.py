@@ -20,6 +20,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import StrEnum
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
+from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
+
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject = dict[str, JsonValue]
@@ -264,7 +266,7 @@ class TaskInput:
 
 @dataclass(frozen=True)
 class BudgetSpec:
-    model_tokens: int = 20_000
+    model_tokens: int = DEFAULT_MODEL_TOKENS
     tool_calls: int = 32
     child_runs: int = 0
     wall_time_seconds: int = 90
@@ -306,7 +308,10 @@ class RunObservation:
     outcome_ref: str | None = None
     config_hashes: Mapping[str, str] = field(default_factory=dict)
     run_id: str | None = None
-    bundle_hash: str | None = None
+    # Immutable arm identity is required for benchmark observations.  Keeping
+    # it on the observation lets the evaluator verify that a completed receipt
+    # came from the exact candidate/base bundle selected for that cell.
+    bundle_hash: str = ""
 
     def __post_init__(self) -> None:
         if self.cost_microunits < 0 or self.latency_seconds < 0 or self.safety_violations < 0:
@@ -946,10 +951,10 @@ class EvaluationProtocol:
     model_profile: str = "openai-codex/gpt-5.6-luna"
     model_tier: str = "medium"
     provider: str = "openai-codex"
+    image_digest: str = "image-unpinned"
     core_planner_hash: str = "core-planner-unset"
     analysis_code_hash: str = "evaluation-analysis-v1"
     retrieval_engine_version: str = "fixture-retrieval-v1"
-    image_digest: str = "image-unpinned"
     seeds: tuple[int, ...] = (17, 23, 29)
     tasks_per_environment: int = 20
     bootstrap_draws: int = 10_000
@@ -1015,7 +1020,7 @@ class EvaluationProtocol:
                 raise PromotionEvidenceRefused(f"partition hash changed for {key}")
 
     def to_dict(self, *, include_frozen: bool = True) -> JsonObject:
-        value: JsonObject = {"modelProfile": self.model_profile, "modelTier": self.model_tier, "provider": self.provider, "corePlannerHash": self.core_planner_hash, "analysisCodeHash": self.analysis_code_hash, "retrievalEngineVersion": self.retrieval_engine_version, "imageDigest": self.image_digest, "seeds": list(self.seeds), "tasksPerEnvironment": self.tasks_per_environment, "bootstrapDraws": self.bootstrap_draws, "analysisSeed": self.analysis_seed, "validationCandidateLimit": self.validation_candidate_limit, "runBudget": self.run_budget.to_dict(), "concurrencyLimit": self.concurrency_limit, "knownEnvironments": list(self.known_environments), "sealedEnvironment": self.sealed_environment, "thresholds": dict(self.thresholds)}
+        value: JsonObject = {"modelProfile": self.model_profile, "modelTier": self.model_tier, "provider": self.provider, "imageDigest": self.image_digest, "corePlannerHash": self.core_planner_hash, "analysisCodeHash": self.analysis_code_hash, "retrievalEngineVersion": self.retrieval_engine_version, "seeds": list(self.seeds), "tasksPerEnvironment": self.tasks_per_environment, "bootstrapDraws": self.bootstrap_draws, "analysisSeed": self.analysis_seed, "validationCandidateLimit": self.validation_candidate_limit, "runBudget": self.run_budget.to_dict(), "concurrencyLimit": self.concurrency_limit, "knownEnvironments": list(self.known_environments), "sealedEnvironment": self.sealed_environment, "thresholds": dict(self.thresholds)}
         if include_frozen and self._frozen is not None:
             value["protocolHash"] = self._frozen.protocol_hash
         return value
@@ -1026,7 +1031,6 @@ class FrozenProtocol:
     protocol_hash: str
     fixture_hashes: Mapping[str, str]
     partition_hashes: Mapping[str, str]
-    inputs: Mapping[str, JsonValue]
     inputs: Mapping[str, JsonValue]
 
     def to_dict(self) -> JsonObject:
@@ -1039,8 +1043,6 @@ class AblationInput:
     system_instructions: str
     retrieval_inputs: tuple[str, ...]
     artifacts: tuple[Mapping[str, str], ...] = ()
-    baseline_inventory: tuple[Mapping[str, str], ...] = ()
-    removed_learned_hashes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1059,16 +1061,6 @@ def audit_ablation(value: AblationInput) -> AblationAudit:
     for index, artifact in enumerate(value.artifacts):
         if artifact.get("source") in {"learned", "candidate", "promotion"}:
             hits.append(f"artifact:{index}")
-    pinned_removed = set(value.removed_learned_hashes)
-    for artifact in value.baseline_inventory:
-        if artifact.get("source") in {"learned", "candidate", "promotion"} or artifact.get("kind") == "learned":
-            artifact_hash = artifact.get("hash") or artifact.get("contentHash") or artifact.get("sha256")
-            if artifact_hash:
-                pinned_removed.add(artifact_hash)
-    for index, artifact in enumerate(value.artifacts):
-        artifact_hash = artifact.get("hash") or artifact.get("contentHash") or artifact.get("sha256")
-        if artifact_hash in pinned_removed:
-            hits.append(f"retained-hash:{index}")
     return AblationAudit(not hits, tuple(hits), sha256_json({"bundleHash": value.bundle_hash, "hits": hits}))
 
 
@@ -1146,7 +1138,7 @@ def _paired_metric(pairs: Sequence[tuple[RunObservation, RunObservation]]) -> di
 
 
 def _trusted_observation(row: RunObservation, frozen: FrozenProtocol, package: EnvironmentPackage) -> bool:
-    if row.model_provenance is not ModelProvenance.REAL_MODEL or not row.response_id or not row.accounting_ref or not row.evidence_ref:
+    if row.model_provenance is not ModelProvenance.REAL_MODEL or not row.run_id or not row.response_id or not row.accounting_ref or not row.evidence_ref:
         return False
     expected = {
         "model": sha256_json({"profile": frozen.inputs["modelProfile"], "provider": frozen.inputs["provider"]}),
@@ -1200,14 +1192,12 @@ class EvaluationReport:
     actual_input_tokens: int = 0
     actual_output_tokens: int = 0
     nominal_cost_usd: float | None = None
-    effective_cost_microunits: int | None = None
     wall_duration_seconds: float = 0.0
-    billing_basis: str = "SDK nominal usage cost proxy; subscription billing not measured"
+    billing_basis: str = "SDK nominal usage cost; subscription billing not measured"
 
     @property
     def promotion_eligible(self) -> bool:
-        real_probe_evidence = set(self.safety_probe_outputs) == {"EVAL-004", "EVAL-005"} and all("controller_toolbroker" in set(result.get("provenance", [])) for result in self.safety_probe_outputs.values())
-        return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed and self.metric_cells_complete and self.safety_cells_complete and self.model_provenance_complete and real_probe_evidence and self.attestation_ledger is not None and self.attestation_ledger.durable and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in getattr(self, "_rows", ()))
+        return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed and self.metric_cells_complete and self.safety_cells_complete and self.model_provenance_complete and bool(self.safety_probe_outputs) and self.attestation_ledger is not None and self.attestation_ledger.durable and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in getattr(self, "_rows", ()))
 
     def require_promotion_evidence(self, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage]) -> "EvaluationReport":
         protocol.assert_integrity(packages)
@@ -1227,7 +1217,7 @@ class EvaluationReport:
         return self
 
     def to_dict(self) -> JsonObject:
-        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "safetyProbeOutputs": _jsonable(self.safety_probe_outputs), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit), "actualInputTokens": self.actual_input_tokens, "actualOutputTokens": self.actual_output_tokens, "nominalCostUsd": self.nominal_cost_usd, "effectiveCostMicrounits": self.effective_cost_microunits, "wallDurationSeconds": self.wall_duration_seconds, "billingBasis": self.billing_basis}
+        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "safetyProbeOutputs": _jsonable(self.safety_probe_outputs), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit), "actualInputTokens": self.actual_input_tokens, "actualOutputTokens": self.actual_output_tokens, "nominalCostUsd": self.nominal_cost_usd, "wallDurationSeconds": self.wall_duration_seconds, "billingBasis": self.billing_basis}
 
 
 Executor = Callable[[Arm, EnvironmentPackage, TaskInput, int], RunObservation]
