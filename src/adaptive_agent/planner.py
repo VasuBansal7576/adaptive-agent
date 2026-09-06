@@ -12,7 +12,9 @@ import argparse
 import importlib
 import inspect
 import json
+import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from threading import Event
@@ -35,8 +37,21 @@ class PlannerCancelled(PlannerError):
     """The run was cancelled before the next model or kernel turn."""
 
 
+class PlannerTimedOut(PlannerError):
+    """The model call exceeded the parent-owned wall-clock deadline."""
+
+
 class PlannerModelClient(Protocol):
-    def invoke(self, *, goal: str, environment: Mapping[str, Any], messages: Sequence[Mapping[str, str]]) -> Mapping[str, Any]: ...
+    def invoke(
+        self,
+        *,
+        goal: str,
+        environment: Mapping[str, Any],
+        messages: Sequence[Mapping[str, str]],
+        remaining_deadline: float | None = None,
+        cancel: Event | None = None,
+        token_cap: int | None = None,
+    ) -> Mapping[str, Any]: ...
 
 
 class PlannerEvidenceSink(Protocol):
@@ -115,6 +130,160 @@ def _usage_tokens(usage: Mapping[str, Any]) -> int:
     raise PlannerError("model usage must include a non-negative token count")
 
 
+def _canonical_model(provider: Any, model: Any) -> tuple[str, str]:
+    """Validate provider identity and normalize Prime's bare model name."""
+    if provider != MODEL_PROVIDER or not isinstance(model, str):
+        raise PlannerError("authenticated model response requires provider, model, response id, text, and usage")
+    if model == "gpt-5.6-luna":
+        model = MODEL_NAME
+    if model != MODEL_NAME:
+        raise PlannerError("authenticated model response requires provider, model, response id, text, and usage")
+    return provider, model
+
+
+def _message_text(message: Mapping[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+        return ""
+    return "".join(
+        str(part.get("text", ""))
+        for part in content
+        if isinstance(part, Mapping) and part.get("type") == "text"
+    )
+
+
+class PrimeCliModelClient:
+    """Invoke the authenticated Prime CLI through a bounded one-shot process.
+
+    Prime's JSON mode emits a JSON-lines event stream rather than one response
+    object.  The client selects the final assistant ``message_end`` event and
+    returns the provider, response ID, text, and usage observed by the trusted
+    parent.  No session, tools, extensions, skills, prompt templates, or
+    context files are enabled for these calls.
+    """
+
+    def __init__(
+        self,
+        *,
+        executable: str = "prime-agent",
+        coding_agent_dir: str | os.PathLike[str] | None = None,
+        cwd: str | os.PathLike[str] = "/private/tmp",
+        thinking: str = "medium",
+    ) -> None:
+        self.executable = executable
+        self.coding_agent_dir = os.fspath(coding_agent_dir) if coding_agent_dir is not None else None
+        self.cwd = os.fspath(cwd)
+        self.thinking = thinking
+
+    def invoke(
+        self,
+        *,
+        goal: str,
+        environment: Mapping[str, Any],
+        messages: Sequence[Mapping[str, str]],
+        remaining_deadline: float | None = None,
+        cancel: Event | None = None,
+        token_cap: int | None = None,
+    ) -> Mapping[str, Any]:
+        if cancel is not None and cancel.is_set():
+            raise PlannerCancelled("model call cancelled before launch")
+        if remaining_deadline is not None and remaining_deadline <= 0:
+            raise PlannerTimedOut("model call deadline expired before launch")
+        coding_agent_dir = self.coding_agent_dir or os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
+        if not coding_agent_dir:
+            raise PlannerError("PRIME_AGENT_CODING_AGENT_DIR is required for the Prime CLI model client")
+        history = json.dumps(
+            {"goal": goal, "environment": environment, "messages": list(messages)},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        if token_cap is not None:
+            history = f"A hard parent token cap of {max(0, token_cap)} applies to this call.\n" + history
+        command = [
+            self.executable,
+            "--print",
+            "--mode", "json",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--no-session",
+            "--cwd", self.cwd,
+            "--provider", MODEL_PROVIDER,
+            "--model", MODEL_NAME,
+            "--thinking", self.thinking,
+            "--",
+            history,
+        ]
+        env = os.environ.copy()
+        env["PRIME_AGENT_CODING_AGENT_DIR"] = coding_agent_dir
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=self.cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            raise PlannerError(f"unable to launch Prime CLI: {exc}") from exc
+
+        started = time.monotonic()
+        stdout = ""
+        stderr = ""
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    process.terminate()
+                    process.communicate(timeout=1)
+                    raise PlannerCancelled("model call cancelled")
+                remaining = None if remaining_deadline is None else remaining_deadline - (time.monotonic() - started)
+                if remaining is not None and remaining <= 0:
+                    process.terminate()
+                    process.communicate(timeout=1)
+                    raise PlannerTimedOut("model call exceeded deadline")
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.1, remaining) if remaining is not None else 0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except (PlannerCancelled, PlannerTimedOut):
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+            raise
+        if process.returncode != 0:
+            detail = stderr.strip()[-2_000:]
+            raise PlannerError(f"Prime CLI exited with status {process.returncode}: {detail}")
+        return self._parse_events(stdout)
+
+    @staticmethod
+    def _parse_events(stdout: str) -> Mapping[str, Any]:
+        final: Mapping[str, Any] | None = None
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, Mapping) or event.get("type") != "message_end":
+                continue
+            message = event.get("message")
+            if not isinstance(message, Mapping) or message.get("role") != "assistant":
+                continue
+            text = _message_text(message)
+            if text:
+                provider, model = _canonical_model(message.get("provider"), message.get("model"))
+                final = {"provider": provider, "model": model, "responseId": message.get("responseId"), "text": text, "usage": message.get("usage")}
+        if final is None:
+            raise PlannerError("Prime CLI JSON stream did not contain a final assistant message")
+        return final
+
+
 def _parse_action(text: str, max_code_chars: int) -> tuple[str, str | None]:
     try:
         payload = json.loads(text)
@@ -189,15 +358,37 @@ class LunaPlanner:
                 publish("status", "Planner budget exhausted.")
                 return PlannerResult("budget_exhausted", None, turn - 1, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
 
-            raw = self._invoke(goal, environment, messages)
+            try:
+                raw = self._invoke(
+                    goal,
+                    environment,
+                    self._bounded_history(messages),
+                    remaining_deadline=remaining,
+                    cancel=cancel,
+                    token_cap=self.limits.max_model_tokens - model_tokens,
+                )
+            except PlannerCancelled:
+                publish("status", "Planner cancelled during model turn.")
+                return PlannerResult("cancelled", None, turn - 1, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
+            except PlannerTimedOut:
+                publish("status", "Planner timed out during model turn.")
+                return PlannerResult("timed_out", None, turn - 1, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
             provider, model, response_id, text, usage = self._validate_response(raw)
             used = _usage_tokens(usage)
             model_tokens += used
+            # Record the provider's actual usage before enforcing the parent
+            # token cap.  Over-cap evidence is still needed for accounting.
+            self.evidence_sink.record_model_observation({"provider": provider, "model": model, "responseId": response_id, "usage": dict(usage)}, trusted_parent=True)
+            response_ids.append(response_id)
+            if cancel and cancel.is_set():
+                publish("status", "Planner cancelled after model turn.")
+                return PlannerResult("cancelled", None, turn, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
+            if time.monotonic() - started >= self.limits.max_wall_seconds:
+                publish("status", "Planner timed out after model turn.")
+                return PlannerResult("timed_out", None, turn, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
             if model_tokens > self.limits.max_model_tokens:
                 publish("status", "Model token budget exceeded.")
                 return PlannerResult("budget_exhausted", None, turn, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
-            self.evidence_sink.record_model_observation({"provider": provider, "model": model, "responseId": response_id, "usage": dict(usage)}, trusted_parent=True)
-            response_ids.append(response_id)
             publish("model", "Authenticated Luna response received.", response_id)
             action, value = _parse_action(text, self.limits.max_code_chars)
             messages.append({"role": "assistant", "content": text})
@@ -206,9 +397,16 @@ class LunaPlanner:
                 return PlannerResult("succeeded", value, turn, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
 
             assert value is not None
+            remaining_after_model = self.limits.max_wall_seconds - (time.monotonic() - started)
+            if cancel and cancel.is_set():
+                publish("status", "Planner cancelled before kernel turn.")
+                return PlannerResult("cancelled", None, turn, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
+            if remaining_after_model <= 0:
+                publish("status", "Planner timed out before kernel turn.")
+                return PlannerResult("timed_out", None, turn, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
             kernel_steps += 1
             publish("execute", "Generated Python submitted to Prime kernel.")
-            result = self.kernel.execute(value, timeout=min(remaining, self.limits.max_wall_seconds), cancel=cancel)
+            result = self.kernel.execute(value, timeout=min(remaining_after_model, self.limits.max_wall_seconds), cancel=cancel)
             status = getattr(result, "status", "error")
             feedback = self._sanitize_execution(result)
             messages.append({"role": "user", "content": "Prime execution feedback:\n" + feedback})
@@ -232,11 +430,43 @@ class LunaPlanner:
             "A tool result or error is feedback for the next turn. The contract context is:\n" + contract
         )
 
-    def _invoke(self, goal: str, environment: Mapping[str, Any], messages: Sequence[Mapping[str, str]]) -> Mapping[str, Any]:
+    def _bounded_history(self, messages: Sequence[Mapping[str, str]]) -> list[Mapping[str, str]]:
+        """Keep the system prompt and newest turns within the context cap."""
+        if not messages:
+            return []
+        system = messages[0]
+        selected: list[Mapping[str, str]] = [system]
+        used = len(_bounded_text(system, self.limits.max_context_chars))
+        for message in reversed(messages[1:]):
+            encoded = _bounded_text(message, self.limits.max_context_chars)
+            if used + len(encoded) > self.limits.max_context_chars:
+                break
+            selected.append(message)
+            used += len(encoded)
+        return [selected[0], *reversed(selected[1:])]
+
+    def _invoke(
+        self,
+        goal: str,
+        environment: Mapping[str, Any],
+        messages: Sequence[Mapping[str, str]],
+        *,
+        remaining_deadline: float | None,
+        cancel: Event | None,
+        token_cap: int,
+    ) -> Mapping[str, Any]:
         invoke = self.client.invoke
         parameters = inspect.signature(invoke).parameters
-        if "messages" in parameters or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-            return invoke(goal=goal, environment=environment, messages=messages)
+        accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+        if "messages" in parameters or accepts_kwargs:
+            kwargs: dict[str, Any] = {"goal": goal, "environment": environment, "messages": messages}
+            if "remaining_deadline" in parameters or accepts_kwargs:
+                kwargs["remaining_deadline"] = remaining_deadline
+            if "cancel" in parameters or accepts_kwargs:
+                kwargs["cancel"] = cancel
+            if "token_cap" in parameters or accepts_kwargs:
+                kwargs["token_cap"] = token_cap
+            return invoke(**kwargs)
         # Compatibility for the existing parent adapter while it is being
         # upgraded to retain conversation messages.
         return invoke(goal=goal, environment={**environment, "plannerMessages": list(messages)})
@@ -245,10 +475,10 @@ class LunaPlanner:
     def _validate_response(raw: Mapping[str, Any]) -> tuple[str, str, str, str, Mapping[str, Any]]:
         if not isinstance(raw, Mapping):
             raise PlannerError("model response must be an object")
-        provider, model = raw.get("provider"), raw.get("model")
+        provider, model = _canonical_model(raw.get("provider"), raw.get("model"))
         response_id = raw.get("responseId", raw.get("response_id"))
         text, usage = raw.get("text"), raw.get("usage")
-        if provider != MODEL_PROVIDER or model != MODEL_NAME or not isinstance(response_id, str) or not response_id.strip() or not isinstance(text, str) or not text.strip() or not isinstance(usage, Mapping) or not usage:
+        if not isinstance(response_id, str) or not response_id.strip() or not isinstance(text, str) or not text.strip() or not isinstance(usage, Mapping) or not usage:
             raise PlannerError("authenticated model response requires provider, model, response id, text, and usage")
         return provider, model, response_id, text, usage
 
@@ -281,9 +511,21 @@ def make_luna_model_runner(
 
         class RecordingClient:
             def invoke(self, **kwargs: Any) -> Mapping[str, Any]:
-                raw = client.invoke(**kwargs)
+                invoke = client.invoke
+                parameters = inspect.signature(invoke).parameters
+                accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+                if accepts_kwargs:
+                    raw = invoke(**kwargs)
+                else:
+                    forwarded = {key: value for key, value in kwargs.items() if key in parameters}
+                    if "messages" not in parameters:
+                        forwarded["environment"] = {**kwargs["environment"], "plannerMessages": list(kwargs["messages"])}
+                        forwarded.pop("messages", None)
+                    raw = invoke(**forwarded)
                 if isinstance(raw, Mapping):
                     observed.update(raw)
+                    if raw.get("model") == "gpt-5.6-luna":
+                        observed["model"] = MODEL_NAME
                 return raw
 
         result = LunaPlanner(
@@ -332,4 +574,4 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0 if result.status == "succeeded" else 1
 
 
-__all__ = ["KernelExecutor", "LunaInvocation", "LunaPlanner", "MODEL_NAME", "MODEL_PROVIDER", "PlannerError", "PlannerEvent", "PlannerEvidenceSink", "PlannerLimits", "PlannerModelClient", "PlannerResult", "PlannerBudgetExceeded", "PlannerCancelled", "main", "make_luna_model_runner"]
+__all__ = ["KernelExecutor", "LunaInvocation", "LunaPlanner", "MODEL_NAME", "MODEL_PROVIDER", "PrimeCliModelClient", "PlannerError", "PlannerEvent", "PlannerEvidenceSink", "PlannerLimits", "PlannerModelClient", "PlannerResult", "PlannerBudgetExceeded", "PlannerCancelled", "PlannerTimedOut", "main", "make_luna_model_runner"]

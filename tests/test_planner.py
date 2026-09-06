@@ -1,9 +1,10 @@
 from dataclasses import dataclass
+import stat
 from threading import Event
 
 import pytest
 
-from adaptive_agent.planner import LunaPlanner, PlannerError, PlannerLimits, make_luna_model_runner
+from adaptive_agent.planner import LunaPlanner, PlannerError, PlannerLimits, PrimeCliModelClient, make_luna_model_runner
 
 
 @dataclass
@@ -110,3 +111,45 @@ def test_control_plane_runner_adapter_returns_authenticated_final_invocation():
     assert invocation.provider == "openai-codex"
     assert invocation.response_id == "r1"
     assert events[-1][0] == "status"
+
+
+def test_prime_cli_client_parses_json_lines_and_normalizes_bare_model(tmp_path):
+    executable = tmp_path / "prime-agent"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "print(json.dumps({'type': 'message_end', 'message': {\n"
+        "  'role': 'assistant', 'provider': 'openai-codex', 'model': 'gpt-5.6-luna',\n"
+        "  'responseId': 'resp-cli', 'content': [{'type': 'text', 'text': '{\\\"action\\\":\\\"finish\\\",\\\"answer\\\":\\\"ok\\\"}'}],\n"
+        "  'usage': {'input': 7, 'output': 3, 'totalTokens': 10}}}))\n"
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    client = PrimeCliModelClient(executable=str(executable), coding_agent_dir=tmp_path)
+    result = client.invoke(goal="goal", environment={}, messages=[], remaining_deadline=5, token_cap=20)
+    assert result["provider"] == "openai-codex"
+    assert result["model"] == "openai-codex/gpt-5.6-luna"
+    assert result["responseId"] == "resp-cli"
+    assert result["usage"]["totalTokens"] == 10
+
+
+def test_model_usage_is_recorded_before_token_cap_rejection():
+    client = Client([response("r1", '{"action":"finish","answer":"done"}')])
+    sink = Sink()
+    result = LunaPlanner(client, Kernel(), sink, limits=PlannerLimits(max_model_tokens=3)).run(goal="goal", environment={})
+    assert result.status == "budget_exhausted"
+    assert result.model_tokens == 4
+    assert len(sink.observations) == 1
+
+
+def test_cancel_after_model_turn_prevents_finish_or_kernel_execution():
+    cancel = Event()
+
+    class CancellingClient(Client):
+        def invoke(self, **kwargs):
+            cancel.set()
+            return response("r1", '{"action":"finish","answer":"done"}')
+
+    sink = Sink()
+    result = LunaPlanner(CancellingClient([]), Kernel(), sink).run(goal="goal", environment={}, cancel=cancel)
+    assert result.status == "cancelled"
+    assert len(sink.observations) == 1

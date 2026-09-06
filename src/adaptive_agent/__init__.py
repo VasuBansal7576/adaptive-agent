@@ -1,6 +1,6 @@
 """Adaptive Agent bounded execution and control-plane package."""
 
-from .planner import LunaInvocation, LunaPlanner, PlannerError, PlannerLimits, PlannerResult, make_luna_model_runner
+from .planner import LunaInvocation, LunaPlanner, PlannerError, PlannerLimits, PlannerResult, PrimeCliModelClient, make_luna_model_runner
 from .prime_runtime import (
     AdapterError,
     ArtifactRef,
@@ -27,7 +27,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "AdapterError", "ArtifactRef", "Capability", "CapabilityBroker", "CapabilitySet",
-    "ControlPlane", "ExecutionMode", "ExecutionResult", "LunaPlanner", "ModelObservation",
+    "ControlPlane", "ExecutionMode", "ExecutionResult", "LunaPlanner", "PrimeCliModelClient", "ModelObservation",
     "PlannerError", "PlannerLimits", "PlannerResult", "PrimeRuntimeAdapter", "LunaInvocation", "make_luna_model_runner",
     "PrimeRuntimeConfig", "SecurityViolation", "app", "create_app", "make_authenticated_model_runner",
 ]
