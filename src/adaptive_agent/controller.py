@@ -624,8 +624,20 @@ class Controller:
         return ev
 
     def record_broker_tool_result(self, run_id: str, result_payload: Mapping[str, Any]) -> EvidenceRecord:
-        """Raw tool_result persists as operator-only evidence; the learner gets a
-        separate sanitized projection event (raw never enters learner context)."""
+        """Persist an already-brokered result and its learner-safe evidence.
+
+        Requires a callId bound to this run's tool_calls row; the raw result
+        is persisted on the call row AND as operator-only evidence, while the
+        learner gets a separate sanitized projection event (raw never enters
+        learner context)."""
+        call_id = result_payload.get("callId")
+        if not isinstance(call_id, str):
+            raise ValueError("broker result callId is required")
+        call = self.store.get_tool_call(call_id)
+        if not isinstance(call, Mapping) or call.get("run_id") != run_id:
+            raise ValueError("broker result is not bound to the requested run")
+        result_json = json.dumps(dict(result_payload), sort_keys=True, separators=(",", ":"))
+        self.store.save_tool_result(call_id, result_json, str(result_payload.get("effect") or call.get("effect") or "unknown"))
         raw = dict(result_payload)
         self.append_event(run_id, "tool_result", raw, "broker", "operator")
         return self.append_event(
