@@ -520,6 +520,8 @@ class Controller:
     def append_event(self, run_id: str, event_type: str, payload: dict[str, Any], trust_class: str, visibility: str) -> EvidenceRecord:
         # Sanitized feedback boundary: learner-visible events never carry
         # credential-shaped values.
+        if event_type == "model_observation":
+            raise ValueError("legacy model_observation events are not supported; use model_response")
         if visibility == "learner":
             payload = _sanitize_for_learner(payload)
         seq = self.store.next_event_sequence(run_id)
