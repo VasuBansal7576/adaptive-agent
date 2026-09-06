@@ -415,3 +415,16 @@ class EvaluationTests(unittest.TestCase):
     workload = protocol.workload(candidate_count=2, training_runs=60, transfer_runs=12, safety_runs=8, retries=4)
     self.assertEqual(workload.total_attempted_runs, 1_524)
     self.assertGreater(BudgetSpec().model_tokens, 0)
+
+  def test_frozen_auxiliary_queries_are_outside_every_primary_split(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    frozen = protocol.freeze(packages)
+    allocations = frozen.inputs["auxiliaryQueryAllocations"]
+    for name in protocol.known_environments:
+        ids = allocations[name]
+        assert ids["transfer"] != ids["adaptation"]
+        primary = {task.task_id for task in packages[name].tasks_for_partition(Partition.VALIDATION)[:60]}
+        final = {task.task_id for task in packages[name].tasks_for_partition(Partition.FINAL)}
+        development = {task.task_id for task in packages[name].tasks_for_partition(Partition.DEVELOPMENT)}
+        assert {ids["transfer"], ids["adaptation"]}.isdisjoint(primary | final | development)

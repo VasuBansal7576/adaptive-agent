@@ -1502,7 +1502,19 @@ class EvaluationRunner:
         safety_passed = all(row.safety_violations == 0 for row in rows) and safety_cells_complete and all(safety_results.get(case_id, False) for case_id in self.protocol.safety_case_ids)
         model_provenance_complete = bool(rows) and all(_trusted_observation(row, self.frozen, self.packages[row.environment_id]) and self.evidence_store.verify(row, self.frozen, self.packages[row.environment_id]) for row in rows)
         auxiliary = dict(auxiliary_evidence or {})
-        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, safety_passed, missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, evaluator_refs, environment_cells, cells_complete, safety_cells_complete, model_provenance_complete, None, safety_results, safety_probe_outputs, self.evaluator_registry.ledger, auxiliary.get("summaries", {}), auxiliary.get("overhead", {}), auxiliary.get("exposure", {}), tuple(auxiliary.get("limitations", ())))
+        report = EvaluationReport(
+            comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash,
+            report_partition_hashes, summaries, intervals, safety_passed,
+            missing_pairs, partition_leak, resets, failures, tuple(exposure),
+            self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit,
+            evaluator_refs, environment_cells, cells_complete, safety_cells_complete,
+            model_provenance_complete, None, safety_results, safety_probe_outputs,
+            self.evaluator_registry.ledger,
+            auxiliary_summaries=auxiliary.get("summaries", {}),
+            auxiliary_overhead=auxiliary.get("overhead", {}),
+            auxiliary_exposure=auxiliary.get("exposure", {}),
+            auxiliary_limitations=tuple(auxiliary.get("limitations", ())),
+        )
         attestation_payload = {"comparison": comparison, "candidateHash": candidate_hash, "baseHash": base_hash, "protocolHash": self.frozen.protocol_hash, "partitionHashes": report_partition_hashes, "evaluatorRefs": evaluator_refs, "environmentCells": environment_cells, "armSummaries": summaries, "confidenceIntervals": intervals, "validityStatus": report.validity_status, "safetyPassed": report.safety_passed, "safetyCaseResults": report.safety_case_results, "safetyProbeOutputs": report.safety_probe_outputs, "missingPairs": report.missing_pairs, "partitionLeak": report.partition_leak, "invalidFixtureResets": report.invalid_fixture_resets, "infrastructureFailures": report.infrastructure_failures, "metricCellsComplete": report.metric_cells_complete, "safetyCellsComplete": report.safety_cells_complete, "modelProvenanceComplete": report.model_provenance_complete, "auxiliarySummaries": report.auxiliary_summaries, "auxiliaryOverhead": report.auxiliary_overhead, "auxiliaryExposure": report.auxiliary_exposure, "auxiliaryLimitations": report.auxiliary_limitations}
         object.__setattr__(report, "attestation", self.evaluator_registry.attest(attestation_payload))
         object.__setattr__(report, "_rows", tuple(rows))
