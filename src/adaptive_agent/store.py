@@ -166,6 +166,24 @@ class Store:
                     consumed_call_id TEXT,
                     expires_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS task_runs (
+                    task_run_id TEXT PRIMARY KEY,
+                    environment_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    partition TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    state_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS evaluator_allocations (
+                    scope_id TEXT NOT NULL,
+                    allocation_id TEXT PRIMARY KEY,
+                    panel_index INTEGER NOT NULL,
+                    panel_hash TEXT NOT NULL,
+                    task_ids_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(scope_id, panel_index)
+                );
                 CREATE TABLE IF NOT EXISTS learning_records (
                     record_id TEXT PRIMARY KEY,
                     environment_id TEXT NOT NULL,
@@ -193,6 +211,16 @@ class Store:
             yield conn
         finally:
             conn.close()
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Public transaction seam for trusted adapters (evaluator/benchmark).
+
+        Same semantics as _connect; exposed so session-owned adapters do not
+        depend on a private method. Callers must commit explicitly.
+        """
+        with self._connect() as conn:
+            yield conn
 
     # ------------------------------------------------------------------ artifacts
     def put_artifact(self, data: Any) -> ArtifactRef:
@@ -241,6 +269,130 @@ class Store:
         if not path.exists():
             raise KeyError(f"blob {sha} not found")
         return path.read_bytes()
+
+    # ------------------------------------------------------------------ resumable task runs (benchmark seam)
+    def claim_task_run(
+        self,
+        task_run_id: str,
+        environment_id: str,
+        task_id: str,
+        partition: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Atomically claim a task run (pending -> running). Returns
+        (True, row) for a fresh claim, (False, existing row) when resuming."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)
+                ).fetchone()
+                if existing is not None:
+                    conn.commit()
+                    return False, dict(existing)
+                conn.execute(
+                    "INSERT INTO task_runs (task_run_id, environment_id, task_id, partition, status, state_json, updated_at) VALUES (?, ?, ?, ?, 'running', '{}', ?)",
+                    (task_run_id, environment_id, task_id, partition, _utcnow()),
+                )
+                conn.commit()
+                return True, dict(conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone())
+            except Exception:
+                conn.rollback()
+                raise
+
+    def update_task_run_status(self, task_run_id: str, status: str, state_json: str | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE task_runs SET status = ?, state_json = COALESCE(?, state_json), updated_at = ? WHERE task_run_id = ?",
+                (status, state_json, _utcnow(), task_run_id),
+            )
+            conn.commit()
+
+    def get_task_run(self, task_run_id: str) -> dict[str, Any] | None:
+        return self._get_json("task_runs", "task_run_id", task_run_id)
+
+    def list_task_runs(
+        self,
+        environment_id: str | None = None,
+        partition: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM task_runs WHERE 1=1"
+        params: list[Any] = []
+        if environment_id is not None:
+            query += " AND environment_id = ?"
+            params.append(environment_id)
+        if partition is not None:
+            query += " AND partition = ?"
+            params.append(partition)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ atomic evaluation allocation
+    def reserve_allocation(
+        self,
+        scope_id: str,
+        allocation_id: str,
+        panels: list[list[str]],
+        limit: int,
+    ) -> int | None:
+        """Atomically reserve the next free panel for a validation allocation.
+
+        Mirrors the benchmark/evaluator contract: None when the allocation id is
+        already consumed or the panel pool is exhausted; the reserved panel
+        index on success. Restart-safe: persisted in SQLite.
+        """
+        if not panels or len(panels) < limit:
+            raise ValueError("allocation panels must cover the configured limit")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT panel_index FROM evaluator_allocations WHERE allocation_id = ?",
+                    (allocation_id,),
+                ).fetchone()
+                if existing:
+                    conn.commit()
+                    return None
+                used = {
+                    int(r["panel_index"])
+                    for r in conn.execute(
+                        "SELECT panel_index FROM evaluator_allocations WHERE scope_id = ?",
+                        (scope_id,),
+                    ).fetchall()
+                }
+                index = next((i for i in range(limit) if i not in used), None)
+                if index is None:
+                    conn.commit()
+                    return None
+                task_ids = list(panels[index])
+                conn.execute(
+                    "INSERT INTO evaluator_allocations (scope_id, allocation_id, panel_index, panel_hash, task_ids_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (scope_id, allocation_id, index, sha256_json(task_ids), json.dumps(task_ids, sort_keys=True), _utcnow()),
+                )
+                conn.commit()
+                return index
+            except Exception:
+                conn.rollback()
+                raise
+
+    # ------------------------------------------------------------------ trusted development smoke gate
+    def dev_smoke_ok(self, environment_id: str) -> bool:
+        """True when the environment has at least one development-partition run
+        with a trusted outcome recorded (the held-out gate prerequisite)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT 1 FROM outcomes o
+                    JOIN runs r ON r.run_id = o.run_id
+                    JOIN tasks t ON t.id = r.task_id
+                    WHERE r.environment_id = ? AND t.partition = 'development' AND o.passed = 1
+                    LIMIT 1""",
+                (environment_id,),
+            ).fetchone()
+            return row is not None
 
     # ------------------------------------------------------------------ learning records (session7 seam)
     def save_learning_record(self, record_id: str, environment_id: str, run_id: str, record_json: str) -> None:
