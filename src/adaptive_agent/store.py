@@ -788,16 +788,15 @@ class Store:
         trusted = isinstance(trusted_row, Mapping)
         outcome_passed = bool(trusted_row.get("passed")) if trusted_row is not None else False
         for row in self.list_evidence(run_id):
-            provenance = self.evidence_provenance(row["evidence_id"])
-            is_development_model = row.get("event_type") == "model_response" and provenance and provenance.get("partition") == "development"
-            if row.get("visibility") != "learner" and not is_development_model:
+            if row.get("visibility") != "learner":
                 continue
             try:
                 source = json.loads(row["source_ref"])
                 content = self.get_artifact(source["sha256"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
-            text = "Verified development model execution evidence is available for this run." if is_development_model else (content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":")))
+            text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":"))
+            provenance = self.evidence_provenance(row["evidence_id"])
             if not provenance or provenance.get("environment_id") != environment_id:
                 continue
             content_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()

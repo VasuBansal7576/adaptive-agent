@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -14,25 +15,74 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     remain production implementations.
     """
     monkeypatch.setenv("ADAPTIVE_AGENT_IMAGE_DIGEST", "sha256:e1242afd3804f022cb3bcdc4ae3fe1e5dcb5b79d09e98bdaffd5db320a32f0bb")
-    from adaptive_agent.app import create_runtime_app
+    import adaptive_agent.app as app_module
+    create_runtime_app = app_module.create_runtime_app
     from adaptive_agent.evaluation import Arm
     from adaptive_agent.production_evaluator import _lifecycle_execution_plan, _lifecycle_stages
+    from adaptive_agent.prime_runtime import ChildPlannerBudget, SharedBudget
 
     class TaskModel:
         def __init__(self):
-            self.calls = 0
+            self.turn = 0
+            self.turns_by_goal = {}
 
-        def __call__(self, *, goal, environment, emit):
-            self.calls += 1
-            return SimpleNamespace(
-                text="synthetic boundary receipt",
-                provider="openai-codex",
-                model="openai-codex/gpt-5.6-luna",
-                response_id=f"synthetic-task-{self.calls}",
-                usage={"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
-                nominalCostUsd=0.000001,
-                economicCostStatus="unknown",
+        def invoke(self, *, goal, environment, messages, **kwargs):
+            self.turn += 1
+            turn = self.turns_by_goal.get(goal, 0) + 1
+            self.turns_by_goal[goal] = turn
+            identifiers = re.findall(r"[A-Z]{3}-[A-Z]+-\d{3}", goal)
+            schemas = {schema["name"]: schema for schema in environment["toolSchemas"]}
+            goal_words = set(re.findall(r"[a-z]+", goal.lower()))
+            tool = next(name for name, schema in schemas.items() if schema.get("effect") == "write" and set(name.lower().split(".")).intersection(goal_words))
+            properties = schemas[tool].get("inputSchema", {}).get("properties", {})
+            arguments = {}
+            identifier_index = 0
+            for key in properties:
+                if key.endswith("_id"):
+                    arguments[key] = identifiers[min(identifier_index, len(identifiers) - 1)]
+                    identifier_index += 1
+                elif key == "expected_version":
+                    arguments[key] = 1
+                elif key == "resolution":
+                    arguments[key] = "customer-approved"
+                elif key == "reason":
+                    arguments[key] = "enhanced-review"
+                elif key == "status":
+                    arguments[key] = "resolved" if "ticket" in goal else "closed"
+            capability_id = next(capability for capability in environment["capabilities"] if capability.endswith(f":{tool}"))
+            request = {"type": "broker.call", "capabilityId": capability_id, "arguments": arguments}
+            action = (
+                json.dumps({"action": "execute", "code": f"result = host_request({json.dumps(request, separators=(',', ':'))})"}, separators=(",", ":"))
+                if turn == 1 else '{"action":"finish","answer":"applied"}'
             )
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"synthetic-task-{self.turn}", "text": action, "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2, "economicCost": {"status": "measured", "microunits": 0}}}
+
+    class FakePrime:
+        def __init__(self, config, broker):
+            self.config = config
+            self.broker = broker
+            self.child_planner = None
+            self._budget = SharedBudget(config.max_total_wall_seconds, config.max_total_artifact_bytes, config.max_artifact_count, config.child_runs, config.max_model_tokens)
+
+        @property
+        def planner_budget(self):
+            return ChildPlannerBudget(self._budget)
+
+        def record_model_observation(self, evidence, *, trusted_parent=False):
+            return evidence
+
+        def execute(self, code, *, timeout=None, cancel=None):
+            def host_request(payload):
+                return self.broker.call(payload["capabilityId"], payload.get("arguments", {}))
+
+            namespace = {"host_request": host_request}
+            exec(code, {"__builtins__": {}}, namespace)
+            return SimpleNamespace(status="ok", result=json.dumps(namespace.get("result")), stdout="", stderr="", error=None)
+
+        def close(self, remove_workspace=True):
+            return None
+
+    monkeypatch.setattr(app_module, "PrimeRuntimeAdapter", FakePrime)
 
     class LearningModel:
         def __init__(self):
@@ -51,7 +101,7 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
                     for item in value:
                         yield from evidence_ids(item)
 
-            evidence = next((item for item in evidence_ids(environment) if item.startswith("ev_")), None)
+            evidence = next((item for item in evidence_ids(environment) if item.startswith("broker:")), None)
             assert evidence
             proposal = {
                 "predictedEffect": "bounded synthetic improvement",
@@ -95,15 +145,15 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     assert learned is not None
     a_hash = result.runtime_accounting  # retain a durable accounting assertion below
     assert runtime.controller.store.get_bundle_by_hash(result.reports["final"].candidate_hash) is not None
-    assert task_model.calls > 0 and learning_model.calls == 1
+    assert task_model.turn > 0 and learning_model.calls == 1
 
-    first_calls = task_model.calls
+    first_calls = task_model.turn
     restarted_app = create_runtime_app(data_dir=tmp_path, model_runner=task_model, learning_model_client=learning_model, evaluator=lambda **_: {"passed": True, "reliable": True, "safetyViolations": 0, "fixtureResetOk": True})
     restarted = restarted_app.state.durable_runtime
     restarted_job = restarted.build_evaluation_job(protocol, {Arm.B0: restarted.controller.get_active_bundle()})
     resumed = restarted_job.run_experiment("full-production-synthetic", _lifecycle_stages(restarted, protocol, 0), limits=limits)
     assert resumed.status == "complete"
-    assert task_model.calls == first_calls
+    assert task_model.turn == first_calls
     assert learning_model.calls == 1
 
     final_state = resumed.reports["final"] if resumed.reports else None
@@ -123,4 +173,4 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
         conn.execute("DELETE FROM evidence WHERE evidence_id = ?", (evidence_id,))
         conn.commit()
     with pytest.raises(Exception):
-        restarted_job._experiment_report(_lifecycle_stages(restarted, protocol, 0), {"results": {"validation": {receipt["cellKey"]: receipt}}}, stage_name="validation")
+        restarted_job.run_experiment("full-production-synthetic", _lifecycle_stages(restarted, protocol, 0), limits=limits, context={"resume": True})

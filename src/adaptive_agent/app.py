@@ -584,7 +584,10 @@ class DurableRuntime:
             outcome_meta = {}
         reliable = bool(outcome_meta.get("reliable", passed)) if isinstance(outcome_meta, Mapping) else passed
         safety_violations = int(outcome_meta.get("safetyViolations", 0) or 0) if isinstance(outcome_meta, Mapping) else 0
-        observation_kwargs = {"provenance": Provenance.DETERMINISTIC_SIMULATION, "model_provenance": ModelProvenance.REAL_MODEL, "model_profile": model_name, "core_planner_hash": core_hash, "budget": budget, "response_id": model_payload.get("responseId"), "accounting_ref": accounting_ref, "evidence_ref": model_row["evidence_id"], "outcome_ref": outcome_ref, "config_hashes": {"model": sha256_json({"profile": model_name, "provider": provider_name}), "planner": core_hash, "budget": sha256_json(budget_value), "policy": sha256_json(package.manifest.policy_ref), "schema": sha256_json(package.manifest.tool_schemas), "image": image_digest}, "run_id": run.run_id}
+        version_refs = model_payload.get("versionRefs") if isinstance(model_payload, Mapping) else None
+        if not isinstance(version_refs, Mapping):
+            raise LearningRuntimeError("evaluation model receipt lacks frozen config hashes")
+        observation_kwargs = {"provenance": Provenance.DETERMINISTIC_SIMULATION, "model_provenance": ModelProvenance.REAL_MODEL, "model_profile": model_name, "core_planner_hash": core_hash, "budget": budget, "response_id": model_payload.get("responseId"), "accounting_ref": accounting_ref, "evidence_ref": model_row["evidence_id"], "outcome_ref": outcome_ref, "config_hashes": dict(version_refs), "run_id": run.run_id}
         # Session-6's evaluator model includes bundle_hash; keep this worker
         # compatible with the pre-merge evaluator while exposing it whenever
         # the authoritative type is present.
@@ -1557,9 +1560,9 @@ class DurableRuntime:
                     score = float(evaluated.get("score", 1.0 if passed else 0.0))
                 except (TypeError, ValueError):
                     score = 1.0 if passed else 0.0
-                return DurableOutcome(runId=run_id, passed=passed, score=score, metadata=evaluated)
+                return DurableOutcome(runId=run_id, passed=passed, score=score, metadata={**evaluated, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal})
             fixture = package.evaluate(task.task_id, provider.session)
-            return DurableOutcome(runId=run_id, passed=fixture.passed, score=1.0 if fixture.passed else 0.0, metadata={"reason": fixture.reason, "evaluatorVersion": fixture.evaluator_version, "plannerStatus": result.status})
+            return DurableOutcome(runId=run_id, passed=fixture.passed, score=1.0 if fixture.passed else 0.0, metadata={"reason": fixture.reason, "evaluatorVersion": fixture.evaluator_version, "plannerStatus": result.status, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal})
         try:
             self._execute_run(run_id, package.environment_id, provider, driver, evaluate)
         finally:
