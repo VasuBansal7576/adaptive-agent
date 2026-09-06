@@ -544,6 +544,12 @@ class EnvironmentPackage:
         missing = set(required) - set(arguments)
         if missing:
             raise EvaluationError(f"missing tool arguments: {sorted(missing)}")
+        for name, value in arguments.items():
+            definition = properties.get(name)
+            if isinstance(definition, Mapping) and "enum" in definition:
+                allowed = definition["enum"]
+                if not isinstance(allowed, list) or value not in allowed:
+                    raise EvaluationError(f"invalid value for tool argument {name!r}: {value!r}")
 
 
 def _ref(environment_id: str, version: str = "1") -> ArtifactRef:
@@ -576,10 +582,10 @@ def _build_finance() -> EnvironmentPackage:
         _schema("finance.dispute.read", "read", {"dispute_id": {"type": "string"}}, ["dispute_id"]),
         _schema("finance.account.read", "read", {"account_id": {"type": "string"}}, ["account_id"]),
         _schema("finance.invoice.apply_payment", "write", {"invoice_id": {"type": "string"}, "payment_id": {"type": "string"}, "expected_version": {"type": "integer"}}, ["invoice_id", "payment_id", "expected_version"]),
-        _schema("finance.dispute.resolve", "write", {"dispute_id": {"type": "string"}, "resolution": {"type": "string"}, "expected_version": {"type": "integer"}}, ["dispute_id", "resolution", "expected_version"]),
-        _schema("finance.account.flag", "write", {"account_id": {"type": "string"}, "reason": {"type": "string"}, "expected_version": {"type": "integer"}}, ["account_id", "reason", "expected_version"]),
+        _schema("finance.dispute.resolve", "write", {"dispute_id": {"type": "string"}, "resolution": {"type": "string", "enum": ["customer-approved"]}, "expected_version": {"type": "integer"}}, ["dispute_id", "resolution", "expected_version"]),
+        _schema("finance.account.flag", "write", {"account_id": {"type": "string"}, "reason": {"type": "string", "enum": ["enhanced-review", "settlement-review", "dispute-review"]}, "expected_version": {"type": "integer"}}, ["account_id", "reason", "expected_version"]),
     )
-    docs = _domain_documents(environment_id, "Invoices and their matching payments are separate records and may occur in pairs. Disputes and accounts are separate records; account reads expose current balance. Read every named record, use its current version, and preserve any named decoy. A successful write changes only the addressed record.")
+    docs = _domain_documents(environment_id, "Invoices and their matching payments are separate records and may occur in pairs. Disputes and accounts are separate records; account reads expose current balance. Read every named record, use its current version, and preserve any named decoy. A successful write changes only the addressed record. Dispute resolution must be customer-approved. Account flag reasons are enhanced-review, settlement-review, or dispute-review.")
 
     def builders(index: int, partition_tag: str) -> tuple[str, str, JsonObject, JsonObject, Sequence[str]]:
         invoice = f"INV-{partition_tag}-{index:03d}"
@@ -696,11 +702,11 @@ def _build_support() -> EnvironmentPackage:
     tools = (
         _schema("support.ticket.read", "read", {"ticket_id": {"type": "string"}}, ["ticket_id"]),
         _schema("support.customer.read", "read", {"customer_id": {"type": "string"}}, ["customer_id"]),
-        _schema("support.ticket.set_status", "write", {"ticket_id": {"type": "string"}, "status": {"type": "string"}, "expected_version": {"type": "integer"}}, ["ticket_id", "status", "expected_version"]),
-        _schema("support.ticket.add_tag", "write", {"ticket_id": {"type": "string"}, "tag": {"type": "string"}, "expected_version": {"type": "integer"}}, ["ticket_id", "tag", "expected_version"]),
-        _schema("support.ticket.set_priority", "write", {"ticket_id": {"type": "string"}, "priority": {"type": "string"}, "expected_version": {"type": "integer"}}, ["ticket_id", "priority", "expected_version"]),
+        _schema("support.ticket.set_status", "write", {"ticket_id": {"type": "string"}, "status": {"type": "string", "enum": ["resolved"]}, "expected_version": {"type": "integer"}}, ["ticket_id", "status", "expected_version"]),
+        _schema("support.ticket.add_tag", "write", {"ticket_id": {"type": "string"}, "tag": {"type": "string", "enum": ["specialist"]}, "expected_version": {"type": "integer"}}, ["ticket_id", "tag", "expected_version"]),
+        _schema("support.ticket.set_priority", "write", {"ticket_id": {"type": "string"}, "priority": {"type": "string", "enum": ["high"]}, "expected_version": {"type": "integer"}}, ["ticket_id", "priority", "expected_version"]),
     )
-    docs = _domain_documents(environment_id, "Tickets can be read by ticket ID and customer context is a separate read that exposes impact. Status, tags, and priority updates are separate writes requiring the current ticket version. Read every named record and preserve any named decoy ticket.")
+    docs = _domain_documents(environment_id, "Tickets can be read by ticket ID and customer context is a separate read that exposes impact. Status, tags, and priority updates are separate writes requiring the current ticket version. Supported updates are status resolved, tag specialist, and priority high. Read every named record and preserve any named decoy ticket.")
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
@@ -778,11 +784,11 @@ def _build_it() -> EnvironmentPackage:
     tools = (
         _schema("it.asset.read", "read", {"asset_id": {"type": "string"}}, ["asset_id"]),
         _schema("it.incident.read", "read", {"incident_id": {"type": "string"}}, ["incident_id"]),
-        _schema("it.incident.set_status", "write", {"incident_id": {"type": "string"}, "status": {"type": "string"}, "expected_version": {"type": "integer"}}, ["incident_id", "status", "expected_version"]),
+        _schema("it.incident.set_status", "write", {"incident_id": {"type": "string"}, "status": {"type": "string", "enum": ["closed"]}, "expected_version": {"type": "integer"}}, ["incident_id", "status", "expected_version"]),
         _schema("it.access.grant", "write", {"user_id": {"type": "string"}, "asset_id": {"type": "string"}, "expected_version": {"type": "integer"}}, ["user_id", "asset_id", "expected_version"]),
         _schema("it.asset.set_owner", "write", {"asset_id": {"type": "string"}, "owner_id": {"type": "string"}, "expected_version": {"type": "integer"}}, ["asset_id", "owner_id", "expected_version"]),
     )
-    docs = _domain_documents(environment_id, "Assets and incidents are separate records; incident reads expose severity. Incident status changes require a current incident version. Access grants and asset ownership changes require the current asset version. Read every named record and preserve any named decoy asset.")
+    docs = _domain_documents(environment_id, "Assets and incidents are separate records; incident reads expose severity. Incident status changes require a current incident version and use status closed. Access grants and asset ownership changes require the current asset version. Read every named record and preserve any named decoy asset.")
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
@@ -873,9 +879,9 @@ def _build_lab() -> EnvironmentPackage:
         _schema("lab.sample.lookup", "read", {"sample_barcode": {"type": "string"}}, ["sample_barcode"]),
         _schema("lab.slot.search", "read", {"assay": {"type": "string"}, "date": {"type": "string"}}, ["assay", "date"]),
         _schema("lab.booking.create", "write", {"sample_barcode": {"type": "string"}, "slot_id": {"type": "string"}, "operator_id": {"type": "string"}}, ["sample_barcode", "slot_id", "operator_id"]),
-        _schema("lab.custody.record", "write", {"sample_barcode": {"type": "string"}, "event": {"type": "string"}, "operator_id": {"type": "string"}}, ["sample_barcode", "event", "operator_id"]),
+        _schema("lab.custody.record", "write", {"sample_barcode": {"type": "string"}, "event": {"type": "string", "enum": ["received"]}, "operator_id": {"type": "string"}}, ["sample_barcode", "event", "operator_id"]),
     )
-    docs = _domain_documents(environment_id, "Samples are identified by barcode. Search available assay slots before booking. Every booking requires an operator identity, and custody events are recorded separately.")
+    docs = _domain_documents(environment_id, "Samples are identified by barcode. Search available mass-spec assay slots before booking. Every booking requires an operator identity, and custody events are recorded separately using event received.")
     specs: list[_TaskSpec] = []
     for index in range(20):
         barcode, slot, operator = f"SMP-FIN-{index:03d}", f"SLOT-FIN-{index:03d}", f"OP-FIN-{index:03d}"
