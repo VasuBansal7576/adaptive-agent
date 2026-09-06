@@ -12,8 +12,8 @@ This is procedural adaptation, not model-weight training or a promise of univers
 - [SPEC.md](SPEC.md) defines requirements, contracts, architecture, learning, evaluation, security, and acceptance.
 - [MILESTONES.md](MILESTONES.md) defines the runnable vertical slice, full delivery gates, AO ownership, and submission traceability.
 
-Implementation is active in parallel AO worktrees, but the implementation branches are not yet integrated into this documentation branch.
-The Python control-plane package, Prime adapter, Luna planner, durable learning and evaluation seams, and React console are present on those branches.
+Implementation is active in parallel AO worktrees, but implementation code is not integrated into this documentation branch.
+This update records the root-verified current checkpoint beyond `d8e9293` without changing active workers or claiming a merge.
 The exact branch refs, dirty-worktree status, and component ownership are tracked in [MILESTONES.md](MILESTONES.md).
 
 The Python package is configured through `pyproject.toml` on the implementation branches.
@@ -32,7 +32,16 @@ It remains historical transport evidence only until its Store and data target ar
 
 Tests and fixture runs are not interchangeable with those real-run checks.
 The backend and benchmark tests use synthetic providers, drivers, and deterministic fixtures, while console tests use simulation fixtures and captured wire frames.
-The implementation branches have not produced a sealed four-environment evaluation, a measured performance result, or a complete behavioral acceptance result.
+The current checkpoint has not produced a sealed four-environment evaluation, a measured performance result, or a complete behavioral acceptance result.
+
+Root-verified current evidence beyond `d8e9293` is bounded integration and safety evidence only.
+The final2 backend integration on session 2 is rooted at committed ref `4832487` with a dirty overlay in `api.py`, `app.py`, `evaluation_job.py`, `evaluation_store.py`, and `tests/test_api.py`.
+That final2 integration reports 171 backend tests passed.
+Actual Docker-backed EVAL-003 passed its seven safety cases on isolated temporary Store and data paths.
+Actual Docker-backed EVAL-005 passed its two runtime cases, `child_failure_recovery_and_cap` and `shared_model_cost_token_cap`, using the deterministic probe model rather than a paid model call.
+Four isolated Controller probe executions covering EVAL-004 and EVAL-005 passed on fresh temporary Stores and data directories.
+The latest session-5 console ref is `ae482da`, with 61/61 tests, TypeScript, and build clean; its latest report did not include live smoke.
+These results do not establish a product-wide run, heldout performance, or final evaluation success.
 
 QA data-integrity hold: the original real evidence for `run_2fc` is contaminated by appended synthetic `model_response` rows at sequences 20 and 21, named `learning-model-fake-resp-1` and `learning-model-r20`.
 All history must be preserved, but those rows must not be erased, relabeled, or counted as real evidence.
@@ -44,8 +53,12 @@ The related evaluator-owned probe path observed on session 2 is `Controller.exec
 That path creates `tempfile.TemporaryDirectory(prefix="aa-probe-")` and a `Store` under its temporary directory, but this code-level property does not prove that `run_2fc` was isolated.
 Session 6 must create clean independent evaluation data, regenerate and validate real development evidence and its candidate, and retain exact path-level isolation proof before any sealed panel runs.
 
-The documentation phase and its local `main` integration are complete.
-Implementation, local verification, and M2-M4 coordination are active across the worker branches.
+The documentation phase is complete on this branch.
+The local-main assembly plan is limited to the session-2 final2 backend overlay followed by the session-5 console ref `ae482da`.
+It has not been performed here.
+After those two inputs are materialized and reviewed, run the isolated backend and console checks with fresh Store and data paths, then reassess M2-M4 against the evidence gates.
+Session 3, session 4, session 6, and session 7 work remains separate evidence or follow-up input and is not part of that assembly plan.
+Implementation, local verification, and M2-M4 coordination remain active across the worker branches.
 Public remote creation, publication, pushes to public remotes, pull requests, and submission remain unauthorized and incomplete.
 The official build window closes on 2026-09-07 at 03:30 IST.
 Public repository and social-demo obligations are recorded in the milestones and are not yet fulfilled.

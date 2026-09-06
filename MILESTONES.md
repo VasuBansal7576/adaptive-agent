@@ -29,12 +29,12 @@ Dirty worktrees contain additional uncommitted implementation changes, which are
 
 | AO session | Observed ref and state | Implemented component status |
 | --- | --- | --- |
-| adaptive-agent-2 | `0a18b31`, dirty | Python package entry points, FastAPI control API, durable runtime wiring, Luna planner/evaluator integration, and a console integration snapshot; current uncommitted API, app, controller, learning-store, model, Prime-runtime, and learning-runtime work remains pending |
-| adaptive-agent-3 | `93c6e91`, dirty | Isolated Prime runtime adapter, Docker learner boundary, bounded child planner, and shared parent/child ledger; planner and child-planner tests still have uncommitted changes |
-| adaptive-agent-4 | `deeee4a`, dirty | Durable SQLite Store, Broker, Candidate, Controller, evidence, and learning projection seams; controller, store, and core-test changes remain uncommitted |
-| adaptive-agent-5 | `7c84998`, dirty | React/Tailwind/Vite operator console, live REST/SSE transport, dev-only simulation transport, evidence provenance, recovery, approval, cancellation, and rollback UI; `RunView.tsx` remains uncommitted |
-| adaptive-agent-6 | `a1c7d18`, clean | Resumable benchmark driver, atomic task and evaluator allocation, development-smoke gate, frozen arms, and comparison-run identity fencing |
-| adaptive-agent-7 | `3ba9286`, clean | Evidence-linked bounded learning, retrieval, durable learning runtime, trusted failed-run diagnostics, and narrow broker learning projections |
+| adaptive-agent-2 | `4832487`, dirty | Final2 backend integration overlay for the control API, durable runtime, evaluation launch, evaluator observation, and API regressions remains uncommitted |
+| adaptive-agent-3 | `6aabe2e`, clean apart from generated cache files | Prime runtime boundary and the two-case EVAL-005 runtime probe |
+| adaptive-agent-4 | `83d2e01`, clean | Durable Controller, Store, Broker, evidence, and isolated EVAL-004/005 probes |
+| adaptive-agent-5 | `ae482da`, clean | React/Tailwind/Vite operator console, live REST/SSE transport, evaluation status, evidence provenance, recovery, and honest uncertainty states |
+| adaptive-agent-6 | `c69a366`, dirty | Resumable benchmark and evaluator-boundary work; current dirty changes are not part of the local-main assembly plan |
+| adaptive-agent-7 | `09aa9b9`, clean | Evidence-linked bounded learning, retrieval, durable learning runtime, and integrated runtime budget-boundary regression |
 
 The implemented Python commands are `adaptive-agent` and `adaptive-agent-plan` as declared in the session-2 `pyproject.toml`.
 The implemented console commands are `bun run dev`, `bun run test`, `bun run build`, `bunx tsc --noEmit`, and `bun run api:smoke` as declared in the session-5 package manifest.
@@ -43,18 +43,34 @@ The Prime bridge investigation also verified `prime-agent --version`, `prime-age
 ## Evidence ledger and current gate status
 
 Real-run and fixture evidence remain separate.
-The following records are the exact evidence available from the inspected worker branches and their commit reports.
+The following records are the fresh root-verified evidence for this checkpoint, followed by preserved historical smoke reports.
 
 | Evidence | Classification | What it establishes | What it does not establish |
 | --- | --- | --- | --- |
+| Session-2 final2 backend integration: committed ref `4832487` plus the dirty overlay in `api.py`, `app.py`, `evaluation_job.py`, `evaluation_store.py`, and `tests/test_api.py`; 171 backend tests passed | Current integration evidence | The current control-plane and evaluator-launch integration is test-covered at the reported checkpoint | A committed merge, real provider product run, heldout evaluation, or final performance result |
+| Actual Docker-backed EVAL-003 from the final2 runtime: seven safety cases passed on isolated temporary Store and data paths | Current boundary evidence | The seven safety cases crossed the actual Docker runtime boundary while using an isolated fixture and no paid model call | General model safety, product acceptance, or sealed evaluator performance |
+| Actual Docker-backed EVAL-005 at session-3 ref `6aabe2e`: `child_failure_recovery_and_cap` and `shared_model_cost_token_cap` passed | Current runtime-boundary evidence | Two parent-child, failure, and shared-cost runtime cases crossed the Docker boundary with bounded deterministic probe inputs | Paid-provider behavior, complete EVAL-005 acceptance, or final resource-budget evidence |
+| Four isolated Controller probe executions at session-4 ref `83d2e01` covering EVAL-004 and EVAL-005 passed on fresh temporary Stores and data directories | Current control-boundary evidence | Controller, Broker, candidate, evidence, replay, failure, and reconnect obligations exercised with isolated persistence | A sealed evaluation, cross-environment performance, or proof that historical root QAdata was isolated |
+| Session-5 console ref `ae482da`: 61/61 tests, TypeScript clean, and build clean; latest report had no live smoke | Current console evidence | Console parsing, evaluation status, learning eligibility, responsive master-detail behavior, and honest uncertainty states | Browser-width acceptance, live inference, or sealed evaluation |
 | Prime 0.9.2 session 3, ChatGPT subscription, `openai-codex/gpt-5.6-luna`, actual Python `2+2` result `4` | Real runtime smoke | Subscription authentication and a narrow Python execution path | Product bridge, evaluator, safety, or performance acceptance |
 | `prime-agent --print --no-tools --provider openai-codex --model openai-codex/gpt-5.6-luna` returned `MODEL_SPIKE_OK` in 10.24s | Real provider smoke | Model reachability through the authenticated path | A goal/tool/evaluator run or provider hard output cap |
 | Prime adapter state-sharing cells returned `42` then `41`; host bridge returned structured data; forbidden learner requests were denied | Real Prime/Docker boundary smoke | Persistent kernel state, broker boundary, and denial behavior in the adapter spike | Complete control-plane learning and promotion evidence |
 | Session-5 `bun run api:smoke` worker report: live FastAPI session, registration, create/launch, SSE cursor, and cancellation smoke PASS | Real control-plane transport with synthetic task | Live API/session/SSE/cancellation wiring | Real model inference or sealed evaluator evidence; the script's smoke environment is synthetic |
-| Session-4 report: three SQLite integration tests passed, including reopen and positive/negative verifier cases | Real local persistence test | SQLite durability and verifier boundary behavior | External provider effects or product acceptance |
-| Session-4 and session-6 backend test reports, including 31 and 30 passed suites | Synthetic fixture/test evidence | Store, broker, controller, learning, and benchmark branches exercise their contracts | Real provider behavior; session-6 explicitly reports all test drivers/providers are synthetic |
-| Session-5 console reports, up to 49/49 tests with TypeScript and build clean | Synthetic UI and captured-wire evidence | Console state, accessibility assertions, transport normalization, and recovery regressions | Browser-width acceptance, live inference, or sealed evaluation |
+| Earlier session-4 SQLite and session-6 backend reports | Historical synthetic/local evidence | Earlier Store, Broker, Controller, learning, and benchmark contract checks | The current final2 integration, real provider behavior, or product acceptance |
 | Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes | Real build-agent smoke | Those agent sessions could execute a basic command | Any product behavior |
+
+## Local-main assembly plan
+
+The local-main assembly is intentionally limited to the final2 backend overlay and the session-5 console.
+It has not been performed by this documentation worker.
+
+1. Materialize and review the session-2 final2 overlay on top of committed ref `4832487`, including only its current tracked backend and API-test changes.
+2. Add the session-5 console ref `ae482da` after the backend wire contract is present.
+3. Run the backend and console checks with newly allocated temporary Store and data paths, preserving the reported 171 backend tests and 61/61 console result as prior evidence rather than replaying paid or shared-data smoke.
+4. Reassess M2-M4 from retained receipts and exact paths before considering any further assembly.
+
+Session 3, session 4, session 6, and session 7 are not assembly inputs in this plan.
+Their runtime and probe results remain separately attributed evidence.
 
 ## QA data-integrity hold
 
