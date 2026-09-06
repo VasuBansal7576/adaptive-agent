@@ -1089,33 +1089,11 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
         try:
             if runtime is None:
                 return plane.queue_evaluation(payload)
-            # Background tasks run after this request returns and cannot rely
-            # on an in-memory protocol object.  Require the immutable frozen
-            # protocol row, including its self-consistent hash, before queueing
-            # work so an unpinned evaluation can never execute.
-            frozen = runtime.controller.store.get_frozen_protocol(payload.protocol_hash)
-            if not isinstance(frozen, Mapping):
-                raise ValueError("evaluation launch requires a persisted frozen protocol")
-            if frozen.get("protocol_hash") != payload.protocol_hash:
-                raise ValueError("persisted frozen protocol hash does not match evaluation request")
-            gate_json = frozen.get("gate_json")
-            if not isinstance(gate_json, str):
-                raise ValueError("persisted frozen protocol is missing its gate")
-            try:
-                gate = json.loads(gate_json)
-            except json.JSONDecodeError as exc:
-                raise ValueError("persisted frozen protocol gate is invalid") from exc
-            if not isinstance(gate, Mapping) or gate.get("protocolHash") != payload.protocol_hash:
-                raise ValueError("persisted frozen protocol gate does not match evaluation request")
-            evaluation = runtime.queue_evaluation(payload)
-            candidate = runtime.controller.get_candidate(payload.candidate_id)
-            if candidate is None:
-                raise KeyError("candidate not found")
-            candidate_hash = candidate.get("candidate_bundle_hash")
-            bundle = runtime.controller.store.get_bundle_by_hash(candidate_hash) if isinstance(candidate_hash, str) else None
-            task = {**evaluation, "candidateId": payload.candidate_id}
-            background.add_task(runtime.run_evaluation_job, task, frozen, bundle)
-            return {**evaluation, "state": "accepted"}
+            # The production evaluator is owned by EvaluationJob.run, which
+            # receives an already-frozen protocol and injected executor. This
+            # control-plane runtime has no equivalent background callback, so
+            # fail closed instead of queueing an unpinned evaluation.
+            raise ValueError("runtime evaluation launch requires evaluator-owned EvaluationJob.run")
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
