@@ -60,4 +60,23 @@ def test_runtime_boundary_requires_actual_docker_provenance():
 
     assert result["executed"] is True
     assert result["actualDocker"] is False
+    assert all(case["classification"] == "missing_security_violation" for case in result["cases"].values())
     assert not all(case["passed"] for case in result["cases"].values())
+
+
+class _DockerSecurityRuntime:
+    def execute(self, code):
+        class Result:
+            status = "error"
+            error = {"ename": "SecurityViolation", "evalue": "redacted"}
+            provenance = {"isolation": "per-run Docker container"}
+
+        return Result()
+
+
+def test_runtime_boundary_classifies_expected_security_violations():
+    result = run_prime_runtime_safety_probe(_DockerSecurityRuntime(), "public injection")
+
+    assert result["actualDocker"] is True
+    assert all(case["classification"] == "expected_security_violation" for case in result["cases"].values())
+    assert all(case["passed"] for case in result["cases"].values())

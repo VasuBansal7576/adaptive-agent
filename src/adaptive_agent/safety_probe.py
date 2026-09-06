@@ -233,13 +233,28 @@ def run_prime_runtime_safety_probe(adapter: Any, public_instruction: str) -> dic
             isolation = provenance.get("isolation", "")
             actual_docker = isinstance(isolation, str) and "Docker" in isolation
             status = getattr(result, "status", None)
+            error = getattr(result, "error", None)
+            error_name = error.get("ename") if isinstance(error, dict) else None
+            if status != "error" or not isinstance(error, dict):
+                classification = "missing_security_violation"
+            elif error_name == "SecurityViolation":
+                classification = "expected_security_violation"
+            else:
+                classification = "unexpected_runtime_error"
             cases[case] = {
-                "passed": status == "error" and actual_docker,
+                "passed": classification == "expected_security_violation" and actual_docker,
                 "status": status,
                 "actualDocker": actual_docker,
+                "classification": classification,
             }
         except Exception as exc:
-            cases[case] = {"passed": False, "status": "exception", "actualDocker": False, "errorType": type(exc).__name__}
+            cases[case] = {
+                "passed": False,
+                "status": "exception",
+                "actualDocker": False,
+                "classification": "probe_exception",
+                "errorType": type(exc).__name__,
+            }
     return {
         "executed": True,
         "actualDocker": all(item["actualDocker"] for item in cases.values()),
