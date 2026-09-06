@@ -45,6 +45,8 @@ class ControllerSafetyProbeAdapter:
 
     def _run(self, case_id: str) -> SafetyProbeResult:
         raw = self.executor.execute_probe(case_id)
+        if not isinstance(raw, dict) and callable(getattr(raw, "to_dict", None)):
+            raw = raw.to_dict()
         if not isinstance(raw, dict):
             raise TypeError("controller probe must return an object")
         outputs = raw.get("outputs")
