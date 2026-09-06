@@ -28,6 +28,7 @@ from adaptive_agent.evaluation import (
     EvaluationRunner,
     Partition,
     RunObservation,
+    _summary,
 )
 from adaptive_agent.evaluation_store import SQLiteRunEvidenceStore, build_durable_evaluation_runner
 from adaptive_agent.store import Store
@@ -90,6 +91,7 @@ class LifecycleStage:
 
 
 LIFECYCLE_STAGE_ORDER = ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final")
+LIFECYCLE_NESTED_SUBCALLS = {"learning": 1, "transfer": 2, "adaptation": 3}
 _LIFECYCLE_OPERATIONAL_CONTEXT_KEYS = frozenset({"resume"})
 
 
@@ -399,14 +401,24 @@ class EvaluationJob:
         if names != LIFECYCLE_STAGE_ORDER:
             raise EvaluationError(f"lifecycle stages must be ordered as {LIFECYCLE_STAGE_ORDER}")
         default_budget = self.protocol.run_budget
-        bound_limits = dict(limits or {
-            "attempts": sum(len(stage.cells) * (stage.retries + 1) for stage in stages),
-            "inputTokens": default_budget.model_tokens * sum(len(stage.cells) for stage in stages),
-            "outputTokens": default_budget.model_tokens * sum(len(stage.cells) for stage in stages),
-            "toolCalls": default_budget.tool_calls * sum(len(stage.cells) for stage in stages),
-            "wallMicros": default_budget.wall_time_seconds * 1_000_000 * sum(len(stage.cells) for stage in stages),
-            "costMicrounits": default_budget.cost_microunits * sum(len(stage.cells) for stage in stages),
-        })
+        if limits is None:
+            # A lifecycle cell can admit runtime-owned child calls.  Reserve
+            # capacity for every retry of both the parent and its children so
+            # the default is a real upper bound, not just the top-level count.
+            admissions = sum(
+                (len(stage.cells) * (1 + LIFECYCLE_NESTED_SUBCALLS.get(stage.name, 0)))
+                * (stage.retries + 1)
+                for stage in stages
+            )
+            limits = {
+                "attempts": admissions,
+                "inputTokens": default_budget.model_tokens * admissions,
+                "outputTokens": default_budget.model_tokens * admissions,
+                "toolCalls": default_budget.tool_calls * admissions,
+                "wallMicros": default_budget.wall_time_seconds * 1_000_000 * admissions,
+                "costMicrounits": default_budget.cost_microunits * admissions,
+            }
+        bound_limits = dict(limits)
         required = {"attempts", "inputTokens", "outputTokens", "toolCalls", "wallMicros", "costMicrounits"}
         if set(bound_limits) != required or any(not isinstance(value, int) or value < 0 for value in bound_limits.values()):
             raise EvaluationError("lifecycle limits must be non-negative integer totals")
@@ -619,6 +631,7 @@ class EvaluationJob:
         if not isinstance(candidate_hash, str) or not candidate_hash:
             raise EvaluationError("lifecycle report lacks pinned candidate bundle hash")
         evaluator = build_durable_evaluation_runner(self.protocol, self.packages, self.store, probe_executor=self.controller)
+        auxiliary_evidence = self._auxiliary_evidence(stages, state, recover)
         ablation_audit = None
         if selected.name == "final":
             ablation = self.arm_bundles.get(Arm.A, self.arm_bundles.get(Arm.A.value))
@@ -653,6 +666,7 @@ class EvaluationJob:
             observations=observations,
             expected_partitions=frozen.partition_hashes,
             ablation_audit=ablation_audit,
+            auxiliary_evidence=auxiliary_evidence,
         )
         # Keep the report seam compatible with evaluator-owned test doubles
         # and alternate concrete report implementations.  Persistence only
@@ -661,6 +675,72 @@ class EvaluationJob:
         if report is None or not callable(getattr(report, "to_dict", None)):
             raise EvaluationError("durable evaluator returned a malformed lifecycle report")
         return report
+
+    def _auxiliary_evidence(self, stages: Sequence[LifecycleStage], state: Mapping[str, Any], recover: Callable[..., Sequence[Any]]) -> dict[str, Any]:
+        """Rebuild transfer/adaptation evidence from durable receipts on every report assembly."""
+        results = state.get("results")
+        if not isinstance(results, Mapping):
+            return {}
+        summaries: dict[str, Any] = {}
+        overhead: dict[str, Any] = {}
+        exposure: dict[str, Any] = {}
+        for name in ("transfer", "adaptation"):
+            stage = next((item for item in stages if item.name == name), None)
+            stage_results = results.get(name)
+            if stage is None or not isinstance(stage_results, Mapping):
+                continue
+            query_rows: list[Any] = []
+            support_rows: list[Any] = []
+            source_ids: list[str] = []
+            task_ids: list[str] = []
+            query_input = query_output = query_total = query_cost = 0
+            for cell_key in stage.cells:
+                receipt = stage_results.get(cell_key)
+                if not isinstance(receipt, Mapping):
+                    continue
+                recovered = recover(receipt, stage=name, cell_key=cell_key)
+                wanted = set(receipt.get("queryRunIds", receipt.get("runIds", ())))
+                support_wanted = set(receipt.get("supportRunIds", ()))
+                new_query_rows = [row for row in recovered if getattr(row, "run_id", None) in wanted]
+                new_support_rows = [row for row in recovered if getattr(row, "run_id", None) in support_wanted]
+                query_rows.extend(new_query_rows)
+                support_rows.extend(new_support_rows)
+                source_ids.extend(value for value in receipt.get("sourceRunIds", receipt.get("trainingSourceRunIds", ())) if isinstance(value, str))
+                source_ids.extend(value for value in receipt.get("supportRunIds", ()) if isinstance(value, str))
+                task_ids.extend(value for value in receipt.get("queryTaskIds", ()) if isinstance(value, str))
+                task_ids.extend(value for value in receipt.get("supportTaskIds", ()) if isinstance(value, str))
+                task_ids.extend(getattr(row, "task_id") for row in new_query_rows if isinstance(getattr(row, "task_id", None), str))
+                task_ids.extend(getattr(row, "task_id") for row in new_support_rows if isinstance(getattr(row, "task_id", None), str))
+                for row in new_query_rows:
+                    accounting = self.store.get_artifact(row.accounting_ref) if row.accounting_ref else None
+                    usage = accounting.get("usage", {}) if isinstance(accounting, Mapping) else {}
+                    query_input += int(usage.get("inputTokens", 0) or 0)
+                    query_output += int(usage.get("outputTokens", 0) or 0)
+                    query_total += int(usage.get("totalTokens", 0) or 0)
+                    query_cost += int(row.cost_microunits)
+            learning_input = learning_output = learning_total = learning_cost = 0
+            support_input = support_output = support_total = support_cost = 0
+            for row in support_rows:
+                accounting = self.store.get_artifact(row.accounting_ref) if row.accounting_ref else None
+                usage = accounting.get("usage", {}) if isinstance(accounting, Mapping) else {}
+                support_input += int(usage.get("inputTokens", 0) or 0)
+                support_output += int(usage.get("outputTokens", 0) or 0)
+                support_total += int(usage.get("totalTokens", 0) or 0)
+                support_cost += int(row.cost_microunits)
+            for cell_key in stage.cells:
+                receipt = stage_results.get(cell_key)
+                learning = receipt.get("learningReceipt") if isinstance(receipt, Mapping) else None
+                usage = learning.get("usage", {}) if isinstance(learning, Mapping) else {}
+                learning_input += int(usage.get("inputTokens", 0) or 0)
+                learning_output += int(usage.get("outputTokens", 0) or 0)
+                learning_total += int(usage.get("totalTokens", 0) or 0)
+                if isinstance(learning, Mapping) and isinstance(learning.get("costMicrounits"), (int, float)):
+                    learning_cost += int(learning["costMicrounits"])
+            metric = _summary(query_rows)
+            summaries[name] = {"query": metric.to_dict(), "queryCount": metric.count, "exact": True}
+            overhead[name] = {"query": {"inputTokens": query_input, "outputTokens": query_output, "totalTokens": query_total, "costMicrounits": query_cost}, "support": {"inputTokens": support_input, "outputTokens": support_output, "totalTokens": support_total, "costMicrounits": support_cost}, "learning": {"inputTokens": learning_input, "outputTokens": learning_output, "totalTokens": learning_total, "costMicrounits": learning_cost}, "supportAndLearningIncluded": True}
+            exposure[name] = {"taskIds": sorted(set(task_ids)), "sourceRunIds": sorted(set(source_ids)), "queryRunIds": sorted({getattr(row, "run_id", "") for row in query_rows if getattr(row, "run_id", None)}), "exact": True}
+        return {"summaries": summaries, "overhead": overhead, "exposure": exposure, "limitations": ("Transfer and adaptation are small-sample auxiliary measurements, not primary promotion panels.",)}
 
     def planned_workload(self, candidate_count: int = 1, *, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0):
         return self.protocol.workload(candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)
@@ -784,7 +864,9 @@ class EvaluationJob:
                 wall_duration_seconds=accounting["wallDurationSeconds"],
                 billing_basis=accounting["billingBasis"],
             )
-            if summary.complete and report.validity_status == "valid" and report.promotion_eligible and candidate_id is not None:
+            # Final is an immutable measurement panel.  Only validation may
+            # advance the active candidate pointer.
+            if comparison == "validation" and summary.complete and report.validity_status == "valid" and report.promotion_eligible and candidate_id is not None:
                 report.require_promotion_evidence(self.protocol, self.packages)
                 decision = self.controller.candidates.promote(candidate_id, {**report.to_dict(), "reportId": f"{job_id}:{comparison}"})
                 self._save(job_id, comparison, "decided", report, runtime_accounting=accounting)

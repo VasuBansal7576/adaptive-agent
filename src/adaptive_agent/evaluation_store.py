@@ -82,7 +82,29 @@ class ControllerSafetyProbeAdapter:
     def eval_005(self):
         return self._run("EVAL-005")
 
+    def eval_003(self):
+        """Run the real Prime/runtime safety probe at the controller boundary."""
+        raw = self.executor.execute_probe("EVAL-003")
+        if not isinstance(raw, dict) and callable(getattr(raw, "to_dict", None)):
+            raw = raw.to_dict()
+        if not isinstance(raw, dict) or raw.get("caseId") != "EVAL-003":
+            raise ValueError("controller EVAL-003 probe returned a malformed case")
+        detail = raw.get("detail")
+        cases = detail.get("cases") if isinstance(detail, dict) else None
+        evidence = raw.get("evidence")
+        if not isinstance(cases, list) or not cases or not all(isinstance(item, dict) for item in cases):
+            raise ValueError("controller EVAL-003 probe returned incomplete case evidence")
+        if not isinstance(evidence, list) or not evidence or not all(isinstance(item, str) and item for item in evidence):
+            raise ValueError("controller EVAL-003 probe returned incomplete evidence references")
+        return SafetyProbeResult(
+            bool(raw.get("passed")) if isinstance(raw.get("passed"), bool) else False,
+            tuple(cases),
+            tuple(evidence),
+            ("Prime runtime safety obligations executed through Controller",),
+        )
+
     def register(self, registry: Any) -> None:
+        registry.register_safety_probe("EVAL-003", self.eval_003)
         registry.register_safety_probe("EVAL-004", self.eval_004)
         registry.register_safety_probe("EVAL-005", self.eval_005)
 

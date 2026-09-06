@@ -5,11 +5,14 @@ from adaptive_agent.evaluation import (
     AblationInput,
     Arm,
     ArtifactRef,
+    BootstrapEstimate,
     BudgetSpec,
     EnvironmentManifest,
     EvaluationError,
     EvaluationProtocol,
+    EvaluationReport,
     EvaluationRunner,
+    MetricSummary,
     ModelProvenance,
     Partition,
     PromotionEvidenceRefused,
@@ -22,7 +25,9 @@ from adaptive_agent.evaluation import (
     build_environment_packages,
     clustered_paired_bootstrap,
     TrustedEvaluatorRegistry,
+    WorkloadPlan,
 )
+from adaptive_agent.performance_gate import GateConfig, evaluate_performance_gate
 
 
 def _observation(env, task, seed, arm, passed=True, *, partition=Partition.VALIDATION):
@@ -30,6 +35,109 @@ def _observation(env, task, seed, arm, passed=True, *, partition=Partition.VALID
 
 
 class EvaluationTests(unittest.TestCase):
+  def _gate(self, *, baseline=None, candidate=None, ci=0.01, environments=None, required_environments=None, config=None, safety=True, safety_cases=None, integrity=()):
+    baseline = baseline or {"accuracy": 0.5, "reliability": 0.8, "meanCostMicrounits": 100.0, "p95LatencySeconds": 10.0, "count": 10}
+    candidate = candidate or {"accuracy": 0.6, "reliability": 0.8, "meanCostMicrounits": 105.0, "p95LatencySeconds": 10.0, "count": 10}
+    environments = environments or {"finance": {"B0": baseline, "L": candidate}}
+    return evaluate_performance_gate(
+        expected_comparison="final",
+        comparison="final",
+        baseline=baseline,
+        candidate=candidate,
+        accuracy_ci_lower=ci,
+        environment_cells=environments,
+        required_environments=tuple(required_environments or environments),
+        required_safety_case_ids=("EVAL-004",),
+        safety_passed=safety,
+        safety_violations=0,
+        safety_case_results={"EVAL-004": True} if safety_cases is None else safety_cases,
+        integrity_failures=integrity,
+        config=config or GateConfig(),
+    )
+
+  def test_performance_gate_requires_positive_ci_and_per_environment_non_regression(self):
+    self.assertTrue(self._gate().passed)
+    self.assertFalse(self._gate(ci=-0.01).passed)
+    regressed = {"finance": {"B0": {"accuracy": 0.5, "reliability": 0.8, "count": 10}, "L": {"accuracy": 0.6, "reliability": 0.79, "count": 10}}}
+    self.assertFalse(self._gate(environments=regressed).passed)
+
+  def test_performance_gate_enforces_absolute_budget_and_zero_baseline_bound(self):
+    generous_ratio = GateConfig(max_cost_ratio=20.0, max_latency_ratio=20.0, max_cost_microunits=500.0, max_latency_seconds=50.0)
+    over_budget = self._gate(candidate={"accuracy": 0.6, "reliability": 0.8, "meanCostMicrounits": 1_000.0, "p95LatencySeconds": 10.0, "count": 10}, config=generous_ratio)
+    self.assertFalse(over_budget.passed)
+    zero_baseline = {"accuracy": 0.5, "reliability": 0.8, "meanCostMicrounits": 0.0, "p95LatencySeconds": 0.0, "count": 10}
+    within = self._gate(baseline=zero_baseline, candidate={"accuracy": 0.6, "reliability": 0.8, "meanCostMicrounits": 500.0, "p95LatencySeconds": 50.0, "count": 10}, config=generous_ratio)
+    self.assertTrue(within.passed)
+    outside = self._gate(baseline=zero_baseline, candidate={"accuracy": 0.6, "reliability": 0.8, "meanCostMicrounits": 501.0, "p95LatencySeconds": 50.0, "count": 10}, config=generous_ratio)
+    self.assertFalse(outside.passed)
+
+  def test_performance_gate_fails_closed_for_missing_safety_and_integrity(self):
+    missing = self._gate(candidate={"accuracy": 0.6, "reliability": 0.8, "count": 10})
+    self.assertFalse(missing.passed)
+    self.assertFalse(self._gate(safety=False).passed)
+    self.assertFalse(self._gate(integrity=("report has missing pairs",)).passed)
+    self.assertFalse(self._gate(candidate={"accuracy": 1.1, "reliability": 0.8, "meanCostMicrounits": 105.0, "p95LatencySeconds": 10.0, "count": 10}).passed)
+    self.assertFalse(self._gate(safety_cases={"EVAL-005": True}).passed)
+
+  def test_performance_gate_rejects_unexpected_environment_cells(self):
+    environments = {
+        "finance": {"B0": {"accuracy": 0.5, "reliability": 0.8, "count": 10}, "L": {"accuracy": 0.6, "reliability": 0.8, "count": 10}},
+        "unexpected": {"B0": {"accuracy": 0.5, "reliability": 0.8, "count": 10}, "L": {"accuracy": 0.6, "reliability": 0.8, "count": 10}},
+    }
+    self.assertFalse(self._gate(environments=environments, required_environments=("finance",)).passed)
+    self.assertFalse(self._gate(environments=environments, required_environments=("finance",), config=GateConfig(require_per_environment_non_regression=False)).passed)
+
+  def test_protocol_freezes_nondefault_gate_thresholds(self):
+    protocol = EvaluationProtocol(thresholds=(("accuracy_gain", 0.20), ("ci_lower_bound", 0.05), ("cost_ratio", 1.05), ("latency_ratio", 1.05)))
+    packages = build_environment_packages()
+    protocol.freeze(packages)
+    self.assertEqual(protocol.gate_config.min_accuracy_gain, 0.20)
+    self.assertEqual(protocol.gate_config.ci_lower_bound, 0.05)
+    self.assertEqual(protocol.gate_config.max_cost_ratio, 1.05)
+    self.assertEqual(protocol.gate_config.max_latency_ratio, 1.05)
+    self.assertFalse(self._gate(config=protocol.gate_config).passed)
+    object.__setattr__(protocol, "thresholds", (("accuracy_gain", 0.01), ("cost_ratio", 9.0), ("latency_ratio", 9.0)))
+    object.__setattr__(protocol, "run_budget", BudgetSpec(cost_microunits=1, wall_time_seconds=1))
+    self.assertEqual(protocol.gate_config.min_accuracy_gain, 0.20)
+    with self.assertRaisesRegex(PromotionEvidenceRefused, "changed after freeze"):
+      protocol.assert_integrity(packages)
+
+  def test_final_report_serializes_attested_verdict_without_using_ablation_arm(self):
+    summary = lambda accuracy, reliability, cost, latency: MetricSummary(accuracy, reliability, cost, latency, latency, 0, 10)
+    report = EvaluationReport(
+        comparison="final",
+        validity_status="valid",
+        candidate_hash="learned",
+        base_hash="base",
+        protocol_hash="protocol",
+        partition_hashes={"finance:final": "hash"},
+        arm_summaries={"B0": summary(0.5, 0.8, 100.0, 10.0), "L": summary(0.6, 0.8, 105.0, 10.0), "A": summary(0.99, 0.99, 1.0, 1.0)},
+        confidence_intervals=(BootstrapEstimate("accuracy", 0.1, 0.01, 0.2, 10_000, 1),),
+        safety_passed=True,
+        missing_pairs=0,
+        partition_leak=False,
+        invalid_fixture_resets=0,
+        infrastructure_failures=(),
+        exposure=(),
+        workload=WorkloadPlan(1, 1, 1, 1, 0, 1, 0),
+        analysis_seed=1,
+        evaluator_refs=("trusted",),
+        environment_cells={"finance": {"B0": summary(0.5, 0.8, 100.0, 10.0), "L": summary(0.6, 0.8, 105.0, 10.0), "A": summary(0.99, 0.99, 1.0, 1.0)}},
+        metric_cells_complete=True,
+        safety_cells_complete=True,
+        model_provenance_complete=True,
+        attestation="attested",
+        safety_case_results={"EVAL-004": True},
+        safety_probe_outputs={"EVAL-004": {"passed": True}},
+        expected_environments=("finance",),
+        required_safety_case_ids=("EVAL-004",),
+    )
+    self.assertTrue(report.final_gate_passed)
+    payload = report.to_dict()
+    self.assertTrue(payload["finalGatePassed"])
+    self.assertEqual(payload["finalGateReasons"], [])
+    self.assertNotIn("A", payload["finalGate"])
+
   def test_required_argument_schemas_reject_privileged_fields_and_unknown_tools(self):
     packages = build_environment_packages()
     task = packages["finance"].learner_tasks()[0]
@@ -89,7 +197,7 @@ class EvaluationTests(unittest.TestCase):
         package = packages[environment_id]
         for partition in Partition:
             tasks = package.tasks_for_partition(partition)
-            self.assertEqual(len(tasks), 60 if partition is Partition.VALIDATION else 20)
+            self.assertEqual(len(tasks), 62 if partition is Partition.VALIDATION else 20)
             for task in tasks:
                 session = package.reset(task.task_id, 1)
                 spec_state = session.state
@@ -415,3 +523,25 @@ class EvaluationTests(unittest.TestCase):
     workload = protocol.workload(candidate_count=2, training_runs=60, transfer_runs=12, safety_runs=8, retries=4)
     self.assertEqual(workload.total_attempted_runs, 1_524)
     self.assertGreater(BudgetSpec().model_tokens, 0)
+
+  def test_frozen_auxiliary_queries_are_outside_every_primary_split(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    frozen = protocol.freeze(packages)
+    allocations = frozen.inputs["auxiliaryQueryAllocations"]
+    for name in protocol.known_environments:
+        ids = allocations[name]
+        assert ids["transfer"] != ids["adaptation"]
+        primary = {task.task_id for task in packages[name].tasks_for_partition(Partition.VALIDATION)[:60]}
+        final = {task.task_id for task in packages[name].tasks_for_partition(Partition.FINAL)}
+        development = {task.task_id for task in packages[name].tasks_for_partition(Partition.DEVELOPMENT)}
+        assert {ids["transfer"], ids["adaptation"]}.isdisjoint(primary | final | development)
+
+  def test_freeze_rejects_a_validation_pool_before_auxiliary_indexing(self):
+    from unittest.mock import patch
+
+    packages = build_environment_packages()
+    original = packages["finance"].tasks_for_partition
+    with patch.object(packages["finance"], "tasks_for_partition", side_effect=lambda partition: original(partition)[:60] if partition is Partition.VALIDATION else original(partition)):
+        with self.assertRaisesRegex(EvaluationError, "auxiliary query allocation"):
+            EvaluationProtocol().freeze(packages)

@@ -285,8 +285,8 @@ class DefaultExperimentStageRunner:
         value = _mapping(receipt, "lifecycle receipt")
         receipt_stage = stage or value.get("stage")
         receipt_cell = cell_key or value.get("cellKey")
-        if receipt_stage not in {"validation", "final"} or not isinstance(receipt_cell, str) or not receipt_cell:
-            raise ExperimentRuntimeError("observation recovery requires a validation/final cell")
+        if receipt_stage not in {"transfer", "adaptation", "validation", "final"} or not isinstance(receipt_cell, str) or not receipt_cell:
+            raise ExperimentRuntimeError("observation recovery requires an evaluation lifecycle cell")
         run_ids = value.get("runIds")
         if not isinstance(run_ids, list) or not run_ids or any(not isinstance(run_id, str) or not run_id for run_id in run_ids):
             raise ExperimentRuntimeError("lifecycle receipt lacks durable observation run IDs")
@@ -328,7 +328,8 @@ class DefaultExperimentStageRunner:
             environment_id = run.get("environment_id")
             task_row = store.get_task(task_id) if isinstance(task_id, str) else None
             partition = task_row.get("partition") if isinstance(task_row, Mapping) else None
-            if not isinstance(task_id, str) or not isinstance(environment_id, str) or partition != receipt_stage:
+            allowed_partitions = {"development", "validation"} if receipt_stage == "adaptation" else {"validation"} if receipt_stage == "transfer" else {receipt_stage}
+            if not isinstance(task_id, str) or not isinstance(environment_id, str) or partition not in allowed_partitions:
                 raise ExperimentRuntimeError(f"observation run {run_id!r} is not bound to {receipt_stage}")
             if task_ids is not None and task_ids[index] != task_id:
                 raise ExperimentRuntimeError("receipt task IDs do not match durable runs")
@@ -499,6 +500,18 @@ class DefaultExperimentStageRunner:
         if index < 0 or index >= len(tasks):
             raise ExperimentRuntimeError(f"task index {index} is outside {environment_id}/{partition}")
         return tasks[index]
+
+    def _auxiliary_query_task(self, environment_id: str, purpose: str) -> Any:
+        allocations = self.inputs.get("auxiliaryQueryAllocations")
+        if not isinstance(allocations, Mapping) or not isinstance(allocations.get(environment_id), Mapping):
+            raise ExperimentRuntimeError("frozen protocol lacks auxiliary query allocation")
+        task_id = allocations[environment_id].get(purpose)
+        if not isinstance(task_id, str) or not task_id:
+            raise ExperimentRuntimeError(f"frozen protocol lacks {purpose} query allocation")
+        for task in _tasks(_package(self.runtime, environment_id), "validation"):
+            if _task_id(task) == task_id:
+                return task
+        raise ExperimentRuntimeError("frozen auxiliary query task is unavailable")
 
     def _execute(self, task: Any, arm: str, seed: int, bundle: Any, attempt: int) -> Any:
         config = _ExecutionConfig(self.frozen_protocol, arm, seed, _bundle_hash(bundle), attempt)
@@ -896,9 +909,12 @@ class DefaultExperimentStageRunner:
         if not eligible:
             raise ExperimentRuntimeError("transfer training set does not prove leave-one-environment-out exclusion")
         candidate, candidate_receipt = self._candidate_for_excluded_environment(context, environment_id)
-        validation_task = self._task_for_cell(cell_key, "validation", environment_id, 0)
+        # Transfer queries are operational lifecycle evidence, not promotion
+        # evidence. Keep them outside the validation panel so this cell can
+        # never consume the primary promotion task allocation.
+        query_task = self._auxiliary_query_task(environment_id, "transfer")
         observation, evaluation_receipt = self._execute_stage_subcall(
-            validation_task,
+            query_task,
             "L",
             int(self.protocol.seeds[0]),
             candidate,
@@ -914,7 +930,7 @@ class DefaultExperimentStageRunner:
             cell_key,
             [observation],
             self.pins,
-            extra={"environmentId": environment_id, "partition": "validation", "resetBefore": True, "exposed": False, "heldoutAccess": False, "disjointDevelopmentEnvironments": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": list(candidate_receipt["sourceRunIds"]), "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"], "learningReceipt": dict(candidate_receipt)},
+            extra={"environmentId": environment_id, "partition": "validation", "purpose": "transfer_query", "resetBefore": True, "exposed": False, "heldoutAccess": False, "disjointDevelopmentEnvironments": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": list(candidate_receipt["sourceRunIds"]), "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"], "learningReceipt": dict(candidate_receipt)},
         )
         return self._merge_receipts(
             receipt,
@@ -933,7 +949,9 @@ class DefaultExperimentStageRunner:
         environment_id = match.group(1)
         candidate = self._candidate(context)
         support = self._task_for_cell(cell_key, "development", environment_id, 0)
-        query = self._task_for_cell(cell_key, "validation", environment_id, 0)
+        # Adaptation support is development-only; its query must be disjoint
+        # from both development support and the validation promotion panel.
+        query = self._auxiliary_query_task(environment_id, "adaptation")
         support_observation, support_receipt = self._execute_stage_subcall(
             support,
             "L",
