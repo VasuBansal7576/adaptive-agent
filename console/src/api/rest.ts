@@ -47,7 +47,13 @@ export class ApiError extends Error {
     const envelope = detail && typeof detail === "object" && !Array.isArray(detail)
       ? (detail as Record<string, unknown>)
       : payload;
-    const code = typeof envelope.code === "string" ? envelope.code : typeof payload.code === "string" ? payload.code : "UNKNOWN";
+    const code = typeof envelope.code === "string"
+      ? envelope.code
+      : typeof payload.code === "string"
+        ? payload.code
+        : status === 422
+          ? "INVALID_INPUT"
+          : "UNKNOWN";
     const message = typeof envelope.message === "string" && envelope.message
       ? envelope.message
       : arrayMessage && typeof arrayMessage.msg === "string" && arrayMessage.msg
