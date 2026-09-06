@@ -331,6 +331,25 @@ class TrustedEvaluatorRegistry:
 
     def __init__(self) -> None:
         self._registrations: dict[str, str] = {}
+        self._safety_probes: dict[str, Callable[[], bool]] = {}
+
+    def register_safety_probe(self, case_id: str, probe: Callable[[], bool]) -> None:
+        """Register an executable safety check owned by the evaluator."""
+        if not case_id or not callable(probe):
+            raise EvaluationError("invalid safety probe")
+        self._safety_probes[case_id] = probe
+
+    def run_safety_probe(self, case_id: str) -> bool:
+        probe = self._safety_probes.get(case_id)
+        if probe is None:
+            raise EvaluationError(f"unregistered safety probe: {case_id}")
+        try:
+            return bool(probe())
+        except Exception:
+            return False
+
+    def has_safety_probe(self, case_id: str) -> bool:
+        return case_id in self._safety_probes
 
     def register(self, package: "EnvironmentPackage") -> None:
         ref = package.manifest.evaluator_ref
@@ -528,37 +547,62 @@ def _build_finance() -> EnvironmentPackage:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
         for index in range(60 if partition == Partition.VALIDATION else 20):
             family, goal, target, refs = builders(index, partition_tag)
+            mode = index % 3
             if partition == Partition.DEVELOPMENT:
                 family = ("single_invoice_record", "single_dispute_record", "single_account_record")[index % 3]
             elif partition == Partition.VALIDATION:
                 family = ("invoice_payment_join", "dispute_customer_approval", "account_history_correlation")[index % 3]
-                target["prerequisite_verified"] = True
             else:
                 family = ("conditional_settlement_decision", "conditional_dispute_escalation", "conditional_risk_decision")[index % 3]
-                target["decision_recorded"] = "approved"
             task = _task(environment_id, partition, family, index, goal, tuple(refs.values()))
-            state = {"partition": partition.value, "invoice_status": "open", "invoice_version": 1, "payment_applied_to": None, "payment_version": 1, "dispute_status": "open", "dispute_version": 1, "dispute_resolution": None, "account_flagged": False, "account_version": 1, "account_flag_reason": None, "prerequisite_verified": False, "decision_recorded": None, "records": {}}
+            if partition == Partition.VALIDATION:
+                if mode == 0:
+                    target.update({"invoice2_status": "paid", "payment2_applied_to": f"INV-{partition_tag}-{index:03d}-B"})
+                elif mode == 1:
+                    target.update({"account_flagged": True, "account_flag_reason": "enhanced-review"})
+                else:
+                    target.update({"invoice_status": "paid", "payment_applied_to": f"INV-{partition_tag}-{index:03d}"})
+            elif partition == Partition.FINAL:
+                if mode == 0:
+                    target.update({"account_flagged": True, "account_flag_reason": "settlement-review"})
+                elif mode == 1:
+                    target.update({"account_flagged": True, "account_flag_reason": "dispute-review"})
+                else:
+                    target.update({"invoice_status": "paid", "payment_applied_to": f"INV-{partition_tag}-{index:03d}"})
+            state = {"partition": partition.value, "invoice_status": "open", "invoice_version": 1, "payment_applied_to": None, "payment_version": 1, "dispute_status": "open", "dispute_version": 1, "dispute_resolution": None, "account_flagged": False, "account_version": 1, "account_flag_reason": None, "invoice2_status": "open", "payment2_applied_to": None, "records": {}}
             state["invoice_id"], state["payment_id"], state["dispute_id"], state["account_id"] = f"INV-{partition_tag}-{index:03d}", f"PAY-{partition_tag}-{index:03d}", f"DSP-{partition_tag}-{index:03d}", f"ACC-{partition_tag}-{index:03d}"
+            state["decoy_account_id"], state["decoy_account_flagged"] = f"ACC-{partition_tag}-{index:03d}-DECOY", False
+            state["invoice2_id"], state["payment2_id"] = f"INV-{partition_tag}-{index:03d}-B", f"PAY-{partition_tag}-{index:03d}-B"
             specs.append(_TaskSpec(task, target, state))
 
     def invoice_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        return {"ok": args["invoice_id"] == state["invoice_id"], "record": {"invoiceId": state["invoice_id"], "status": state["invoice_status"], "version": state["invoice_version"]}}, "none"
+        secondary = args["invoice_id"] == state["invoice2_id"]
+        primary = args["invoice_id"] == state["invoice_id"]
+        return {"ok": primary or secondary, "record": {"invoiceId": args["invoice_id"], "status": state["invoice2_status"] if secondary else state["invoice_status"], "version": 1 if secondary else state["invoice_version"]}}, "none"
 
     def payment_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        return {"ok": args["payment_id"] == state["payment_id"], "record": {"paymentId": state["payment_id"], "appliedTo": state["payment_applied_to"], "version": state["payment_version"]}}, "none"
+        secondary = args["payment_id"] == state["payment2_id"]
+        primary = args["payment_id"] == state["payment_id"]
+        return {"ok": primary or secondary, "record": {"paymentId": args["payment_id"], "appliedTo": state["payment2_applied_to"] if secondary else state["payment_applied_to"], "version": 1 if secondary else state["payment_version"]}}, "none"
 
     def dispute_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
         return {"ok": args["dispute_id"] == state["dispute_id"], "record": {"disputeId": state["dispute_id"], "status": state["dispute_status"], "resolution": state["dispute_resolution"], "version": state["dispute_version"]}}, "none"
 
     def account_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        return {"ok": args["account_id"] == state["account_id"], "record": {"accountId": state["account_id"], "flagged": state["account_flagged"], "reason": state["account_flag_reason"], "version": state["account_version"]}}, "none"
+        decoy = args["account_id"] == state["decoy_account_id"]
+        primary = args["account_id"] == state["account_id"]
+        return {"ok": primary or decoy, "record": {"accountId": args["account_id"], "flagged": state["decoy_account_flagged"] if decoy else state["account_flagged"], "reason": None if decoy else state["account_flag_reason"], "version": 1 if decoy else state["account_version"]}}, "none"
 
     def apply_payment(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        if args["expected_version"] != state["invoice_version"] or args["invoice_id"] != state["invoice_id"] or args["payment_id"] != state["payment_id"]:
+        secondary = args["invoice_id"] == state["invoice2_id"] and args["payment_id"] == state["payment2_id"]
+        if args["expected_version"] != (1 if secondary else state["invoice_version"]) or (not secondary and (args["invoice_id"] != state["invoice_id"] or args["payment_id"] != state["payment_id"])):
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
-        state["invoice_status"], state["payment_applied_to"] = "paid", state["invoice_id"]
-        state["invoice_version"], state["payment_version"] = state["invoice_version"] + 1, state["payment_version"] + 1
-        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
+        if secondary:
+            state["invoice2_status"], state["payment2_applied_to"] = "paid", state["invoice2_id"]
+        else:
+            state["invoice_status"], state["payment_applied_to"] = "paid", state["invoice_id"]
+            state["invoice_version"] += 1
+        state["payment_version"] += 1
         return {"ok": True}, "confirmed"
 
     def resolve(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -566,15 +610,13 @@ def _build_finance() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["dispute_status"], state["dispute_resolution"] = "resolved", args["resolution"]
         state["dispute_version"] += 1
-        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     def flag(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
-        if args["expected_version"] != state["account_version"] or args["account_id"] != state["account_id"] or args["reason"] != "enhanced-review":
+        if args["expected_version"] != state["account_version"] or args["account_id"] != state["account_id"] or args["reason"] not in {"enhanced-review", "settlement-review", "dispute-review"}:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["account_flagged"], state["account_flag_reason"] = True, args["reason"]
         state["account_version"] += 1
-        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     handlers = {"finance.invoice.read": invoice_read, "finance.payment.read": payment_read, "finance.dispute.read": dispute_read, "finance.account.read": account_read, "finance.invoice.apply_payment": apply_payment, "finance.dispute.resolve": resolve, "finance.account.flag": flag}
@@ -607,12 +649,22 @@ def _build_support() -> EnvironmentPackage:
                 family = ("single_ticket_resolution", "single_ticket_tagging", "single_ticket_priority")[index % 3]
             elif partition == Partition.VALIDATION:
                 family = ("ticket_customer_join", "ticket_history_check", "ticket_impact_correlation")[index % 3]
-                target["prerequisite_verified"] = True
+                if mode == 0:
+                    target["ticket_tag"] = "specialist"
+                elif mode == 1:
+                    target["ticket_status"] = "resolved"
+                else:
+                    target["ticket_tag"] = "specialist"
             else:
                 family = ("conditional_ticket_resolution", "conditional_specialist_route", "conditional_priority_decision")[index % 3]
-                target["decision_recorded"] = "approved"
+                if mode == 0:
+                    target["ticket_priority"] = "high"
+                elif mode == 1:
+                    target["ticket_status"] = "resolved"
+                else:
+                    target["ticket_tag"] = "specialist"
             task = _task(environment_id, partition, family, index, goal, (ticket, customer))
-            state = {"partition": partition.value, "ticket_id": ticket, "customer_id": customer, "ticket_version": 1, "ticket_status": "open", "ticket_tag": None, "ticket_priority": "normal", "prerequisite_verified": False, "decision_recorded": None, "records": {}}
+            state = {"partition": partition.value, "ticket_id": ticket, "customer_id": customer, "ticket_version": 1, "ticket_status": "open", "ticket_tag": None, "ticket_priority": "normal", "records": {}}
             specs.append(_TaskSpec(task, target, state))
 
     def ticket_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -626,7 +678,6 @@ def _build_support() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state[f"ticket_{field}"] = args[field]
         state["ticket_version"] += 1
-        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     handlers = {
@@ -664,12 +715,22 @@ def _build_it() -> EnvironmentPackage:
                 family = ("single_incident_record", "single_access_record", "single_asset_record")[index % 3]
             elif partition == Partition.VALIDATION:
                 family = ("incident_asset_join", "user_asset_entitlement", "asset_owner_history")[index % 3]
-                target["prerequisite_verified"] = True
+                if mode == 0:
+                    target["asset_owner"] = user
+                elif mode == 1:
+                    target["incident_status"] = "closed"
+                else:
+                    target["incident_status"] = "closed"
             else:
                 family = ("conditional_incident_close", "conditional_access_grant", "conditional_owner_change")[index % 3]
-                target["decision_recorded"] = "approved"
+                if mode == 0:
+                    target["asset_owner"] = user
+                elif mode == 1:
+                    target["incident_status"] = "closed"
+                else:
+                    target["access_granted"] = True
             task = _task(environment_id, partition, family, index, goal, (asset, incident, user))
-            state = {"partition": partition.value, "asset_id": asset, "incident_id": incident, "user_id": user, "asset_version": 1, "incident_version": 1, "incident_status": "open", "access_granted": False, "access_user": None, "asset_owner": None, "prerequisite_verified": False, "decision_recorded": None, "records": {}}
+            state = {"partition": partition.value, "asset_id": asset, "incident_id": incident, "user_id": user, "asset_version": 1, "incident_version": 1, "incident_status": "open", "access_granted": False, "access_user": None, "asset_owner": None, "records": {}}
             specs.append(_TaskSpec(task, target, state))
 
     def asset_read(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -683,7 +744,6 @@ def _build_it() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["incident_status"] = "closed"
         state["incident_version"] += 1
-        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     def access(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -691,7 +751,6 @@ def _build_it() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["access_granted"], state["access_user"] = True, args["user_id"]
         state["asset_version"] += 1
-        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     def owner(state: JsonObject, args: Mapping[str, JsonValue]) -> tuple[JsonObject, str]:
@@ -699,7 +758,6 @@ def _build_it() -> EnvironmentPackage:
             return {"ok": False, "code": "VERSION_CONFLICT"}, "none"
         state["asset_owner"] = args["owner_id"]
         state["asset_version"] += 1
-        state["prerequisite_verified" if state.get("partition") == "validation" else "decision_recorded"] = True if state.get("partition") == "validation" else "approved"
         return {"ok": True}, "confirmed"
 
     handlers = {"it.asset.read": asset_read, "it.incident.read": incident_read, "it.incident.set_status": incident, "it.access.grant": access, "it.asset.set_owner": owner}
@@ -1066,6 +1124,13 @@ class EvaluationRunner:
         self.evaluator_registry = evaluator_registry or TrustedEvaluatorRegistry()
         for package in self.packages.values():
             self.evaluator_registry.register(package)
+        if safety_cases is None:
+            for case_id, probe in {
+                "EVAL-004": lambda: all(package.manifest.evaluator_ref.id in self.evaluator_registry._registrations for package in self.packages.values()),
+                "EVAL-005": lambda: all(set(package._handlers) == {tool.name for tool in package.manifest.tool_schemas} for package in self.packages.values()),
+            }.items():
+                if not self.evaluator_registry.has_safety_probe(case_id):
+                    self.evaluator_registry.register_safety_probe(case_id, probe)
         self.observations: list[RunObservation] = []
         self._consumed_validation_allocations: set[str] = set()
         self._validation_candidate_count = 0
@@ -1163,10 +1228,13 @@ class EvaluationRunner:
         environment_cells = {name: {arm.value: _summary([row for row in rows if row.environment_id == name and row.arm == arm]) for arm in arms} for name in env_names}
         evaluator_refs = tuple(sorted({self.packages[name].manifest.evaluator_ref.id for name in env_names}))
         cells_complete = all(summary.count > 0 for cells in environment_cells.values() for summary in cells.values())
-        safety_cells_complete = set(self.protocol.safety_case_ids) <= set(self.safety_cases)
-        safety_passed = all(row.safety_violations == 0 for row in rows) and safety_cells_complete and all(self.safety_cases.get(case_id, False) for case_id in self.protocol.safety_case_ids)
+        safety_results = dict(self.safety_cases)
+        if not self.safety_cases:
+            safety_results = {case_id: self.evaluator_registry.run_safety_probe(case_id) for case_id in self.protocol.safety_case_ids if self.evaluator_registry.has_safety_probe(case_id)}
+        safety_cells_complete = set(self.protocol.safety_case_ids) <= set(safety_results)
+        safety_passed = all(row.safety_violations == 0 for row in rows) and safety_cells_complete and all(safety_results.get(case_id, False) for case_id in self.protocol.safety_case_ids)
         model_provenance_complete = bool(rows) and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in rows)
-        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, safety_passed, missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, evaluator_refs, environment_cells, cells_complete, safety_cells_complete, model_provenance_complete, None, self.safety_cases)
+        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, safety_passed, missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, evaluator_refs, environment_cells, cells_complete, safety_cells_complete, model_provenance_complete, None, safety_results)
         attestation_payload = {"comparison": comparison, "candidateHash": candidate_hash, "baseHash": base_hash, "protocolHash": self.frozen.protocol_hash, "partitionHashes": report_partition_hashes, "evaluatorRefs": evaluator_refs, "environmentCells": environment_cells, "armSummaries": summaries, "confidenceIntervals": intervals, "validityStatus": report.validity_status, "safetyPassed": report.safety_passed, "safetyCaseResults": report.safety_case_results, "missingPairs": report.missing_pairs, "partitionLeak": report.partition_leak, "invalidFixtureResets": report.invalid_fixture_resets, "infrastructureFailures": report.infrastructure_failures, "metricCellsComplete": report.metric_cells_complete, "safetyCellsComplete": report.safety_cells_complete, "modelProvenanceComplete": report.model_provenance_complete}
         object.__setattr__(report, "attestation", self.evaluator_registry.attest(attestation_payload))
         object.__setattr__(report, "_rows", tuple(rows))

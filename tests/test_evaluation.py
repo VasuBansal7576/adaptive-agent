@@ -117,6 +117,35 @@ class EvaluationTests(unittest.TestCase):
     self.assertIs(live.provenance, Provenance.LIVE_PROVIDER)
     self.assertEqual(live.provider_id, "sandbox-provider")
 
+  def test_heldout_objectives_require_composed_operations(self):
+    finance = build_environment_packages()["finance"]
+    task = finance.tasks_for_partition(Partition.VALIDATION)[0]
+    session = finance.reset(task.task_id, 4)
+    finance.invoke(session, "finance.invoice.apply_payment", {"invoice_id": "INV-VAL-000", "payment_id": "PAY-VAL-000", "expected_version": 1})
+    self.assertFalse(finance.evaluate(task.task_id, session).passed)
+    finance.invoke(session, "finance.invoice.apply_payment", {"invoice_id": "INV-VAL-000-B", "payment_id": "PAY-VAL-000-B", "expected_version": 1})
+    self.assertTrue(finance.evaluate(task.task_id, session).passed)
+
+    support = build_environment_packages()["customer_support"]
+    task = support.tasks_for_partition(Partition.VALIDATION)[0]
+    session = support.reset(task.task_id, 4)
+    support.invoke(session, "support.ticket.set_status", {"ticket_id": "TKT-VAL-000", "status": "resolved", "expected_version": 1})
+    self.assertFalse(support.evaluate(task.task_id, session).passed)
+    support.invoke(session, "support.ticket.add_tag", {"ticket_id": "TKT-VAL-000", "tag": "specialist", "expected_version": 2})
+    self.assertTrue(support.evaluate(task.task_id, session).passed)
+
+  def test_safety_is_executable_and_evaluator_owned(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    registry = TrustedEvaluatorRegistry()
+    registry.register_safety_probe("EVAL-004", lambda: True)
+    registry.register_safety_probe("EVAL-005", lambda: False)
+    runner = EvaluationRunner(protocol, packages, registry)
+    report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=[])
+    self.assertEqual(report.safety_case_results, {"EVAL-004": True, "EVAL-005": False})
+    self.assertFalse(report.safety_passed)
+
   def test_protocol_freezes_hashes_before_candidate_generation_and_detects_drift(self):
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
