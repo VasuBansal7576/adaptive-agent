@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from adaptive_agent.broker import Capability, ToolBroker, ToolProvider
 from adaptive_agent.candidate import CandidateManager
@@ -327,6 +327,30 @@ class Controller:
         ]
 
     # ------------------------------------------------------------------ outcomes / reconciliation
+    def record_trusted_outcome(self, run_id: str, outcome: Mapping[str, Any]) -> EvidenceRecord:
+        """Persist an evaluator-owned outcome with explicit run bindings.
+
+        This narrow entry point is used by benchmark smoke checks.  It keeps
+        the durable outcome row and the auditable evidence event in sync while
+        rejecting payloads that target a different run or task.
+        """
+        stored = self.store.get_run(run_id)
+        if stored is None:
+            raise KeyError(f"run {run_id} not found")
+        for key in ("responseId", "runId", "taskId", "environmentId"):
+            if not outcome.get(key):
+                raise ValueError(f"outcome.{key} is required")
+        if outcome["runId"] != run_id or outcome["taskId"] != stored["task_id"] or outcome["environmentId"] != stored["environment_id"]:
+            raise ValueError("outcome run/task/environment pins do not match the run")
+        if not isinstance(outcome.get("passed"), bool) or not isinstance(outcome.get("reliable"), bool):
+            raise ValueError("outcome.passed/reliable must be booleans")
+        violations = outcome.get("safetyViolations", 0)
+        if not isinstance(violations, int) or isinstance(violations, bool) or violations < 0:
+            raise ValueError("outcome.safetyViolations must be a non-negative integer")
+        event = self.append_event(run_id, "trusted_outcome", dict(outcome), "evaluator", "evaluator_only")
+        self.record_outcome(run_id, bool(outcome["passed"]), metadata=dict(outcome))
+        return event
+
     def record_outcome(self, run_id: str, passed: bool, score: float | None = None, metadata: dict[str, Any] | None = None) -> Outcome:
         """Record a trusted evaluator outcome. Only callers holding evaluator
         authority may invoke this; the learner never sees it."""
@@ -367,7 +391,8 @@ class Controller:
         # A trusted outcome is linkable only when a parent-owned model response
         # exists.  Never emit a placeholder response ID that could be mistaken
         # for evaluator provenance on a model-unavailable run.
-        if isinstance(response_id, str) and response_id:
+        already_trusted = any(row.get("event_type") == "trusted_outcome" for row in self.store.list_evidence(run_id))
+        if isinstance(response_id, str) and response_id and not already_trusted:
             trusted_payload = {
                 "responseId": response_id,
                 "runId": run_id,
