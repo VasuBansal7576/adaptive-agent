@@ -430,6 +430,24 @@ class Controller:
             return {"caseId": case_id, "passed": not missing, "detail": {"undispatchable": missing}, "obligations": []}
         raise KeyError(f"unknown probe case {case_id!r}")
 
+    # ------------------------------------------------------------------ held-out gate + learner visibility
+    def require_dev_smoke(self, env_id: str) -> None:
+        """Held-out gate: refuse validation/final panels until the environment
+        has a trusted development smoke outcome (benchmark contract)."""
+        if not self.store.dev_smoke_ok(env_id):
+            raise PermissionError(
+                f"environment {env_id!r} has no trusted development smoke outcome; "
+                "held-out panels are not authorized"
+            )
+
+    def learner_tasks(self, env_id: str) -> list[dict[str, Any]]:
+        """Learner-visible task listing: development partition only, stripped to
+        public fields — validation/final tasks and hidden inputs never leak."""
+        return [
+            {"taskId": t.task_id, "goal": t.goal, "partition": t.partition}
+            for t in self.registry.list_tasks_by_partition(env_id, "development")
+        ]
+
     # ------------------------------------------------------------------ outcomes / reconciliation
     def record_outcome(self, run_id: str, passed: bool, score: float | None = None, metadata: dict[str, Any] | None = None) -> Outcome:
         """Record a trusted evaluator outcome. Only callers holding evaluator

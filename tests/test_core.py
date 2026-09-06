@@ -582,6 +582,63 @@ class TestControllerSeam:
             ctl.execute_probe("EVAL-999")
 
 
+    def test_task_run_resume_and_allocation(self, store: Store, workspace):
+        # Resumable task-run statuses: claim once, resume returns existing row.
+        claimed, row = store.claim_task_run("tr-1", ENV, "t1", "validation")
+        assert claimed and row["status"] == "running"
+        resumed, row2 = store.claim_task_run("tr-1", ENV, "t1", "validation")
+        assert not resumed and row2["task_run_id"] == "tr-1"
+        store.update_task_run_status("tr-1", "complete")
+        assert store.get_task_run("tr-1")["status"] == "complete"
+        assert [r["task_run_id"] for r in store.list_task_runs(ENV, "validation")] == ["tr-1"]
+
+        # Atomic allocation reservation with restart persistence.
+        panels = [["a", "b"], ["c", "d"], ["e", "f"]]
+        assert store.reserve_allocation("scope", "alloc-1", panels, 3) == 0
+        assert store.reserve_allocation("scope", "alloc-1", panels, 3) is None  # consumed
+        assert store.reserve_allocation("scope", "alloc-2", panels, 3) == 1
+        assert store.reserve_allocation("scope", "alloc-3", panels, 3) == 2
+        assert store.reserve_allocation("scope", "alloc-4", panels, 3) is None  # exhausted
+        store2 = Store(workspace)
+        assert store2.reserve_allocation("scope", "alloc-2", panels, 3) is None  # restart-safe
+
+    def test_dev_smoke_gate_and_learner_hiding(self, store, registry, broker):
+        from adaptive_agent.controller import Controller
+        from adaptive_agent.models import Budget, ModelProfile, RunRequest
+
+        registry.register(NEUTRAL_MANIFEST)
+        ctl = Controller(store, registry, broker)
+
+        dev = TaskInput(taskId="t-dev-ok", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="public dev goal", partition="development")
+        hidden = TaskInput(taskId="t-final-secret", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="secret", partition="final")
+        registry.register_task(dev)
+        registry.register_task(hidden)
+
+        # Held-out panels denied before any trusted dev smoke.
+        with pytest.raises(PermissionError):
+            ctl.require_dev_smoke(ENV)
+
+        # Learner sees only development tasks, public fields only.
+        visible = ctl.learner_tasks(ENV)
+        assert [t["taskId"] for t in visible] == ["t-dev-ok"]
+        assert all(set(t) == {"taskId", "goal", "partition"} for t in visible)
+
+        run = ctl.create_run(
+            RunRequest(
+                taskRef=store.put_artifact(dev.model_dump(mode="json", by_alias=True)),
+                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
+                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
+                idempotencyKey="idem-smoke",
+            ),
+            dev,
+        )
+        ctl.record_trusted_outcome(run.run_id, {
+            "responseId": "r1", "runId": run.run_id, "taskId": "t-dev-ok",
+            "environmentId": ENV, "passed": True, "reliable": True, "safetyViolations": 0,
+        })
+        ctl.require_dev_smoke(ENV)  # now allowed
+
+
 class TestCandidateLifecycle:
     def _base(self, manager: CandidateManager, store: Store) -> SkillBundle:
         bundle = SkillBundle(skills=[])
