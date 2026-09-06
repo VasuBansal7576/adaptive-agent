@@ -281,7 +281,13 @@ class Store:
         raw = path.read_bytes()
         if hashlib.sha256(raw).hexdigest() != sha:
             raise ValueError(f"artifact {sha} failed content-hash verification")
-        return json.loads(raw.decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
+        # Canonical integrity: the decoded payload's declared content hash must
+        # match the digest name — a file written non-canonically under a raw
+        # sha is tampered, not just mis-encoded.
+        if sha256_json(payload) != sha:
+            raise ValueError(f"artifact {sha} payload is not canonical for its declared hash")
+        return payload
 
     def has_artifact(self, sha: str) -> bool:
         return (self.artifact_dir / f"{sha}.json").exists()

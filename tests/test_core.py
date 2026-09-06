@@ -6,8 +6,10 @@ claims real learning.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -124,6 +126,24 @@ class TestStore:
         ref = store.put_artifact({"x": [1, 2, 3], "when": datetime(2026, 9, 6, tzinfo=timezone.utc)})
         assert store.get_artifact(ref) == {"x": [1, 2, 3], "when": "2026-09-06T00:00:00+00:00"}
         assert store.get_artifact(ref.sha256) == store.get_artifact(ref)
+
+    def test_artifact_read_fails_closed_on_tamper(self, store: Store):
+        """Final ablation/report reads must reject tampered or non-canonical
+        content under a digest-named file."""
+        # Report-shaped artifact; tampering the file content fails on raw sha.
+        ref = store.put_artifact({"ablation": "no-memory", "arm": "A", "pinned": True})
+        path = Path(store.artifact_dir) / f"{ref.sha256}.json"
+        path.write_text('{"ablation":"deny","arm":"A","pinned":true}')
+        with pytest.raises(ValueError):
+            store.get_artifact(ref)
+        # Non-canonical bytes under a raw-sha name: raw check passes but the
+        # canonical payload hash must still fail closed.
+        payload = {"report": "fake"}
+        noncanonical = json.dumps(payload, indent=2).encode("utf-8")
+        sha = hashlib.sha256(noncanonical).hexdigest()
+        (Path(store.artifact_dir) / f"{sha}.json").write_bytes(noncanonical)
+        with pytest.raises(ValueError):
+            store.get_artifact(sha)
 
 
 class TestSchemaValidation:
