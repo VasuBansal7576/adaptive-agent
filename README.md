@@ -14,12 +14,11 @@ Read [MILESTONES.md](MILESTONES.md) for implementation evidence and delivery gat
 ## Current status
 
 The public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent).
-The verified root-committed `main` checkpoint is `ccf3b3a`.
+The verified root-committed `main` checkpoint is `28baed7`.
 The public repository and its `main` branch were verified at this checkpoint.
 
-The current checkpoint records 86 focused tests passed.
-A full raw Prime scripted production lifecycle passed in 224.41 seconds across 60 training, 360 validation, and 720 final runs, including restart and tamper checks.
-This is lifecycle evidence, not an achieved improvement claim.
+The current checkpoint records 55 combined tests passed in 72.87 seconds, with source bytes verified.
+This is integration evidence, not an achieved performance claim.
 
 Earlier backend and console checks remain historical evidence, including 123 focused backend checks, 71 console tests, clean TypeScript and production-build checks, and a real local API browser pass at 375, 768, and 1440 pixel widths with no overflow or page errors.
 
@@ -37,16 +36,16 @@ An earlier real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC a
 It produced no learning result, validation result, final metrics, or measured improvement.
 M4 is therefore not complete.
 
-The AppWorld adapter is integrated at `ccf3b3a` with installed AppWorld `0.1.3.post1`.
-A real TRAIN run produced a strict receipt but exhausted its 20,000-token task budget.
-The full AppWorld CLI workload of 8 train tasks, 20 dev tasks times 3, and 20 test tasks times 3 remains under review.
+The AppWorld adapter and CLI are integrated at `28baed7` with installed AppWorld `0.1.3.post1`.
+Actual AppWorld evaluation is RUNNING against frozen source `28baed7` since 2026-09-06 18:08 UTC, covering 128 task cells: 8 train, 60 dev, and 60 test.
+No final metrics are available yet, and no achieved performance claim is made.
 
 Multi-run learning is integrated.
 On frozen source `15e1624`, actual training completed 60 tasks, with 48 successes and 12 budget failures.
 The learner selected a bounded set of 8 sources.
 Learner usage of 6,678 input and 582 output tokens produced an unpromoted candidate; receipt accounting then failed, and that failure was fixed generically.
 
-A fresh actual original full experiment has been RUNNING against frozen source `ccf3b3a` since 2026-09-06 17:57 UTC.
+A fresh actual original full experiment remains associated with frozen source `ccf3b3a` since 2026-09-06 17:57 UTC.
 No new held-out report is available, so M4 remains unproven.
 
 The accepted Luna-through-ChatGPT subscription path does not expose an API-key or provider switch.
@@ -101,6 +100,85 @@ An optional authenticated reachability check invokes the subscription model and 
 
 ```sh
 prime-agent --print --no-tools --provider openai-codex --model openai-codex/gpt-5.6-luna
+```
+
+## AppWorld setup and experiment
+
+AppWorld is an external published simulated environment.
+Use an existing AppWorld checkout and an existing Python executable with AppWorld exactly at version `0.1.3.post1`.
+The commands below verify that boundary; they do not install or download AppWorld or Prime Agent.
+
+Replace the portable path and pin placeholders with the exact values for the frozen run.
+The source pin for this checkpoint is `28baed7`.
+The image and core planner pins must be exact immutable values, not tags or `image-unpinned`.
+The data directory must be new and empty for `--initialize`.
+
+```sh
+APPWORLD_ROOT="/path/to/AppWorld"
+APPWORLD_PYTHON="/path/to/appworld-python"
+APPWORLD_SETUP_MANIFEST="$(mktemp)"
+APPWORLD_DATA_DIR="$(mktemp -d)"
+SOURCE_REVISION="28baed7"
+IMAGE_DIGEST="sha256:<exact-frozen-image-digest>"
+CORE_PLANNER_HASH="<exact-frozen-core-planner-hash>"
+
+test -d "$APPWORLD_ROOT/data"
+test -x "$APPWORLD_PYTHON"
+test "$($APPWORLD_PYTHON -c 'import importlib.metadata as m; print(m.version("appworld"))')" = "0.1.3.post1"
+
+uv run adaptive-agent-appworld setup \
+  --root "$APPWORLD_ROOT" \
+  --python "$APPWORLD_PYTHON" \
+  --package-version 0.1.3.post1 \
+  --output "$APPWORLD_SETUP_MANIFEST"
+```
+
+The setup manifest describes the public catalog boundary.
+The catalog has no ground-truth or task-report access, and test-task access remains sealed until explicitly enabled.
+The isolated evaluator uses minimal evaluator-only ground truth and returns aggregate-only responses.
+
+Complete the Prime subscription prerequisites above, including `PRIME_AGENT_CODING_AGENT_DIR` and `AO_SESSION_ID`, then export the same frozen pins used by the command.
+
+```sh
+export ADAPTIVE_AGENT_SOURCE_REVISION="$SOURCE_REVISION"
+export ADAPTIVE_AGENT_IMAGE_DIGEST="$IMAGE_DIGEST"
+export ADAPTIVE_AGENT_CORE_PLANNER_HASH="$CORE_PLANNER_HASH"
+
+uv run adaptive-agent-appworld-experiment \
+  --initialize \
+  --data-dir "$APPWORLD_DATA_DIR" \
+  --appworld-root "$APPWORLD_ROOT" \
+  --appworld-python "$APPWORLD_PYTHON" \
+  --source-revision "$SOURCE_REVISION" \
+  --image-digest "$IMAGE_DIGEST" \
+  --core-planner-hash "$CORE_PLANNER_HASH" \
+  --model-profile openai-codex/gpt-5.6-luna \
+  --model-tokens 20000 \
+  --prime-executable prime-agent \
+  --coding-agent-dir "$PRIME_AGENT_CODING_AGENT_DIR"
+```
+
+The experiment protocol fixes 8 train tasks, 20 `dev` tasks across three arms, and 20 `test_normal` tasks across three arms.
+Each task has the fixed runtime budget of 20,000 model tokens, 32 tool calls, and 90 seconds.
+The train, development, and final task cells total 8, 60, and 60 respectively.
+
+To continue an initialized experiment, use the same data directory and exactly the same pins.
+Resume verifies the immutable manifest, frozen runtime pins, and durable cell receipts.
+Completed cells are not re-dispatched; a missing cell can continue, while a tampered or invalid receipt fails closed.
+
+```sh
+uv run adaptive-agent-appworld-experiment \
+  --resume \
+  --data-dir "$APPWORLD_DATA_DIR" \
+  --appworld-root "$APPWORLD_ROOT" \
+  --appworld-python "$APPWORLD_PYTHON" \
+  --source-revision "$SOURCE_REVISION" \
+  --image-digest "$IMAGE_DIGEST" \
+  --core-planner-hash "$CORE_PLANNER_HASH" \
+  --model-profile openai-codex/gpt-5.6-luna \
+  --model-tokens 20000 \
+  --prime-executable prime-agent \
+  --coding-agent-dir "$PRIME_AGENT_CODING_AGENT_DIR"
 ```
 
 ## Run locally
