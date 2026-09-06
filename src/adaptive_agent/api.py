@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
+from adaptive_agent.learning_store import LearningStoreError
 
 
 JsonObject = dict[str, Any]
@@ -800,6 +801,9 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
     @app.post("/environments/register", status_code=201)
     def register_environment(payload: EnvironmentRegistration) -> JsonObject:
         try:
+            plane.validate_registration(payload)
+            if runtime is not None:
+                return runtime.register_environment(payload)
             return plane.register_environment(payload)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -809,6 +813,9 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
     @app.post("/environments", status_code=201)
     def register_environment(payload: EnvironmentRegistration) -> JsonObject:
         try:
+            plane.validate_registration(payload)
+            if runtime is not None:
+                return runtime.register_environment(payload)
             return plane.register_environment(payload)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -819,6 +826,8 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
             manifest = payload.manifest()
             # Console-generated document content is trusted by this boundary.
             plane.trust_reference("docs", manifest.docs[0])
+            if runtime is not None:
+                return runtime.register_environment(manifest)
             return plane.register_environment(manifest)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -952,12 +961,12 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
 
     def _launch_learning(payload: LearningRequest) -> JsonObject:
         if runtime is not None:
-            run = runtime.get_run(payload.run_id)
-            if run is None:
-                raise HTTPException(status_code=404, detail="run not found")
-            artifact = runtime.controller.store.put_artifact({"runId": payload.run_id, "predictedEffect": payload.predicted_effect, "evidenceIds": payload.evidence_ids})
-            runtime.controller.append_event(payload.run_id, "learning_proposal", {"predictedEffect": payload.predicted_effect, "evidenceIds": payload.evidence_ids, "proposalRef": artifact.model_dump(mode="json", by_alias=True)}, "learner", "operator")
-            return {"actionId": f"learn_{uuid.uuid4().hex}", "runId": payload.run_id, "predictedEffect": payload.predicted_effect, "evidenceIds": payload.evidence_ids, "proposalRef": artifact.model_dump(mode="json", by_alias=True), "status": "staged", "createdAt": _now()}
+            try:
+                return runtime.launch_learning(payload)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except (LearningStoreError, ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         if payload.run_id not in plane.runs:
             raise HTTPException(status_code=404, detail="run not found")
         action = {"actionId": f"learn_{uuid.uuid4().hex}", "runId": payload.run_id, "predictedEffect": payload.predicted_effect, "evidenceIds": payload.evidence_ids, "status": "staged", "createdAt": _now()}
@@ -981,12 +990,16 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
 
     @app.get("/candidates")
     def candidates() -> list[JsonObject]:
+        if runtime is not None:
+            return runtime.list_candidates()
         with plane._lock:
             return [dict(candidate) for candidate in plane.candidates.values()]
 
     @app.post("/candidates", status_code=201)
     def create_candidate(payload: CandidateProposalRequest) -> JsonObject:
         try:
+            if runtime is not None:
+                return runtime.create_candidate(payload)
             return plane.create_candidate(payload)
         except IdempotencyConflict as exc:
             raise HTTPException(status_code=409, detail={"code": "VERSION_CONFLICT", "message": str(exc), "correlationId": uuid.uuid4().hex, "retry": "never"}) from exc
@@ -994,6 +1007,8 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
     @app.post("/evaluations", status_code=202)
     def create_evaluation(payload: EvaluationRequest) -> JsonObject:
         try:
+            if runtime is not None:
+                return runtime.queue_evaluation(payload)
             return plane.queue_evaluation(payload)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1002,6 +1017,8 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
 
     @app.get("/evaluations")
     def evaluations() -> list[JsonObject]:
+        if runtime is not None:
+            return runtime.list_evaluations()
         with plane._lock:
             return [dict(evaluation) for evaluation in plane.evaluations.values()]
 
@@ -1025,6 +1042,13 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
 
     @app.post("/rollbacks")
     def rollback_resource(payload: RollbackRouteRequest) -> JsonObject:
+        if runtime is not None:
+            try:
+                return runtime.rollback_candidate(payload.candidate_id, payload.reason)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         with plane._lock:
             candidate = plane.candidates.get(payload.candidate_id)
             if candidate is None:

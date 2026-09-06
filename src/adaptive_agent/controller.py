@@ -9,6 +9,7 @@ evaluator identity, and the active bundle never enters the learner.
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterator, Protocol
@@ -292,18 +293,42 @@ class Controller:
     def record_outcome(self, run_id: str, passed: bool, score: float | None = None, metadata: dict[str, Any] | None = None) -> Outcome:
         """Record a trusted evaluator outcome. Only callers holding evaluator
         authority may invoke this; the learner never sees it."""
-        outcome = Outcome(runId=run_id, passed=passed, score=score, metadata=metadata or {})
+        metadata = metadata or {}
+        stored = self.store.get_run(run_id)
+        if stored is None:
+            raise KeyError(f"run {run_id} not found")
+        response_id = metadata.get("responseId")
+        if not isinstance(response_id, str):
+            for row in reversed(self.store.list_evidence(run_id)):
+                if row.get("event_type") != "model_response":
+                    continue
+                try:
+                    ref = json.loads(row["source_ref"])
+                    envelope = self.store.get_artifact(ref["sha256"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(envelope, dict) and isinstance(envelope.get("responseId"), str):
+                    response_id = envelope["responseId"]
+                    break
+        outcome_metadata = dict(metadata)
+        if isinstance(response_id, str):
+            outcome_metadata["responseId"] = response_id
+        outcome_metadata.setdefault("runId", run_id)
+        outcome_metadata.setdefault("taskId", stored["task_id"])
+        outcome_metadata.setdefault("environmentId", stored["environment_id"])
+        outcome = Outcome(runId=run_id, passed=passed, score=score, metadata=outcome_metadata)
         self.store.save_outcome(
             outcome.outcome_id,
             {
                 "run_id": run_id,
                 "passed": 1 if passed else 0,
                 "score": score,
-                "metadata_json": __import__("json").dumps(outcome.metadata),
+                "metadata_json": json.dumps(outcome.metadata),
                 "checked_at": outcome.checked_at.isoformat(),
             },
         )
-        self.append_event(run_id, "outcome_recorded", {"passed": passed, "score": score}, "evaluator", "operator")
+        trusted_payload = {"runId": run_id, "taskId": stored["task_id"], "environmentId": stored["environment_id"], "responseId": response_id, "passed": passed, "reliable": bool(metadata.get("reliable", passed)), "safetyViolations": int(metadata.get("safetyViolations", 0) or 0), "score": score, "metadata": outcome_metadata}
+        self.append_event(run_id, "trusted_outcome", trusted_payload, "evaluator", "evaluator_only")
         return outcome
 
     def reconcile_run(self, run_id: str, provider: ToolProvider) -> list[str]:

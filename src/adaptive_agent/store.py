@@ -8,6 +8,7 @@ candidates, frozen evaluation protocols, promotions, and the active-bundle linea
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -206,7 +207,28 @@ class Store:
             return json.load(f)
 
     def has_artifact(self, sha: str) -> bool:
-        return (self.artifact_dir / f"{sha}.json").exists()
+        return (self.artifact_dir / f"{sha}.json").exists() or (self.artifact_dir / f"{sha}.bin").exists()
+
+    def put_immutable_bytes(self, data: bytes) -> dict[str, Any]:
+        """Persist exact bytes by SHA-256 for patches and other opaque inputs."""
+        import hashlib
+
+        value = bytes(data)
+        digest = hashlib.sha256(value).hexdigest()
+        path = self.artifact_dir / f"{digest}.bin"
+        if path.exists() and path.read_bytes() != value:
+            raise ValueError("immutable artifact digest collision")
+        if not path.exists():
+            tmp = self.artifact_dir / f"{digest}.tmp"
+            tmp.write_bytes(value)
+            tmp.replace(path)
+        return {"sha256": digest, "size": len(value), "immutable": True}
+
+    def get_immutable_bytes(self, digest: str) -> bytes:
+        path = self.artifact_dir / f"{digest}.bin"
+        if not path.exists():
+            raise KeyError(f"immutable artifact {digest} not found")
+        return path.read_bytes()
 
     # ------------------------------------------------------------------ generic helpers
     def _insert_json(self, table: str, id_col: str, obj_id: str, data: dict[str, Any]) -> None:
@@ -493,6 +515,42 @@ class Store:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def list_learning_records(self, *, environment_id: str, run_id: str) -> list[dict[str, Any]]:
+        """Return the narrow, provenance-checked projection exposed to learning."""
+        records: list[dict[str, Any]] = []
+        environment = self.get_environment(environment_id)
+        if environment:
+            try:
+                manifest_ref = json.loads(environment["manifest_ref"])
+                manifest = self.get_artifact(manifest_ref["sha256"])
+                for ref in manifest.get("docs", []):
+                    if not isinstance(ref, dict):
+                        continue
+                    content = self.get_artifact(ref["sha256"])
+                    text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":"))
+                    records.append({"kind": "public_doc", "sourceId": ref.get("id", ref["sha256"]), "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "visibility": "public"})
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        trusted = self.has_trusted_outcome(run_id)
+        for row in self.list_evidence(run_id):
+            if row.get("visibility") != "learner":
+                continue
+            try:
+                source = json.loads(row["source_ref"])
+                content = self.get_artifact(source["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":"))
+            provenance = self.evidence_provenance(row["evidence_id"])
+            if not provenance or provenance.get("environment_id") != environment_id:
+                continue
+            content_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            records.append({"kind": "live_evidence", "sourceId": row["evidence_id"], "content": text, "contentHash": content_digest, "environmentId": environment_id, "runId": run_id, "partition": provenance.get("partition"), "visibility": "learner", "trustClass": row.get("trust_class"), "trustedOutcome": trusted})
+        if trusted:
+            text = "A trusted evaluator outcome is stored for this development run."
+            records.append({"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True})
+        return records
+
     def evidence_provenance(self, evidence_id: str) -> dict[str, Any] | None:
         """Join evidence -> run -> task to expose partition and terminal status."""
         with self._connect() as conn:
@@ -706,6 +764,11 @@ class Store:
                 (protocol_hash, candidate_hash),
             ).fetchone()
             return dict(row) if row else None
+
+    def list_evaluations(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM evaluations ORDER BY report_id").fetchall()
+            return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------ promotions
     def save_promotion(self, decision_id: str, data: dict[str, Any]) -> None:

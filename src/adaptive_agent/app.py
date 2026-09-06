@@ -22,7 +22,9 @@ from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
 from adaptive_agent.broker import Capability, ToolBroker, ToolProvider
 from adaptive_agent.controller import Controller
 from adaptive_agent.environment import EnvironmentRegistry
-from adaptive_agent.evaluation import build_environment_packages, sha256_json
+from adaptive_agent.evaluation import build_environment_packages, sha256_json, FixtureSession, Outcome as FixtureOutcome
+from adaptive_agent.learning import LearningService
+from adaptive_agent.learning_store import DurableLearningSourceAdapter, CandidateManagerLearningAdapter, LearningStoreError
 from adaptive_agent.planner import PrimeCliModelClient, LunaPlanner, PlannerResult, PlannerLimits
 from adaptive_agent.prime_runtime import Capability as PrimeCapability, CapabilityBroker, PrimeRuntimeAdapter, PrimeRuntimeConfig
 from adaptive_agent.models import ArtifactRef, EnvironmentManifest as DurableManifest, TaskInput as DurableTask, ToolSchema as DurableTool, RunStatus, ToolRequest, Outcome as DurableOutcome
@@ -57,6 +59,35 @@ class _FixtureProvider(ToolProvider):
         self._run_id = run_id
 
 
+class _RegisteredPackage:
+    """Executable shell for an operator-registered manifest.
+
+    Registration supplies schemas and task goals, while the deployment may
+    provide the actual model/evaluator.  Unknown tools fail closed through the
+    broker; direct model runs can still use the durable lifecycle.
+    """
+
+    def __init__(self, manifest: DurableManifest, tasks: list[DurableTask]) -> None:
+        self.environment_id = manifest.environment_id
+        self.manifest = manifest
+        self._tasks = tasks
+
+    def learner_tasks(self) -> list[Any]:
+        return list(self._tasks)
+
+    def learner_documents(self) -> list[Any]:
+        return []
+
+    def reset(self, task_id: str, seed: int) -> FixtureSession:
+        return FixtureSession(self.environment_id, task_id, seed, {})
+
+    def invoke(self, session: FixtureSession, tool: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+        raise RuntimeError(f"no trusted fixture provider is registered for {self.environment_id}:{tool}")
+
+    def evaluate(self, task_id: str, session: FixtureSession) -> FixtureOutcome:
+        return FixtureOutcome(False, False, 0, "registered environment evaluator is not configured", "unconfigured")
+
+
 class DurableRuntime:
     """Adapter used by the HTTP layer to make Controller the source of truth."""
 
@@ -72,6 +103,116 @@ class DurableRuntime:
             for name in self.packages
             for task in registry.list_tasks_by_partition(name, "development")
         }
+        self._reload_registered_environments()
+
+    def _reload_registered_environments(self) -> None:
+        """Rebuild manifest/task projections from SQLite after a restart."""
+        with self.controller.store._connect() as conn:
+            rows = conn.execute("SELECT id FROM environments ORDER BY id").fetchall()
+        for row in rows:
+            env_id = str(row["id"])
+            if env_id in self.packages:
+                continue
+            manifest = self.registry.get_manifest(env_id)
+            if manifest is None:
+                continue
+            tasks = self.registry.list_tasks_by_partition(env_id, "development")
+            if not tasks:
+                continue
+            self.packages[env_id] = _RegisteredPackage(manifest, tasks)
+            self._tasks.update({task.task_id: task for task in tasks})
+
+    def register_environment(self, payload: Any) -> dict[str, Any]:
+        from adaptive_agent.models import ArtifactRef, EnvironmentManifest, TaskInput, ToolSchema
+
+        docs = [ArtifactRef.model_validate(ref) for ref in payload.docs]
+        manifest = EnvironmentManifest(
+            schemaVersion=payload.schema_version,
+            environmentId=payload.environment_id,
+            version=payload.version,
+            docs=docs,
+            toolSchemas=[ToolSchema.model_validate(tool.model_dump(by_alias=True)) for tool in payload.tool_schemas],
+            policyRef=ArtifactRef.model_validate(payload.policy_ref),
+            evaluatorRef=ArtifactRef.model_validate(payload.evaluator_ref),
+            resetRef=ArtifactRef.model_validate(payload.reset_ref),
+            executionModes=list(payload.execution_modes),
+            capabilities=list(payload.capabilities),
+        )
+        self.registry.register(manifest)
+        tasks: list[Any] = []
+        for index, goal in enumerate(payload.task_goals):
+            task_id = f"{payload.environment_id}-development-{index:02d}"
+            task = TaskInput(taskId=task_id, environmentRef=ArtifactRef(id=payload.environment_id, version=payload.version, sha256=sha256_json({"environmentId": payload.environment_id, "version": payload.version})), goal=goal, partition="development")
+            self.registry.register_task(task)
+            tasks.append(task)
+        self.packages[payload.environment_id] = _RegisteredPackage(manifest, tasks)
+        self._tasks.update({task.task_id: task for task in tasks})
+        return {"environmentId": payload.environment_id, "version": payload.version, "validationState": "valid", "evaluatorReady": self.evaluator is not None, "toolCount": len(manifest.tool_schemas), "policyScope": manifest.policy_ref.id}
+
+    def list_candidates(self) -> list[dict[str, Any]]:
+        out = []
+        with self.controller.store._connect() as conn:
+            rows = conn.execute("SELECT candidate_json FROM candidates ORDER BY created_at").fetchall()
+        for row in rows:
+            try:
+                out.append(json.loads(row["candidate_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return out
+
+    def create_candidate(self, payload: Any) -> dict[str, Any]:
+        adapter = CandidateManagerLearningAdapter(self.controller.store, self.controller.candidates, proposal_type=__import__("adaptive_agent.models", fromlist=["CandidateProposal"]).CandidateProposal, bundle_type=__import__("adaptive_agent.models", fromlist=["SkillBundle"]).SkillBundle, skill_type=__import__("adaptive_agent.models", fromlist=["SkillVersion"]).SkillVersion)
+        return dict(adapter.create_candidate(payload.model_dump(by_alias=True)))
+
+    def queue_evaluation(self, payload: Any) -> dict[str, Any]:
+        candidate = self.controller.get_candidate(payload.candidate_id)
+        if candidate is None:
+            raise KeyError("candidate not found")
+        if payload.base_bundle_hash != candidate.get("base_bundle_hash"):
+            raise ValueError("evaluation base does not match candidate")
+        self.controller.start_evaluation(payload.candidate_id)
+        evaluation_id = f"eval_{__import__('uuid').uuid4().hex}"
+        data = {"candidate_hash": candidate.get("candidate_bundle_hash") or payload.candidate_id, "base_hash": payload.base_bundle_hash, "protocol_hash": payload.protocol_hash, "partition_ref": json.dumps(payload.partition_ref, sort_keys=True), "report_json": json.dumps({"evaluationId": evaluation_id, "candidateId": payload.candidate_id, "baseBundleHash": payload.base_bundle_hash, "protocolHash": payload.protocol_hash, "partitionRef": payload.partition_ref, "state": "queued", "trusted": False}, sort_keys=True), "validity": "queued"}
+        self.controller.store.save_evaluation(evaluation_id, data)
+        return json.loads(data["report_json"])
+
+    def list_evaluations(self) -> list[dict[str, Any]]:
+        out = []
+        for row in self.controller.store.list_evaluations():
+            try:
+                out.append(json.loads(row["report_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return out
+
+    def rollback_candidate(self, candidate_id: str, reason: str) -> dict[str, Any]:
+        candidate = self.controller.get_candidate(candidate_id)
+        if candidate is None:
+            raise KeyError("candidate not found")
+        decision = self.controller.rollback(candidate["base_bundle_hash"], reason)
+        return decision.model_dump(mode="json", by_alias=True)
+
+    def launch_learning(self, payload: Any) -> dict[str, Any]:
+        if self.model_runner is None:
+            raise RuntimeError("authenticated model runner is not configured")
+        stored = self.controller.store.get_run(payload.run_id)
+        run = self.controller.get_run(payload.run_id)
+        if stored is None or run is None:
+            raise KeyError("run not found")
+        package = self.packages.get(stored["environment_id"])
+        task = self.registry.get_task(stored["task_id"])
+        if package is None or task is None:
+            raise KeyError("development task not found")
+        source = DurableLearningSourceAdapter(self.controller.store)
+        candidate_sink = CandidateManagerLearningAdapter(self.controller.store, self.controller.candidates, proposal_type=__import__("adaptive_agent.models", fromlist=["CandidateProposal"]).CandidateProposal, bundle_type=__import__("adaptive_agent.models", fromlist=["SkillBundle"]).SkillBundle, skill_type=__import__("adaptive_agent.models", fromlist=["SkillVersion"]).SkillVersion)
+        model_runner = self.model_runner
+        def learning_runner(**kwargs: Any) -> Any:
+            invocation = model_runner(**kwargs)
+            self._record_model_response(payload.run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)})
+            return invocation
+        service = LearningService(source.retriever(environment_id=stored["environment_id"], run_id=payload.run_id), learning_runner, candidate_sink, lambda: self.controller.candidates.get_active_bundle().content_hash if self.controller.candidates.get_active_bundle() else "")
+        proposal = service.propose(run_id=payload.run_id, environment_id=stored["environment_id"], goal=task.goal, environment=self._planner_environment(package, payload.run_id), feedback={"status": run.status.value}, emit=lambda kind, summary, detail=None: self.controller.append_event(payload.run_id, kind, {"summary": summary, "detail": detail}, "learner", "operator"))
+        return {"actionId": f"learn_{__import__('uuid').uuid4().hex}", "runId": payload.run_id, "predictedEffect": proposal.candidate_payload["predictedEffect"], "evidenceIds": proposal.candidate_payload["supportingEvidenceIds"], "proposalRef": self.controller.store.put_artifact(proposal.bundle_patch).model_dump(mode="json", by_alias=True), "candidate": dict(proposal.authoritative_candidate), "status": "staged", "createdAt": __import__("adaptive_agent.api", fromlist=["_now"])._now()}
 
     def list_environments(self) -> list[dict[str, Any]]:
         registered = {task.environment_ref.id for task in self._tasks.values()}
@@ -285,7 +426,9 @@ class DurableRuntime:
             if run is not None and run.execution_mode == "batch" and schema is not None and schema.effect == "write":
                 request.approval_token = self.controller.broker.issue_approval(package.environment_id, run_id, capability.tool, dict(arguments), request.idempotency_key)
             result = self.controller.dispatch_tool(package.environment_id, request, durable_capability, provider, budget_remaining=budget_remaining, dry_run=run is not None and run.execution_mode == "dry_run")
-            self.controller.append_event(run_id, "tool_result", result.model_dump(mode="json", by_alias=True), "broker", "operator")
+            partition = self.controller.store.get_task(stored["task_id"]).get("partition") if stored and self.controller.store.get_task(stored["task_id"]) else None
+            visibility = "learner" if partition == "development" else "operator"
+            self.controller.append_event(run_id, "tool_result", result.model_dump(mode="json", by_alias=True), "broker", visibility)
             if result.status == "ok":
                 budget_remaining["tool_calls"] = max(0, budget_remaining["tool_calls"] - 1)
             return result.model_dump(mode="json", by_alias=True)
