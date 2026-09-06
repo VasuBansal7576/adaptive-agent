@@ -367,7 +367,16 @@ class DefaultExperimentStageRunner:
         baseline_refs = prior_learning_refs if prior_learning_refs is not None else self._learning_observation_ids(run_id)
         admission = self._admit_subcall(context, f"learning:{cell_key}:{run_id}")
         if admission is not None and admission.get("reused") is True:
-            raise ExperimentRuntimeError("nested subcall checkpoint requires durable result recovery")
+            if admission.get("status") != "complete" or not isinstance(admission.get("result"), Mapping):
+                raise ExperimentRuntimeError("nested subcall checkpoint requires durable result recovery")
+            recovered = _mapping(admission["result"], "recovered nested learning receipt")
+            candidate_id = _required_string(recovered.get("candidateId"), "recovered candidate id")
+            candidate_hash = _required_string(recovered.get("candidateBundleHash"), "recovered candidate bundle hash")
+            if bind_primary:
+                self._candidate_id, self._candidate_hash = candidate_id, candidate_hash
+            else:
+                self._rotation_candidates[cell_key] = (candidate_id, candidate_hash)
+            return recovered
         try:
             result = self.runtime.launch_learning(SimpleNamespace(run_id=run_id))
             receipt = self._learning_receipt(cell_key, run_id, result, bind_primary=bind_primary, prior_learning_refs=baseline_refs)
