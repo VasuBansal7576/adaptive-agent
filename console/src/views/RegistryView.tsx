@@ -109,7 +109,10 @@ export function RegistryView({
               <li key={env.environmentId} className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <p className="font-medium text-slate-100">
-                    {env.environmentId} <span className="text-slate-500">v{env.version}</span>
+                    {env.environmentId} <span className="text-slate-500">v{env.version}</span>{" "}
+                    <span className="rounded bg-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-300">
+                      simulated business fixture
+                    </span>
                   </p>
                   <StatusBadge status={env.validationState === "valid" ? "validated" : "invalid"} />
                 </div>

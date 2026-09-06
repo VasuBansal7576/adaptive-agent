@@ -625,7 +625,9 @@ function NewRunDialog({
             {/* free-form goals are not accepted by the durable runtime yet */}
             {fieldErrors.taskId && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.taskId}</p>}
             <p id="newrun-task-hint" className="mt-1 text-[11px] text-slate-500">
-              Select a registered task — this environment accepts registered task goals only.
+              Select a registered task — this environment accepts registered task goals only. Tasks are drawn from
+              the built-in simulated business fixture catalog; results are not from external datasets, and model
+              execution does not change data provenance.
             </p>
           </div>
         )}
@@ -771,7 +773,10 @@ function WorkflowStrip({
     {
       label: "1. Execute goal",
       caption: (
-        <>Run {selected.status === "succeeded" ? "completed" : selected.status === "failed" ? "failed" : `in progress (${selected.status})`} · outcome recorded by the trusted evaluator.</>
+        <>
+          Run {selected.status === "succeeded" ? "completed" : selected.status === "failed" ? "failed" : `in progress (${selected.status})`} · outcome recorded by the trusted
+          evaluator. Tasks come from the built-in simulated business fixture catalog; model execution does not change data provenance.
+        </>
       ),
     },
     {

@@ -217,6 +217,23 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect(calls).toBeGreaterThanOrEqual(2); // the refresh happened without a reload
   });
 
+  it("labels the built-in task catalog truthfully as simulated business fixtures", async () => {
+    const user = userEvent.setup();
+    const transport: ConsoleTransport = { ...createSimulationTransport({ disconnectAfterEvents: 0 }) };
+    render(<App transport={transport} />);
+    await screen.findAllByRole("button", { name: /run-sim-1001/ });
+    // workflow strip states the provenance boundary explicitly
+    expect(screen.getByText(/Tasks come from the built-in simulated business fixture catalog; model execution does not change data provenance/)).toBeInTheDocument();
+    // new-run dialog carries the same boundary near task selection
+    await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
+    const dialog = await screen.findByRole("dialog", { name: "Create run" });
+    expect(
+      await within(dialog).findByText(/built-in simulated business fixture catalog; results are not from external datasets/),
+    ).toBeInTheDocument();
+    // no claim of external/published benchmark sourcing anywhere in the app text
+    expect((document.body.textContent || "").toLowerCase()).not.toContain("appworld");
+  });
+
   it("opens the learning-cycle dialog from the empty-candidates state (regression)", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
