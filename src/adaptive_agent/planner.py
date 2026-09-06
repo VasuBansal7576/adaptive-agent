@@ -560,10 +560,23 @@ class LunaPlanner:
             label = "The caller supplied these active skills because the environment has none:"
         else:
             normalized_environment_skills = list(environment_skills) if isinstance(environment_skills, Sequence) and not isinstance(environment_skills, (str, bytes)) else environment_skills
-            supplemental = explicit_skills if normalized_environment_skills != explicit_skills else []
+            environment_keys = {
+                json.dumps(skill, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+                for skill in normalized_environment_skills
+            } if isinstance(normalized_environment_skills, list) else set()
+            supplemental = []
+            seen_keys = set(environment_keys)
+            for skill in explicit_skills:
+                skill_key = json.dumps(skill, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+                if skill_key not in seen_keys:
+                    supplemental.append(skill)
+                    seen_keys.add(skill_key)
             label = "These additional caller-provided active skills supplement the authoritative environment activeSkills:"
         if supplemental:
-            skills = _bounded_text(_redact({"activeSkills": supplemental}), self.limits.max_context_chars)
+            skills = json.dumps(_redact({"activeSkills": supplemental}), ensure_ascii=False, separators=(",", ":"), default=str)
+            available = self.limits.max_context_chars - len(prompt) - len(label) - 2
+            if len(skills) > available:
+                raise PlannerError("supplemental active skill context exceeds planner context limit")
             prompt += f" {label}\n{skills}"
         return prompt
 

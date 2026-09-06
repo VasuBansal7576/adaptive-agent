@@ -184,6 +184,23 @@ def test_system_prompt_uses_first_class_environment_and_preserves_distinct_skill
     assert "caller-skill" in standalone
 
 
+def test_system_prompt_deduplicates_overlapping_skills_by_full_value():
+    shared = {"id": "shared", "procedure": "same"}
+    environment = {"activeSkills": [shared]}
+    explicit = (shared, {"id": "shared", "procedure": "different"}, {"id": "new"})
+    prompt = LunaPlanner(None, None, None)._system_prompt(environment, explicit)
+    assert prompt.count('"id":"shared"') == 1
+    assert '"procedure":"different"' in prompt
+    assert '"id":"new"' in prompt
+
+
+def test_system_prompt_rejects_supplemental_skill_json_that_would_be_truncated():
+    planner = LunaPlanner(None, None, None, limits=PlannerLimits(max_context_chars=256))
+    long_skill = {"id": "long", "procedure": "雪" * 300}
+    with pytest.raises(PlannerError, match="supplemental active skill context exceeds"):
+        planner.run(goal="goal", environment={}, active_skills=(long_skill,))
+
+
 def test_prime_cli_client_discards_unbounded_intermediate_jsonl_events(tmp_path):
     executable = tmp_path / "prime-agent-many-events"
     executable.write_text(
