@@ -45,6 +45,7 @@ export type ConsoleAction =
   | { type: "connection"; state: ConnectionState }
   | { type: "event"; event: RunEvent }
   | { type: "runUpdated"; run: RunRecord }
+  | { type: "runsRefreshed"; runs: RunRecord[] }
   | { type: "runAdded"; run: RunRecord }
   | { type: "environmentAdded"; environment: EnvironmentPackageSummary }
   | { type: "candidateAdded"; candidate: CandidateDiff }
@@ -68,16 +69,22 @@ export function applyEvent(state: ConsoleState, event: RunEvent): ConsoleState {
   }
   const events = state.events[event.runId] ?? [];
   const run = state.runs.find((r) => r.runId === event.runId);
+  const TERMINAL = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
   const runs = run
-    ? state.runs.map((r) =>
-        r.runId === event.runId
-          ? {
-              ...r,
-              lastEventSequence: Math.max(r.lastEventSequence, event.sequence),
-              status: event.kind === "status" ? derivedStatus(event.summary, r.status) : r.status,
-            }
-          : r,
-      )
+    ? state.runs.map((r) => {
+        let status = r.status;
+        // lifecycle transitions apply only forward: a terminal record (loaded
+        // authoritatively or already reached in sequence order) must never be
+        // downgraded by an OLDER replayed event
+        if (event.runStatus && !TERMINAL.has(status)) {
+          status = event.runStatus;
+        }
+        return {
+          ...r,
+          lastEventSequence: Math.max(r.lastEventSequence, event.sequence),
+          status,
+        };
+      })
     : state.runs;
   return {
     ...state,
@@ -85,17 +92,6 @@ export function applyEvent(state: ConsoleState, event: RunEvent): ConsoleState {
     events: { ...state.events, [event.runId]: [...events, event] },
     cursors: { ...state.cursors, [event.runId]: event.sequence },
   };
-}
-
-function derivedStatus(summary: string, current: RunRecord["status"]): RunRecord["status"] {
-  const s = summary.toLowerCase();
-  if (s.includes("run succeeded")) return "succeeded";
-  if (s.includes("run failed")) return "failed";
-  if (s.includes("cancelled")) return "cancelled";
-  if (s.includes("timed out")) return "timed_out";
-  if (s.includes("approval required")) return "awaiting_approval";
-  if (s.includes("queued")) return current === "queued" ? "queued" : current;
-  return current;
 }
 
 /** Reset ALL per-mode state. Switching transports must never leak runs, events,
@@ -143,6 +139,16 @@ export function reducer(state: ConsoleState, action: ConsoleAction): ConsoleStat
       return applyEvent(state, action.event);
     case "runUpdated":
       return { ...state, runs: state.runs.map((r) => (r.runId === action.run.runId ? action.run : r)) };
+    case "runsRefreshed":
+      // authoritative record refresh (e.g., after plane-shape status events or
+      // stream close): merge server-side status into existing runs
+      return {
+        ...state,
+        runs: state.runs.map((r) => {
+          const fresh = action.runs.find((f) => f.runId === r.runId);
+          return fresh ? { ...r, status: fresh.status, lastEventSequence: Math.max(r.lastEventSequence, fresh.lastEventSequence), budgetUsed: fresh.budgetUsed ?? r.budgetUsed } : r;
+        }),
+      };
     case "runAdded":
       return {
         ...state,

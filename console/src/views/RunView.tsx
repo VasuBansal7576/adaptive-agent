@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ConsoleTransport, CreateRunInput } from "../api/transport";
 import { newIdempotencyKey } from "../api/transport";
 import { describeToolError } from "../api/errors";
-import type { ApprovalRequest, EnvironmentPackageSummary, RunEvent, RunRecord, TaskOption } from "../api/types";
+import type { ApprovalRequest, EnvironmentPackageSummary, RunEvent, RunOptions, RunRecord, TaskOption } from "../api/types";
 import type { ConnectionState } from "../state/consoleStore";
 import { StatusBadge } from "../components/StatusBadge";
 import { Banner, EmptyState, LoadingState, Modal } from "../components/ui";
@@ -90,10 +90,15 @@ export function RunView({
 
   const runEvents = selected ? events[selected.runId] ?? [] : [];
   const lastError = [...runEvents].reverse().find((e) => e.error);
+  // honest failure classification from validated event types: a recorded
+  // run_failed lifecycle event is a runtime failure; otherwise the outcome
+  // evidence decides — no text heuristics
+  const lastRuntimeFailure = [...runEvents].reverse().find((e) => e.lifecycleType === "run_failed");
+  const hasOutcomeEvidence = runEvents.some((e) => e.lifecycleType === "outcome_recorded");
 
   return (
-    <section aria-labelledby="runs-heading" className="grid gap-6 lg:grid-cols-[minmax(280px,380px)_1fr]">
-      <div>
+    <section aria-labelledby="runs-heading" className="grid min-w-0 gap-6 lg:grid-cols-[minmax(280px,380px)_minmax(0,1fr)]">
+      <div className="min-w-0">
         <div className="flex items-center justify-between gap-2">
           <h2 id="runs-heading" className="text-base font-semibold text-slate-100">
             Runs
@@ -113,17 +118,21 @@ export function RunView({
                 type="button"
                 onClick={() => onSelectRun(run.runId)}
                 aria-current={run.runId === selectedRunId ? "true" : undefined}
-                className={`w-full rounded-lg border px-3 py-2.5 text-left text-sm transition-colors ${
+                className={`w-full min-w-0 rounded-lg border px-3 py-2.5 text-left text-sm transition-colors ${
                   run.runId === selectedRunId
                     ? "border-sky-600 bg-sky-950/40 text-slate-100"
                     : "border-slate-700 bg-slate-900/60 text-slate-300 hover:border-slate-500"
                 }`}
               >
-                <span className="flex items-center justify-between gap-2">
-                  <span className="font-mono text-[13px]">{run.runId}</span>
-                  <StatusBadge status={run.status} />
+                <span className="flex min-w-0 items-center justify-between gap-2">
+                  <span className="min-w-0 break-all font-mono text-[13px]">{run.runId}</span>
+                  <span className="shrink-0">
+                    <StatusBadge status={run.status} />
+                  </span>
                 </span>
-                <span className="mt-1 block truncate text-xs text-slate-400">{run.environmentId} — {run.goal}</span>
+                <span className="mt-1 block truncate text-xs text-slate-400" title={`${run.environmentId} — ${run.goal}`}>
+                  {run.environmentId} — {run.goal}
+                </span>
               </button>
             </li>
           ))}
@@ -134,10 +143,10 @@ export function RunView({
         {selected ? (
           <div className="space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-700 bg-slate-900/60 p-4">
-              <div className="min-w-0">
-                <h3 className="font-mono text-sm text-slate-100">{selected.runId}</h3>
-                <p className="mt-0.5 text-[13px] text-slate-400">{selected.goal}</p>
-                <p className="mt-1 text-xs text-slate-500">
+              <div className="min-w-0 flex-1">
+                <h3 className="break-all font-mono text-sm text-slate-100">{selected.runId}</h3>
+                <p className="mt-0.5 text-[13px] text-slate-400 [overflow-wrap:anywhere]">{selected.goal}</p>
+                <p className="mt-1 text-xs text-slate-500 [overflow-wrap:anywhere]">
                   bundle {selected.skillBundleRef.id} v{selected.skillBundleRef.version} · env {selected.environmentRef.id} v{selected.environmentRef.version}
                 </p>
               </div>
@@ -178,9 +187,22 @@ export function RunView({
             )}
 
             {selected.status === "failed" && !lastError?.error && (
-              <Banner tone="bad" title="Run failed">
-                The trusted outcome check did not pass. Inspect the evidence below; the active version is unchanged.
-              </Banner>
+              lastRuntimeFailure ? (
+                <Banner tone="bad" title="Runtime failure" role="alert">
+                  The run failed before or during execution (recorded run_failed evidence). The active version is
+                  unchanged; inspect the expanded event below for the recorded error.
+                </Banner>
+              ) : hasOutcomeEvidence ? (
+                <Banner tone="bad" title="Run failed" role="alert">
+                  The trusted outcome evidence recorded a failure. Inspect the expanded outcome event below; the
+                  active version is unchanged.
+                </Banner>
+              ) : (
+                <Banner tone="bad" title="Run failed" role="alert">
+                  The run reached a failed state. Inspect the event evidence below for the recorded cause; the
+                  active version is unchanged.
+                </Banner>
+              )
             )}
             {selected.status === "timed_out" && (
               <Banner tone="warn" title="Run timed out">
@@ -214,23 +236,62 @@ export function RunView({
               ) : (
                 <ol className="mt-2 space-y-2" aria-label="Run events">
                   {runEvents.map((event) => (
-                    <li key={event.sequence} className="flex gap-3 rounded-lg bg-slate-800/60 px-3 py-2">
-                      <span className="w-10 shrink-0 font-mono text-xs text-slate-500">#{event.sequence}</span>
-                      <div className="min-w-0">
-                        <p className="text-[13px] text-slate-200">
-                          <span className="mr-2 rounded bg-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-300">
-                            {KIND_LABEL[event.kind]}
-                          </span>
-                          {event.summary}
-                        </p>
-                        {event.error && (
-                          <p className="mt-1 text-xs text-rose-300">
-                            {event.error.code} · retry: {event.error.retry} · correlation {event.error.correlationId}
-                          </p>
-                        )}
-                        {event.detail && <p className="mt-1 text-xs text-slate-400">{event.detail}</p>}
-                        <p className="mt-0.5 font-mono text-[10px] text-slate-600">{event.at}</p>
-                      </div>
+                    <li key={event.sequence} className="rounded-lg bg-slate-800/60 px-3 py-2">
+                      <details>
+                        <summary className="flex cursor-pointer list-none gap-3 [&::-webkit-details-marker]:hidden">
+                          <span className="w-10 shrink-0 font-mono text-xs text-slate-500">#{event.sequence}</span>
+                          <div className="min-w-0 flex-1">
+                            <p className="text-[13px] text-slate-200 [overflow-wrap:anywhere]">
+                              <span className="mr-2 rounded bg-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-300">
+                                {KIND_LABEL[event.kind]}
+                              </span>
+                              {event.summary}
+                              {event.evidence?.evidenceId && (
+                                <span className="ml-2 align-middle">
+                                  <span aria-hidden="true" className="text-slate-500">▸</span>
+                                  <span className="sr-only">— evidence details available, expand to inspect</span>
+                                </span>
+                              )}
+                            </p>
+                            {event.error && (
+                              <p className="mt-1 break-all text-xs text-rose-300">
+                                {event.error.code} · retry: {event.error.retry} · correlation {event.error.correlationId}
+                              </p>
+                            )}
+                            {event.detail && <p className="mt-1 text-xs text-slate-400 [overflow-wrap:anywhere]">{event.detail}</p>}
+                            <p className="mt-0.5 font-mono text-[10px] text-slate-600">{event.at}</p>
+                          </div>
+                        </summary>
+                        <div className="mt-2 min-w-0 border-t border-slate-700/60 pt-2 pl-4">
+                          <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-[11px]">
+                            <dt className="text-slate-500">Evidence</dt>
+                            <dd className="break-all font-mono text-slate-300">{event.evidence?.evidenceId ?? "—"}</dd>
+                            <dt className="text-slate-500">Artifact</dt>
+                            <dd className="break-all font-mono text-slate-300">{event.evidence?.sourceRefId ?? "—"}</dd>
+                            <dt className="text-slate-500">Trust class</dt>
+                            <dd className="text-slate-300">{event.evidence?.trustClass ?? "—"}</dd>
+                            <dt className="text-slate-500">Visibility</dt>
+                            <dd className="text-slate-300">{event.evidence?.visibility ?? "—"}</dd>
+                            <dt className="text-slate-500">Redacted</dt>
+                            <dd className="text-slate-300">
+                              {event.evidence?.redacted === undefined ? "—" : event.evidence.redacted ? "yes" : "no"}
+                            </dd>
+                          </dl>
+                          {event.evidence?.contentHash && (
+                            <p
+                              className="mt-1 break-all font-mono text-[10px] text-slate-600"
+                              title={`Content fingerprint ${event.evidence.contentHash}`}
+                            >
+                              fingerprint {event.evidence.contentHash.slice(0, 16)}…
+                            </p>
+                          )}
+                          {event.error && (
+                            <p className="mt-1 text-[11px] text-slate-400 [overflow-wrap:anywhere]">
+                              {describeToolError(event.error)}
+                            </p>
+                          )}
+                        </div>
+                      </details>
                     </li>
                   ))}
                 </ol>
@@ -322,6 +383,7 @@ function NewRunDialog({
   const [tasks, setTasks] = useState<TaskOption[]>([]);
   const [modelProfile, setModelProfile] = useState(MODEL_PROFILES[0].label);
   const [modelProfiles, setModelProfiles] = useState<Array<{ ref: { id: string; version: string; sha256: string }; label: string }>>(MODEL_PROFILES);
+  const [advertisedBudgetRef, setAdvertisedBudgetRef] = useState<RunOptions["budgetRef"]>(undefined);
   const [executionMode, setExecutionMode] = useState<CreateRunInput["executionMode"]>("interactive");
   const [toolCallCeiling, setToolCallCeiling] = useState(String(BUDGET_FALLBACK.toolCalls));
   const [wallSecondsCeiling, setWallSecondsCeiling] = useState(String(BUDGET_FALLBACK.wallTimeSeconds));
@@ -366,6 +428,7 @@ function NewRunDialog({
           setWallSecondsCeiling(String(options.budgetDefaults.wallTimeSeconds));
           setModelTokenCeiling(String(options.budgetDefaults.modelTokens));
         }
+        setAdvertisedBudgetRef(options.budgetRef);
       })
       .catch(() => {
         /* fallback constants remain; never block the dialog on this */
@@ -437,6 +500,7 @@ function NewRunDialog({
       goal: goal.trim(),
       taskId: taskId || undefined,
       modelProfileRef: modelProfiles.find((p) => p.label === modelProfile)?.ref,
+      budgetRef: advertisedBudgetRef,
       modelProfile: modelProfile,
       // same key across recovery retries within this dialog session
       idempotencyKey,
@@ -535,8 +599,7 @@ function NewRunDialog({
             {/* free-form goals are not accepted by the durable runtime yet */}
             {fieldErrors.taskId && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.taskId}</p>}
             <p id="newrun-task-hint" className="mt-1 text-[11px] text-slate-500">
-              This environment has registered tasks; the control plane currently requires one of them — free-form
-              goals are disabled until arbitrary task registration ships.
+              Select a registered task — this environment accepts registered task goals only.
             </p>
           </div>
         )}
@@ -624,7 +687,7 @@ function ApprovalDialog({
   return (
     <Modal open title="Approval required" onClose={() => void decide(false)}>
       <div className="space-y-3 text-sm text-slate-300">
-        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-[13px]">
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5 text-[13px]">
           <dt className="text-slate-500">Tool</dt>
           <dd className="font-mono">{request.tool} <span className="text-slate-500">v{request.toolVersion}</span></dd>
           <dt className="text-slate-500">Effect</dt>
@@ -632,7 +695,7 @@ function ApprovalDialog({
             <StatusBadge status={request.effect === "write" ? "awaiting_approval" : "validated"} /> {request.effect}
           </dd>
           <dt className="text-slate-500">Scope</dt>
-          <dd className="font-mono text-[12px]">{request.resourceScope}</dd>
+          <dd className="break-all font-mono text-[12px]">{request.resourceScope}</dd>
           <dt className="text-slate-500">Expires</dt>
           <dd className="font-mono text-[12px]">{request.expiresAt}</dd>
         </dl>

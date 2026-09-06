@@ -66,7 +66,8 @@ export function Modal({
     if (!open) return;
     restoreRef.current = document.activeElement as HTMLElement | null;
     const panel = panelRef.current;
-    panel?.querySelector<HTMLElement>("input, button, [tabindex]")?.focus();
+    // initial focus prefers the first text field (DOM order) over buttons
+    panel?.querySelector<HTMLElement>("textarea, input, select, button, [tabindex]")?.focus();
 
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {

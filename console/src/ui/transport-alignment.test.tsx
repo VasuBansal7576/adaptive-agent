@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { createSimulationTransport } from "../api/simulation";
@@ -44,7 +44,7 @@ describe("durable SSE event normalization", () => {
     expect(event.runId).toBe("r1");
     expect(event.sequence).toBe(7);
     expect(event.kind).toBe("status");
-    expect(event.summary).toContain("run_started");
+    expect(event.summary).toBe("Run started");
     expect(event.detail).toContain("art-1");
   });
 
@@ -79,7 +79,7 @@ describe("durable SSE event normalization", () => {
     expect(event.runId).toBe("run_9811");
     expect(event.sequence).toBe(1);
     expect(event.kind).toBe("status");
-    expect(event.summary).toContain("run_created");
+    expect(event.summary).toBe("Run created");
     expect(event.detail).toContain("art_9baec1f5358fbce8");
   });
 
@@ -99,6 +99,32 @@ describe("run-options and registered tasks in the new-run dialog", () => {
     await waitFor(() => expect(within(dialog).getByLabelText("Tool-call limit")).toHaveValue(32));
     await waitFor(() => expect(within(dialog).getByLabelText("Time limit (s)")).toHaveValue(90));
     await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000));
+  });
+
+  it("accepts the top-level budgetRef from /run-options (01f2462 shape)", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const sent: Array<{ budgetRef?: { id: string } }> = [];
+    const transport = {
+      ...sim,
+      getRunOptions: async () => {
+        const options = await sim.getRunOptions();
+        return { ...options, budgetDefaults: { ...options.budgetDefaults }, budgetRef: { id: "budget-default", version: "1", sha256: "top-level" } };
+      },
+      createRun: async (input: Parameters<typeof sim.createRun>[0]) => {
+        sent.push({ budgetRef: input.budgetRef ? { id: input.budgetRef.id } : undefined });
+        return sim.createRun(input);
+      },
+    };
+    render(<App transport={transport} />);
+    await screen.findAllByRole("button", { name: /run-sim-1001/ });
+    await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
+    const dialog = await screen.findByRole("dialog", { name: "Create run" });
+    await waitFor(() => expect(within(dialog).getByLabelText("Model")).toHaveValue("Luna"));
+    fireEvent.change(within(dialog).getByLabelText("Goal"), { target: { value: "top-level ref probe" } });
+    await user.click(within(dialog).getByRole("button", { name: "Create run" }));
+    await waitFor(() => expect(sent.length).toBe(1));
+    expect(sent[0].budgetRef?.id).toBe("budget-default");
   });
 
   it("sources the goal from a registered task and records its id", async () => {

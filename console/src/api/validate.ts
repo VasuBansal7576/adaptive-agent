@@ -11,9 +11,11 @@ import type {
   CandidateDiff,
   EnvironmentPackageSummary,
   RunEvent,
+  RunOptions,
   RunRecord,
   RunStatus,
   SkillVersionSummary,
+  TaskOption,
   ToolError,
   ToolErrorCode,
 } from "./types";
@@ -102,6 +104,138 @@ export function parseRunEvent(value: unknown, field: string): RunEvent {
   if (o.detail !== undefined) event.detail = str(o.detail, `${field}.detail`);
   if (o.error !== undefined) event.error = parseToolError(o.error, `${field}.error`);
   if (o.approval !== undefined) event.approval = parseApproval(o.approval, `${field}.approval`);
+  return event;
+}
+
+/** Operator-readable summaries per durable event type; distinguishes runtime
+ *  failures from outcome-check results so a dry_run preview is not mistaken
+ *  for a runtime error. */
+const SUMMARY_BY_TYPE: Record<string, string> = {
+  run_created: "Run created",
+  run_started: "Run started",
+  run_failed: "Runtime failure recorded",
+  run_cancelled: "Run cancelled",
+  run_completed: "Run completed",
+  run_succeeded: "Run completed",
+  run_timed_out: "Run timed out",
+  outcome_recorded: "Trusted outcome check recorded",
+  model_observation: "Model observation recorded",
+  step_started: "Step started",
+  step_completed: "Step completed",
+  approval: "Approval recorded",
+};
+
+/** Durable lifecycle event types -> authoritative RunStatus transitions.
+ *  Status is taken ONLY from the validated event type, never display text. */
+const EVENT_TYPE_TO_STATUS: Record<string, RunStatus> = {
+  run_created: "queued",
+  run_started: "running",
+  run_completed: "succeeded",
+  run_succeeded: "succeeded",
+  run_failed: "failed",
+  run_cancelled: "cancelled",
+  run_timed_out: "timed_out",
+};
+
+/** Durable evidence event types -> console event kinds. */
+const EVENT_TYPE_TO_KIND: Record<string, RunEvent["kind"]> = {
+  run_created: "status",
+  run_started: "status",
+  run_completed: "status",
+  run_succeeded: "status",
+  run_failed: "status",
+  run_cancelled: "status",
+  run_timed_out: "status",
+  step_started: "step",
+  step_completed: "step",
+  tool_called: "tool",
+  tool_result: "tool",
+  approval: "approval",
+  approval_requested: "approval",
+  approval_decided: "approval",
+  outcome_recorded: "evidence",
+  model_observation: "evidence",
+  evidence: "evidence",
+  budget: "budget",
+  budget_reserved: "budget",
+  budget_recorded: "budget",
+};
+
+/**
+ * Normalize both SSE wire shapes into the console RunEvent:
+ * - plane projection: {runId, sequence, at, kind, summary, ...}
+ * - durable envelope: {id, event, data:{runId, sequence, eventType, ...}}
+ * Unknown or partial payloads raise SchemaError instead of entering UI state.
+ */
+export function normalizeSseEvent(value: unknown, field: string): RunEvent {
+  const o = obj(value, field);
+  if (typeof o.kind === "string" && typeof o.summary === "string" && typeof o.runId === "string") {
+    return parseRunEvent(o, field);
+  }
+  // durable evidence envelope (snake_case on the wire)
+  const envelopeId = typeof o.id === "number" ? o.id : undefined;
+  const data = obj(o.data ?? o, `${field}.data`);
+  const runId = str(data.runId ?? data.run_id, `${field}.data.runId`);
+  const sequence = typeof data.sequence === "number"
+    ? num(data.sequence, `${field}.data.sequence`)
+    : envelopeId !== undefined
+      ? num(envelopeId, `${field}.id`)
+      : (() => { throw new SchemaError(`${field}.sequence`); })();
+  const eventType = str(data.eventType ?? data.event_type ?? o.event, `${field}.eventType`);
+  const kind = EVENT_TYPE_TO_KIND[eventType] ?? "step";
+  // source_ref may be an embedded JSON string on the durable wire
+  let sourceId: string | null = null;
+  const sourceRaw = data.sourceRef ?? data.source_ref;
+  if (typeof sourceRaw === "string") {
+    try {
+      const parsed = JSON.parse(sourceRaw) as Record<string, unknown>;
+      if (typeof parsed.id === "string") sourceId = parsed.id;
+    } catch {
+      sourceId = null;
+    }
+  } else if (typeof sourceRaw === "object" && sourceRaw !== null && typeof (sourceRaw as Record<string, unknown>).id === "string") {
+    sourceId = (sourceRaw as Record<string, unknown>).id as string;
+  }
+  const contentHashRaw = data.contentHash ?? data.content_hash;
+  const contentHash = typeof contentHashRaw === "string" ? contentHashRaw : null;
+  // safe operator payload fields when the projection includes them
+  // (visibility-gated server-side; evaluator_only rows never reach the client)
+  const payloadSummaryRaw = data.summary ?? data.payload_summary;
+  const payloadDetailRaw = data.detail ?? data.payload_detail;
+  const detail = sourceId
+    ? `evidence artifact ${sourceId}`
+    : contentHash
+      ? `content ${contentHash.slice(0, 12)}`
+      : undefined;
+  const event: RunEvent = {
+    runId,
+    sequence,
+    at: typeof data.at === "string" ? data.at : "",
+    kind,
+    summary:
+      typeof payloadSummaryRaw === "string" && payloadSummaryRaw
+        ? payloadSummaryRaw
+        : (SUMMARY_BY_TYPE[eventType] ?? `[${eventType}] evidence recorded`),
+  };
+  if (typeof payloadDetailRaw === "string" && payloadDetailRaw) event.detail = payloadDetailRaw;
+  else if (typeof detail === "string") event.detail = detail;
+  else if (payloadDetailRaw !== undefined) event.detail = String(payloadDetailRaw);
+  const evidenceIdRaw = data.evidenceId ?? data.evidence_id;
+  event.evidence = {
+    evidenceId: typeof evidenceIdRaw === "string" ? evidenceIdRaw : undefined,
+    sourceRefId: sourceId ?? undefined,
+    contentHash: contentHash ?? undefined,
+    trustClass: typeof data.trustClass === "string" ? data.trustClass : typeof data.trust_class === "string" ? data.trust_class : undefined,
+    visibility: typeof data.visibility === "string" ? data.visibility : undefined,
+    redacted: typeof data.redacted === "boolean" ? data.redacted : typeof data.redacted === "number" ? data.redacted === 1 : undefined,
+  };
+  event.lifecycleType = eventType;
+  // lifecycle status comes from the validated event type only
+  const statusTransition = EVENT_TYPE_TO_STATUS[eventType];
+  if (statusTransition) event.runStatus = statusTransition;
+  // bare status and outcome rows carry no status field server-side: the
+  // authoritative RunRecord must be refreshed to learn the real state
+  if (eventType === "status" || eventType === "outcome_recorded") event.needsRecordRefresh = true;
   return event;
 }
 
@@ -208,7 +342,6 @@ export function parseCandidates(value: unknown): CandidateDiff[] {
 }
 
 const ENV_VALIDATION = ["valid", "invalid", "unchecked"] as const;
-
 export function parseEnvironments(value: unknown): EnvironmentPackageSummary[] {
   return arr(value, "environments").map((item, i) => {
     const o = obj(item, `environments[${i}]`);
@@ -224,5 +357,54 @@ export function parseEnvironments(value: unknown): EnvironmentPackageSummary[] {
       env.missingFields = arr(o.missingFields, `environments[${i}].missingFields`).map((f) => str(f, "missingFields[]"));
     }
     return env;
+  });
+}
+
+export function parseRunOptions(value: unknown): RunOptions {
+  const o = obj(value, "runOptions");
+  const profiles = arr(o.modelProfiles, "runOptions.modelProfiles").map((item, i) => {
+    const p = obj(item, `runOptions.modelProfiles[${i}]`);
+    const ref = obj(p.ref, `runOptions.modelProfiles[${i}].ref`);
+    const out: RunOptions["modelProfiles"][number] = {
+      ref: {
+        id: str(ref.id, `runOptions.modelProfiles[${i}].ref.id`),
+        version: str(ref.version, `runOptions.modelProfiles[${i}].ref.version`),
+        sha256: str(ref.sha256, `runOptions.modelProfiles[${i}].ref.sha256`),
+      },
+      label: str(p.label, `runOptions.modelProfiles[${i}].label`),
+    };
+    if (p.provider !== undefined) out.provider = str(p.provider, `runOptions.modelProfiles[${i}].provider`);
+    if (p.model !== undefined) out.model = str(p.model, `runOptions.modelProfiles[${i}].model`);
+    return out;
+  });
+  const budget = obj(o.budgetDefaults, "runOptions.budgetDefaults");
+  return {
+    modelProfiles: profiles,
+    budgetDefaults: {
+      modelTokens: num(budget.modelTokens, "runOptions.budgetDefaults.modelTokens"),
+      toolCalls: num(budget.toolCalls, "runOptions.budgetDefaults.toolCalls"),
+      wallTimeSeconds: num(budget.wallTimeSeconds, "runOptions.budgetDefaults.wallTimeSeconds"),
+      childRuns: typeof budget.childRuns === "number" ? budget.childRuns : undefined,
+      costMicrounits: typeof budget.costMicrounits === "number" ? budget.costMicrounits : undefined,
+      currency: typeof budget.currency === "string" ? budget.currency : undefined,
+    },
+    // trusted budget ref: top level since 01f2462, nested since 2b3fc75
+    budgetRef:
+      budget.budgetRef && typeof budget.budgetRef === "object" && !Array.isArray(budget.budgetRef)
+        ? parseArtifactRef(budget.budgetRef, "runOptions.budgetDefaults.budgetRef")
+        : o.budgetRef && typeof o.budgetRef === "object" && !Array.isArray(o.budgetRef)
+          ? parseArtifactRef(o.budgetRef, "runOptions.budgetRef")
+          : undefined,
+  };
+}
+
+export function parseTasks(value: unknown): TaskOption[] {
+  return arr(value, "tasks").map((item, i) => {
+    const t = obj(item, `tasks[${i}]`);
+    return {
+      taskId: str(t.taskId, `tasks[${i}].taskId`),
+      goal: str(t.goal, `tasks[${i}].goal`),
+      executionModes: arr(t.executionModes, `tasks[${i}].executionModes`).map((m) => str(m, `tasks[${i}].executionModes[]`)),
+    };
   });
 }

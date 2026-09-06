@@ -50,6 +50,15 @@ export type RunRecord = {
   budgetUsed?: { calls: number; callsCeiling: number; wallSeconds: number; wallCeiling: number };
 };
 
+export type EvidenceProvenance = {
+  evidenceId?: string;
+  sourceRefId?: string;
+  contentHash?: string;
+  trustClass?: string;
+  visibility?: string;
+  redacted?: boolean;
+};
+
 export type RunEvent = {
   runId: string;
   sequence: number;
@@ -57,8 +66,19 @@ export type RunEvent = {
   kind: "status" | "step" | "tool" | "evidence" | "budget" | "approval";
   summary: string;
   detail?: string; // untrusted text; rendered escaped only
-  approval?: ApprovalRequest;
   error?: ToolError;
+  approval?: ApprovalRequest;
+  /** provenance from the durable evidence row; expandable in the UI */
+  evidence?: EvidenceProvenance;
+  /** authoritative status transition derived from the validated event TYPE
+   *  (never from display text); absent for non-lifecycle events */
+  runStatus?: RunStatus;
+  /** the durable event type this row was projected from (e.g. run_failed,
+   *  outcome_recorded); used for honest failure classification */
+  lifecycleType?: string;
+  /** the API projected no status field for this event (e.g. bare status or
+   *  outcome rows): the authoritative RunRecord must be refreshed */
+  needsRecordRefresh?: boolean;
 };
 
 export type ApprovalRequest = {
@@ -121,4 +141,27 @@ export type EnvironmentPackageSummary = {
   /** declared execution modes projected from the manifest (optional) */
   executionModes?: string[];
   missingFields?: string[];
+};
+
+/** GET /run-options: authoritative model profile and bounded budget controls. */
+export type RunOptions = {
+  modelProfiles: Array<{ ref: { id: string; version: string; sha256: string }; label: string; provider?: string; model?: string }>;
+  budgetDefaults: {
+    modelTokens: number;
+    toolCalls: number;
+    childRuns?: number;
+    wallTimeSeconds: number;
+    costMicrounits?: number;
+    currency?: string;
+  };
+  /** authoritative trusted budget reference advertised by the control plane
+   *  (01f2462 top level; 2b3fc75 nested form tolerated); submitted verbatim */
+  budgetRef?: { id: string; version: string; sha256: string };
+};
+
+/** GET /environments/{id}/tasks: registered task goals a run may target. */
+export type TaskOption = {
+  taskId: string;
+  goal: string;
+  executionModes: string[];
 };
