@@ -12,7 +12,7 @@ from adaptive_agent import (  # noqa: E402
     SecurityViolation,
     SharedBudget,
 )
-from adaptive_agent.prime_child_planner import LunaChildPlanner  # noqa: E402
+from adaptive_agent.prime_child_planner import LunaChildPlanner, _usage_tokens  # noqa: E402
 
 
 class FakeClient:
@@ -33,7 +33,7 @@ class FakeClient:
             "model": "gpt-5.6-luna",
             "responseId": f"child-response-{self.calls}",
             "text": text,
-            "usage": {"totalTokens": self.usage},
+            "usage": self.usage if isinstance(self.usage, dict) else {"totalTokens": self.usage},
         }
 
 
@@ -41,6 +41,28 @@ def request(ledger, prompt="compute", kwargs=None):
     budget = ChildPlannerBudget(ledger)
     return ChildPlanRequest(prompt, kwargs or {"left": 21, "right": 2}, "run", 0,
                             budget.remaining_seconds, (), budget.cancel_event, budget)
+
+
+class UsageNormalizationTests(unittest.TestCase):
+    def test_complete_input_output_shapes_are_summed(self):
+        for usage in (
+            {"inputTokens": 9000, "outputTokens": 1},
+            {"input_tokens": 9000, "output_tokens": 1},
+            {"input": 9000, "output": 1},
+            {"totalTokens": 9001, "inputTokens": 9000, "outputTokens": 1},
+        ):
+            self.assertEqual(_usage_tokens(usage), 9001)
+
+    def test_contradictory_or_invalid_usage_is_rejected(self):
+        for usage in (
+            {"totalTokens": 9000, "inputTokens": 9000, "outputTokens": 1},
+            {"totalTokens": 1, "total_tokens": 2},
+            {"inputTokens": -1, "outputTokens": 1},
+            {"inputTokens": 9000, "outputTokens": "1"},
+            {"inputTokens": 9000},
+        ):
+            with self.assertRaises(AdapterError):
+                _usage_tokens(usage)
 
 
 class ChildPlannerTests(unittest.TestCase):
@@ -96,6 +118,13 @@ class ChildPlannerTests(unittest.TestCase):
             LunaChildPlanner(empty, observation_sink=observations.append)(request(ledger))
         self.assertEqual(observations[0]["responseId"], "child-response-1")
         self.assertEqual(ledger.model_tokens_used, 3)
+        invalid = FakeClient(usage={"inputTokens": "9000", "outputTokens": 1})
+        observations = []
+        ledger = SharedBudget(30, 1000, 4, 1, 100)
+        with self.assertRaises(AdapterError):
+            LunaChildPlanner(invalid, observation_sink=observations.append)(request(ledger))
+        self.assertEqual(observations, [])
+        self.assertEqual(ledger.model_tokens_used, 0)
         over = FakeClient(usage=7)
         observations = []
         ledger = SharedBudget(30, 1000, 4, 1, 5)
@@ -118,6 +147,25 @@ class ChildPlannerTests(unittest.TestCase):
         with self.assertRaises(SecurityViolation):
             proxy.invoke(goal="parent", environment={}, messages=[], remaining_deadline=5)
         self.assertEqual(client.calls, 1)
+
+    def test_parent_and_child_cumulative_usage_blocks_next_dispatch(self):
+        ledger = SharedBudget(30, 1000, 4, 1, 10)
+        budget = ChildPlannerBudget(ledger)
+        client = FakeClient(usage={"inputTokens": 6, "outputTokens": 1})
+        observations = []
+        planner = LunaChildPlanner(client, budget=budget, observation_sink=observations.append)
+        parent = planner.parent_model_client(observation_sink=observations.append)
+        parent.invoke(goal="parent", environment={}, messages=[], remaining_deadline=5)
+        client.usage = {"input_tokens": 3, "output_tokens": 1}
+        with self.assertRaises(SecurityViolation):
+            planner(request(ledger))
+        self.assertEqual(ledger.model_tokens_used, 11)
+        self.assertEqual(len(observations), 2)
+        with self.assertRaises(SecurityViolation):
+            parent.invoke(goal="blocked", environment={}, messages=[], remaining_deadline=5)
+        with self.assertRaises(SecurityViolation):
+            planner(request(ledger))
+        self.assertEqual(client.calls, 2)
 
     def test_parent_receipt_uses_same_ledger_and_overage_is_retained(self):
         ledger = SharedBudget(30, 1000, 4, 1, 5)

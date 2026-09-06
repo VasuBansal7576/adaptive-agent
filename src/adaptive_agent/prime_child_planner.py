@@ -61,6 +61,7 @@ class SharedLedgerModelClient:
             raise AdapterError("parent model response is not the pinned Luna subscription")
         if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
             raise AdapterError("parent model response lacks response id or usage accounting")
+        tokens = _usage_tokens(usage)
         if self.observation_sink is not None:
             self.observation_sink({
                 "provider": provider,
@@ -70,20 +71,45 @@ class SharedLedgerModelClient:
             })
         # Charge exactly once, immediately after the provider call. The
         # observation sink persists the response envelope before exhaustion.
-        self.budget.record_model_usage(_usage_tokens(usage))
+        self.budget.record_model_usage(tokens)
         return raw
 
 
 def _usage_tokens(usage: Mapping[str, Any]) -> int:
-    for key in ("totalTokens", "total_tokens", "outputTokens", "output_tokens"):
-        value = usage.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-            return value
-    input_tokens = usage.get("input", usage.get("input_tokens"))
-    output_tokens = usage.get("output", usage.get("output_tokens"))
-    if isinstance(input_tokens, int) and isinstance(output_tokens, int) and input_tokens >= 0 and output_tokens >= 0:
-        return input_tokens + output_tokens
-    raise AdapterError("child model usage must include total token accounting")
+    """Normalize provider usage without silently dropping paid input tokens."""
+    if not isinstance(usage, Mapping) or not usage:
+        raise AdapterError("model usage must be a non-empty object")
+
+    def field(label: str, aliases: tuple[str, ...]) -> int | None:
+        values: list[int] = []
+        for key in aliases:
+            if key not in usage:
+                continue
+            value = usage[key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise AdapterError(f"model usage field {key!r} must be a non-negative integer")
+            values.append(value)
+        if values and any(value != values[0] for value in values[1:]):
+            raise AdapterError(f"model usage has contradictory {label} fields")
+        return values[0] if values else None
+
+    total = field("total", ("totalTokens", "total_tokens"))
+    input_tokens = field("input", ("input", "inputTokens", "input_tokens"))
+    output_tokens = field("output", ("output", "outputTokens", "output_tokens"))
+    if input_tokens is not None:
+        if output_tokens is None:
+            raise AdapterError("model usage input tokens require output tokens")
+        complete = input_tokens + output_tokens
+        if total is not None and total != complete:
+            raise AdapterError("model usage total contradicts input plus output")
+        return complete
+    if output_tokens is not None:
+        if total is not None and total != output_tokens:
+            raise AdapterError("model usage total contradicts output-only usage")
+        return output_tokens
+    if total is not None:
+        return total
+    raise AdapterError("model usage must include total or input/output token accounting")
 
 
 def _text(raw: Mapping[str, Any]) -> str:
@@ -228,6 +254,7 @@ class LunaChildPlanner:
             raise AdapterError("child model response is not the pinned Luna subscription")
         if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
             raise AdapterError("child model response lacks response id or usage")
+        tokens = _usage_tokens(usage)
         observation = {
             "provider": provider,
             "model": MODEL_NAME if model == "gpt-5.6-luna" else model,
@@ -240,7 +267,7 @@ class LunaChildPlanner:
             self.observation_sink(observation)
         # Record completed provider usage before enforcing the shared cap. An
         # over-cap receipt remains visible in the ledger and blocks later calls.
-        request.budget.record_model_usage(_usage_tokens(usage))
+        request.budget.record_model_usage(tokens)
         if not text:
             raise AdapterError("child model response lacks text")
         return _bind_kwargs(_parse_plan(text, self.max_code_chars), request.kwargs)
