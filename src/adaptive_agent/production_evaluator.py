@@ -128,6 +128,7 @@ def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | No
         image_digest=image_digest,
         analysis_code_hash=analysis_hash,
         run_budget=BudgetSpec(model_tokens=MODEL_TOKENS, wall_time_seconds=WALL_SECONDS),
+        concurrency_limit=4,
     )
     protocol.freeze(runtime.packages)
     _persist_or_verify_frozen(runtime.controller.store, protocol.start_candidate_generation(), initialize=initialize)

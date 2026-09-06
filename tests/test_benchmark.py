@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -66,6 +68,37 @@ class BenchmarkDriverTests(unittest.TestCase):
             self.assertTrue(result.complete)
             self.assertEqual(result.expected_count, 1)
             self.assertEqual(len(calls), 1)
+
+    def test_parallel_cells_are_bounded_by_frozen_concurrency(self):
+        packages = build_environment_packages()
+        protocol = EvaluationProtocol(concurrency_limit=4)
+        protocol.freeze(packages)
+        active = peak = 0
+        guard = threading.Lock()
+
+        class TrustedEvidence:
+            durable = True
+
+            def verify(self, observation, frozen, package):
+                return True
+
+        def execute(task, frozen_config, bundle):
+            nonlocal active, peak
+            with guard:
+                active += 1
+                peak = max(peak, active)
+            try:
+                time.sleep(0.002)
+                return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, bundle_hash=frozen_config.bundle_hash)
+            finally:
+                with guard:
+                    active -= 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = ResumableEvaluationDriver(Store(Path(directory)), protocol, packages, execute, object(), evidence_store=TrustedEvidence(), arm_bundles=_arm_bundles()).run("parallel", Partition.DEVELOPMENT)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.expected_count, 180)
+        self.assertLessEqual(peak, 4)
 
     def test_smoke_identity_authorizes_held_out_run_after_reopen(self):
         packages = build_environment_packages()
