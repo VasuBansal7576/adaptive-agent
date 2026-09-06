@@ -620,6 +620,28 @@ class DurableRuntime:
         model_payload = self.controller.store.get_artifact(json.loads(model_row["source_ref"])["sha256"])
         accounting_ref = model_payload.get("accountingRef", {}).get("sha256") if isinstance(model_payload, Mapping) else None
         accounting = self.controller.store.get_artifact(accounting_ref) if isinstance(accounting_ref, str) else {}
+        # Kernel and broker work can finish after the final model response.
+        # Publish a new immutable accounting artifact for the completed run so
+        # the observation charges terminal work without rewriting prior evidence.
+        if isinstance(accounting, Mapping):
+            final_accounting = dict(accounting)
+            final_accounting["toolCalls"] = sum(1 for row in evidence_rows if row.get("event_type") == "tool_result")
+            final_accounting["durationSeconds"] = max(float(accounting.get("durationSeconds", 0) or 0), time.monotonic() - execution_started)
+            final_accounting["inferenceDurationSeconds"] = float(accounting.get("inferenceDurationSeconds", 0) or 0)
+            accounting_ref = self.controller.store.put_artifact(final_accounting).sha256
+            accounting = final_accounting
+            # Bind the terminal artifact to the immutable run projection so a
+            # fresh runtime and stage recovery resolve the same accounting.
+            run_row = self.controller.store.get_run(run.run_id)
+            if run_row is not None:
+                try:
+                    run_json = json.loads(run_row.get("run_json", "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    run_json = {}
+                if isinstance(run_json, dict):
+                    run_json["finalAccountingRef"] = accounting_ref
+                    run_row["run_json"] = json.dumps(run_json, sort_keys=True)
+                    self.controller.store.save_run(run.run_id, run_row)
         # Evaluator evidence references name the durable evidence row; the
         # row's sourceRef points at the immutable outcome artifact.
         outcome_ref = outcome_rows[-1]["evidence_id"]
