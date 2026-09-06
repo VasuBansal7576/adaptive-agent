@@ -83,6 +83,52 @@ describe("durable SSE event normalization", () => {
     expect(event.detail).toContain("art_9baec1f5358fbce8");
   });
 
+  it("renders 333ae4d payload projections: run_failed error detail and model usage", () => {
+    const failed = normalizeSseEvent(
+      {
+        id: 12,
+        event: "run_failed",
+        data: {
+          run_id: "r1",
+          sequence: 12,
+          event_type: "run_failed",
+          content_hash: "h12",
+          source_ref: '{"id":"art_12","version":"1","sha256":"h12"}',
+          summary: "Runtime failure recorded",
+          detail: "Prime CLI exited status 130: Daemon worker client closed",
+          trust_class: "system",
+          visibility: "operator",
+        },
+      },
+      "sse",
+    );
+    expect(failed.summary).toBe("Runtime failure recorded");
+    expect(failed.detail).toBe("Prime CLI exited status 130: Daemon worker client closed");
+    expect(failed.runStatus).toBe("failed");
+
+    const model = normalizeSseEvent(
+      {
+        id: 5,
+        event: "model_response",
+        data: {
+          run_id: "r1",
+          sequence: 5,
+          event_type: "model_response",
+          content_hash: "h5",
+          source_ref: '{"id":"art_5","version":"1","sha256":"h5"}',
+          summary: "Model response recorded",
+          detail: '{"model":"openai-codex/gpt-5.6-luna","provider":"openai-codex","usage":{"inputTokens":120,"outputTokens":48,"totalTokens":168}}',
+          trust_class: "system",
+          visibility: "operator",
+        },
+      },
+      "sse",
+    );
+    expect(model.kind).toBe("evidence");
+    expect(model.summary).toBe("Model response recorded");
+    expect(model.detail).toContain("totalTokens");
+  });
+
   it("raises SchemaError on garbage instead of passing it through", () => {
     expect(() => normalizeSseEvent({ id: 1 }, "sse")).toThrow(SchemaError);
   });
