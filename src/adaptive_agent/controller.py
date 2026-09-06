@@ -10,11 +10,12 @@ evaluator identity, and the active bundle never enters the learner.
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterator, Protocol
 
-from adaptive_agent.broker import Capability, ToolBroker, ToolProvider
-from adaptive_agent.candidate import CandidateManager
+from adaptive_agent.broker import Authorizer, Capability, ToolBroker, ToolProvider
+from adaptive_agent.candidate import CandidateManager, ReportVerifier
 from adaptive_agent.environment import EnvironmentRegistry
 from adaptive_agent.models import (
     ArtifactRef,
@@ -101,13 +102,19 @@ class Controller:
         self,
         store: Store,
         registry: EnvironmentRegistry,
-        broker: ToolBroker,
+        broker: ToolBroker | None = None,
         approval_provider: ApprovalProvider | None = None,
+        authorizer: Authorizer | None = None,
+        report_verifier: ReportVerifier | None = None,
     ) -> None:
         self.store = store
         self.registry = registry
+        if broker is None:
+            broker = ToolBroker(store, registry, authorizer=authorizer)
+        elif authorizer is not None:
+            broker.authorizer = authorizer
         self.broker = broker
-        self.candidates = CandidateManager(store)
+        self.candidates = CandidateManager(store, report_verifier=report_verifier)
         self.approval_provider = approval_provider
 
     # ------------------------------------------------------------------ runs
@@ -321,10 +328,12 @@ class Controller:
     def start_evaluation(self, candidate_id: str) -> CandidateProposal:
         return self.candidates.start_evaluation(candidate_id)
 
-    def freeze_protocol(self, gate: PromotionGate, evaluator_id: str) -> str:
-        return self.candidates.freeze_protocol(gate, evaluator_id)
+    def freeze_protocol(self, gate: PromotionGate, evaluator_id: str, **kwargs: Any) -> str:
+        return self.candidates.freeze_protocol(gate, evaluator_id, **kwargs)
 
-    def submit_evaluation_report(self, candidate_id: str, report: EvaluationReport) -> PromotionDecision:
+    def submit_evaluation_report(
+        self, candidate_id: str, report: EvaluationReport | Mapping[str, Any]
+    ) -> PromotionDecision:
         """Evaluator-owned entry point: applies the frozen gate and CAS."""
         return self.candidates.promote(candidate_id, report)
 

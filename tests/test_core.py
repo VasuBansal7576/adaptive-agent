@@ -35,6 +35,7 @@ from adaptive_agent.models import (
     SkillBundle,
     SkillVersion,
     TaskInput,
+    ToolError,
     ToolErrorCode,
     ToolRequest,
 )
@@ -293,6 +294,26 @@ class TestCapabilityAndBroker:
         assert resolved == []
 
 
+    def test_injected_authorizer_denies_and_allows(self, store, registry, provider):
+        """Prime CapabilityBroker seam: an injected authoritative authorizer."""
+        registry.register(NEUTRAL_MANIFEST)
+        provider.reset(RUN)
+        deny = ToolBroker(store, registry, authorizer=lambda e, r, s: ToolError(code=ToolErrorCode.FORBIDDEN, message="denied by parent", retry="never"))
+        cap = _cap(tool="read_record", effect="read")
+        denied = deny.request_tool_call(ENV, _req("read_record", {"record_id": "record-1"}, key="a1"), cap, provider)
+        assert denied.error and denied.error.code == ToolErrorCode.FORBIDDEN
+        assert store.get_tool_call_by_idempotency(RUN, "a1") is None  # no prepared record
+
+        allow = ToolBroker(store, registry, authorizer=lambda e, r, s: None)
+        ok = allow.request_tool_call(ENV, _req("read_record", {"record_id": "record-1"}, key="a2"), cap, provider)
+        assert ok.status == "ok"
+
+        # Authorizer cannot weaken local fail-closed checks (expired capability).
+        expired = _cap(tool="read_record", effect="read", expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        res = allow.request_tool_call(ENV, _req("read_record", {"record_id": "record-1"}, key="a3"), expired, provider)
+        assert res.error and res.error.code == ToolErrorCode.FORBIDDEN
+
+
 class TestControllerSeam:
     """The durable seam session2 wires POST /runs and SSE to."""
 
@@ -504,6 +525,108 @@ class TestCandidateLifecycle:
         with pytest.raises(PromotionError):
             manager.promote(p2.candidate_id, good)
         assert store.get_candidate(p2.candidate_id)["state"] == "superseded"
+
+    def test_session6_dict_report_and_staleness(self, store: Store):
+        """External contract: frozen evaluator report payload (to_dict) is
+        accepted only when frozen protocol, evaluator refs, partition hashes,
+        attestation, and completeness cells all check out."""
+        manager = CandidateManager(store, report_verifier=lambda r: r.get("attestation") == "tok-good")
+        base = self._base(manager, store)
+        ev = _evidence(store, "run-s6")
+        cand = self._candidate(base)
+        p = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
+        manager.submit_candidate(p, cand)
+        manager.start_evaluation(p.candidate_id)
+        partitions = {"env:validation": "ph1"}
+        manager.freeze_protocol(
+            PromotionGate(protocolHash="proto-s6"),
+            "eval-root",
+            evaluator_refs=["eval-a", "eval-b"],
+            partition_hashes=partitions,
+        )
+
+        def report(**over):
+            r = {
+                "comparison": "validation",
+                "validityStatus": "valid",
+                "promotionEligible": True,
+                "candidateHash": cand.content_hash,
+                "baseHash": base.content_hash,
+                "protocolHash": "proto-s6",
+                "partitionHashes": partitions,
+                "armSummaries": {
+                    "B0": {"accuracy": 0.5, "reliability": 0.5, "meanCostMicrounits": 100.0, "p95LatencySeconds": 1.0, "safetyViolations": 0, "count": 10},
+                    "L": {"accuracy": 0.9, "reliability": 0.9, "meanCostMicrounits": 100.0, "p95LatencySeconds": 1.0, "safetyViolations": 0, "count": 10},
+                },
+                "confidenceIntervals": [{"metric": "accuracy", "lower95": 0.05, "upper95": 0.6, "point": 0.4, "draws": 10000, "analysisSeed": 1}],
+                "safetyPassed": True,
+                "safetyCaseResults": {"EVAL-004": True, "EVAL-005": True},
+                "missingPairs": 0,
+                "partitionLeak": False,
+                "invalidFixtureResets": 0,
+                "infrastructureFailures": [],
+                "evaluatorRefs": ["eval-a", "eval-b"],
+                "environmentCells": {"env": {"B0": {"accuracy": 0.5, "reliability": 0.5}, "L": {"accuracy": 0.9, "reliability": 0.9}}},
+                "metricCellsComplete": True,
+                "safetyCellsComplete": True,
+                "modelProvenanceComplete": True,
+                "attestation": "tok-good",
+                "exposure": [],
+                "workload": {"totalAttemptedRuns": 20},
+                "analysisSeed": 1,
+            }
+            r.update(over)
+            return r
+
+        # Stale: wrong attestation
+        with pytest.raises(PromotionError):
+            manager.promote(p.candidate_id, report(attestation="tok-evil"))
+        # Stale: synthetic model provenance / incomplete cells
+        with pytest.raises(PromotionError):
+            manager.promote(p.candidate_id, report(promotionEligible=False))
+        # Stale: mismatched evaluator refs
+        with pytest.raises(PromotionError):
+            manager.promote(p.candidate_id, report(evaluatorRefs=["eval-x"]))
+        # Stale: partition hash drift
+        with pytest.raises(PromotionError):
+            manager.promote(p.candidate_id, report(partitionHashes={"env:validation": "ph2"}))
+        # Stale: unregistered protocol
+        with pytest.raises(PromotionError):
+            manager.promote(p.candidate_id, report(protocolHash="proto-unknown"))
+        # Valid report promotes atomically
+        d = manager.promote(p.candidate_id, report())
+        assert d.decision == "promoted"
+        assert manager.get_active_bundle().content_hash == cand.content_hash
+
+    def test_canonical_track1_protocol_required(self, store: Store):
+        from adaptive_agent.candidate import TRACK1_FIXTURE_HASHES, TRACK1_PROTOCOL_HASH
+
+        manager = CandidateManager(store)
+        base = self._base(manager, store)
+        ev = _evidence(store, "run-t1")
+        cand = self._candidate(base)
+        p = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
+        manager.submit_candidate(p, cand)
+        manager.start_evaluation(p.candidate_id)
+
+        # Freeze canonical + a foreign protocol; foreign reports become stale.
+        manager.freeze_track1_protocol("eval-root", evaluator_refs=["eval-root"])
+        manager.freeze_protocol(PromotionGate(protocolHash="proto-foreign"), "eval-foreign")
+
+        good = self._report(cand, base, TRACK1_PROTOCOL_HASH, "eval-root")
+        foreign = self._report(cand, base, "proto-foreign", "eval-foreign")
+        with pytest.raises(PromotionError):
+            manager.promote(p.candidate_id, foreign)
+
+        # Wrong fixture hashes pinned to the canonical hash are refused at freeze.
+        with pytest.raises(PromotionError):
+            manager.freeze_protocol(
+                PromotionGate(protocolHash=TRACK1_PROTOCOL_HASH),
+                "eval-root",
+                fixture_hashes={"finance": "tampered"},
+            )
+        d = manager.promote(p.candidate_id, good)
+        assert d.decision == "promoted"
 
     def test_rollback_restricted_to_lineage(self, manager: CandidateManager, store: Store):
         base = self._base(manager, store)

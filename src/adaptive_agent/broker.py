@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -168,12 +169,30 @@ def _error_result(call_id: str, tool_version: str, error: ToolError) -> ToolResu
     )
 
 
-class ToolBroker:
-    """Enforces policy, approvals, and idempotency for tool calls."""
+Authorizer = Callable[[str, ToolRequest, ToolSchema], ToolError | None]
 
-    def __init__(self, store: Store, registry: EnvironmentRegistry) -> None:
+
+class ToolBroker:
+    """Enforces policy, approvals, and idempotency for tool calls.
+
+    `authorizer` is an optional authoritative authorization callback injected by
+    the trusted parent (e.g. Prime's CapabilityBroker). It is consulted after
+    local capability and schema checks, before any prepared record exists.
+    Returning a ToolError denies the call (FORBIDDEN-shaped); returning None
+    allows dispatch to proceed through the remaining fail-closed checks. When no
+    authorizer is injected, all local checks still apply — the broker never
+    defaults to permissive.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        registry: EnvironmentRegistry,
+        authorizer: Authorizer | None = None,
+    ) -> None:
         self.store = store
         self.registry = registry
+        self.authorizer = authorizer
 
     # ------------------------------------------------------------------ approvals
     def issue_approval(
@@ -239,6 +258,12 @@ class ToolBroker:
                     retry="never",
                 ),
             )
+
+        # Injected authoritative authorizer (Prime CapabilityBroker seam).
+        if self.authorizer is not None:
+            auth_err = self.authorizer(env_id, request, schema)
+            if auth_err is not None:
+                return _error_result(request.call_id, schema.version, auth_err)
 
         # Budget
         if budget_remaining is not None and budget_remaining.get("tool_calls", 0) <= 0:
