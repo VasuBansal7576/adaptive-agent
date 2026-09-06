@@ -68,10 +68,20 @@ async function main() {
 
   // 4. create + launch a run. The durable runtime requires the goal to match a
   // registered task in the environment, so source goal/taskRef/modes from
-  // /environments/{id}/tasks; fall back to a synthetic goal only for the
-  // legacy plane path (which reports no tasks).
-  const environmentId = environments[0]?.environmentId ?? "neutral";
-  const tasks = await json(`/environments/${encodeURIComponent(environmentId)}/tasks`).catch(() => []);
+  // /environments/{id}/tasks. Prefer an environment that HAS registered tasks;
+  // arbitrary goals are rejected by design and never synthesized when the
+  // durable runtime is active.
+  const withTasks = await (async () => {
+    for (const env of environments) {
+      const tasks = await json(`/environments/${encodeURIComponent(env.environmentId)}/tasks`).catch(() => []);
+      if (Array.isArray(tasks) && tasks.length > 0) {
+        return { environmentId: env.environmentId, tasks };
+      }
+    }
+    return null;
+  })();
+  const environmentId = withTasks?.environmentId ?? environments[0]?.environmentId ?? "neutral";
+  const tasks = withTasks?.tasks ?? (await json(`/environments/${encodeURIComponent(environmentId)}/tasks`).catch(() => []));
   const modeFromTask = (task) => (Array.isArray(task?.executionModes) && task.executionModes.includes("dry_run") ? "dry_run" : task?.executionModes?.[0]);
   const task = Array.isArray(tasks) && tasks.length > 0 ? tasks[0] : null;
   // authoritative model ref comes from the server's own /run-options projection;
