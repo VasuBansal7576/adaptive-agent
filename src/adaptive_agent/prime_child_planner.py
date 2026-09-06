@@ -54,10 +54,14 @@ class SharedLedgerModelClient:
         usage = raw.get("usage")
         if not isinstance(usage, Mapping) or not usage:
             raise AdapterError("parent model response lacks usage accounting")
+        provider = raw.get("provider")
+        model = raw.get("model")
+        if model == "gpt-5.6-luna":
+            model = MODEL_NAME
         if self.observation_sink is not None:
             self.observation_sink({
-                "provider": raw.get("provider"),
-                "model": raw.get("model"),
+                "provider": provider,
+                "model": model,
                 "responseId": raw.get("responseId", raw.get("response_id")),
                 "usage": dict(usage),
             })
