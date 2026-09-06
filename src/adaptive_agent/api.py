@@ -341,6 +341,12 @@ class ControlPlane:
                 "model": {("model", "1", "m"), ("model-profile", "1", _hash("model-profile"))},
                 "budget": {("budget", "1", "b"), ("budget-default", "1", _hash("budget-default"))},
             })
+        # The configured defaults are trusted control-plane references even
+        # when test fixtures are disabled.  This keeps a restarted durable
+        # process aligned with the refs advertised by /run-options.
+        for kind, reference in (("model", self.default_model_ref), ("budget", self.default_budget_ref)):
+            if isinstance(reference, Mapping) and all(isinstance(reference.get(key), str) and reference.get(key) for key in ("id", "version", "sha256")):
+                self._trusted_refs[kind].add(tuple(reference[key] for key in ("id", "version", "sha256")))
 
     def trust_reference(self, kind: str, reference: Mapping[str, Any]) -> None:
         """Register a fully addressed trusted artifact/profile for this process."""
@@ -775,6 +781,9 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
                 "wallTimeSeconds": 90,
                 "costMicrounits": 100000,
                 "currency": "USD",
+                # The browser must submit this trusted reference verbatim when
+                # it does not provide an inline budget object.
+                "budgetRef": plane.default_budget_ref,
             },
         }
 
