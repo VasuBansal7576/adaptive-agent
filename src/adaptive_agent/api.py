@@ -1026,6 +1026,12 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
     def candidate_decision(candidate_id: str, payload: CandidateDecisionRequest) -> JsonObject:
         # Browser/operator requests cannot forge a trusted report. Decisions
         # remain queued until the evaluator integration calls the trusted method.
+        if runtime is not None:
+            if runtime.controller.get_candidate(candidate_id) is None:
+                raise HTTPException(status_code=404, detail="candidate or evaluation not found")
+            if runtime.controller.store.get_evaluation(payload.evaluation_id) is None:
+                raise HTTPException(status_code=404, detail="candidate or evaluation not found")
+            raise HTTPException(status_code=403, detail={"code": "FORBIDDEN", "message": "only the trusted evaluator may decide a candidate", "correlationId": uuid.uuid4().hex, "retry": "never"})
         with plane._lock:
             if candidate_id not in plane.candidates or payload.evaluation_id not in plane.evaluations:
                 raise HTTPException(status_code=404, detail="candidate or evaluation not found")
@@ -1033,6 +1039,8 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
 
     @app.get("/versions/active")
     def active_versions() -> list[JsonObject]:
+        if runtime is not None:
+            return runtime.active_versions()
         with plane._lock:
             return [dict(version) for version in plane.version_history]
 

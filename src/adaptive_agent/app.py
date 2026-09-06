@@ -155,14 +155,20 @@ class DurableRuntime:
             rows = conn.execute("SELECT candidate_json FROM candidates ORDER BY created_at").fetchall()
         for row in rows:
             try:
-                out.append(json.loads(row["candidate_json"]))
+                value = json.loads(row["candidate_json"])
+                if "candidate_id" in value:
+                    value["candidateId"] = value.pop("candidate_id")
+                out.append(value)
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
         return out
 
     def create_candidate(self, payload: Any) -> dict[str, Any]:
         adapter = CandidateManagerLearningAdapter(self.controller.store, self.controller.candidates, proposal_type=__import__("adaptive_agent.models", fromlist=["CandidateProposal"]).CandidateProposal, bundle_type=__import__("adaptive_agent.models", fromlist=["SkillBundle"]).SkillBundle, skill_type=__import__("adaptive_agent.models", fromlist=["SkillVersion"]).SkillVersion)
-        return dict(adapter.create_candidate(payload.model_dump(by_alias=True)))
+        value = dict(adapter.create_candidate(payload.model_dump(by_alias=True)))
+        if "candidate_id" in value:
+            value["candidateId"] = value.pop("candidate_id")
+        return value
 
     def queue_evaluation(self, payload: Any) -> dict[str, Any]:
         candidate = self.controller.get_candidate(payload.candidate_id)
@@ -184,6 +190,11 @@ class DurableRuntime:
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
         return out
+
+    def active_versions(self) -> list[dict[str, Any]]:
+        active = self.controller.store.get_active_bundle()
+        current = active.get("content_hash") if active else None
+        return [{"bundleHash": value, "state": "active" if value == current else "lineage"} for value in self.controller.store.list_active_lineage()]
 
     def rollback_candidate(self, candidate_id: str, reason: str) -> dict[str, Any]:
         candidate = self.controller.get_candidate(candidate_id)
