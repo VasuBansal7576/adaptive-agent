@@ -588,12 +588,21 @@ class ControlPlane:
             raise ValueError("model_observation is not a canonical evidence event; use model_response")
         if evidence_type not in {"model_response", "trusted_outcome"}:
             raise ValueError(f"unsupported evidence event type: {evidence_type}")
-        event = self._emit(run_id, "evidence", summary, json.dumps(dict(payload), sort_keys=True))
+        # Keep evaluator-owned evidence operator-visible without exposing
+        # arbitrary evaluator payload fields through the API projection.
+        visible_payload = dict(payload)
+        if evidence_type == "trusted_outcome":
+            visible_payload = {
+                key: payload[key]
+                for key in ("responseId", "runId", "taskId", "environmentId", "passed", "reliable", "safetyViolations")
+                if key in payload
+            }
+        event = self._emit(run_id, "evidence", summary, json.dumps(visible_payload, sort_keys=True))
         event["evidenceType"] = evidence_type
         event["eventType"] = evidence_type
         event["event_type"] = evidence_type
-        event["visibility"] = "evaluator_only" if evidence_type == "trusted_outcome" else "operator"
-        event["evidence"] = dict(payload)
+        event["visibility"] = "operator"
+        event["evidence"] = visible_payload
         return event
 
     @staticmethod

@@ -226,6 +226,47 @@ def test_register_create_and_live_lifecycle():
     assert model_evidence["imageDigest"] == "image-unpinned"
 
 
+def test_control_plane_trusted_outcome_is_operator_visible_and_redacted():
+    plane = ControlPlane(model_runner=model_runner, evaluator=evaluator)
+    api = TestClient(create_app(plane), base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    api.post("/environments/register", json=manifest())
+    run = api.post(
+        "/runs", json={"goal": "read", "environmentId": "neutral", "idempotencyKey": "operator-outcome"}
+    ).json()
+
+    plane._emit_evidence(
+        run["runId"],
+        "trusted_outcome",
+        "Trusted evaluator recorded outcome.",
+        {
+            "responseId": "resp-test-1",
+            "runId": run["runId"],
+            "taskId": "task-private",
+            "environmentId": "neutral",
+            "passed": True,
+            "reliable": True,
+            "safetyViolations": 0,
+            "hiddenEvaluatorAnswer": "must-not-leak",
+        },
+    )
+
+    response = api.get(f"/runs/{run['runId']}/evidence")
+    assert response.status_code == 200
+    outcome = next(event for event in response.json() if event.get("evidenceType") == "trusted_outcome")
+    assert outcome["visibility"] == "operator"
+    assert outcome["evidence"] == {
+        "responseId": "resp-test-1",
+        "runId": run["runId"],
+        "taskId": "task-private",
+        "environmentId": "neutral",
+        "passed": True,
+        "reliable": True,
+        "safetyViolations": 0,
+    }
+    assert "hiddenEvaluatorAnswer" not in response.text
+
+
 def test_model_token_default_is_shared_and_practical():
     api = client()
     assert api.get("/run-options").json()["budgetDefaults"]["modelTokens"] == DEFAULT_MODEL_TOKENS == 20_000
