@@ -248,7 +248,8 @@ class DefaultExperimentStageRunner:
         self.protocol = protocol
         self.frozen_protocol = protocol.start_candidate_generation()
         self.inputs = _frozen_inputs(self.frozen_protocol)
-        self.base_bundle = _active_bundle(runtime)
+        bound_base_hash = getattr(runtime, "_evaluation_base_bundle_hash", None)
+        self.base_bundle = _load_bundle(runtime, bound_base_hash) if isinstance(bound_base_hash, str) and bound_base_hash else _active_bundle(runtime)
         self.base_hash = _bundle_hash(self.base_bundle)
         self.pins = _pins(runtime, protocol, self.inputs, self.base_hash)
         self._candidate_id: str | None = None
@@ -304,7 +305,7 @@ class DefaultExperimentStageRunner:
         ):
             raise ExperimentRuntimeError("lifecycle receipt evidence references are incomplete")
         receipt_proxy = value.get("costBasis") == "nominal_budget_proxy" and value.get("billingStatus") == "unknown"
-        from adaptive_agent.evaluation import Arm, BudgetSpec, ModelProvenance, Partition, Provenance, RunObservation
+        from adaptive_agent.evaluation import Arm, BudgetSpec, ModelProvenance, Partition, Provenance, RunObservation, sha256_json
 
         frozen_inputs = _protocol_inputs(self.protocol)
         budget_value = _mapping(frozen_inputs["runBudget"], "frozen run budget")
@@ -419,15 +420,21 @@ class DefaultExperimentStageRunner:
             versions = model_payload.get("versionRefs") or accounting.get("versionRefs")
             if not isinstance(versions, Mapping):
                 raise ExperimentRuntimeError(f"observation run {run_id!r} lacks frozen config hashes")
+            package = _package(self.runtime, environment_id)
+            infrastructure_failure = outcome_meta.get("infrastructureFailure")
+            if not isinstance(infrastructure_failure, str):
+                infrastructure_failure = None
+            durable_status = str(run.get("status", "complete"))
+            observation_status = "complete" if durable_status in {"succeeded", "failed"} and infrastructure_failure is None else durable_status
             observations.append(RunObservation(
                 task_id, environment_id, Partition(partition), seed, Arm(arm),
                 passed,
                 reliable,
                 safety_violations,
                 int(cost), float(duration),
-                status=str(run.get("status", "complete")),
+                status=observation_status,
                 fixture_reset_ok=fixture_reset_ok,
-                infrastructure_failure=outcome_meta.get("infrastructureFailure") if isinstance(outcome_meta.get("infrastructureFailure"), str) else None,
+                infrastructure_failure=infrastructure_failure,
                 provenance=Provenance.DETERMINISTIC_SIMULATION,
                 model_provenance=ModelProvenance.REAL_MODEL,
                 model_profile=str(model_payload.get("modelProfile", frozen_inputs["modelProfile"])),
@@ -437,7 +444,14 @@ class DefaultExperimentStageRunner:
                 accounting_ref=accounting_ref,
                 evidence_ref=model_row.get("evidence_id"),
                 outcome_ref=outcome_row.get("evidence_id"),
-                config_hashes=dict(versions),
+                config_hashes={
+                    "model": sha256_json({"profile": frozen_inputs["modelProfile"], "provider": frozen_inputs["provider"]}),
+                    "planner": str(frozen_inputs["corePlannerHash"]),
+                    "budget": sha256_json(frozen_inputs["runBudget"]),
+                    "policy": sha256_json(package.manifest.policy_ref),
+                    "schema": sha256_json(package.manifest.tool_schemas),
+                    "image": str(frozen_inputs["imageDigest"]),
+                },
                 run_id=run_id,
                 bundle_hash=bundle_hash,
             ))
@@ -775,6 +789,7 @@ class DefaultExperimentStageRunner:
         nominal_missing = False
         cost = 0.0
         cost_seen = False
+        cost_missing = False
         billing_unknown = False
         rows = self.runtime.controller.store.list_evidence(run_id)
         wanted = set(refs)
@@ -785,13 +800,22 @@ class DefaultExperimentStageRunner:
             observed += 1
             source = row.get("source_ref")
             if not isinstance(source, str):
+                wall_missing = True
+                nominal_missing = True
+                cost_missing = True
                 continue
             try:
                 source_data = json.loads(source)
                 payload = self.runtime.controller.store.get_artifact(source_data["sha256"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                wall_missing = True
+                nominal_missing = True
+                cost_missing = True
                 continue
             if not isinstance(payload, Mapping):
+                wall_missing = True
+                nominal_missing = True
+                cost_missing = True
                 continue
             duration = payload.get("wallSeconds", payload.get("durationSeconds", payload.get("inferenceDurationSeconds")))
             if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
@@ -809,6 +833,8 @@ class DefaultExperimentStageRunner:
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 cost += float(value)
                 cost_seen = True
+            else:
+                cost_missing = True
             economic = payload.get("economicCost")
             billing_unknown = billing_unknown or isinstance(economic, Mapping) and economic.get("status") == "unknown"
             billing_unknown = billing_unknown or payload.get("economicCostStatus") == "unknown"
@@ -825,11 +851,24 @@ class DefaultExperimentStageRunner:
             if not cost_seen and isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 cost = float(value)
                 cost_seen = True
-        complete = (observed == 0 and wall_seen and (nominal_seen or cost_seen)) or (observed == len(wanted) and not wall_missing and not nominal_missing)
+        # Measured economic cost is an independently complete accounting
+        # signal. Missing nominal USD usage must not downgrade a receipt
+        # whose provider supplied measured cost, since nominal usage is not
+        # the billing contract.
+        measured_complete = cost_seen and not cost_missing and not billing_unknown
+        nominal_complete = nominal_seen and not nominal_missing
+        complete = (observed == 0 and not wanted and wall_seen and (nominal_seen or cost_seen)) or (
+            observed == len(wanted)
+            and not wall_missing
+            and (
+                measured_complete
+                or nominal_complete
+            )
+        )
         output: dict[str, Any] = {"wallSeconds": wall if wall_seen else 0.0, "accountingComplete": complete}
-        if cost_seen and not billing_unknown and complete:
+        if measured_complete and complete:
             output["costMicrounits"] = int(round(cost))
-        elif nominal_seen and not nominal_missing:
+        elif nominal_complete and complete:
             output["nominalCostUsd"] = nominal
         return output
 

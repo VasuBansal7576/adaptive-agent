@@ -107,6 +107,7 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
 
     run_id = f"evaluation-run-{index}"
     response_id = f"evaluation-response-{index}"
+    bundle_hash = "evaluation-bundle-hash"
     version_refs = {
         "policy": package.manifest.policy_ref.sha256,
         "schema": sha256_json(package.manifest.tool_schemas),
@@ -117,11 +118,17 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
     usage = {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
     response = {
         "responseId": response_id,
+        "runId": run_id,
+        "taskId": task.task_id,
+        "environmentId": package.environment_id,
         "provider": frozen.inputs["provider"],
         "modelProfile": frozen.inputs["modelProfile"],
         "status": "complete",
         "usage": usage,
         "versionRefs": version_refs,
+        "arm": arm.value,
+        "seed": seed,
+        "bundleHash": bundle_hash,
     }
     response_ref = store.put_artifact(response)
     accounting = {
@@ -133,6 +140,9 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
         "versionRefs": version_refs,
         "costMicrounits": 1,
         "durationSeconds": 1.0,
+        "arm": arm.value,
+        "seed": seed,
+        "bundleHash": bundle_hash,
     }
     accounting_ref = store.put_artifact(accounting)
     outcome = {
@@ -143,6 +153,9 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
         "passed": True,
         "reliable": True,
         "safetyViolations": 0,
+        "arm": arm.value,
+        "seed": seed,
+        "bundleHash": bundle_hash,
     }
     outcome_ref = store.put_artifact(outcome)
     store.save_run(
@@ -155,16 +168,17 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
             "idempotency_key": run_id,
             "last_event_sequence": 2,
             "created_at": "now",
-            "run_json": "{}",
+            "run_json": json.dumps({"arm": arm.value, "seed": seed, "bundleHash": bundle_hash, "armBundles": {arm.value: bundle_hash}}),
         },
     )
+    store.save_bundle("bundle-active", None, bundle_hash, "{}")
     store.append_evidence(
         f"evaluation-evidence-{index}",
         {"run_id": run_id, "sequence": 1, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0},
     )
     store.append_evidence(
         f"evaluation-outcome-{index}",
-        {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "operator", "redacted": 0},
+        {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0},
     )
     config_hashes = {
         "model": sha256_json({"profile": frozen.inputs["modelProfile"], "provider": frozen.inputs["provider"]}),
@@ -195,6 +209,7 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
         outcome_ref=f"evaluation-outcome-{index}",
         config_hashes=config_hashes,
         run_id=run_id,
+        bundle_hash=bundle_hash,
     )
 
 
@@ -676,6 +691,25 @@ def test_runtime_binds_default_stage_runner_and_clean_pins(monkeypatch, tmp_path
     assert runtime.experiment_stage_runner is None
     runtime.run_experiment_stage(cell_key="bootstrap", context={"stage": "bootstrap", "attempt": 0})
     assert runtime.experiment_stage_runner is not None
+
+
+def test_runtime_persists_phase_bindings_for_gate_and_fresh_publication(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    protocol = EvaluationProtocol()
+    protocol.freeze(runtime.packages)
+    active = runtime.controller.get_active_bundle()
+    assert active is not None
+
+    runtime.build_evaluation_job(protocol, {Arm.B0: active})
+    frozen = runtime.controller.store.get_frozen_protocol(protocol.start_candidate_generation().protocol_hash)
+    assert frozen is not None
+    gate_partitions = json.loads(frozen["partition_hashes_json"])
+    assert set(gate_partitions) == {f"{name}:validation" for name in protocol.known_environments}
+    durable_inputs = json.loads(frozen["protocol_inputs_json"])
+    assert durable_inputs["partitionHashes"] == protocol.start_candidate_generation().partition_hashes
+    assert json.loads(frozen["phase_evaluator_refs_json"])["validation"]
+    assert json.loads(frozen["phase_evaluator_refs_json"])["final"]
 
 
 def test_runtime_strict_observation_verifier_delegates_to_durable_adapter(tmp_path, monkeypatch):

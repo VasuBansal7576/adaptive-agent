@@ -189,6 +189,16 @@ class DurableRuntime:
         }
         self._reload_registered_environments()
 
+    def _get_or_create_experiment_stage_runner(self) -> Any:
+        """Return the runtime-owned runner, lazily restoring it after restart."""
+        callback = self.experiment_stage_runner
+        if callback is None and self._evaluation_protocol is not None:
+            from adaptive_agent.experiment_runtime import DefaultExperimentStageRunner
+
+            callback = DefaultExperimentStageRunner(self, self._evaluation_protocol)
+            self.experiment_stage_runner = callback
+        return callback
+
     def run_experiment_stage(self, *, cell_key: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
         """Run one lifecycle cell through the runtime-owned implementation.
 
@@ -196,12 +206,7 @@ class DurableRuntime:
         complete experiment lifecycle.  A missing binding fails closed instead
         of manufacturing a receipt from workload arithmetic.
         """
-        callback = self.experiment_stage_runner
-        if callback is None and self._evaluation_protocol is not None:
-            from adaptive_agent.experiment_runtime import DefaultExperimentStageRunner
-
-            callback = DefaultExperimentStageRunner(self, self._evaluation_protocol)
-            self.experiment_stage_runner = callback
+        callback = self._get_or_create_experiment_stage_runner()
         if not callable(callback):
             raise LearningRuntimeError("runtime does not have a trusted experiment stage runner")
         result = callback(cell_key=cell_key, context=dict(context))
@@ -581,19 +586,11 @@ class DurableRuntime:
             persisted["run_json"] = json.dumps(run_payload, sort_keys=True)
             self.controller.store.save_run(run.run_id, persisted)
 
-        model_client = self.learning_model_client
-        if model_client is None and self.model_runner is not None:
-            runner = self.model_runner
-            if callable(getattr(runner, "invoke", None)):
-                # A provider client can be injected directly.  Keeping this
-                # object intact preserves its own response/accounting seam.
-                model_client = runner
-            elif callable(runner):
-                class RunnerClient:
-                    def invoke(self, *, goal: str, environment: Mapping[str, Any], **_: Any) -> Mapping[str, Any]:
-                        invocation = runner(goal=goal, environment=dict(environment), emit=lambda *_args: None)
-                        return {"text": invocation.text, "provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)}
-                model_client = RunnerClient()
+        # Prefer the explicit evaluation runner, then use the injected client
+        # for benchmark-only Prime executions that have no separate runner.
+        model_client = self.model_runner if self.model_runner is not None and callable(getattr(self.model_runner, "invoke", None)) else None
+        if model_client is None and self.learning_model_client is not None and callable(getattr(self.learning_model_client, "invoke", None)):
+            model_client = self.learning_model_client
         # launch() owns claim, reset, Prime Docker, broker budget, retries, and
         # trusted outcome persistence for both API and benchmark executions.
         core_hash = str(inputs.get("corePlannerHash", self.core_planner_hash))
@@ -620,7 +617,16 @@ class DurableRuntime:
             outcome_meta = {}
         reliable = bool(outcome_meta.get("reliable", passed)) if isinstance(outcome_meta, Mapping) else passed
         safety_violations = int(outcome_meta.get("safetyViolations", 0) or 0) if isinstance(outcome_meta, Mapping) else 0
-        observation_kwargs = {"provenance": Provenance.DETERMINISTIC_SIMULATION, "model_provenance": ModelProvenance.REAL_MODEL, "model_profile": model_name, "core_planner_hash": core_hash, "budget": budget, "response_id": model_payload.get("responseId"), "accounting_ref": accounting_ref, "evidence_ref": model_row["evidence_id"], "outcome_ref": outcome_ref, "config_hashes": {"model": sha256_json({"profile": model_name, "provider": provider_name}), "planner": core_hash, "budget": sha256_json(budget_value), "policy": sha256_json(package.manifest.policy_ref), "schema": sha256_json(package.manifest.tool_schemas), "image": image_digest}, "run_id": run.run_id}
+        version_refs = model_payload.get("versionRefs") if isinstance(model_payload, Mapping) else None
+        if not isinstance(version_refs, Mapping):
+            raise LearningRuntimeError("evaluation model receipt lacks frozen config hashes")
+        policy_ref = package.manifest.policy_ref
+        if callable(getattr(policy_ref, "model_dump", None)):
+            policy_ref = policy_ref.model_dump(mode="json", by_alias=True)
+        schemas = package.manifest.tool_schemas
+        if schemas and callable(getattr(schemas[0], "model_dump", None)):
+            schemas = tuple(schema.model_dump(mode="json", by_alias=True) for schema in schemas)
+        observation_kwargs = {"provenance": Provenance.DETERMINISTIC_SIMULATION, "model_provenance": ModelProvenance.REAL_MODEL, "model_profile": model_name, "core_planner_hash": core_hash, "budget": budget, "response_id": model_payload.get("responseId"), "accounting_ref": accounting_ref, "evidence_ref": model_row["evidence_id"], "outcome_ref": outcome_ref, "config_hashes": {"model": sha256_json({"profile": inputs.get("modelProfile", model_name), "provider": inputs.get("provider", provider_name)}), "planner": str(inputs.get("corePlannerHash", core_hash)), "budget": sha256_json(inputs.get("runBudget", budget_value)), "policy": sha256_json(policy_ref), "schema": sha256_json(schemas), "image": str(inputs.get("imageDigest", image_digest))}, "run_id": run.run_id}
         # Session-6's evaluator model includes bundle_hash; keep this worker
         # compatible with the pre-merge evaluator while exposing it whenever
         # the authoritative type is present.
@@ -701,12 +707,14 @@ class DurableRuntime:
                 raise LearningRuntimeError(f"evaluation arm bundle {arm_name!r} has no content hash")
             arm_hashes[arm_name] = content_hash
         self._evaluation_arm_bundles = arm_hashes
+        self._evaluation_base_bundle_hash = arm_hashes["B0"]
+        base = next(value for key, value in selected.items() if getattr(key, "value", str(key)) == "B0")
         return ResumableEvaluationDriver(
             self.controller.store,
             protocol,
             self.packages,
             self.execute_evaluation_task,
-            active,
+            base,
             arm_bundles=selected,
             owner_id=owner_id,
         )
@@ -721,6 +729,7 @@ class DurableRuntime:
         """
         from adaptive_agent.evaluation import Arm
         from adaptive_agent.evaluation_job import build_evaluation_job
+        from adaptive_agent.models import PromotionGate
 
         self._evaluation_protocol = protocol
 
@@ -738,6 +747,43 @@ class DurableRuntime:
                 raise LearningRuntimeError(f"evaluation arm bundle {arm_name!r} has no content hash")
             arm_hashes[arm_name] = content_hash
         self._evaluation_arm_bundles = arm_hashes
+        self._evaluation_base_bundle_hash = arm_hashes[Arm.B0.value]
+        frozen = protocol.start_candidate_generation()
+        evaluator_refs = sorted({
+            self.packages[name].manifest.evaluator_ref.id
+            for name in protocol.known_environments
+        })
+        phase_environments = {
+            "validation": tuple(protocol.known_environments),
+            "final": (*protocol.known_environments, protocol.sealed_environment),
+        }
+        phase_evaluator_refs = {
+            phase: sorted(self.packages[name].manifest.evaluator_ref.id for name in environments)
+            for phase, environments in phase_environments.items()
+        }
+        thresholds = dict(protocol.thresholds)
+        if self.controller.store.get_frozen_protocol(frozen.protocol_hash) is None:
+            self.controller.candidates.freeze_protocol(
+                PromotionGate(
+                    protocolHash=frozen.protocol_hash,
+                    minBalancedAccuracyGain=float(thresholds["accuracy_gain"]),
+                    maxCostRatio=float(thresholds["cost_ratio"]),
+                    maxLatencyRatio=float(thresholds["latency_ratio"]),
+                ),
+                evaluator_id="|".join(evaluator_refs),
+                evaluator_refs=evaluator_refs,
+                fixture_hashes=dict(frozen.fixture_hashes),
+                partition_hashes={
+                    f"{name}:validation": frozen.partition_hashes[f"{name}:validation"]
+                    for name in protocol.known_environments
+                },
+                protocol_inputs=dict(frozen.inputs),
+                phase_evaluator_refs=phase_evaluator_refs,
+            )
+        # CandidateManager consumes the evaluator's serialized report contract.
+        # Bind its verifier to the same durable attestation ledger used by the
+        # runtime's evaluation read path before any promotion decision runs.
+        self.controller.candidates.report_verifier = self._verify_promotion_report
         return build_evaluation_job(
             self.controller.store,
             self.controller,
@@ -748,30 +794,83 @@ class DurableRuntime:
             total_budget_microunits=total_budget_microunits,
         )
 
-    def _verify_evaluation_report(self, report: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
-        """Verify a serialized report against the durable evaluator ledger."""
-        protocol = self._evaluation_protocol
-        if protocol is None or not isinstance(report, Mapping):
+    def _verify_promotion_report(self, report: Mapping[str, Any]) -> bool:
+        """Verify a candidate report against frozen inputs and the durable ledger."""
+        if not isinstance(report, Mapping):
             return False
         try:
-            frozen = protocol.start_candidate_generation()
-            protocol_hash = frozen.protocol_hash
+            protocol_hash = report.get("protocolHash")
+            if not isinstance(protocol_hash, str) or not protocol_hash:
+                return False
+            frozen = self.controller.store.get_frozen_protocol(protocol_hash)
+            if frozen is None:
+                return False
+            inputs = json.loads(frozen["protocol_inputs_json"] or "{}")
+            known_value = inputs.get("knownEnvironments")
+            if not isinstance(known_value, list) or not known_value or any(not isinstance(name, str) or not name for name in known_value):
+                return False
+            known = tuple(known_value)
+            validation_key = f"{known[0]}:validation"
+            partition_hashes = inputs.get("partitionHashes")
+            if not isinstance(partition_hashes, Mapping):
+                return False
+        except (AttributeError, IndexError, KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        row = {
+            "protocol_hash": protocol_hash,
+            "candidate_hash": report.get("candidateHash"),
+            "base_hash": report.get("baseHash"),
+            "partition_ref": {"id": "validation", "sha256": partition_hashes[validation_key]},
+        }
+        return self._verify_evaluation_report(report, row)
+
+    def _verify_evaluation_report(self, report: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
+        """Verify a serialized report against the durable evaluator ledger."""
+        if not isinstance(report, Mapping):
+            return False
+        try:
+            protocol_hash = row.get("protocol_hash")
+            if not isinstance(protocol_hash, str) or not protocol_hash:
+                return False
+            frozen = self.controller.store.get_frozen_protocol(protocol_hash)
+            if frozen is None:
+                return False
             if row.get("protocol_hash") != protocol_hash or report.get("protocolHash") != protocol_hash:
                 return False
             if report.get("candidateHash") != row.get("candidate_hash") or report.get("baseHash") != row.get("base_hash"):
                 return False
             if report.get("validityStatus") != "valid":
                 return False
-            environments = tuple(getattr(protocol, "known_environments", ()))
-            expected_partitions = {f"{name}:validation": frozen.partition_hashes[f"{name}:validation"] for name in environments}
-            if report.get("partitionHashes") != expected_partitions:
-                return False
             partition_ref = row.get("partition_ref")
             if isinstance(partition_ref, str):
                 partition_ref = json.loads(partition_ref)
-            if not isinstance(partition_ref, Mapping) or partition_ref.get("id") != "validation" or partition_ref.get("sha256") != next(iter(expected_partitions.values())):
+            if not isinstance(partition_ref, Mapping) or partition_ref.get("id") not in {"validation", "final"}:
                 return False
-            expected_refs = tuple(sorted({self.packages[name].manifest.evaluator_ref.id for name in environments if name in self.packages}))
+            phase = str(partition_ref["id"])
+            inputs = json.loads(frozen["protocol_inputs_json"] or "{}")
+            known_value = inputs.get("knownEnvironments")
+            sealed = inputs.get("sealedEnvironment")
+            if not isinstance(known_value, list) or not known_value or any(not isinstance(name, str) or not name for name in known_value) or not isinstance(sealed, str) or not sealed:
+                return False
+            known = tuple(known_value)
+            environments = known if phase == "validation" else (*known, sealed)
+            frozen_partitions = inputs.get("partitionHashes")
+            if not isinstance(frozen_partitions, Mapping):
+                return False
+            expected_keys = tuple(f"{name}:{phase}" for name in environments)
+            expected_partitions = {key: frozen_partitions[key] for key in expected_keys}
+            if not expected_partitions:
+                return False
+            if report.get("partitionHashes") != expected_partitions:
+                return False
+            first_partition = next(iter(expected_partitions))
+            if partition_ref.get("sha256") != expected_partitions[first_partition]:
+                return False
+            phase_refs = json.loads(frozen["phase_evaluator_refs_json"] or "{}")
+            phase_ref_values = phase_refs.get(phase)
+            if not isinstance(phase_ref_values, list) or any(not isinstance(value, str) or not value for value in phase_ref_values):
+                return False
+            expected_refs = tuple(sorted(phase_ref_values))
             refs = report.get("evaluatorRefs")
             if not isinstance(refs, (list, tuple)) or tuple(sorted(str(value) for value in refs)) != expected_refs:
                 return False
@@ -838,6 +937,12 @@ class DurableRuntime:
             if "validity" in value and "validityStatus" not in value:
                 value["validityStatus"] = value.pop("validity")
             canonical = bool(row is not None and self._verify_evaluation_report(value, row))
+            if "candidateId" not in value:
+                candidate_hash = value.get("candidateHash")
+                if isinstance(candidate_hash, str):
+                    candidate = self.controller.store.get_candidate_by_bundle_hash(candidate_hash)
+                    if candidate is not None:
+                        value["candidateId"] = candidate.get("candidate_id")
             raw_state = value.get("state")
             if raw_state in {"completed", "complete", "decided", "failed", "error", "incomplete"}:
                 value["state"] = "valid" if canonical else "invalid"
@@ -855,6 +960,16 @@ class DurableRuntime:
                         value["reason"] = error
                     else:
                         value["reason"] = value["trustReason"]
+            if isinstance(payload.get("comparison"), str) and payload["comparison"] in {"validation", "final"}:
+                safe_keys = {
+                    "comparison", "validityStatus", "promotionEligible", "candidateHash", "baseHash", "protocolHash",
+                    "armSummaries", "confidenceIntervals", "safetyPassed", "missingPairs", "metricCellsComplete",
+                    "safetyCellsComplete", "modelProvenanceComplete", "infrastructureFailures", "analysisSeed",
+                    "nominalCostUsd", "actualInputTokens", "actualOutputTokens", "wallDurationSeconds", "billingBasis",
+                }
+                value["report"] = {key: value[key] for key in safe_keys if key in value}
+                for key in ("attestation", "exposure", "safetyProbeOutputs", "environmentCells", "workload"):
+                    value.pop(key, None)
             return value
 
         for row in self.controller.store.list_evaluations():
@@ -1205,6 +1320,9 @@ class DurableRuntime:
         nominal_cost_usd = sum(nominal_values) if nominal_values else None
         nominal_coverage = {"knownReceipts": len(nominal_values), "totalReceipts": len(all_receipts)}
         nominal_status = "complete" if nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"] else "partial"
+        accounting_cost = aggregate_cost if explicit_cost else (
+            round(nominal_cost_usd * 1_000_000) if nominal_status == "complete" and nominal_cost_usd is not None else None
+        )
         nominal_proxy_fields = {"costBasis": "nominal_budget_proxy", "billingStatus": "unknown"} if not explicit_cost and nominal_status == "complete" else {}
         usage = dict(canonical_usage(evidence.get("usage")))
         if all_receipts:
@@ -1212,7 +1330,7 @@ class DurableRuntime:
         frozen_core_planner = evidence.get("corePlannerHash") if isinstance(evidence.get("corePlannerHash"), str) and evidence.get("corePlannerHash") else self.core_planner_hash
         frozen_image = evidence.get("imageDigest") if isinstance(evidence.get("imageDigest"), str) and evidence.get("imageDigest") else self.image_digest
         version_refs = {
-            "policy": run.policy_ref.sha256,
+            "policy": package.manifest.policy_ref.sha256,
             "schema": sha256_json(package.manifest.tool_schemas),
             "planner": frozen_core_planner,
             "budget": run.budget_ref.sha256,
@@ -1276,7 +1394,7 @@ class DurableRuntime:
             "seed": seed,
             "bundleHash": bundle_hash,
             "versionRefs": version_refs,
-            "costMicrounits": aggregate_cost if explicit_cost else None,
+            "costMicrounits": accounting_cost,
             "economicCost": {"status": economic_status, "microunits": aggregate_cost if explicit_cost and not aggregate_cost_unknown else None, "coverage": {"knownReceipts": sum(1 for item in all_receipts if "costMicrounits" in item), "totalReceipts": len(all_receipts)}},
             "nominalCostUsd": nominal_cost_usd,
             "nominalCostStatus": nominal_status,
@@ -1364,6 +1482,10 @@ class DurableRuntime:
                         "passed": bool(outcome.passed),
                         "reliable": bool(metadata.get("reliable", outcome.passed)),
                         "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
+                        **({"arm": metadata["arm"]} if isinstance(metadata.get("arm"), str) else {}),
+                        **({"seed": metadata["seed"]} if isinstance(metadata.get("seed"), int) and not isinstance(metadata.get("seed"), bool) else {}),
+                        **({"bundleHash": metadata["bundleHash"]} if isinstance(metadata.get("bundleHash"), str) else {}),
+                        **({"goal": metadata["goal"]} if isinstance(metadata.get("goal"), str) else {}),
                     },
                 )
         return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
@@ -1490,10 +1612,11 @@ class DurableRuntime:
                 def act(self, _ctx: Any) -> None:
                     nonlocal invocation
                     invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
-                    runtime._record_model_response(run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest})
+                    runtime._record_model_response(run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest, **({"nominalCostUsd": invocation.nominalCostUsd} if hasattr(invocation, "nominalCostUsd") else {}), **({"costMicrounits": invocation.costMicrounits} if hasattr(invocation, "costMicrounits") else ({"costMicrounits": invocation.cost_microunits} if hasattr(invocation, "cost_microunits") else {})), **({"economicCostStatus": invocation.economicCostStatus} if hasattr(invocation, "economicCostStatus") else {})})
             def evaluate() -> DurableOutcome:
                 outcome = runtime._invoke_evaluator(run_id=run_id, goal=task.goal, model_output=invocation.text, environment=runtime._planner_environment(package, run_id)) if invocation is not None else None
                 outcome = outcome or {"passed": False}
+                outcome = {**outcome, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal}
                 return DurableOutcome(runId=run_id, passed=bool(outcome.get("passed") is True), metadata=outcome)
             self._execute_run(run_id, package.environment_id, provider, DirectDriver(), evaluate)
             self._cancel_events.pop(run_id, None)
@@ -1611,9 +1734,9 @@ class DurableRuntime:
                     score = float(evaluated.get("score", 1.0 if passed else 0.0))
                 except (TypeError, ValueError):
                     score = 1.0 if passed else 0.0
-                return DurableOutcome(runId=run_id, passed=passed, score=score, metadata=evaluated)
+                return DurableOutcome(runId=run_id, passed=passed, score=score, metadata={**evaluated, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal})
             fixture = package.evaluate(task.task_id, provider.session)
-            return DurableOutcome(runId=run_id, passed=fixture.passed, score=1.0 if fixture.passed else 0.0, metadata={"reason": fixture.reason, "evaluatorVersion": fixture.evaluator_version, "plannerStatus": result.status})
+            return DurableOutcome(runId=run_id, passed=fixture.passed, score=1.0 if fixture.passed else 0.0, metadata={"reason": fixture.reason, "evaluatorVersion": fixture.evaluator_version, "plannerStatus": result.status, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal})
         try:
             self._execute_run(run_id, package.environment_id, provider, driver, evaluate)
         finally:
@@ -1666,6 +1789,18 @@ def _seed_durable_stack(plane: ControlPlane, store_dir: Path) -> tuple[Controlle
         # allocated only by the frozen evaluation protocol, never registered as
         # operator training tasks.
         if not public_tasks:
+            registry.register(DurableManifest(
+                schemaVersion=1,
+                environmentId=manifest.environment_id,
+                version=manifest.version,
+                docs=[ArtifactRef.model_validate(ref.to_dict()) for ref in manifest.docs],
+                toolSchemas=[DurableTool.model_validate(tool.to_dict()) for tool in manifest.tool_schemas],
+                policyRef=ArtifactRef.model_validate(manifest.policy_ref.to_dict()),
+                evaluatorRef=ArtifactRef.model_validate(manifest.evaluator_ref.to_dict()),
+                resetRef=ArtifactRef.model_validate(manifest.reset_ref.to_dict()),
+                executionModes=list(manifest.execution_modes),
+                capabilities=list(manifest.capabilities),
+            ))
             continue
         for kind, ref in (("policy", manifest.policy_ref), ("evaluator", manifest.evaluator_ref), ("reset", manifest.reset_ref)):
             plane.trust_reference(kind, ref.to_dict())

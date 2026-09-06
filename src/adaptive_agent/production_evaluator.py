@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 MODEL_TOKENS = 20_000
@@ -88,8 +88,8 @@ def _require_bound_real_receipt(source_dir: str, run_id: str) -> None:
     if run is None or run.get("status") != "succeeded":
         raise RuntimeError(f"bound source run is not a succeeded durable run: {run_id}")
     evidence = source_store.list_evidence(run_id)
-    model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("trust_class") in {"broker", "system"} and row.get("visibility") in {"operator", "evaluator_only"}]
-    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("trust_class") == "evaluator" and row.get("visibility") in {"operator", "evaluator_only"}]
+    model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("trust_class") in {"broker", "system"} and row.get("visibility") == "operator"]
+    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("trust_class") == "evaluator" and row.get("visibility") == "evaluator_only"]
     if not model or not trusted:
         raise RuntimeError(
             f"bound source run lacks canonical model/trusted outcome evidence: {run_id}"
@@ -160,14 +160,37 @@ def _require_pin(name: str, value: str, *, image: bool = False) -> str:
 
 def _persist_or_verify_frozen(store: Any, frozen: Any, *, initialize: bool) -> None:
     payload = frozen.to_dict()
-    existing = store.get_frozen_protocol(frozen.protocol_hash)
-    if initialize:
-        if existing is not None:
-            raise RuntimeError("initialization refuses an existing frozen protocol")
-        store.save_frozen_protocol(frozen.protocol_hash, json.dumps(payload, sort_keys=True), "production-evaluator")
-        return
-    if existing is None or json.loads(existing.get("gate_json", "{}")) != payload:
-        raise RuntimeError("resume frozen protocol pins do not match")
+    encoded = json.dumps(payload, sort_keys=True)
+    with store.connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS evaluation_protocol_bindings (protocol_hash TEXT PRIMARY KEY, protocol_json TEXT NOT NULL)")
+        existing = conn.execute("SELECT protocol_json FROM evaluation_protocol_bindings WHERE protocol_hash = ?", (frozen.protocol_hash,)).fetchone()
+        if initialize:
+            if existing is not None:
+                raise RuntimeError("initialization refuses an existing frozen protocol")
+            conn.execute("INSERT INTO evaluation_protocol_bindings(protocol_hash, protocol_json) VALUES (?, ?)", (frozen.protocol_hash, encoded))
+            conn.commit()
+            return
+        if existing is None or existing["protocol_json"] != encoded:
+            raise RuntimeError("resume frozen protocol pins do not match")
+
+
+def _persist_or_restore_base_bundle(store: Any, job_id: str, active: Any, *, initialize: bool) -> Any:
+    """Freeze B0 by job so resume cannot silently use a promoted active bundle."""
+    active_hash = getattr(active, "content_hash", None)
+    if not isinstance(active_hash, str) or not active_hash:
+        raise RuntimeError("durable runtime has no hashable active base bundle")
+    with store.connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS evaluation_job_bases (job_id TEXT PRIMARY KEY, base_bundle_hash TEXT NOT NULL)")
+        row = conn.execute("SELECT base_bundle_hash FROM evaluation_job_bases WHERE job_id = ?", (job_id,)).fetchone()
+        if initialize:
+            if row is not None:
+                raise RuntimeError("initialization refuses an existing job base binding")
+            conn.execute("INSERT INTO evaluation_job_bases(job_id, base_bundle_hash) VALUES (?, ?)", (job_id, active_hash))
+            conn.commit()
+            return active
+        if row is None:
+            raise RuntimeError("resume job has no persisted base bundle binding")
+        return _bundle_by_hash(store, str(row["base_bundle_hash"]))
 
 
 def _persist_or_verify_workload(store: Any, job_id: str, workload: dict[str, Any], *, initialize: bool) -> None:
@@ -188,7 +211,7 @@ def _persist_or_verify_workload(store: Any, job_id: str, workload: dict[str, Any
             raise RuntimeError("job workload is already frozen with different counts")
 
 
-def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | None, source_run_id: str | None, *, a_hash: str | None = None, initialize: bool = False, force_job: bool = False) -> tuple[Any, Any, Any]:
+def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | None, source_run_id: str | None, *, a_hash: str | None = None, initialize: bool = False, force_job: bool = False, job_id: str | None = None) -> tuple[Any, Any, Any]:
     """Build an evaluator job around the integrated durable runtime.
 
     The import is deliberately local: an evaluator process must resolve the
@@ -227,7 +250,8 @@ def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | No
     active = runtime.controller.get_active_bundle()
     if active is None:
         raise RuntimeError("durable runtime has no active base bundle")
-    bundles: dict[Any, Any] = {Arm.B0: active}
+    base = _persist_or_restore_base_bundle(runtime.controller.store, job_id, active, initialize=initialize) if job_id is not None else active
+    bundles: dict[Any, Any] = {Arm.B0: base}
     if candidate_id is not None:
         learned = _candidate_bundle(runtime.controller.store, candidate_id)
         bundles[Arm.L] = learned
@@ -295,7 +319,53 @@ def _lifecycle_stages(runtime: Any, protocol: Any, declared_retries: int) -> tup
     def invoke(cell_key: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
         return callback(cell_key=cell_key, context={**dict(context), "declaredRetries": declared_retries, "sealedEnvironment": protocol.sealed_environment})
 
-    return tuple(LifecycleStage(name, cells[name], invoke) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final"))
+    def recover(receipt: Mapping[str, Any], *, stage: str, cell_key: str) -> Sequence[Any]:
+        get_runner = getattr(runtime, "_get_or_create_experiment_stage_runner", None)
+        runner = get_runner() if callable(get_runner) else getattr(runtime, "experiment_stage_runner", None)
+        recovery = getattr(runner, "recover_evaluation_observations", None)
+        if not callable(recovery):
+            recovery = getattr(runner, "recover_observations", None)
+        if not callable(recovery):
+            raise RuntimeError("runtime does not expose durable observation recovery")
+        return recovery(receipt, stage=stage, cell_key=cell_key)
+
+    def prepare_final(state: Mapping[str, Any]) -> Mapping[str, Any]:
+        bundles = getattr(runtime, "_evaluation_arm_bundles", None)
+        if isinstance(bundles, Mapping) and isinstance(bundles.get("A"), str) and bundles["A"]:
+            return {"ablationBundleHash": bundles["A"]}
+        learning = state.get("results", {}).get("learning", {}) if isinstance(state.get("results"), Mapping) else {}
+        candidate_hash = next((value.get("candidateBundleHash") for value in learning.values() if isinstance(value, Mapping) and isinstance(value.get("candidateBundleHash"), str)), None) if isinstance(learning, Mapping) else None
+        if not isinstance(candidate_hash, str) or not candidate_hash:
+            raise RuntimeError("cannot derive final ablation without a frozen learned bundle")
+        learned = _bundle_by_hash(runtime.controller.store, candidate_hash)
+        from adaptive_agent.models import SkillBundle
+
+        payload = learned.model_dump(mode="json", by_alias=True)
+        # The ablation is a separate durable lineage object.  A stable ID and
+        # inherited creation timestamp make preparation idempotent across
+        # process restarts without allowing INSERT OR REPLACE to overwrite L.
+        payload["bundle_id"] = f"{learned.bundle_id}:memory-disabled"
+        payload["parent"] = learned.content_hash
+        payload["skills"] = []
+        execution_config = payload.setdefault("executionConfig", {})
+        execution_config["skill_refs"] = []
+        execution_config["instruction_variant"] = "default"
+        payload["contentHash"] = ""
+        ablation = SkillBundle.model_validate(payload)
+        existing = runtime.controller.store.get_bundle(ablation.bundle_id)
+        if existing is None:
+            runtime.controller.store.save_bundle(ablation.bundle_id, ablation.parent, ablation.content_hash, ablation.model_dump_json(by_alias=True), False)
+        elif existing.get("content_hash") != ablation.content_hash:
+            raise RuntimeError("durable memory-disabled ablation binding conflicts with existing bundle")
+        if not isinstance(bundles, dict):
+            bundles = {}
+            setattr(runtime, "_evaluation_arm_bundles", bundles)
+        # The actual runtime task executor consumes the arm map as hashes.
+        # EvaluationJob receives its own object-valued arm map at construction.
+        bundles["A"] = ablation.content_hash
+        return {"ablationBundleHash": ablation.content_hash}
+
+    return tuple(LifecycleStage(name, cells[name], invoke, retries=declared_retries, observation_recoverer=recover if name in {"validation", "final"} else None, final_preparer=prepare_final if name == "final" else None, report_required=name in {"validation", "final"}) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final"))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -325,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.comparison not in {"smoke", "experiment"} and (not args.candidate_id or not args.source_data_dir or not args.source_run_id):
         parser.error("held-out evaluation requires candidate/source store/source run bindings")
-    app, protocol, job = build_job(args.data_dir, args.source_data_dir, args.candidate_id, args.source_run_id, a_hash=args.a_hash, initialize=args.initialize, force_job=args.comparison == "experiment")
+    app, protocol, job = build_job(args.data_dir, args.source_data_dir, args.candidate_id, args.source_run_id, a_hash=args.a_hash, initialize=args.initialize, force_job=args.comparison == "experiment", job_id=args.job)
     workload = _workload(protocol, args.candidate_count, args.training_runs, args.transfer_runs, args.safety_runs, args.retries)
     print(json.dumps({"job": args.job, "comparison": args.comparison, "workload": workload}, sort_keys=True))
     if workload["transferRuns"] < 1:

@@ -4,7 +4,7 @@ import tempfile
 
 import pytest
 
-from adaptive_agent.production_evaluator import _lifecycle_execution_plan, _reject_shared_qa_path, _require_bound_real_receipt
+from adaptive_agent.production_evaluator import _lifecycle_execution_plan, _lifecycle_stages, _reject_shared_qa_path, _require_bound_real_receipt, build_job
 from adaptive_agent.store import Store
 
 
@@ -26,6 +26,55 @@ def test_lifecycle_execution_plan_accounts_for_nested_work_and_retries():
     assert plan == {"primaryCells": 1150, "primaryAttempts": 2300, "retryAttempts": 1150, "nestedSubcalls": 32, "totalAdmissions": 2332, "retriesPerCell": 1}
 
 
+def test_lifecycle_recovery_restores_lazy_stage_runner(tmp_path: Path):
+    from adaptive_agent.app import create_runtime_app
+    from adaptive_agent.evaluation import EvaluationProtocol
+
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    protocol = EvaluationProtocol(core_planner_hash=runtime.core_planner_hash, image_digest=runtime.image_digest)
+    protocol.freeze(runtime.packages)
+    runtime._evaluation_protocol = protocol
+    runtime.experiment_stage_runner = None
+
+    validation = next(stage for stage in _lifecycle_stages(runtime, protocol, 0) if stage.name == "validation")
+    assert validation.observation_recoverer is not None
+    with pytest.raises(RuntimeError, match="lifecycle receipt lacks durable observation run IDs"):
+        validation.observation_recoverer(
+            {"stage": "validation", "cellKey": "validation:0", "runIds": []},
+            stage="validation",
+            cell_key="validation:0",
+        )
+    assert runtime.experiment_stage_runner is not None
+
+
+def test_public_build_job_resume_restores_original_b0_after_promotion(tmp_path: Path, monkeypatch):
+    from adaptive_agent.evaluation import Arm
+    from adaptive_agent.experiment_runtime import DefaultExperimentStageRunner
+    from adaptive_agent.models import SkillBundle, SkillVersion
+    import adaptive_agent.production_evaluator as production_evaluator
+
+    image = "sha256:" + "1" * 64
+    monkeypatch.setattr(production_evaluator, "_docker_image_digest", lambda: image)
+    first_app, _, first_job = build_job(str(tmp_path), None, None, None, initialize=True, force_job=True, job_id="restart-job")
+    runtime = first_app.state.durable_runtime
+    original = first_job.arm_bundles[Arm.B0]
+    original_hash = original.content_hash
+
+    promoted = SkillBundle(parent=original.bundle_id, skills=[SkillVersion(skillId="promoted-skill", version="1", procedure="new procedure")])
+    promoted.content_hash = runtime.controller.candidates.recompute_bundle_hash(promoted)
+    runtime.controller.store.save_bundle(promoted.bundle_id, promoted.parent, promoted.content_hash, promoted.model_dump_json(by_alias=True), False)
+    runtime.controller.store.set_active_bundle(promoted.content_hash)
+
+    resumed_app, resumed_protocol, resumed_job = build_job(str(tmp_path), None, None, None, initialize=False, force_job=True, job_id="restart-job")
+    resumed_runtime = resumed_app.state.durable_runtime
+    resumed_b0 = resumed_job.arm_bundles[Arm.B0]
+
+    assert resumed_runtime.controller.get_active_bundle().content_hash == promoted.content_hash
+    assert resumed_b0.content_hash == original_hash
+    assert DefaultExperimentStageRunner(resumed_runtime, resumed_protocol).base_hash == original_hash
+
+
 def test_bound_private_outcome_requires_trusted_canonical_identity():
     with tempfile.TemporaryDirectory() as directory:
         store = Store(Path(directory))
@@ -36,6 +85,6 @@ def test_bound_private_outcome_requires_trusted_canonical_identity():
         outcome = {**identity, "responseId": "response-1", "passed": True, "reliable": True, "safetyViolations": 0}
         response_ref = store.put_artifact(response)
         outcome_ref = store.put_artifact(outcome)
-        store.append_evidence("model", {"run_id": run_id, "sequence": 1, "event_type": "model_response", "trust_class": "broker", "visibility": "evaluator_only", "redacted": 0, "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True)})
+        store.append_evidence("model", {"run_id": run_id, "sequence": 1, "event_type": "model_response", "trust_class": "broker", "visibility": "operator", "redacted": 0, "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True)})
         store.append_evidence("outcome", {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0, "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True)})
         _require_bound_real_receipt(directory, run_id)

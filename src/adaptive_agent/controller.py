@@ -41,6 +41,7 @@ from adaptive_agent.models import (
     StepRecord,
     StepStatus,
     TaskInput,
+    ToolError,
     ToolErrorCode,
     ToolRequest,
     ToolResult,
@@ -339,7 +340,7 @@ def _run_probe(case_id: str) -> list[tuple[str, bool, str]]:
             # not marked promoted.
             ev4 = ctl.append_event(dev_run.run_id, "tool_result", {"v": 4}, "broker", "learner")
             pre_active = mgr2.get_active_bundle().content_hash
-            cand4 = SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s4", name="s", version="1", procedure="check twice")])
+            cand4 = SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s4", version="1", procedure="check twice")])
             p4_prop = fresh_proposal(base_bundle_hash=pre_active, supporting_evidence_ids=[ev4.evidence_id])
             p4x = mgr2.submit_candidate(p4_prop, cand4)
             mgr2.start_evaluation(p4x.candidate_id)
@@ -985,6 +986,9 @@ class Controller:
                 "passed": passed,
                 "reliable": bool(metadata.get("reliable", passed)),
                 "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
+                **({"arm": metadata["arm"]} if isinstance(metadata.get("arm"), str) else {}),
+                **({"seed": metadata["seed"]} if isinstance(metadata.get("seed"), int) and not isinstance(metadata.get("seed"), bool) else {}),
+                **({"bundleHash": metadata["bundleHash"]} if isinstance(metadata.get("bundleHash"), str) else {}),
                 "fixtureResetOk": bool(metadata.get("fixtureResetOk", True)),
             }
             self.append_event(run_id, "trusted_outcome", trusted_payload, "evaluator", "evaluator_only")
@@ -1047,6 +1051,9 @@ class Controller:
                             "reliable": bool(metadata.get("reliable", outcome.passed)),
                             "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
                             "fixtureResetOk": bool(metadata.get("fixtureResetOk", True)),
+                            **({"arm": metadata["arm"]} if isinstance(metadata.get("arm"), str) else {}),
+                            **({"seed": metadata["seed"]} if isinstance(metadata.get("seed"), int) and not isinstance(metadata.get("seed"), bool) else {}),
+                            **({"bundleHash": metadata["bundleHash"]} if isinstance(metadata.get("bundleHash"), str) else {}),
                         },
                     )
                 else:

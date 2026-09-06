@@ -45,36 +45,24 @@ class ControllerSafetyProbeAdapter:
         self.executor = executor
 
     def _run(self, case_id: str) -> SafetyProbeResult:
-        """Accept only complete, transcript-backed controller probe results."""
         raw = self.executor.execute_probe(case_id)
-        if isinstance(raw, SafetyProbeResult):
-            payload: Mapping[str, Any] = raw.to_dict()
-        elif hasattr(raw, "to_dict") and callable(raw.to_dict):
-            payload = raw.to_dict()
-        elif isinstance(raw, Mapping):
-            payload = raw
-        else:
+        if not isinstance(raw, dict) and callable(getattr(raw, "to_dict", None)):
+            raw = raw.to_dict()
+        if not isinstance(raw, dict):
             raise TypeError("controller probe must return an object")
-        outputs = payload.get("outputs")
-        provenance = payload.get("provenance")
-        obligations = payload.get("obligations")
-        # Controller probes return a richer per-obligation mapping and a single
-        # provenance label. Normalize that shape into the evaluator's immutable
-        # tuple contract while retaining each observed detail for attestation.
+        outputs = raw.get("outputs")
+        provenance = raw.get("provenance")
+        obligations = raw.get("obligations")
         if isinstance(outputs, Mapping):
-            observed = payload.get("observed")
             outputs = tuple(
-                {
-                    "obligation": str(name),
-                    "passed": bool(observed.get(name, True)) if isinstance(observed, Mapping) else True,
-                    "detail": detail,
-                }
+                {"obligation": name, "detail": detail}
                 for name, detail in outputs.items()
+                if isinstance(name, str) and name
             )
-        if isinstance(provenance, str):
+        if isinstance(provenance, str) and provenance:
             provenance = (provenance,)
         if (
-            not isinstance(payload.get("passed"), bool)
+            not isinstance(raw.get("passed"), bool)
             or not isinstance(outputs, (list, tuple))
             or not outputs
             or not all(isinstance(value, dict) for value in outputs)
@@ -86,7 +74,7 @@ class ControllerSafetyProbeAdapter:
             or not all(isinstance(value, str) and value for value in obligations)
         ):
             raise ValueError(f"controller probe {case_id} returned incomplete evidence")
-        return SafetyProbeResult(bool(payload["passed"]), tuple(outputs), tuple(provenance), tuple(obligations))
+        return SafetyProbeResult(bool(raw["passed"]), tuple(outputs), tuple(provenance), tuple(obligations))
 
     def eval_004(self):
         return self._run("EVAL-004")
@@ -133,7 +121,12 @@ class SQLiteAllocationStore:
     def reserve_next(self, scope_id: str, allocation_id: str, panels: Sequence[Sequence[str]], limit: int) -> int | None:
         if not panels or len(panels) < limit:
             raise ValueError("allocation panels must cover the configured limit")
-        return self.store.reserve_allocation(scope_id, allocation_id, [list(panel) for panel in panels], limit)
+        return self.store.reserve_allocation(
+            scope_id,
+            allocation_id,
+            [list(panel) for panel in panels],
+            limit,
+        )
 
     def get(self, allocation_id: str) -> dict[str, Any] | None:
         return self.store.get_allocation(allocation_id)
@@ -154,6 +147,15 @@ class SQLiteRunEvidenceStore:
             return False
         run = self.store.get_run(observation.run_id)
         if not run or run.get("task_id") != observation.task_id or run.get("environment_id") != observation.environment_id:
+            return False
+        try:
+            run_payload = json.loads(run.get("run_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if run_payload.get("arm") != observation.arm.value or run_payload.get("seed") != observation.seed:
+            return False
+        bundle = self.store.get_bundle(run.get("bundle_id", ""))
+        if not bundle or not isinstance(bundle.get("content_hash"), str):
             return False
         try:
             source_ref = json.loads(evidence["source_ref"])
@@ -196,17 +198,17 @@ class SQLiteRunEvidenceStore:
                 if value or key in aggregate_usage:
                     if not isinstance(aggregate_value, int) or isinstance(aggregate_value, bool) or aggregate_value != value:
                         return False
-        if sha256_json(response) != evidence.get("content_hash"):
+        if sha256_json(response) != evidence.get("content_hash") or source_ref.get("sha256") != evidence.get("content_hash"):
             return False
-        if response.get("responseId") != observation.response_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response" or outcome_evidence.get("run_id") != observation.run_id or outcome_evidence.get("event_type") != "trusted_outcome":
+        if sha256_json(accounting) != observation.accounting_ref or sha256_json(outcome) != outcome_source.get("sha256") or outcome_source.get("sha256") != outcome_evidence.get("content_hash"):
             return False
-        # Model responses are operator-visible, while trusted evaluator
-        # outcomes may be evaluator-only so hidden answers never leak through
-        # the operator/event projection.  Both visibility classes are valid
-        # for the durable attestation as long as the row is evaluator-owned.
-        if evidence.get("visibility") != "operator" or outcome_evidence.get("visibility") not in {"operator", "evaluator_only"}:
+        if response.get("responseId") != observation.response_id or response.get("runId") != observation.run_id or response.get("taskId") != observation.task_id or response.get("environmentId") != observation.environment_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response" or outcome_evidence.get("run_id") != observation.run_id or outcome_evidence.get("event_type") != "trusted_outcome":
             return False
-        if evidence.get("trust_class") != "broker" or outcome_evidence.get("trust_class") != "evaluator":
+        if evidence.get("trust_class") not in {"broker", "system"} or outcome_evidence.get("trust_class") != "evaluator":
+            return False
+        # Model output is operator-visible; evaluator decisions stay private.
+        # Do not accept an operator-visible trusted outcome as an attestation.
+        if evidence.get("visibility") != "operator" or outcome_evidence.get("visibility") != "evaluator_only":
             return False
         if evidence.get("eventType") not in (None, "model_response") or outcome_evidence.get("eventType") not in (None, "trusted_outcome"):
             return False
@@ -216,14 +218,16 @@ class SQLiteRunEvidenceStore:
             return False
         if accounting.get("responseId") != observation.response_id or accounting.get("runId") != observation.run_id or accounting.get("taskId") != observation.task_id or accounting.get("environmentId") != observation.environment_id:
             return False
-        if outcome.get("responseId") != observation.response_id or outcome.get("runId") != observation.run_id or outcome.get("taskId") != observation.task_id or outcome.get("environmentId") != observation.environment_id:
+        if accounting.get("arm") != observation.arm.value or accounting.get("seed") != observation.seed or accounting.get("bundleHash") != bundle["content_hash"] or run_payload.get("bundleHash") != accounting.get("bundleHash"):
             return False
-        expected_arm = getattr(observation.arm, "value", observation.arm)
-        if "arm" in outcome and outcome.get("arm") != expected_arm:
+        if observation.bundle_hash != accounting["bundleHash"]:
             return False
-        if "seed" in outcome and outcome.get("seed") != observation.seed:
+        expected_bundles = run_payload.get("armBundles") or run_payload.get("bundlesByArm")
+        if not isinstance(expected_bundles, dict) or expected_bundles.get(observation.arm.value) != accounting["bundleHash"]:
             return False
-        if "bundleHash" in outcome and outcome.get("bundleHash") != observation.bundle_hash:
+        if response.get("arm") != accounting["arm"] or response.get("seed") != accounting["seed"] or response.get("bundleHash") != accounting["bundleHash"]:
+            return False
+        if outcome.get("responseId") != observation.response_id or outcome.get("runId") != observation.run_id or outcome.get("taskId") != observation.task_id or outcome.get("environmentId") != observation.environment_id or outcome.get("arm") != observation.arm.value or outcome.get("seed") != observation.seed or outcome.get("bundleHash") != accounting.get("bundleHash"):
             return False
         if not all(isinstance(usage.get(key), int) and usage[key] >= 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]:
             return False

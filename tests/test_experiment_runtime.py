@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +27,7 @@ class Store:
                 "costMicrounits": 7,
             }
         }
+        self.evidence = []
 
     def get_bundle_by_hash(self, content_hash):
         return {"bundle_json": "{}", "content_hash": content_hash}
@@ -47,7 +49,7 @@ class Store:
         return {"passed": 1} if run_id == "dev-run" else None
 
     def list_evidence(self, _run_id):
-        return []
+        return list(self.evidence)
 
 
 class Package:
@@ -256,6 +258,78 @@ def test_partial_known_cost_remains_unknown():
     assert "costMicrounits" not in partial_receipt
 
 
+def test_learning_accounting_requires_cost_for_every_wanted_receipt():
+    runtime = Runtime()
+    runtime.controller.store.artifacts.update({
+        "acct-a": {"wallSeconds": 1.0, "costMicrounits": 12, "economicCostStatus": "measured"},
+        "acct-b": {"wallSeconds": 1.0},
+    })
+    runtime.controller.store.evidence = [
+        {"evidence_id": "a", "event_type": "learning_model_observation", "source_ref": json.dumps({"sha256": "acct-a"})},
+        {"evidence_id": "b", "event_type": "learning_model_observation", "source_ref": json.dumps({"sha256": "acct-b"})},
+    ]
+
+    accounting = DefaultExperimentStageRunner(runtime, Protocol())._learning_accounting("run", ["a", "b"], {})
+
+    assert accounting["accountingComplete"] is False
+    assert "costMicrounits" not in accounting
+
+
+@pytest.mark.parametrize("source_ref", [json.dumps({"sha256": "missing"}), "not-json"])
+def test_learning_accounting_rejects_missing_or_malformed_wanted_artifact(source_ref):
+    runtime = Runtime()
+    runtime.controller.store.evidence = [
+        {"evidence_id": "wanted", "event_type": "learning_model_observation", "source_ref": source_ref},
+    ]
+
+    accounting = DefaultExperimentStageRunner(runtime, Protocol())._learning_accounting("run", ["wanted"], {})
+
+    assert accounting["accountingComplete"] is False
+
+
+def test_learning_accounting_accepts_all_measured_receipts_without_nominal_cost():
+    runtime = Runtime()
+    runtime.controller.store.artifacts.update({
+        "acct-a": {"wallSeconds": 1.0, "costMicrounits": 12, "economicCostStatus": "measured"},
+        "acct-b": {"wallSeconds": 1.0, "costMicrounits": 8, "economicCostStatus": "measured"},
+    })
+    runtime.controller.store.evidence = [
+        {"evidence_id": "a", "event_type": "learning_model_observation", "source_ref": json.dumps({"sha256": "acct-a"})},
+        {"evidence_id": "b", "event_type": "learning_model_observation", "source_ref": json.dumps({"sha256": "acct-b"})},
+    ]
+
+    accounting = DefaultExperimentStageRunner(runtime, Protocol())._learning_accounting("run", ["a", "b"], {})
+
+    assert accounting == {"wallSeconds": 2.0, "accountingComplete": True, "costMicrounits": 20}
+
+
+def test_learning_accounting_uses_complete_nominal_coverage_for_mixed_cost_receipts():
+    runtime = Runtime()
+    runtime.controller.store.artifacts.update({
+        "acct-a": {"wallSeconds": 1.0, "costMicrounits": 12, "nominalCostUsd": 0.001},
+        "acct-b": {"wallSeconds": 1.0, "nominalCostUsd": 0.002},
+    })
+    runtime.controller.store.evidence = [
+        {"evidence_id": "a", "event_type": "learning_model_observation", "source_ref": json.dumps({"sha256": "acct-a"})},
+        {"evidence_id": "b", "event_type": "learning_model_observation", "source_ref": json.dumps({"sha256": "acct-b"})},
+    ]
+
+    accounting = DefaultExperimentStageRunner(runtime, Protocol())._learning_accounting("run", ["a", "b"], {})
+
+    assert accounting == {"wallSeconds": 2.0, "accountingComplete": True, "nominalCostUsd": 0.003}
+
+
+def test_learning_accounting_does_not_use_aggregate_fallback_for_missing_requested_receipt():
+    runtime = Runtime()
+
+    accounting = DefaultExperimentStageRunner(runtime, Protocol())._learning_accounting(
+        "run", ["missing"], {"wallSeconds": 1.0, "costMicrounits": 12}
+    )
+
+    assert accounting["accountingComplete"] is False
+    assert "costMicrounits" not in accounting
+
+
 def test_observation_cost_requires_complete_nominal_coverage():
     from adaptive_agent.app import LearningRuntimeError, _effective_observation_cost
 
@@ -268,6 +342,7 @@ def test_observation_cost_requires_complete_nominal_coverage():
 
 def test_recovery_uses_receipt_refs_and_nominal_proxy():
     import json
+    from adaptive_agent.evaluation import build_environment_packages
 
     class RecoveryStore:
         def __init__(self):
@@ -297,7 +372,7 @@ def test_recovery_uses_receipt_refs_and_nominal_proxy():
             return {}
 
     store = RecoveryStore()
-    runtime = SimpleNamespace(controller=SimpleNamespace(store=store, get_active_bundle=lambda: Bundle("base")), core_planner_hash="core", image_digest="image", packages={})
+    runtime = SimpleNamespace(controller=SimpleNamespace(store=store, get_active_bundle=lambda: Bundle("base")), core_planner_hash="core", image_digest="image", packages={"known-a": build_environment_packages()["finance"]})
     runner = DefaultExperimentStageRunner(runtime, Protocol())
     receipt = {"stage": "validation", "cellKey": "validation:0", "runIds": ["run"], "evidenceRefs": ["model-ref"], "outcomeRefs": ["outcome-ref"], "costBasis": "nominal_budget_proxy", "billingStatus": "unknown"}
 
@@ -307,10 +382,61 @@ def test_recovery_uses_receipt_refs_and_nominal_proxy():
         runner.recover_evaluation_observations({**receipt, "evidenceRefs": ["missing"]})
 
 
+def test_recovery_treats_audited_wrong_answer_as_complete_but_not_infrastructure_failure():
+    import json
+    from adaptive_agent.evaluation import build_environment_packages
+
+    class RecoveryStore:
+        def __init__(self):
+            self.infrastructure_failure = None
+            self.artifacts = {
+                "model-art": {"responseId": "response", "arm": "B0", "seed": 17, "bundleHash": "base", "versionRefs": {"planner": "core"}, "accountingRef": "acct"},
+                "outcome-art": {"passed": False, "reliable": True, "safetyViolations": 0, "fixtureResetOk": True},
+                "acct": {"costMicrounits": 12, "durationSeconds": 1.0},
+            }
+            self.rows = {
+                "model-ref": {"evidence_id": "model-ref", "run_id": "run", "event_type": "model_response", "source_ref": json.dumps({"sha256": "model-art"})},
+                "outcome-ref": {"evidence_id": "outcome-ref", "run_id": "run", "event_type": "trusted_outcome", "source_ref": json.dumps({"sha256": "outcome-art"})},
+            }
+
+        def get_run(self, run_id):
+            return {"task_id": "task", "environment_id": "known-a", "status": "failed", "run_json": json.dumps({"arm": "B0", "seed": 17, "bundleHash": "base"})} if run_id == "run" else None
+
+        def get_task(self, task_id):
+            return {"partition": "validation"} if task_id == "task" else None
+
+        def get_evidence(self, evidence_id):
+            return self.rows.get(evidence_id)
+
+        def get_artifact(self, ref):
+            return self.artifacts[ref]
+
+        def get_outcome_by_run_id(self, _run_id):
+            metadata = {"reliable": True, "safetyViolations": 0, "fixtureResetOk": True}
+            if self.infrastructure_failure is not None:
+                metadata["infrastructureFailure"] = self.infrastructure_failure
+            return {"metadata_json": json.dumps(metadata)}
+
+    store = RecoveryStore()
+    runtime = SimpleNamespace(controller=SimpleNamespace(store=store, get_active_bundle=lambda: Bundle("base")), core_planner_hash="core", image_digest="image", packages={"known-a": build_environment_packages()["finance"]})
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    receipt = {"stage": "validation", "cellKey": "validation:0", "runIds": ["run"], "evidenceRefs": ["model-ref"], "outcomeRefs": ["outcome-ref"]}
+
+    audited_failure = runner.recover_evaluation_observations(receipt)[0]
+    assert audited_failure.passed is False
+    assert audited_failure.status == "complete"
+    assert audited_failure.infrastructure_failure is None
+
+    store.infrastructure_failure = "provider_timeout"
+    infrastructure_failure = runner.recover_evaluation_observations(receipt)[0]
+    assert infrastructure_failure.status == "failed"
+    assert infrastructure_failure.infrastructure_failure == "provider_timeout"
+
+
 def test_learning_receipt_preserves_nominal_proxy_and_wall_time(monkeypatch):
     runtime = Runtime()
     runner = DefaultExperimentStageRunner(runtime, Protocol())
-    monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 4, "outputTokens": 3, "totalTokens": 7}, ["learning-ref"]))
+    monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 4, "outputTokens": 3, "totalTokens": 7}, []))
 
     receipt = runner._learning_receipt(
         "learning",
@@ -483,7 +609,7 @@ def test_transfer_charged_subcalls_are_accounted_once_by_real_evaluation_job(tmp
     }
     runner = DefaultExperimentStageRunner(runtime, Protocol())
     monkeypatch.setattr(experiment_runtime, "_load_bundle", lambda _runtime, content_hash: Bundle(content_hash))
-    monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, ["learning-ref"]))
+    monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, []))
 
     def generic(cell, context):
         return {

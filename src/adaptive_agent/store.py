@@ -11,6 +11,7 @@ import json
 import hashlib
 import re
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,6 +146,8 @@ class Store:
                     evaluator_refs_json TEXT NOT NULL DEFAULT '[]',
                     fixture_hashes_json TEXT NOT NULL DEFAULT '{}',
                     partition_hashes_json TEXT NOT NULL DEFAULT '{}',
+                    protocol_inputs_json TEXT NOT NULL DEFAULT '{}',
+                    phase_evaluator_refs_json TEXT NOT NULL DEFAULT '{}',
                     frozen_at TEXT NOT NULL,
                     active INTEGER DEFAULT 1
                 );
@@ -257,6 +260,8 @@ class Store:
                 ("evaluator_refs_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("fixture_hashes_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("partition_hashes_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("protocol_inputs_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("phase_evaluator_refs_json", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 if name not in frozen_cols:
                     conn.execute(f"ALTER TABLE frozen_protocols ADD COLUMN {name} {declaration}")
@@ -288,7 +293,7 @@ class Store:
         sha = sha256_json(data)
         path = self.artifact_dir / f"{sha}.json"
         if not path.exists():
-            tmp = self.artifact_dir / f"{sha}.tmp"
+            tmp = self.artifact_dir / f".{sha}.{uuid.uuid4().hex}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=default)
             tmp.replace(path)
@@ -315,7 +320,7 @@ class Store:
         if path.exists() and path.read_bytes() != value:
             raise ValueError("immutable artifact digest collision")
         if not path.exists():
-            tmp = self.artifact_dir / f"{digest}.tmp"
+            tmp = self.artifact_dir / f".{digest}.{uuid.uuid4().hex}.tmp"
             tmp.write_bytes(value)
             tmp.replace(path)
         return {"sha256": digest, "size": len(value), "immutable": True}
@@ -1179,6 +1184,14 @@ class Store:
     def get_candidate(self, candidate_id: str) -> dict[str, Any] | None:
         return self._get_json("candidates", "candidate_id", candidate_id)
 
+    def get_candidate_by_bundle_hash(self, bundle_hash: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM candidates WHERE candidate_bundle_hash = ? ORDER BY created_at DESC LIMIT 1",
+                (bundle_hash,),
+            ).fetchone()
+            return dict(row) if row else None
+
     def update_candidate(self, candidate_id: str, state: str, candidate_json: str) -> None:
         """Keep the state column and candidate_json payload synchronized."""
         with self._connect() as conn:
@@ -1198,11 +1211,13 @@ class Store:
         evaluator_refs: list[str] | None = None,
         fixture_hashes: dict[str, str] | None = None,
         partition_hashes: dict[str, str] | None = None,
+        protocol_inputs: dict[str, Any] | None = None,
+        phase_evaluator_refs: dict[str, list[str]] | None = None,
     ) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO frozen_protocols (protocol_hash, gate_json, evaluator_id, evaluator_refs_json, fixture_hashes_json, partition_hashes_json, frozen_at, active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-                (protocol_hash, gate_json, evaluator_id, json.dumps(evaluator_refs or []), json.dumps(fixture_hashes or {}), json.dumps(partition_hashes or {}), _utcnow()),
+                "INSERT INTO frozen_protocols (protocol_hash, gate_json, evaluator_id, evaluator_refs_json, fixture_hashes_json, partition_hashes_json, protocol_inputs_json, phase_evaluator_refs_json, frozen_at, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                (protocol_hash, gate_json, evaluator_id, json.dumps(evaluator_refs or []), json.dumps(fixture_hashes or {}), json.dumps(partition_hashes or {}), json.dumps(protocol_inputs or {}, sort_keys=True), json.dumps(phase_evaluator_refs or {}, sort_keys=True), _utcnow()),
             )
             conn.commit()
 

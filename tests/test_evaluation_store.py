@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import dataclasses
+import json
 from unittest.mock import patch
 from pathlib import Path
 
@@ -46,18 +47,22 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             protocol = EvaluationProtocol(image_digest="sha256:image-real")
             frozen = protocol.freeze(build_environment_packages())
             run_id, response_id = "run-1", "provider-response-1"
-            store.save_run(run_id, {"task_id": task.task_id, "environment_id": "finance", "bundle_id": "bundle", "status": "succeeded", "idempotency_key": "run-key", "last_event_sequence": 0, "created_at": "now", "run_json": "{}"})
+            bundle_hash = "bundle-hash"
+            store.save_bundle("bundle", None, bundle_hash, "{}")
+            store.save_run(run_id, {"task_id": task.task_id, "environment_id": "finance", "bundle_id": "bundle", "status": "succeeded", "idempotency_key": "run-key", "last_event_sequence": 0, "created_at": "now", "run_json": json.dumps({"arm": "L", "seed": 17, "bundleHash": bundle_hash, "armBundles": {"L": bundle_hash}})})
             version_refs = {"policy": package.manifest.policy_ref.sha256, "schema": sha256_json(package.manifest.tool_schemas), "planner": protocol.core_planner_hash, "budget": sha256_json(frozen.inputs["runBudget"]), "image": protocol.image_digest}
             usage = {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
-            response = {"responseId": response_id, "provider": "openai-codex", "modelProfile": protocol.model_profile, "status": "complete", "usage": usage, "versionRefs": version_refs}
+            response = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "provider": "openai-codex", "modelProfile": protocol.model_profile, "status": "complete", "usage": usage, "versionRefs": version_refs, "arm": "L", "seed": 17, "bundleHash": bundle_hash}
             response_ref = store.put_artifact(response)
             store.append_evidence("evidence-1", {"run_id": run_id, "sequence": 1, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
-            accounting_ref = store.put_artifact({"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "usage": usage, "costMicrounits": 1, "durationSeconds": 1.0, "versionRefs": version_refs})
+            accounting_ref = store.put_artifact({"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "usage": usage, "costMicrounits": 1, "durationSeconds": 1.0, "versionRefs": version_refs, "arm": "L", "seed": 17, "bundleHash": bundle_hash})
             outcome = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "passed": True, "reliable": True, "safetyViolations": 0}
             outcome_ref = store.put_artifact(outcome)
-            store.append_evidence("outcome-1", {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "operator", "redacted": 0})
+            outcome = {**outcome, "taskId": task.task_id, "environmentId": "finance", "arm": "L", "seed": 17, "bundleHash": bundle_hash}
+            outcome_ref = store.put_artifact(outcome)
+            store.append_evidence("outcome-1", {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0})
             expected = {"model": sha256_json({"profile": protocol.model_profile, "provider": protocol.provider}), "planner": protocol.core_planner_hash, "budget": sha256_json(frozen.inputs["runBudget"]), "policy": sha256_json(package.manifest.policy_ref), "schema": sha256_json(package.manifest.tool_schemas), "image": protocol.image_digest}
-            row = RunObservation(task.task_id, "finance", Partition.VALIDATION, 17, Arm.L, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, response_id=response_id, accounting_ref=accounting_ref.sha256, evidence_ref="evidence-1", outcome_ref="outcome-1", config_hashes=expected, run_id=run_id)
+            row = RunObservation(task.task_id, "finance", Partition.VALIDATION, 17, Arm.L, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, response_id=response_id, accounting_ref=accounting_ref.sha256, evidence_ref="evidence-1", outcome_ref="outcome-1", config_hashes=expected, run_id=run_id, bundle_hash=bundle_hash)
             verifier = SQLiteRunEvidenceStore(store)
             self.assertTrue(verifier.verify(row, frozen, package))
             nominal_accounting = store.put_artifact({
@@ -73,6 +78,9 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
                 "economicCost": {"status": "unknown", "microunits": None},
                 "durationSeconds": 1.0,
                 "versionRefs": version_refs,
+                "arm": "L",
+                "seed": 17,
+                "bundleHash": bundle_hash,
             })
             nominal_row = dataclasses.replace(row, accounting_ref=nominal_accounting.sha256, cost_microunits=1)
             self.assertTrue(verifier.verify(nominal_row, frozen, package))
@@ -90,9 +98,6 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
                 "versionRefs": version_refs,
             })
             self.assertFalse(verifier.verify(dataclasses.replace(nominal_row, accounting_ref=partial_accounting.sha256), frozen, package))
-            with store.connect() as conn:
-                conn.execute("UPDATE evidence SET visibility = 'evaluator_only' WHERE evidence_id = ?", ("outcome-1",))
-                conn.commit()
             self.assertTrue(verifier.verify(row, frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, response_id="wrong"), frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, run_id="wrong"), frozen, package))
