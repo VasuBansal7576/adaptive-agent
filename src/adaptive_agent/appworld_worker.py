@@ -29,6 +29,29 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _public_supervisor(value: Any) -> dict[str, str]:
+    """Keep only the public supervisor identity fields used for discovery."""
+    fields = {
+        "first_name": "firstName",
+        "last_name": "lastName",
+        "email": "email",
+        "phone_number": "phoneNumber",
+    }
+    result: dict[str, str] = {}
+    for source, target in fields.items():
+        item = value.get(source) if isinstance(value, Mapping) else getattr(value, source, None)
+        if isinstance(item, str) and item:
+            result[target] = item
+    return result
+
+
+def _public_app_descriptions(value: Any) -> dict[str, str]:
+    """Return public app descriptions without carrying runtime objects across the boundary."""
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(name): description for name, description in value.items() if isinstance(description, str)}
+
+
 def run(root: Path) -> int:
     from appworld.environment import AppWorld  # type: ignore[import-not-found]
 
@@ -56,7 +79,13 @@ def run(root: Path) -> int:
                     raise_on_failure=False,
                     show_api_response_schemas=False,
                 )
-                result: Any = {"taskId": task_id, "instruction": str(world.task.instruction), "allowedApps": list(getattr(world.task, "allowed_apps", ())),}
+                result: Any = {
+                    "taskId": task_id,
+                    "instruction": str(world.task.instruction),
+                    "allowedApps": list(getattr(world.task, "allowed_apps", ())),
+                    "supervisor": _public_supervisor(getattr(world.task, "supervisor", {})),
+                    "appDescriptions": _public_app_descriptions(getattr(world.task, "app_descriptions", {})),
+                }
             elif operation == "call":
                 if world is None:
                     raise ValueError("worker has not been reset")
