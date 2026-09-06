@@ -543,6 +543,41 @@ def test_learning_runtime_uses_durable_projection_and_excludes_operator_evidence
     assert inferred.json()["environmentId"] == "finance"
 
 
+def test_tool_result_projection_exposes_safe_broker_fields_and_hides_output(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "tool-result-projection"}).json()
+    controller = app.state.controller
+    controller.record_broker_tool_result(
+        run["runId"],
+        {
+            "callId": "c1",
+            "tool": "ledger.append",
+            "toolVersion": "1.4.0",
+            "status": "error",
+            "effect": "unknown",
+            "error": {"code": "OUTCOME_UNKNOWN", "message": "Dispatch timed out", "correlationId": "corr-1", "retry": "after_reconciliation"},
+            "output": {"secret": "raw-payload-must-not-leak"},
+        },
+        development=True,
+    )
+    controller.record_broker_tool_result(
+        run["runId"],
+        {"callId": "c2", "tool": "inventory.read", "toolVersion": "1.0.0", "status": "ok", "effect": "none"},
+        development=True,
+    )
+    events = controller.events(run["runId"], 0)
+    failures = [event for event in events if event["event"] == "tool_result" and event["data"].get("status") == "error"]
+    assert failures, "operator failure projection missing"
+    assert failures[0]["data"]["summary"] == "Tool failure recorded"
+    assert "OUTCOME_UNKNOWN" in failures[0]["data"]["detail"]
+    assert "raw-payload-must-not-leak" not in failures[0]["data"]["detail"]
+    oks = [event for event in events if event["event"] == "tool_result" and event["data"].get("status") == "ok"]
+    assert oks[0]["data"]["summary"] == "Tool result recorded"
+
+
 def test_durable_event_projection_exposes_safe_failure_summary_and_hides_evaluator_rows(tmp_path):
     app = create_runtime_app(data_dir=tmp_path)
     api = TestClient(app, base_url="http://127.0.0.1")

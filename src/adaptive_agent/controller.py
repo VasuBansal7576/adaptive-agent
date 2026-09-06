@@ -649,6 +649,30 @@ class Controller:
             fields = {key: payload[key] for key in ("passed", "score", "reason") if key in payload}
             detail = json.dumps(fields, sort_keys=True, separators=(",", ":")) if fields else ""
             return {"summary": "Trusted outcome check recorded", **({"detail": detail} if detail else {})}
+        if event_type == "tool_result":
+            # Allowlisted broker outcome fields only: no raw tool output, no
+            # credentials, no evaluator payload ever reaches this projection.
+            tool_fields: dict[str, Any] = {}
+            for key in ("tool", "toolVersion", "status", "effect"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    tool_fields[key] = value
+            error = payload.get("error")
+            if isinstance(error, Mapping):
+                safe_error = {
+                    key: error[key]
+                    for key in ("code", "message", "retry", "correlationId")
+                    if isinstance(error.get(key), str) and error[key]
+                }
+                if safe_error:
+                    tool_fields["error"] = safe_error
+            if not tool_fields:
+                return {}
+            detail = json.dumps(tool_fields, sort_keys=True, separators=(",", ":"))
+            failed = isinstance(tool_fields.get("error"), dict)
+            projection = {key: value for key, value in tool_fields.items() if isinstance(value, str)}
+            projection.update({"summary": "Tool failure recorded" if failed else "Tool result recorded", "detail": detail})
+            return projection
         if event_type in {"model_response", "model_observation"}:
             fields: dict[str, Any] = {}
             for key in ("provider", "model", "modelProfile"):
