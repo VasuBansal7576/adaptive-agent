@@ -293,6 +293,7 @@ def test_diagnostic_missing_observation_fails_projection_and_preserves_receipt(
         conn.commit()
     projected = runtime.diagnostics.get(diagnostic_id)
     assert projected["state"] == "failed"
+    assert projected["resumable"] is False
     assert projected["error"]
     assert any(item["infrastructureErrors"] == 1 for item in projected["armSummaries"])
     runtime.diagnostics.run(diagnostic_id)

@@ -168,6 +168,8 @@ class DevelopmentDiagnosticManager:
         }
 
     def _resumable(self, record: Mapping[str, Any]) -> bool:
+        if record.get("_integrity_invalid"):
+            return False
         if record.get("state") not in {"queued", "running"}:
             return False
         lock = self._locks.setdefault(str(record["diagnostic_id"]), threading.Lock())
