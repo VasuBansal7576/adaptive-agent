@@ -268,7 +268,8 @@ class LearningRuntime:
                     if isinstance(error, Mapping):
                         safe["error"] = {key: _sanitize_learning_value(error.get(key)) for key in ("code", "retry") if key in error}
             content = f"Broker development observation: eventType={event['event_type']}; details={canonical_json(safe)}"
-            source_id = f"broker:{event['evidence_id']}"
+            evidence_id = event["evidence_id"]
+            source_id = evidence_id if isinstance(evidence_id, str) and evidence_id.startswith("broker:") else f"broker:{evidence_id}"
             record = {"kind": "live_evidence", "sourceId": source_id, "content": content, "contentHash": content_hash(content), "sourceContentHash": event["content_hash"], "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": event.get("trust_class", "broker"), "trustedOutcome": True, "outcomePassed": outcome_passed}
             persist(f"learning-evidence-{source_id}", record)
         # A run may already contain the narrow broker projection written by a
