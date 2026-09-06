@@ -95,7 +95,7 @@ export function CandidatesView({
         {candidates.map((cand) => (
           <article key={cand.candidateId} className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <h3 className="font-mono text-sm text-slate-100">{cand.candidateId}</h3>
+              <h3 className="break-all font-mono text-sm text-slate-100">{cand.candidateId}</h3>
               <StatusBadge status={cand.state} />
             </div>
             <p className="mt-1 text-xs text-slate-500">
@@ -135,7 +135,7 @@ export function CandidatesView({
                         <li key={r}>{r}</li>
                       ))}
                     </ul>
-                    <p className="mt-1 font-mono text-[10px] text-slate-600">report {cand.measured.evaluationRef.id} · {cand.measured.evaluationRef.sha256}</p>
+                    <p className="mt-1 break-all font-mono text-[10px] text-slate-600">report {cand.measured.evaluationRef.id} · {cand.measured.evaluationRef.sha256}</p>
                   </div>
                 ) : (
                   <div className="rounded-lg bg-slate-800/60 p-3">
