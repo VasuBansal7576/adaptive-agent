@@ -65,8 +65,16 @@ export function applyEvent(state: ConsoleState, event: RunEvent): ConsoleState {
   const cursor = state.cursors[event.runId] ?? 0;
   if (event.sequence <= cursor) return state; // duplicate
   if (event.sequence > cursor + 1) {
-    // gap: treat as stale, expect transport to reconnect from cursor
-    return { ...state, connection: "stale" };
+    // sequence gaps are EXPECTED in the durable projection: evaluator_only
+    // rows are filtered server-side, so visible sequences legitimately skip.
+    // Advance the acknowledged cursor past the hidden rows (the server resume
+    // cursor is compared against its own full ledger) and surface nothing as
+    // stale — authoritative recovery comes from the record refresh path, not
+    // a permanent false warning.
+    return {
+      ...state,
+      cursors: { ...state.cursors, [event.runId]: event.sequence },
+    };
   }
   const events = state.events[event.runId] ?? [];
   const run = state.runs.find((r) => r.runId === event.runId);

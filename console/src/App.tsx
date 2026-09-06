@@ -130,12 +130,26 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     dispatch({ type: "connection", state: "connecting" });
     const close = transport.openRunStream(runId, cursor, {
       onEvent: (event) => {
+        // hidden evaluator_only rows create legitimate sequence gaps: recover
+        // authoritatively via a record refresh instead of a false stale warning
+        const prevCursor = state.cursors[runId] ?? 0;
+        const gapSkipped = event.sequence > prevCursor + 1;
         dispatch({ type: "event", event });
         // refresh the authoritative record when the event carries no validated
         // status (bare status/outcome rows) or when plane-shape status/approval
         // events arrive — never parse display text
-        if (event.needsRecordRefresh || (!event.runStatus && (event.kind === "status" || event.kind === "approval"))) {
-          void refreshRunRecords();
+        if (gapSkipped || event.needsRecordRefresh || (!event.runStatus && (event.kind === "status" || event.kind === "approval"))) {
+          void refreshRunRecords(true);
+        }
+        // a terminal lifecycle event settles the run: close the stream and
+        // schedule the authoritative record refresh (private outcome commits
+        // server-side around this transition)
+        const TERMINAL_STATES = ["succeeded", "failed", "cancelled", "timed_out"];
+        if (event.runStatus && TERMINAL_STATES.includes(event.runStatus)) {
+          closeStreamRef.current?.();
+          closeStreamRef.current = null;
+          dispatch({ type: "connection", state: "closed" });
+          setTimeout(() => void refreshRunRecords(true), 1200);
         }
         // terminal finalization: the server commits the private trusted outcome
         // (evaluator_only, never streamed) around this transition; a delayed
@@ -376,9 +390,6 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
         </div>
       </main>
 
-      <footer className="border-t border-slate-800 py-4 text-center text-xs text-slate-600">
-        Operator actions are audited. The learner never receives the operator token. Evidence renders as escaped text.
-      </footer>
     </div>
   );
 }

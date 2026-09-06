@@ -37,10 +37,13 @@ describe("event cursor semantics", () => {
     expect(replayedAgain.events["r1"]).toHaveLength(2);
   });
 
-  it("marks the connection stale on a sequence gap instead of applying", () => {
+  it("advances the cursor past hidden evaluator rows on a sequence gap without a false stale warning", () => {
     const s1 = applyEvent(state, ev(3));
-    expect(s1.cursors["r1"]).toBeUndefined();
-    expect(s1.connection).toBe("stale");
+    // hidden evaluator_only rows create legitimate gaps: the cursor advances
+    // past them (server resume ledger is complete), no stale flag is raised,
+    // and no fabricated event content is applied
+    expect(s1.cursors["r1"]).toBe(3);
+    expect(s1.connection).toBe(initialConsoleState.connection);
     expect(s1.events["r1"]).toBeUndefined();
   });
 
