@@ -113,6 +113,13 @@ class SQLiteAllocationStore:
             raise ValueError("allocation panels must cover the configured limit")
         return self.store.reserve_allocation(scope_id, allocation_id, [list(panel) for panel in panels], limit)
 
+    def get(self, allocation_id: str) -> dict[str, Any] | None:
+        with self.store.connect() as conn:
+            row = conn.execute("SELECT * FROM evaluator_allocations WHERE allocation_id = ?", (allocation_id,)).fetchone()
+        if row is None:
+            return None
+        return {**dict(row), "task_ids": json.loads(row["task_ids_json"])}
+
 
 class SQLiteRunEvidenceStore:
     durable = True
