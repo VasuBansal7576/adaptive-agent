@@ -15,7 +15,7 @@ import hashlib
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from adaptive_agent.broker import Capability, ToolBroker, ToolProvider
 from adaptive_agent.candidate import CandidateManager

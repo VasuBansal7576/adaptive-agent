@@ -117,6 +117,9 @@ class Store:
                     protocol_hash TEXT PRIMARY KEY,
                     gate_json TEXT NOT NULL,
                     evaluator_id TEXT NOT NULL,
+                    evaluator_refs_json TEXT NOT NULL DEFAULT '[]',
+                    fixture_hashes_json TEXT NOT NULL DEFAULT '{}',
+                    partition_hashes_json TEXT NOT NULL DEFAULT '{}',
                     frozen_at TEXT NOT NULL,
                     active INTEGER DEFAULT 1
                 );
@@ -180,6 +183,15 @@ class Store:
                 );
                 """
             )
+            for column, definition in (
+                ("evaluator_refs_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("fixture_hashes_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("partition_hashes_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE frozen_protocols ADD COLUMN {column} {definition}")
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
 
     @contextmanager
@@ -751,11 +763,20 @@ class Store:
             conn.commit()
 
     # ------------------------------------------------------------------ frozen protocols / evaluations
-    def save_frozen_protocol(self, protocol_hash: str, gate_json: str, evaluator_id: str) -> None:
+    def save_frozen_protocol(
+        self,
+        protocol_hash: str,
+        gate_json: str,
+        evaluator_id: str,
+        *,
+        evaluator_refs: list[str] | None = None,
+        fixture_hashes: dict[str, str] | None = None,
+        partition_hashes: dict[str, str] | None = None,
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO frozen_protocols (protocol_hash, gate_json, evaluator_id, frozen_at, active) VALUES (?, ?, ?, ?, 1)",
-                (protocol_hash, gate_json, evaluator_id, _utcnow()),
+                "INSERT INTO frozen_protocols (protocol_hash, gate_json, evaluator_id, evaluator_refs_json, fixture_hashes_json, partition_hashes_json, frozen_at, active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                (protocol_hash, gate_json, evaluator_id, json.dumps(evaluator_refs or []), json.dumps(fixture_hashes or {}), json.dumps(partition_hashes or {}), _utcnow()),
             )
             conn.commit()
 

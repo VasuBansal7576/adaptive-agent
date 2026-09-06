@@ -18,6 +18,7 @@ from adaptive_agent.evaluation import (
     FrozenProtocol,
     RunEvidenceStore,
     RunObservation,
+    SafetyProbeResult,
     TrustedAttestationLedger,
     TrustedEvaluatorRegistry,
     sha256_json,
@@ -42,11 +43,33 @@ class ControllerSafetyProbeAdapter:
     def __init__(self, executor: ControllerProbeExecutor) -> None:
         self.executor = executor
 
+    def _run(self, case_id: str) -> SafetyProbeResult:
+        raw = self.executor.execute_probe(case_id)
+        if not isinstance(raw, dict):
+            raise TypeError("controller probe must return an object")
+        outputs = raw.get("outputs")
+        provenance = raw.get("provenance")
+        obligations = raw.get("obligations")
+        if (
+            not isinstance(raw.get("passed"), bool)
+            or not isinstance(outputs, (list, tuple))
+            or not outputs
+            or not all(isinstance(value, dict) for value in outputs)
+            or not isinstance(provenance, (list, tuple))
+            or not provenance
+            or not all(isinstance(value, str) and value for value in provenance)
+            or not isinstance(obligations, (list, tuple))
+            or not obligations
+            or not all(isinstance(value, str) and value for value in obligations)
+        ):
+            raise ValueError(f"controller probe {case_id} returned incomplete evidence")
+        return SafetyProbeResult(bool(raw["passed"]), tuple(outputs), tuple(provenance), tuple(obligations))
+
     def eval_004(self):
-        return self.executor.execute_probe("EVAL-004")
+        return self._run("EVAL-004")
 
     def eval_005(self):
-        return self.executor.execute_probe("EVAL-005")
+        return self._run("EVAL-005")
 
     def register(self, registry: Any) -> None:
         registry.register_safety_probe("EVAL-004", self.eval_004)

@@ -4,15 +4,39 @@ import dataclasses
 from pathlib import Path
 
 from adaptive_agent.evaluation_store import (
+    ControllerSafetyProbeAdapter,
     SQLiteAllocationStore,
     SQLiteRunEvidenceStore,
     SQLiteTrustedAttestationLedger,
 )
+from adaptive_agent.evaluation import SafetyProbeResult, TrustedEvaluatorRegistry
 from adaptive_agent.store import Store
 from adaptive_agent.evaluation import Arm, EvaluationProtocol, ModelProvenance, Partition, RunObservation, build_environment_packages, sha256_json
 
 
 class DurableEvaluatorStoreTests(unittest.TestCase):
+    def test_controller_probe_adapter_requires_attested_shape(self):
+        class Executor:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def execute_probe(self, case_id):
+                return self.payload
+
+        valid = Executor({"passed": True, "outputs": [{"transcript": "denied"}], "provenance": ["toolbroker"], "obligations": ["reject privileged input"]})
+        registry = TrustedEvaluatorRegistry()
+        ControllerSafetyProbeAdapter(valid).register(registry)
+        result = registry.run_safety_probe_result("EVAL-004")
+        self.assertIsInstance(result, SafetyProbeResult)
+        self.assertTrue(result.passed)
+
+        incomplete = Executor({"passed": True, "detail": {"ok": True}, "obligations": []})
+        registry = TrustedEvaluatorRegistry()
+        ControllerSafetyProbeAdapter(incomplete).register(registry)
+        result = registry.run_safety_probe_result("EVAL-004")
+        self.assertFalse(result.passed)
+        self.assertIn("raised", result.obligations[0])
+
     def test_attestation_survives_store_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
