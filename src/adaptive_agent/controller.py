@@ -305,6 +305,27 @@ class Controller:
                 return
             time.sleep(poll_interval)
 
+    # ------------------------------------------------------------------ held-out gate + learner visibility
+    def require_dev_smoke(self, env_id: str) -> None:
+        """Refuse held-out work until a trusted development outcome exists."""
+        if not self.store.dev_smoke_ok(env_id):
+            raise PermissionError(
+                f"environment {env_id!r} has no trusted development smoke outcome; "
+                "held-out panels are not authorized"
+            )
+
+    def learner_tasks(self, env_id: str) -> list[dict[str, Any]]:
+        """Return only public development tasks to the learner."""
+        tasks = self.registry.list_tasks_by_partition(env_id, "development")
+        return [
+            {
+                "taskId": task.task_id,
+                "goal": task.goal,
+                "partition": getattr(task.partition, "value", task.partition),
+            }
+            for task in tasks
+        ]
+
     # ------------------------------------------------------------------ outcomes / reconciliation
     def record_outcome(self, run_id: str, passed: bool, score: float | None = None, metadata: dict[str, Any] | None = None) -> Outcome:
         """Record a trusted evaluator outcome. Only callers holding evaluator
