@@ -46,6 +46,8 @@ class PlannerEvidenceSink(Protocol):
 
 
 class CandidateSink(Protocol):
+    def persist_candidate_patch(self, patch_bytes: bytes, content_hash: str) -> Mapping[str, Any]: ...
+
     def create_candidate(self, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
@@ -112,8 +114,8 @@ class PlannerLearningAdapter:
                 "content": (
                     "Propose one generic bounded learning patch from verified development evidence. "
                     "Return only the JSON proposal schema requested by the caller. "
-                    "Predicted effects are hypotheses, not outcomes. Do not emit fixture IDs, action sequences, "
-                    "hidden evaluator material, policy changes, credentials, or broker/store/planner edits."
+                    "Predicted effects are hypotheses, not outcomes. Only patch the bounded skill/config paths; "
+                    "do not emit fixture IDs, hidden evaluator material, or authority-bearing fields."
                 ),
             },
             {"role": "user", "content": json.dumps({"goal": goal, "environment": environment}, sort_keys=True, ensure_ascii=False)},
@@ -148,13 +150,16 @@ class LearningProposal:
     citations: tuple[Citation, ...]
     model_provenance: dict[str, Any]
     authoritative_candidate: Mapping[str, Any]
+    patch_bytes: bytes
 
 
 _TOP_LEVEL = {"predictedEffect", "editOperations", "changedArtifactHashes", "supportingEvidenceIds", "proposerVersion", "skill", "executionConfigPatch"}
-_SKILL_FIELDS = {"procedure", "applicability", "preconditions", "failureHandling"}
 _PATCH_FIELDS = {"path", "operation", "value"}
-_PRIVILEGED = {"broker", "evaluator", "policy", "store", "credential", "secret", "expectedanswer", "actionsequence", "planner"}
-_FIXTURE_ID = re.compile(r"\b(?:INV|TKT|PAY|SMP|SLOT|DEV|FIN|SUP|IT)-[A-Z0-9_-]+\b", re.IGNORECASE)
+_FIXTURE_ID = re.compile(r"\b(?:INV|TKT|PAY|SMP|SLOT|DEV)-[A-Z0-9_-]+\b", re.IGNORECASE)
+_HIDDEN_LITERAL = re.compile(r"(?i)(expected\s*answer|hidden\s*answer|answer\s*key|evaluator[_ -]?only)")
+_SKILL_FIELDS = {"procedure", "applicability", "preconditions", "failureHandling"}
+_MAX_PATCH_BYTES = 32_768
+_MAX_CHANGED_LINES = 200
 
 
 def _parse_model_json(text: str) -> dict[str, Any]:
@@ -176,12 +181,25 @@ def _parse_model_json(text: str) -> dict[str, Any]:
     return parsed
 
 
-def _canonical_operations(value: Any) -> list[str]:
+def _logical_lines(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value.splitlines()) if value else 0
+    if isinstance(value, Mapping):
+        return sum(_logical_lines(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_logical_lines(item) for item in value)
+    return 0
+
+
+def _canonical_operations(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise LearningError("at least one edit operation is required")
     if len(value) > 3:
         raise LearningError("candidate exceeds the three-artifact bound")
-    operations: list[str] = []
+    operations: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    total_bytes = 0
+    total_lines = 0
     for item in value:
         if isinstance(item, str):
             raise LearningError("edit operations must identify a bounded path and operation")
@@ -190,14 +208,33 @@ def _canonical_operations(value: Any) -> list[str]:
         path, operation = item["path"], item["operation"]
         if not isinstance(path, str) or not isinstance(operation, str) or operation not in {"add", "replace", "remove"}:
             raise LearningError("malformed edit operation")
-        if not (path.startswith("skills/") or path == "executionConfig/instructionVariant"):
+        segments = path.split("/")
+        if path.startswith("/") or any(segment in {"", ".", ".."} for segment in segments):
+            raise LearningError("candidate path contains an unsafe segment")
+        skill_path = len(segments) == 3 and segments[0] == "skills" and segments[2] in _SKILL_FIELDS
+        config_path = segments == ["executionConfig", "instructionVariant"]
+        if not (skill_path or config_path):
             raise LearningError("candidate path is outside the learner bundle")
-        lowered = path.casefold()
-        if any(term in lowered for term in _PRIVILEGED) or path.startswith("skills/../"):
-            raise LearningError("candidate attempts to edit a trusted control")
-        serialized = json.dumps({"operation": operation, "path": path, "value": item.get("value")}, sort_keys=True, separators=(",", ":"))
-        operations.append(serialized)
-    if sum(len(item.splitlines()) for item in operations) > 200:
+        if skill_path and (not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", segments[1]) or _FIXTURE_ID.search(segments[1])):
+            raise LearningError("candidate skill path is not a stable generic identifier")
+        if path in seen_paths:
+            raise LearningError("candidate contains duplicate applied paths")
+        seen_paths.add(path)
+        applied_value = item["value"]
+        if operation == "remove" and applied_value is not None:
+            raise LearningError("remove operations must have a null applied value")
+        if operation != "remove" and applied_value is None:
+            raise LearningError("add and replace operations require an applied value")
+        expected_type = str if segments[-1] in {"procedure", "instructionVariant"} else (dict if segments[-1] == "applicability" else list)
+        if operation != "remove" and not isinstance(applied_value, expected_type):
+            raise LearningError(f"applied value for {path} has the wrong type")
+        if operation != "remove" and segments[-1] in {"preconditions", "failureHandling"} and not all(isinstance(entry, str) for entry in applied_value):
+            raise LearningError(f"applied value for {path} must contain only strings")
+        canonical_operation = {"operation": operation, "path": path, "value": applied_value}
+        operations.append(canonical_operation)
+        total_bytes += len(canonical_json(canonical_operation).encode("utf-8"))
+        total_lines += _logical_lines(applied_value)
+    if total_lines > _MAX_CHANGED_LINES or total_bytes > _MAX_PATCH_BYTES:
         raise LearningError("candidate exceeds the 200-line bound")
     return operations
 
@@ -208,11 +245,8 @@ def _validate_skill(value: Any) -> dict[str, Any]:
     procedure = value["procedure"]
     if not isinstance(procedure, str) or not procedure.strip() or len(procedure.splitlines()) > 120:
         raise LearningError("skill procedure is empty or too large")
-    lowered = procedure.casefold()
-    if any(term in lowered for term in _PRIVILEGED) or _FIXTURE_ID.search(procedure):
-        raise LearningError("skill contains a trusted-control reference or fixture identifier")
-    if any(marker in procedure for marker in ("call_tool(", "tool_sequence", "action_sequence", "expectedAnswer")):
-        raise LearningError("skill contains a literal workflow or hidden-answer field")
+    if _FIXTURE_ID.search(procedure) or _HIDDEN_LITERAL.search(procedure):
+        raise LearningError("skill contains a fixture identifier or hidden-answer literal")
     result = {"procedure": procedure}
     for key in ("applicability", "preconditions", "failureHandling"):
         if key in value:
@@ -221,6 +255,8 @@ def _validate_skill(value: Any) -> dict[str, Any]:
             if key != "applicability" and (not isinstance(value[key], list) or not all(isinstance(item, str) for item in value[key])):
                 raise LearningError(f"skill {key} must be a string array")
             result[key] = value[key]
+    if _HIDDEN_LITERAL.search(canonical_json(result)) or _FIXTURE_ID.search(canonical_json(result)):
+        raise LearningError("skill contains a fixture identifier or hidden-answer literal")
     return result
 
 
@@ -265,12 +301,35 @@ class LearningService:
         config_patch = parsed.get("executionConfigPatch", {})
         if config_patch and (not isinstance(config_patch, Mapping) or set(config_patch) - {"instructionVariant"}):
             raise LearningError("execution configuration patch is outside the bounded learner surface")
-        bundle_patch = {"skills": skill, "editOperations": operations, "executionConfigPatch": dict(config_patch)}
-        patch_hash = _sha256(bundle_patch)
+        applied_skill: dict[str, Any] = {}
+        applied_config: dict[str, Any] = {}
+        for operation in operations:
+            path = operation["path"]
+            destination = applied_config if path == "executionConfig/instructionVariant" else applied_skill
+            field = "instructionVariant" if path == "executionConfig/instructionVariant" else path.split("/")[-1]
+            destination[field] = operation["value"]
+        if applied_skill != skill:
+            raise LearningError("skill fields must equal the exact values in the applied operations")
+        if applied_config != dict(config_patch):
+            raise LearningError("execution configuration must equal the exact values in the applied operations")
+        bundle_patch = {"operations": operations, "skill": applied_skill, "executionConfigPatch": applied_config}
+        patch_bytes = canonical_json(bundle_patch).encode("utf-8")
+        if len(patch_bytes) > _MAX_PATCH_BYTES:
+            raise LearningError("candidate patch exceeds the byte bound")
+        patch_hash = hashlib.sha256(patch_bytes).hexdigest()
         declared_hashes = parsed.get("changedArtifactHashes")
         if declared_hashes is not None and declared_hashes != [patch_hash]:
             raise LearningError("changed artifact hash does not match the proposed patch")
+        persist = getattr(self.candidate_sink, "persist_candidate_patch", None)
+        if not callable(persist):
+            raise LearningError("candidate sink must persist exact immutable patch bytes before staging")
+        persisted = persist(patch_bytes, patch_hash)
+        if not isinstance(persisted, Mapping) or persisted.get("sha256", persisted.get("contentHash")) != patch_hash or persisted.get("stored") is not True or persisted.get("immutable") is not True:
+            raise LearningError("candidate sink did not attest the exact persisted patch bytes")
+        if "size" in persisted and persisted["size"] != len(patch_bytes):
+            raise LearningError("candidate sink persisted a different patch size")
         payload = {"baseBundleHash": active, "editOperations": operations, "changedArtifactHashes": [patch_hash], "supportingEvidenceIds": [item.source_id for item in evidence], "predictedEffect": predicted, "proposerVersion": proposer_version}
+        payload["editOperations"] = [canonical_json(operation) for operation in operations]
         authoritative = self.candidate_sink.create_candidate(payload)
         if not isinstance(authoritative, Mapping):
             raise LearningError("authoritative candidate store returned a non-object")
@@ -279,7 +338,7 @@ class LearningService:
             raise LearningError("learning sink attempted to activate or decide a candidate")
         if emit:
             emit("learning", "Evidence-linked bounded candidate staged for independent evaluation.", None)
-        return LearningProposal(active, payload, bundle_patch, tuple(Citation(item.source_id, item.content_hash, item.kind) for item in evidence), {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(usage)}, dict(authoritative))
+        return LearningProposal(active, payload, bundle_patch, tuple(Citation(item.source_id, item.content_hash, item.kind) for item in evidence), {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(usage)}, dict(authoritative), patch_bytes)
 
 
 class Session2CandidateAdapter:
@@ -289,9 +348,18 @@ class Session2CandidateAdapter:
     injected avoids importing or mutating session 2's API module.
     """
 
-    def __init__(self, control_plane: Any, request_factory: Callable[..., Any] | None = None) -> None:
+    def __init__(self, control_plane: Any, request_factory: Callable[..., Any] | None = None, patch_store: Callable[[bytes, str], Mapping[str, Any]] | None = None) -> None:
         self.control_plane = control_plane
         self.request_factory = request_factory
+        self.patch_store = patch_store
+
+    def persist_candidate_patch(self, patch_bytes: bytes, content_hash: str) -> Mapping[str, Any]:
+        if self.patch_store is None:
+            raise LearningError("session 2 adapter requires an authoritative immutable patch store")
+        result = self.patch_store(patch_bytes, content_hash)
+        if not isinstance(result, Mapping):
+            raise LearningError("authoritative patch store returned a non-object")
+        return result
 
     def create_candidate(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         request = self.request_factory(**dict(payload)) if self.request_factory else payload

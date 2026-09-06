@@ -60,6 +60,12 @@ class SourceRecord:
             raise RetrievalError("source id and content are required")
         if self.content_hash != content_hash(self.content):
             raise RetrievalError(f"content hash mismatch for source {self.source_id}")
+        if not isinstance(self.verified, bool) or not isinstance(self.active, bool):
+            raise RetrievalError("verified and active must be booleans")
+        if not isinstance(self.visibility, str) or not isinstance(self.trust_class, str):
+            raise RetrievalError("visibility and trust_class must be strings")
+        if "authority" in self.metadata and not isinstance(self.metadata["authority"], bool):
+            raise RetrievalError("skill authority metadata must be boolean")
         if self.visibility not in {"learner", "operator", "evaluator_only"}:
             raise RetrievalError("unknown source visibility")
         if self.kind is SourceKind.LIVE_EVIDENCE and self.partition not in {"training", "development", "validation", "final"}:
@@ -72,6 +78,8 @@ class SourceRecord:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "SourceRecord":
         """Construct a record from a store adapter without trusting its hash."""
+        if not isinstance(value, Mapping):
+            raise RetrievalError("source record must be an object")
         raw_kind = value.get("kind")
         try:
             kind = raw_kind if isinstance(raw_kind, SourceKind) else SourceKind(str(raw_kind))
@@ -83,20 +91,41 @@ class SourceRecord:
         supplied_hash = value.get("contentHash", value.get("content_hash"))
         if not isinstance(supplied_hash, str):
             raise RetrievalError("source content hash is required")
+        verified = value.get("verified", False)
+        active = value.get("active", True)
+        if not isinstance(verified, bool) or not isinstance(active, bool):
+            raise RetrievalError("verified and active must be booleans")
+        citations = value.get("citations", ())
+        if not isinstance(citations, (list, tuple)) or not all(isinstance(item, str) for item in citations):
+            raise RetrievalError("citations must be a string array")
+        metadata = value.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise RetrievalError("metadata must be an object")
+        source_id = value.get("sourceId", value.get("source_id", ""))
+        visibility = value.get("visibility", "learner")
+        trust_class = value.get("trustClass", value.get("trust_class", "operator"))
+        environment_id = value.get("environmentId", value.get("environment_id"))
+        run_id = value.get("runId", value.get("run_id"))
+        if not isinstance(source_id, str) or not isinstance(visibility, str) or not isinstance(trust_class, str):
+            raise RetrievalError("source id, visibility, and trust class must be strings")
+        if environment_id is not None and not isinstance(environment_id, str):
+            raise RetrievalError("environment id must be a string")
+        if run_id is not None and not isinstance(run_id, str):
+            raise RetrievalError("run id must be a string")
         return cls(
-            source_id=str(value.get("sourceId", value.get("source_id", ""))),
+            source_id=source_id,
             kind=kind,
             content=content,
             content_hash=supplied_hash,
-            environment_id=value.get("environmentId", value.get("environment_id")),
-            run_id=value.get("runId", value.get("run_id")),
+            environment_id=environment_id,
+            run_id=run_id,
             partition=value.get("partition"),
-            visibility=str(value.get("visibility", "learner")),
-            trust_class=str(value.get("trustClass", value.get("trust_class", "operator"))),
-            verified=bool(value.get("verified", False)),
-            active=bool(value.get("active", True)),
-            citations=tuple(str(item) for item in value.get("citations", ())),
-            metadata=dict(value.get("metadata", {})),
+            visibility=visibility,
+            trust_class=trust_class,
+            verified=verified,
+            active=active,
+            citations=tuple(citations),
+            metadata=dict(metadata),
         )
 
 
@@ -173,7 +202,7 @@ class AccessFilteredRetriever:
         self.max_items_per_kind = max_items_per_kind
 
     def _allowed(self, source: SourceRecord, *, environment_id: str, run_id: str, allowed_skill_ids: set[str] | None) -> bool:
-        if not source.active or not source.verified or source.visibility == "evaluator_only":
+        if not source.active or not source.verified or source.visibility != "learner":
             return False
         if source.environment_id not in {None, environment_id}:
             return False

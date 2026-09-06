@@ -28,6 +28,11 @@ class Sink:
         self.payloads.append(dict(payload))
         return {"candidateId": "candidate-from-authority", "state": "validated", **payload}
 
+    def persist_candidate_patch(self, patch_bytes, content_hash):
+        self.patch_bytes = bytes(patch_bytes)
+        self.patch_hash = hashlib.sha256(self.patch_bytes).hexdigest()
+        return {"sha256": self.patch_hash, "size": len(self.patch_bytes), "stored": True, "immutable": True}
+
 
 class PlannerClient:
     def __init__(self, payload):
@@ -71,6 +76,13 @@ class RetrievalTests(unittest.TestCase):
         self.assertNotIn("ev-hidden", result.source_ids)
         self.assertNotIn("ev-other-run", result.source_ids)
 
+    def test_operator_visibility_and_string_boolean_are_not_learner_inputs(self):
+        operator_doc = {"sourceId": "operator-doc", "kind": "public_doc", "content": "private operator note", "contentHash": content_hash("private operator note"), "visibility": "operator", "trustClass": "operator", "verified": True, "active": True}
+        with self.assertRaisesRegex(RetrievalError, "boolean"):
+            SourceRecord.from_mapping({**operator_doc, "verified": "false"})
+        retriever = AccessFilteredRetriever(InMemorySourceProvider([operator_doc]))
+        self.assertEqual(retriever.search("private operator note", environment_id="env", run_id="run-a").docs, ())
+
     def test_hash_and_development_evidence_are_verified(self):
         with self.assertRaises(RetrievalError):
             SourceRecord("bad", SourceKind.PUBLIC_DOC, "text", "0" * 64)
@@ -101,7 +113,10 @@ class LearningTests(unittest.TestCase):
     def valid_payload(self):
         return {
             "predictedEffect": "reduce stale updates",
-            "editOperations": [{"path": "skills/generic-retry/procedure", "operation": "replace", "value": "Re-read current state after a version conflict before proposing a retry."}],
+            "editOperations": [
+                {"path": "skills/generic-retry/procedure", "operation": "replace", "value": "When a tool reports a version conflict, re-read live state before retrying."},
+                {"path": "skills/generic-retry/preconditions", "operation": "replace", "value": ["the broker has authorized the read"]},
+            ],
             "supportingEvidenceIds": ["ev-dev"],
             "proposerVersion": "model-proposal-1",
             "skill": {"procedure": "When a tool reports a version conflict, re-read live state before retrying.", "preconditions": ["the broker has authorized the read"]},
@@ -116,6 +131,8 @@ class LearningTests(unittest.TestCase):
         self.assertNotIn("evaluatorRef", self.seen["environment"])  # learner sees no trusted control reference
         self.assertNotIn("passed", self.seen["environment"]["sanitizedFeedback"])
         self.assertEqual(len(self.sink.payloads), 1)
+        self.assertEqual(self.sink.patch_hash, result.candidate_payload["changedArtifactHashes"][0])
+        self.assertEqual(hashlib.sha256(result.patch_bytes).hexdigest(), result.candidate_payload["changedArtifactHashes"][0])
 
     def test_learner_claims_and_hidden_evaluator_feedback_never_reach_model(self):
         feedback = {
@@ -150,6 +167,38 @@ class LearningTests(unittest.TestCase):
         payload["skill"]["procedure"] = "Use INV-DEV-000 and call_tool('update_record') in this exact sequence."
         with self.assertRaises(LearningError):
             self.service(payload).propose(run_id="run-a", environment_id="env", goal="learn", environment={})
+
+    def test_actual_value_lines_and_exact_skill_binding_are_bounded(self):
+        payload = self.valid_payload()
+        payload["editOperations"][0]["value"] = "line\n" * 201
+        payload["skill"]["procedure"] = payload["editOperations"][0]["value"]
+        with self.assertRaisesRegex(LearningError, "200-line"):
+            self.service(payload).propose(run_id="run-a", environment_id="env", goal="learn", environment={})
+        payload = self.valid_payload()
+        payload["editOperations"][0]["value"] = "A generic but different applied value."
+        with self.assertRaisesRegex(LearningError, "exact values"):
+            self.service(payload).propose(run_id="run-a", environment_id="env", goal="learn", environment={})
+        payload = self.valid_payload()
+        payload["editOperations"][0]["path"] = "skills/generic-retry/../procedure"
+        with self.assertRaisesRegex(LearningError, "unsafe segment"):
+            self.service(payload).propose(run_id="run-a", environment_id="env", goal="learn", environment={})
+
+    def test_metadata_only_patch_attestation_is_rejected(self):
+        class MetadataOnlySink(Sink):
+            def persist_candidate_patch(self, patch_bytes, content_hash):
+                return {"sha256": content_hash, "size": len(patch_bytes)}
+
+        service = LearningService(self.retriever, self.runner_for(self.valid_payload()), MetadataOnlySink(), lambda: "a" * 64)
+        with self.assertRaisesRegex(LearningError, "exact persisted patch"):
+            service.propose(run_id="run-a", environment_id="env", goal="learn", environment={})
+
+    def test_legitimate_learned_tool_orchestration_is_allowed(self):
+        payload = self.valid_payload()
+        procedure = "Read current state with call_tool('inventory.read'), then use the returned version for the bounded update."
+        payload["editOperations"][0]["value"] = procedure
+        payload["skill"]["procedure"] = procedure
+        result = self.service(payload).propose(run_id="run-a", environment_id="env", goal="learn", environment={})
+        self.assertIn("call_tool", result.bundle_patch["skill"]["procedure"])
 
     def test_stale_base_is_rejected(self):
         with self.assertRaisesRegex(LearningError, "pinned active"):
