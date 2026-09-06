@@ -1205,6 +1205,7 @@ class DurableRuntime:
         nominal_cost_usd = sum(nominal_values) if nominal_values else None
         nominal_coverage = {"knownReceipts": len(nominal_values), "totalReceipts": len(all_receipts)}
         nominal_status = "complete" if nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"] else "partial"
+        nominal_proxy_fields = {"costBasis": "nominal_budget_proxy", "billingStatus": "unknown"} if not explicit_cost and nominal_status == "complete" else {}
         usage = dict(canonical_usage(evidence.get("usage")))
         if all_receipts:
             usage.update({key: value for key, value in all_receipts[-1]["usage"].items() if key in cache_keys or key == "cost"})
@@ -1261,6 +1262,7 @@ class DurableRuntime:
             "nominalCostUsd": nominal_cost_usd,
             "nominalCostStatus": nominal_status,
             "nominalCostCoverage": nominal_coverage,
+            **nominal_proxy_fields,
         }
         accounting = {
             "responseId": response_id,
@@ -1281,6 +1283,7 @@ class DurableRuntime:
             "nominalCostCoverage": nominal_coverage,
             "durationSeconds": whole_run_duration,
             "inferenceDurationSeconds": aggregate_inference,
+            **nominal_proxy_fields,
         }
         accounting_ref = self.controller.store.put_artifact(accounting)
         payload["accountingRef"] = accounting_ref.model_dump(mode="json", by_alias=True)
