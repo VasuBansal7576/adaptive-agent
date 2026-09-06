@@ -176,6 +176,9 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     job = runtime.build_evaluation_job(protocol, {Arm.B0: active})
     result = job.run_experiment("full-production-synthetic", stages, limits=limits)
     assert result.status == "complete", result.error
+    assert result.runtime_accounting is not None
+    assert result.runtime_accounting["blocked"] is False
+    assert result.runtime_accounting["costMicrounits"] > 0
     assert result.reports is not None and set(result.reports) == {"validation", "final"}
     assert result.reports["validation"].validity_status == "valid"
     assert result.reports["final"].validity_status == "valid"
@@ -221,6 +224,8 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
         learning_receipt = stage_receipt["learningReceipt"]
         assert learning_receipt["modelObservationRefs"]
         assert learning_receipt["sourceRunIds"]
+        assert learning_receipt["costBasis"] == "nominal_budget_proxy"
+        assert learning_receipt["billingStatus"] == "unknown"
         assert learning_receipt.get("reusedCandidate") is not True
 
     for report in (result.reports or {}).values():
