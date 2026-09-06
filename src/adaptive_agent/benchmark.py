@@ -39,6 +39,7 @@ class FrozenExecutionConfig:
     protocol: FrozenProtocol
     arm: Arm
     seed: int
+    bundle_hash: str
 
 
 TrustedTaskExecutor = Callable[[TaskInput, FrozenExecutionConfig, object], RunObservation]
@@ -118,8 +119,11 @@ class ResumableEvaluationDriver:
         partition = Partition(partition)
         if partition is not Partition.DEVELOPMENT and not self._development_smoke_complete(benchmark_id):
             raise EvaluationError("development smoke with trusted evidence is required before held-out panels")
+        arms = (Arm.B0,) if partition is Partition.DEVELOPMENT else ((Arm.B0, Arm.L) if partition is not Partition.FINAL else (Arm.B0, Arm.L, Arm.A))
+        missing_arms = [arm.value for arm in arms if arm not in self.arm_bundles and arm.value not in self.arm_bundles]
+        if missing_arms:
+            raise EvaluationError(f"missing expected arm bundles before execution: {', '.join(missing_arms)}")
         tasks_by_env = self._tasks_for_partition(benchmark_id, partition, base_hash, candidate_hash, frozen)
-        arms = (Arm.B0, Arm.L) if partition is not Partition.FINAL else (Arm.B0, Arm.L, Arm.A)
         statuses: list[BenchmarkTaskStatus] = []
         for environment_id, tasks in tasks_by_env.items():
             package = self.packages[environment_id]
@@ -128,9 +132,17 @@ class ResumableEvaluationDriver:
                     for arm in arms:
                         prior = self._load(benchmark_id, task.task_id, arm, seed)
                         if prior is not None and prior.status == "complete":
-                            if prior.observation is not None and self.evidence_store.verify(prior.observation, frozen, package):
-                                statuses.append(prior)
-                                continue
+                            selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
+                            bundle_hash = self._bundle_hash(selected_bundle)
+                            if prior.observation is not None:
+                                try:
+                                    self._validate_observation(prior.observation, task, environment_id, partition, seed, arm, bundle_hash)
+                                except EvaluationError:
+                                    pass
+                                else:
+                                    if self.evidence_store.verify(prior.observation, frozen, package):
+                                        statuses.append(prior)
+                                        continue
                             self._save(benchmark_id, task, arm, seed, "failed", "persisted evidence no longer verifies", None)
                         if not self._claim(benchmark_id, task, arm, seed):
                             existing = self._load(benchmark_id, task.task_id, arm, seed)
@@ -139,8 +151,9 @@ class ResumableEvaluationDriver:
                             continue
                         try:
                             selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
-                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed), selected_bundle)
-                            self._validate_observation(observation, task, environment_id, partition, seed, arm)
+                            bundle_hash = self._bundle_hash(selected_bundle)
+                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash), selected_bundle)
+                            self._validate_observation(observation, task, environment_id, partition, seed, arm, bundle_hash)
                             if not self.evidence_store.verify(observation, frozen, package):
                                 raise EvaluationError("runtime observation lacks trusted persisted evidence")
                             self._save(benchmark_id, task, arm, seed, "complete", None, observation)
@@ -165,15 +178,22 @@ class ResumableEvaluationDriver:
         task = package.tasks_for_partition(Partition.DEVELOPMENT)[0]
         arm, seed = Arm.B0, self.protocol.seeds[0]
         prior = self._load(benchmark_id, task.task_id, arm, seed)
-        if prior is not None and prior.status == "complete" and prior.observation is not None and self.evidence_store.verify(prior.observation, frozen, package):
-            return BenchmarkSummary(benchmark_id, Partition.DEVELOPMENT, (prior,), 1)
+        selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
+        bundle_hash = self._bundle_hash(selected_bundle)
+        if prior is not None and prior.status == "complete" and prior.observation is not None:
+            try:
+                self._validate_observation(prior.observation, task, environment_id, Partition.DEVELOPMENT, seed, arm, bundle_hash)
+            except EvaluationError:
+                pass
+            else:
+                if self.evidence_store.verify(prior.observation, frozen, package):
+                    return BenchmarkSummary(benchmark_id, Partition.DEVELOPMENT, (prior,), 1)
         if not self._claim(benchmark_id, task, arm, seed):
             existing = self._load(benchmark_id, task.task_id, arm, seed)
             return BenchmarkSummary(benchmark_id, Partition.DEVELOPMENT, (existing,) if existing else (), 1)
         try:
-            selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
-            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed), selected_bundle)
-            self._validate_observation(observation, task, environment_id, Partition.DEVELOPMENT, seed, arm)
+            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash), selected_bundle)
+            self._validate_observation(observation, task, environment_id, Partition.DEVELOPMENT, seed, arm, bundle_hash)
             if not self.evidence_store.verify(observation, frozen, package):
                 raise EvaluationError("runtime observation lacks trusted persisted evidence")
             self._save(benchmark_id, task, arm, seed, "complete", None, observation)
@@ -186,9 +206,18 @@ class ResumableEvaluationDriver:
         with self.store.connect() as conn:
             rows = conn.execute("SELECT task_id, environment_id, arm, seed FROM benchmark_task_runs WHERE benchmark_id = ? AND partition = 'development' AND status = 'complete' AND observation_json IS NOT NULL", (benchmark_id,)).fetchall()
         for row in rows:
-            status = self._load(benchmark_id, row["task_id"], Arm(row["arm"]), int(row["seed"]))
-            if status and status.observation and self.evidence_store.verify(status.observation, self.protocol.start_candidate_generation(), self.packages[row["environment_id"]]):
-                return True
+            arm = Arm(row["arm"])
+            status = self._load(benchmark_id, row["task_id"], arm, int(row["seed"]))
+            selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
+            bundle_hash = self._bundle_hash(selected_bundle)
+            task = next((item for item in self.packages[row["environment_id"]].tasks_for_partition(Partition.DEVELOPMENT) if item.task_id == row["task_id"]), None)
+            if status and status.observation and task is not None:
+                try:
+                    self._validate_observation(status.observation, task, row["environment_id"], Partition.DEVELOPMENT, int(row["seed"]), arm, bundle_hash)
+                except EvaluationError:
+                    continue
+                if self.evidence_store.verify(status.observation, self.protocol.start_candidate_generation(), self.packages[row["environment_id"]]):
+                    return True
         return False
 
     def _tasks_for_partition(self, benchmark_id: str, partition: Partition, base_hash: str, candidate_hash: str, frozen: FrozenProtocol) -> dict[str, tuple[TaskInput, ...]]:
@@ -211,7 +240,7 @@ class ResumableEvaluationDriver:
 
         serialized_bundle = bundle_value(self.bundle)
         arm_values = {
-            key.value if isinstance(key, Arm) else str(key): bundle_value(value)
+            key.value if isinstance(key, Arm) else str(key): self._bundle_hash(value)
             for key, value in self.arm_bundles.items()
         }
         plan_fingerprint = sha256_json({"protocol": frozen.protocol_hash, "partition": partition.value, "base": base_hash, "candidate": candidate_hash, "bundle": sha256_json(serialized_bundle), "armBundles": arm_values})
@@ -279,13 +308,30 @@ class ResumableEvaluationDriver:
             conn.commit()
 
     @staticmethod
-    def _validate_observation(observation: RunObservation, task: TaskInput, environment_id: str, partition: Partition, seed: int, arm: Arm) -> None:
+    def _bundle_hash(bundle: object) -> str:
+        bundle_hash = getattr(bundle, "content_hash", None)
+        if not isinstance(bundle_hash, str) or not bundle_hash:
+            raise EvaluationError("selected arm bundle has no content hash")
+        model_dump = getattr(bundle, "model_dump", None)
+        if callable(model_dump):
+            try:
+                payload = model_dump(mode="json", by_alias=True, exclude={"content_hash"})
+            except TypeError:
+                payload = model_dump()
+            if isinstance(payload, Mapping) and sha256_json(payload) != bundle_hash:
+                raise EvaluationError("selected arm bundle content hash is invalid")
+        return bundle_hash
+
+    @staticmethod
+    def _validate_observation(observation: RunObservation, task: TaskInput, environment_id: str, partition: Partition, seed: int, arm: Arm, bundle_hash: str) -> None:
         if not isinstance(observation, RunObservation):
             raise EvaluationError("trusted executor must return RunObservation")
         if (observation.task_id, observation.environment_id, observation.partition, observation.seed, observation.arm) != (task.task_id, environment_id, partition, seed, arm):
             raise EvaluationError("trusted observation identity does not match requested task")
         if observation.model_provenance is not ModelProvenance.REAL_MODEL:
             raise EvaluationError("synthetic observation is not valid runtime evidence")
+        if not bundle_hash or observation.bundle_hash != bundle_hash:
+            raise EvaluationError("observation bundle hash does not match the requested arm bundle")
 
 
 __all__ = ["BenchmarkSummary", "BenchmarkTaskStatus", "FrozenExecutionConfig", "ResumableEvaluationDriver", "TrustedTaskExecutor"]
