@@ -277,7 +277,7 @@ class DefaultExperimentStageRunner:
             "cellKey": cell_key,
             "status": "complete",
             "executed": True,
-            "clean": True,
+            "clean": clean["clean"],
             "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0},
             "toolCalls": 0,
             "wallSeconds": 0,
@@ -292,7 +292,7 @@ class DefaultExperimentStageRunner:
             "exposedEnvironments": list(known),
             "sealedEnvironment": self.protocol.sealed_environment,
             "provenanceRef": clean["provenanceRef"],
-            "actualDocker": True,
+            "actualDocker": clean["actualDocker"],
         }
 
     def _task_for_cell(self, cell_key: str, partition: str, environment_id: str | None = None, index: int = 0) -> Any:
