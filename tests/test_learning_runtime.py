@@ -52,13 +52,13 @@ class FakeClient:
 def test_runtime_composes_durable_learning_and_restart_readback(tmp_path: Path):
     store, manager, evidence_id = _setup_store(tmp_path)
     client = FakeClient()
-    runtime = LearningRuntime.build(store=store, manager=manager, model_client=client, token_budget=1000, wall_seconds=20)
+    runtime = LearningRuntime.build(store=store, manager=manager, model_client=client, token_budget=20_000, wall_seconds=20)
     result = runtime.propose_completed_run(RUN)
     assert result.authoritative_candidate["state"] == "validated"
     assert result.candidate_payload["supportingEvidenceIds"] == [evidence_id]
     restarted_store = type(store)(tmp_path)
     restarted_manager = CandidateManager(restarted_store)
-    restarted = LearningRuntime.build(store=restarted_store, manager=restarted_manager, model_client=FakeClient(), token_budget=1000, wall_seconds=20)
+    restarted = LearningRuntime.build(store=restarted_store, manager=restarted_manager, model_client=FakeClient(), token_budget=20_000, wall_seconds=20)
     assert restarted.reload_candidate(result.authoritative_candidate["candidate_id"])["state"] == "validated"
 
 
@@ -187,7 +187,7 @@ def test_failed_trusted_development_run_can_produce_candidate(tmp_path: Path):
     store, manager, evidence_id = _setup_store(tmp_path)
     _mark_run(store, status="failed", passed=0)
     client = FakeClient()
-    result = LearningRuntime.build(store=store, manager=manager, model_client=client, token_budget=1000, wall_seconds=20).propose_completed_run(RUN)
+    result = LearningRuntime.build(store=store, manager=manager, model_client=client, token_budget=20_000, wall_seconds=20).propose_completed_run(RUN)
     assert result.authoritative_candidate["state"] == "validated"
     assert result.candidate_payload["supportingEvidenceIds"] == [evidence_id]
     assert client.feedback == {"status": "failed"}
