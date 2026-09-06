@@ -420,12 +420,12 @@ class Controller:
         self,
         store: Store,
         registry: EnvironmentRegistry,
-        broker: ToolBroker,
+        broker: ToolBroker | None = None,
         approval_provider: ApprovalProvider | None = None,
     ) -> None:
         self.store = store
         self.registry = registry
-        self.broker = broker
+        self.broker = broker or ToolBroker(store, registry)
         self.candidates = CandidateManager(store)
         self.approval_provider = approval_provider
 

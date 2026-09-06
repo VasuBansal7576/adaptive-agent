@@ -15,6 +15,7 @@ from adaptive_agent.controller import Controller
 from adaptive_agent.planner import make_luna_model_runner
 from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
 from adaptive_agent.evaluation import sha256_json
+from adaptive_agent.models import RunStatus
 
 
 def manifest():
@@ -532,6 +533,58 @@ def test_durable_runtime_builds_production_job_with_bound_executor(tmp_path):
     assert job.execute.__func__ is runtime.execute_evaluation_task.__func__
     assert job.arm_bundles[Arm.B0] is active
     assert job.arm_bundles[Arm.L] is active
+
+
+def test_runtime_binds_default_stage_runner_and_clean_pins(monkeypatch, tmp_path):
+    monkeypatch.setenv("ADAPTIVE_AGENT_IMAGE_DIGEST", "sha256:" + "a" * 64)
+    monkeypatch.setattr("adaptive_agent.app.subprocess.run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    protocol = EvaluationProtocol(core_planner_hash=runtime.core_planner_hash, image_digest=runtime.image_digest)
+    protocol.freeze(runtime.packages)
+    job = runtime.build_evaluation_job(protocol, {Arm.B0: runtime.controller.get_active_bundle()})
+    assert job is not None
+    clean = runtime.establish_clean_experiment(protocol)
+    assert clean["clean"] is True
+    assert clean["actualDocker"] is True
+    assert clean["provenanceRef"]
+    assert runtime.experiment_stage_runner is None
+    runtime.run_experiment_stage(cell_key="bootstrap", context={"stage": "bootstrap", "attempt": 0})
+    assert runtime.experiment_stage_runner is not None
+
+
+def test_runtime_strict_observation_verifier_delegates_to_durable_adapter(tmp_path, monkeypatch):
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    protocol = EvaluationProtocol()
+    protocol.freeze(runtime.packages)
+    verifier = runtime.controller.evaluator_adapters[2]
+    calls = []
+    original = verifier.verify
+
+    def wrapped(observation, frozen, package):
+        calls.append((observation, frozen, package))
+        return original(observation, frozen, package)
+
+    monkeypatch.setattr(verifier, "verify", wrapped)
+    task = runtime.packages["finance"].tasks_for_partition("development")[0]
+    observation = SimpleNamespace(bundle_hash="bundle", model_provenance="real_model")
+    config = SimpleNamespace(protocol=protocol.start_candidate_generation(), bundle_hash="bundle")
+    assert runtime.verify_evaluation_observation(observation, config, task) is False
+    assert calls and calls[0][2] is runtime.packages["finance"]
+
+
+def test_failed_development_run_is_learning_eligible(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "learning-failed"}).json()
+    controller = app.state.controller
+    controller.record_trusted_outcome(run["runId"], {"runId": run["runId"], "taskId": task["taskId"], "environmentId": "finance", "responseId": "r", "passed": False, "reliable": True, "safetyViolations": 0})
+    controller._set_run_status(run["runId"], RunStatus.failed)
+    public = app.state.durable_runtime.get_run(run["runId"])
+    assert public["learningEligible"] is True
 
 
 def test_evaluation_job_rejects_final_without_pinned_ablation(tmp_path):

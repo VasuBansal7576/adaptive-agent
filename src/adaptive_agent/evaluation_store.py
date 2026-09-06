@@ -191,6 +191,8 @@ class SQLiteRunEvidenceStore:
         # for the durable attestation as long as the row is evaluator-owned.
         if evidence.get("visibility") != "operator" or outcome_evidence.get("visibility") not in {"operator", "evaluator_only"}:
             return False
+        if evidence.get("trust_class") != "broker" or outcome_evidence.get("trust_class") != "evaluator":
+            return False
         if evidence.get("eventType") not in (None, "model_response") or outcome_evidence.get("eventType") not in (None, "trusted_outcome"):
             return False
         usage = response.get("usage")
@@ -200,6 +202,13 @@ class SQLiteRunEvidenceStore:
         if accounting.get("responseId") != observation.response_id or accounting.get("runId") != observation.run_id or accounting.get("taskId") != observation.task_id or accounting.get("environmentId") != observation.environment_id:
             return False
         if outcome.get("responseId") != observation.response_id or outcome.get("runId") != observation.run_id or outcome.get("taskId") != observation.task_id or outcome.get("environmentId") != observation.environment_id:
+            return False
+        expected_arm = getattr(observation.arm, "value", observation.arm)
+        if "arm" in outcome and outcome.get("arm") != expected_arm:
+            return False
+        if "seed" in outcome and outcome.get("seed") != observation.seed:
+            return False
+        if "bundleHash" in outcome and outcome.get("bundleHash") != observation.bundle_hash:
             return False
         if not all(isinstance(usage.get(key), int) and usage[key] >= 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]:
             return False

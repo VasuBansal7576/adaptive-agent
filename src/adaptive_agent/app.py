@@ -14,6 +14,7 @@ import inspect
 import math
 import os
 import json
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -136,6 +137,7 @@ class DurableRuntime:
         self.learning_model_client = learning_model_client
         self.evaluation_executor = evaluation_executor
         self.experiment_stage_runner = experiment_stage_runner
+        self._evaluation_protocol: Any | None = None
         # These pins are process-scoped and are captured before any learned
         # candidate can be generated.  They never derive from the active
         # skill bundle, which is the arm-specific input under evaluation.
@@ -168,12 +170,83 @@ class DurableRuntime:
         of manufacturing a receipt from workload arithmetic.
         """
         callback = self.experiment_stage_runner
+        if callback is None and self._evaluation_protocol is not None:
+            from adaptive_agent.experiment_runtime import DefaultExperimentStageRunner
+
+            callback = DefaultExperimentStageRunner(self, self._evaluation_protocol)
+            self.experiment_stage_runner = callback
         if not callable(callback):
             raise LearningRuntimeError("runtime does not have a trusted experiment stage runner")
         result = callback(cell_key=cell_key, context=dict(context))
         if not isinstance(result, Mapping):
             raise LearningRuntimeError("experiment stage runner returned a non-object")
         return dict(result)
+
+    def establish_clean_experiment(self, protocol: Any) -> dict[str, Any]:
+        """Verify and persist the immutable bootstrap provenance for a job."""
+        frozen = protocol.start_candidate_generation()
+        inputs = getattr(frozen, "inputs", None)
+        active = self.controller.get_active_bundle()
+        active_hash = getattr(active, "content_hash", None)
+        adapters = getattr(self.controller, "evaluator_adapters", ())
+        verifier_ready = isinstance(adapters, tuple) and len(adapters) >= 3 and bool(getattr(adapters[2], "durable", False))
+        image = self.image_digest
+        image_available = False
+        if isinstance(image, str) and image and image != "image-unpinned":
+            inspected = subprocess.run(["docker", "image", "inspect", image], capture_output=True, check=False)
+            image_available = inspected.returncode == 0
+        known = tuple(getattr(protocol, "known_environments", ()))
+        partitions_clean = bool(known) and all(
+            environment_id in self.packages
+            and callable(getattr(self.packages[environment_id], "reset", None))
+            and callable(getattr(self.packages[environment_id], "evaluate", None))
+            and bool(tuple(self.packages[environment_id].tasks_for_partition("development")))
+            for environment_id in known
+        )
+        clean = bool(
+            isinstance(inputs, Mapping)
+            and isinstance(active_hash, str)
+            and bool(active_hash)
+            and self.controller.store.get_bundle_by_hash(active_hash) is not None
+            and verifier_ready
+            and image_available
+            and partitions_clean
+            and inputs.get("corePlannerHash") == self.core_planner_hash
+            and inputs.get("imageDigest") == image
+            and inputs.get("provider") == "openai-codex"
+            and inputs.get("modelProfile") == "openai-codex/gpt-5.6-luna"
+        )
+        if not clean:
+            return {"clean": False, "actualDocker": image_available, "provenanceRef": ""}
+        provenance = {
+            "kind": "clean_experiment_bootstrap",
+            "protocolHash": frozen.protocol_hash,
+            "corePlannerHash": self.core_planner_hash,
+            "imageDigest": image,
+            "baseBundleHash": active_hash,
+            "developmentEnvironments": list(known),
+            "developmentTaskIds": [task.task_id for environment_id in known for task in self.packages[environment_id].tasks_for_partition("development")],
+        }
+        ref = self.controller.store.put_artifact(provenance)
+        return {"clean": True, "actualDocker": True, "provenanceRef": ref.sha256}
+
+    def verify_evaluation_observation(self, observation: Any, config: Any, task: Any) -> bool:
+        """Verify a benchmark receipt using the durable strict evaluator adapter."""
+        frozen = getattr(config, "protocol", None)
+        if frozen is None or not isinstance(getattr(frozen, "inputs", None), Mapping):
+            return False
+        environment_id = getattr(getattr(task, "environment_ref", None), "id", None) or getattr(task, "environment_id", None)
+        package = self.packages.get(environment_id) if isinstance(environment_id, str) else None
+        if package is None or getattr(config, "bundle_hash", None) != getattr(observation, "bundle_hash", None):
+            return False
+        adapters = getattr(self.controller, "evaluator_adapters", ())
+        verifier = adapters[2] if isinstance(adapters, tuple) and len(adapters) >= 3 else None
+        if verifier is None or not bool(getattr(verifier, "durable", False)):
+            return False
+        try:
+            return verifier.verify(observation, frozen, package) is True
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
 
     def _reload_registered_environments(self) -> None:
         """Rebuild manifest/task projections from SQLite after a restart."""
@@ -274,6 +347,14 @@ class DurableRuntime:
             raise KeyError("candidate not found")
         if payload.base_bundle_hash != candidate.get("base_bundle_hash"):
             raise ValueError("evaluation base does not match candidate")
+        if self._evaluation_protocol is not None:
+            frozen = self._evaluation_protocol.start_candidate_generation()
+            if payload.protocol_hash != frozen.protocol_hash:
+                raise ValueError("evaluation protocol does not match the frozen server protocol")
+            partition = frozen.partition_hashes.get("validation")
+            supplied = payload.partition_ref.get("sha256") if isinstance(payload.partition_ref, Mapping) else None
+            if isinstance(partition, str) and supplied != partition:
+                raise ValueError("evaluation partition does not match the frozen server partition")
         self.controller.start_evaluation(payload.candidate_id)
         evaluation_id = f"eval_{__import__('uuid').uuid4().hex}"
         response = {
@@ -298,6 +379,55 @@ class DurableRuntime:
             },
         )
         return response
+
+    def launch_evaluation(self, evaluation_id: str) -> dict[str, Any]:
+        """Execute one queued evaluation through the bound durable job."""
+        queued = self.controller.store.get_evaluation_queue(evaluation_id)
+        if queued is None:
+            raise KeyError("evaluation not found")
+        if queued.get("state") == "completed":
+            report = self.controller.store.get_evaluation(evaluation_id)
+            if report is None:
+                return {"evaluationId": evaluation_id, "state": "completed", "trusted": False, "trustReason": "missing evaluator report"}
+            try:
+                payload = json.loads(report["report_json"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            normalized = dict(payload) if isinstance(payload, Mapping) else {}
+            normalized["evaluationId"] = evaluation_id
+            normalized["candidateId"] = report.get("candidate_id")
+            normalized["baseBundleHash"] = report.get("base_hash")
+            normalized["protocolHash"] = report.get("protocol_hash")
+            normalized["trusted"] = bool(normalized.get("validityStatus") == "valid" and normalized.get("attestation") and normalized.get("evaluatorRefs"))
+            if not normalized["trusted"]:
+                normalized["trustReason"] = "unverified evaluator report"
+            return normalized
+        with self.controller.store.connect() as conn:
+            claimed = conn.execute(
+                "UPDATE evaluation_queue SET state = 'running', updated_at = datetime('now') WHERE evaluation_id = ? AND state IN ('queued', 'failed')",
+                (evaluation_id,),
+            ).rowcount
+            conn.commit()
+        if claimed != 1:
+            current = self.controller.store.get_evaluation_queue(evaluation_id) or queued
+            return {"evaluationId": evaluation_id, "candidateId": current.get("candidate_id"), "state": current.get("state", "running"), "trusted": False, "trustReason": "evaluation is already running"}
+        protocol = getattr(self, "_evaluation_protocol", None)
+        if protocol is None:
+            raise ValueError("evaluation protocol is not bound")
+        candidate_id = str(queued["candidate_id"])
+        candidate = self.controller.get_candidate(candidate_id)
+        active = self.controller.get_active_bundle()
+        if candidate is None or active is None:
+            raise KeyError("candidate or base bundle not found")
+        candidate_hash = candidate.get("candidate_bundle_hash")
+        if not isinstance(candidate_hash, str) or not candidate_hash:
+            raise ValueError("candidate has no durable bundle hash")
+        bundle = self.controller.store.get_bundle_by_hash(candidate_hash)
+        if bundle is None:
+            raise ValueError("candidate bundle is not durable")
+        job = self.build_evaluation_job(protocol, {"B0": active, "L": __import__("adaptive_agent.models", fromlist=["SkillBundle"]).SkillBundle.model_validate(json.loads(bundle["bundle_json"]))})
+        result = job.run(evaluation_id, "validation", base_hash=str(queued["base_hash"]), candidate_hash=candidate_hash, candidate_id=candidate_id)
+        return {"evaluationId": evaluation_id, "candidateId": candidate_id, "state": result.status, "trusted": result.report is not None, "error": result.error}
 
     def execute_evaluation_task(self, task: Any, frozen_config: Any, bundle: Any) -> Any:
         """Execute one frozen benchmark cell through the shared run path."""
@@ -509,6 +639,8 @@ class DurableRuntime:
         from adaptive_agent.evaluation import Arm
         from adaptive_agent.evaluation_job import build_evaluation_job
 
+        self._evaluation_protocol = protocol
+
         active = self.controller.get_active_bundle()
         if active is None:
             raise LearningRuntimeError("no active bundle is available for evaluation")
@@ -536,13 +668,41 @@ class DurableRuntime:
     def list_evaluations(self) -> list[dict[str, Any]]:
         out = []
         report_ids: set[str] = set()
+
+        def public_job(payload: Mapping[str, Any], *, evaluation_id: str | None = None, row: Mapping[str, Any] | None = None) -> dict[str, Any]:
+            value = dict(payload)
+            if evaluation_id is not None:
+                value.setdefault("evaluationId", evaluation_id)
+            if row is not None:
+                value.setdefault("candidateId", row.get("candidate_id"))
+                value.setdefault("baseBundleHash", row.get("base_hash"))
+                value.setdefault("protocolHash", row.get("protocol_hash"))
+                value.setdefault("state", row.get("state"))
+            if "candidate_id" in value:
+                value["candidateId"] = value.pop("candidate_id")
+            if "base_hash" in value:
+                value["baseBundleHash"] = value.pop("base_hash")
+            if "protocol_hash" in value:
+                value["protocolHash"] = value.pop("protocol_hash")
+            if "validity" in value and "validityStatus" not in value:
+                value["validityStatus"] = value.pop("validity")
+            state = value.get("state")
+            bound = row is not None and value.get("candidateHash") == row.get("candidate_hash") and value.get("baseHash") == row.get("base_hash") and value.get("protocolHash") == row.get("protocol_hash")
+            canonical = bool(bound and value.get("validityStatus") == "valid" and value.get("attestation") and value.get("evaluatorRefs"))
+            value["trusted"] = canonical
+            if not canonical:
+                value.setdefault("trustReason", "unverified evaluator report")
+            return value
+
         for row in self.controller.store.list_evaluations():
             try:
                 report = json.loads(row["report_json"])
                 if isinstance(report, dict):
-                    out.append(report)
-                    if isinstance(report.get("evaluationId"), str):
-                        report_ids.add(report["evaluationId"])
+                    report_id = str(row.get("report_id", report.get("evaluationId", "")))
+                    normalized = public_job(report, evaluation_id=report_id or None, row=row)
+                    out.append(normalized)
+                    if report_id:
+                        report_ids.add(report_id)
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
         for row in self.controller.store.list_evaluation_queue():
@@ -551,7 +711,7 @@ class DurableRuntime:
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
             if isinstance(queued, dict) and row["evaluation_id"] not in report_ids:
-                out.append(queued)
+                out.append(public_job(queued, evaluation_id=row["evaluation_id"], row=row))
         return out
 
     def active_versions(self) -> list[dict[str, Any]]:
@@ -638,12 +798,19 @@ class DurableRuntime:
             "executionModes": list(package.manifest.execution_modes),
         } for task in self._tasks.values() if task.environment_ref.id == environment_id]
 
-    @staticmethod
-    def _public_run(run: Any, task: Any) -> dict[str, Any]:
+    def _public_run(self, run: Any, task: Any) -> dict[str, Any]:
         value = run.model_dump(mode="json", by_alias=True)
         if value.get("outcomeRef") is None:
             value.pop("outcomeRef", None)
         value.update({"environmentId": task.environment_ref.id, "goal": task.goal})
+        status = getattr(run.status, "value", run.status)
+        partition = getattr(getattr(task, "partition", None), "value", getattr(task, "partition", None))
+        value["learningEligible"] = bool(
+            partition == "development"
+            and status in {"succeeded", "failed", "cancelled", "timed_out", "outcome_unknown"}
+            and self.controller.store.get_outcome_by_run_id(run.run_id) is not None
+            and self.controller.store.has_trusted_outcome(run.run_id)
+        )
         return value
 
     def create_run(self, payload: Any) -> dict[str, Any]:
@@ -804,7 +971,10 @@ class DurableRuntime:
                 if isinstance(nominal_value, bool) or not isinstance(nominal_value, (int, float)) or not math.isfinite(float(nominal_value)) or float(nominal_value) < 0:
                     raise ValueError("model accounting nominalCostUsd must be finite and non-negative")
             aggregate_inference += float(duration_value)
-            receipts.append({"responseId": receipt_id, "usage": receipt_usage, "durationSeconds": float(duration_value), "status": str(raw.get("status", "complete")), **({"costMicrounits": cost_value} if cost_value is not None else {}), **({"nominalCostUsd": float(nominal_value)} if nominal_value is not None else {})})
+            receipt_economic_status = raw.get("economicCostStatus")
+            if not isinstance(receipt_economic_status, str) or not receipt_economic_status:
+                receipt_economic_status = "unknown" if cost_value is None else "measured"
+            receipts.append({"responseId": receipt_id, "usage": receipt_usage, "durationSeconds": float(duration_value), "status": str(raw.get("status", "complete")), "economicCostStatus": receipt_economic_status, **({"costMicrounits": cost_value} if cost_value is not None else {}), **({"nominalCostUsd": float(nominal_value)} if nominal_value is not None else {})})
         self._run_last_receipt_at[run_id] = now
         self._run_receipts.setdefault(run_id, []).extend(receipts)
         all_receipts = list(self._run_receipts.get(run_id, ()))
@@ -816,6 +986,8 @@ class DurableRuntime:
         aggregate_inference = sum(float(item.get("durationSeconds", 0.0)) for item in all_receipts)
         explicit_cost = any("costMicrounits" in item for item in all_receipts)
         aggregate_cost = sum(float(item["costMicrounits"]) for item in all_receipts if "costMicrounits" in item)
+        economic_statuses = {str(item.get("economicCostStatus")) for item in all_receipts if isinstance(item.get("economicCostStatus"), str)}
+        aggregate_cost_unknown = any(status == "unknown" for status in economic_statuses) or any("costMicrounits" not in item for item in all_receipts)
         nominal_values = [float(item["nominalCostUsd"]) for item in all_receipts if "nominalCostUsd" in item]
         nominal_cost_usd = sum(nominal_values) if nominal_values else None
         usage = dict(canonical_usage(evidence.get("usage")))
@@ -851,8 +1023,8 @@ class DurableRuntime:
             raise ValueError("model response bundleHash does not match the requested arm bundle")
         whole_run_duration = max(now - started, 1e-6)
         economic_status = evidence.get("economicCostStatus")
-        if not isinstance(economic_status, str):
-            economic_status = "measured" if explicit_cost else "unknown"
+        if not isinstance(economic_status, str) or aggregate_cost_unknown:
+            economic_status = "unknown" if aggregate_cost_unknown else ("measured" if explicit_cost else "unknown")
         payload = {
             "runId": run_id,
             "taskId": stored["task_id"],
@@ -886,7 +1058,7 @@ class DurableRuntime:
             "bundleHash": bundle_hash,
             "versionRefs": version_refs,
             "costMicrounits": aggregate_cost if explicit_cost else None,
-            "economicCost": {"status": economic_status, "microunits": aggregate_cost if explicit_cost else None},
+            "economicCost": {"status": economic_status, "microunits": aggregate_cost if explicit_cost and not aggregate_cost_unknown else None, "coverage": {"knownReceipts": sum(1 for item in all_receipts if "costMicrounits" in item), "totalReceipts": len(all_receipts)}},
             "nominalCostUsd": nominal_cost_usd,
             "durationSeconds": whole_run_duration,
             "inferenceDurationSeconds": aggregate_inference,

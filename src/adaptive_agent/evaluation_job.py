@@ -420,6 +420,8 @@ class EvaluationJob:
         nominal_seen = False
         economic_cost_microunits = 0.0
         economic_cost_seen = False
+        economic_cost_unknown = False
+        economic_cost_known_receipts = 0
         inference_duration_seconds = 0.0
         inference_duration_seen = False
         economic_statuses: set[str] = set()
@@ -440,10 +442,15 @@ class EvaluationJob:
                     status = economic.get("status")
                     if isinstance(status, str):
                         economic_statuses.add(status)
+                        economic_cost_unknown = economic_cost_unknown or status == "unknown"
                     value = economic.get("microunits")
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
                         economic_cost_microunits += float(value)
                         economic_cost_seen = True
+                        economic_cost_known_receipts += 1
+                elif accounting.get("costMicrounits") is None:
+                    economic_cost_unknown = True
+                    economic_cost_unknown = economic_cost_unknown or value is None
                 duration = accounting.get("inferenceDurationSeconds")
                 if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
                     inference_duration_seconds += float(duration)
@@ -475,7 +482,8 @@ class EvaluationJob:
             "outputTokens": output_tokens,
             "totalTokens": input_tokens + output_tokens,
             "nominalCostUsd": nominal_cost if nominal_seen else None,
-            "economicCostMicrounits": economic_cost_microunits if economic_cost_seen else None,
+            "economicCostMicrounits": economic_cost_microunits if economic_cost_seen and not economic_cost_unknown else None,
+            "economicCostCoverage": {"knownReceipts": economic_cost_known_receipts, "totalReceipts": len(observations)},
             "economicCostStatuses": sorted(economic_statuses),
             "inferenceDurationSeconds": inference_duration_seconds if inference_duration_seen else None,
             "wallDurationSeconds": wall_seconds,

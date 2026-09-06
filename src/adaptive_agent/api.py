@@ -1092,11 +1092,11 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
         try:
             if runtime is None:
                 return plane.queue_evaluation(payload)
-            # The production evaluator is owned by EvaluationJob.run, which
-            # receives an already-frozen protocol and injected executor. This
-            # control-plane runtime has no equivalent background callback, so
-            # fail closed instead of queueing an unpinned evaluation.
-            raise ValueError("runtime evaluation launch requires evaluator-owned EvaluationJob.run")
+            if getattr(runtime, "_evaluation_protocol", None) is None:
+                raise ValueError("runtime evaluation launch requires evaluator-owned EvaluationJob.run")
+            queued = runtime.queue_evaluation(payload)
+            background.add_task(runtime.launch_evaluation, queued["evaluationId"])
+            return queued
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
