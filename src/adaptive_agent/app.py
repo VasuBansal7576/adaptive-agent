@@ -1360,11 +1360,12 @@ class DurableRuntime:
             receipt_economic_status = raw.get("economicCostStatus")
             if not isinstance(receipt_economic_status, str) or not receipt_economic_status:
                 receipt_economic_status = "unknown" if cost_value is None else "measured"
+            if receipt_id in existing_receipt_ids:
+                continue
+            existing_receipt_ids.add(receipt_id)
             receipts.append({"responseId": receipt_id, "usage": receipt_usage, "durationSeconds": float(duration_value), "status": str(raw.get("status", "complete")), "economicCostStatus": receipt_economic_status, **({"costMicrounits": cost_value} if cost_value is not None else {}), **({"nominalCostUsd": float(nominal_value)} if nominal_value is not None else {})})
         self._run_last_receipt_at[run_id] = now
-        self._run_receipts.setdefault(run_id, []).extend(
-            item for item in receipts if item.get("responseId") not in existing_receipt_ids
-        )
+        self._run_receipts.setdefault(run_id, []).extend(receipts)
         all_receipts = list(self._run_receipts.get(run_id, ()))
         aggregate = {"inputTokens": sum(item["usage"]["inputTokens"] for item in all_receipts), "outputTokens": sum(item["usage"]["outputTokens"] for item in all_receipts), "totalTokens": sum(item["usage"]["totalTokens"] for item in all_receipts)}
         for key in cache_keys:
@@ -1509,14 +1510,11 @@ class DurableRuntime:
             # recorded, so measured objective failure remains scoreable and
             # failed model usage stays attached to the last response.
             current = self.controller.get_run(run_id)
-            if current is not None and current.status == RunStatus.failed:
-                try:
-                    self._record_evaluated_outcome(run_id, evaluate())
-                except Exception:
-                    # No model receipt means this is an infrastructure failure
-                    # with missing evidence; the caller must not fabricate an
-                    # observation or trusted outcome.
-                    pass
+            has_model_evidence = any(row.get("event_type") == "model_response" for row in self.controller.store.list_evidence(run_id))
+            if current is not None and current.status == RunStatus.failed and has_model_evidence:
+                # Reconcile only terminal failures with a durable response.
+                # Strict evidence errors must surface to the caller.
+                self._record_evaluated_outcome(run_id, evaluate())
             return result
 
         # The canonical core marks a completed driver run succeeded.  Apply
