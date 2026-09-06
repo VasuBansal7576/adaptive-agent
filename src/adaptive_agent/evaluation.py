@@ -272,13 +272,14 @@ class BudgetSpec:
     wall_time_seconds: int = 90
     cost_microunits: int = 100_000
     currency: str = "USD"
+    max_child_depth: int = 1
 
     def __post_init__(self) -> None:
-        if min(self.model_tokens, self.tool_calls, self.child_runs, self.wall_time_seconds, self.cost_microunits) < 0 or not self.currency:
+        if min(self.model_tokens, self.tool_calls, self.child_runs, self.wall_time_seconds, self.cost_microunits, self.max_child_depth) < 0 or not self.currency:
             raise EvaluationError("budget values must be non-negative")
 
     def to_dict(self) -> JsonObject:
-        return {"modelTokens": self.model_tokens, "toolCalls": self.tool_calls, "childRuns": self.child_runs, "wallTimeSeconds": self.wall_time_seconds, "costMicrounits": self.cost_microunits, "currency": self.currency}
+        return {"modelTokens": self.model_tokens, "toolCalls": self.tool_calls, "childRuns": self.child_runs, "childDepth": self.max_child_depth, "wallTimeSeconds": self.wall_time_seconds, "costMicrounits": self.cost_microunits, "currency": self.currency}
 
 
 @dataclass(frozen=True)
