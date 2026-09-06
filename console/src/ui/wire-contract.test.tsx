@@ -175,6 +175,7 @@ describe("FastAPI detail normalization", () => {
     );
     await expect(transport.cancelRun("r")).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT", correlationId: "c9" });
     await expect(transport.cancelRun("r")).rejects.toMatchObject({ message: "goal or taskRef.goal is required" });
-    await expect(transport.cancelRun("r")).rejects.toMatchObject({ message: "field required" });
+    // validation arrays classify as INVALID_INPUT with the normalized first msg
+    await expect(transport.cancelRun("r")).rejects.toMatchObject({ code: "INVALID_INPUT", message: "field required" });
   });
 });
