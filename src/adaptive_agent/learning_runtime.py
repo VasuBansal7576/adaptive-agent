@@ -17,7 +17,7 @@ from typing import Any, Mapping
 
 from .learning import LearningProposal, LearningService, PlannerLearningAdapter
 from .learning_store import CandidateManagerLearningAdapter, DurableLearningSourceAdapter, LearningStoreError
-from .learning_projection import DurableBrokerLearningProjection
+from .learning_projection import DurableBrokerLearningProjection, LearningProjectionError
 from .retrieval import AccessFilteredRetriever, InMemorySourceProvider, canonical_json, content_hash
 
 
@@ -163,10 +163,19 @@ class LearningRuntime:
         manifest_ref = environment.get("manifest_ref")
         manifest_docs: list[Mapping[str, Any]] = []
         if isinstance(manifest_ref, str):
-            manifest = self.store.get_artifact(json.loads(manifest_ref)["sha256"])
-            manifest_docs = [doc for doc in manifest.get("docs", []) if isinstance(doc, Mapping)]
+            try:
+                manifest = self.store.get_artifact(json.loads(manifest_ref)["sha256"])
+                manifest_docs = [doc for doc in manifest.get("docs", []) if isinstance(doc, Mapping)]
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                # A restart can retain the narrow learner projection after
+                # source CAS compaction.  Existing records are sufficient in
+                # that case; a run with no projection still fails closed below.
+                manifest = {}
         if callable(public_doc_reader):
-            docs = public_doc_reader(environment_id)
+            try:
+                docs = public_doc_reader(environment_id)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                docs = []
         else:
             if not isinstance(manifest_ref, str):
                 raise LearningRuntimeError("completed run public manifest reference is missing")
@@ -216,12 +225,18 @@ class LearningRuntime:
             raise LearningRuntimeError("completed development run lacks a trusted evaluator outcome")
         outcome_passed = bool(trusted_outcome["passed"])
         run_row = self.store.get_run(run_id)
-        projected = DurableBrokerLearningProjection(self.store).project(
-            environment_id=environment_id,
-            run_id=run_id,
-            task_id=run_row["task_id"] if isinstance(run_row, Mapping) else "",
-            outcome_passed=outcome_passed,
-        )
+        try:
+            projected = DurableBrokerLearningProjection(self.store).project(
+                environment_id=environment_id,
+                run_id=run_id,
+                task_id=run_row["task_id"] if isinstance(run_row, Mapping) else "",
+                outcome_passed=outcome_passed,
+            )
+        except LearningProjectionError:
+            # If the raw broker source was compacted, continue with a
+            # previously persisted and validated projection.  Without one,
+            # the unified evidence seam below reports the missing dependency.
+            projected = []
         for record_id, record in projected:
             persist(record_id, record)
         persisted_projection = []
