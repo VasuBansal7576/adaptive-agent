@@ -374,6 +374,17 @@ def test_actual_durable_runtime_rejects_unfrozen_execution_before_model_dispatch
     assert runtime.learning_model_client.calls == 0
 
 
+def test_observation_cost_uses_measured_then_complete_nominal_cost():
+    pytest.importorskip("fastapi")
+    from adaptive_agent.app import _effective_observation_cost, LearningRuntimeError
+
+    assert _effective_observation_cost({"costMicrounits": 17, "nominalCostUsd": 0.000021}) == 17
+    assert _effective_observation_cost({"costMicrounits": None, "nominalCostUsd": 0.000021}) == 21
+
+    with pytest.raises(LearningRuntimeError, match="complete economic or nominal cost"):
+        _effective_observation_cost({"costMicrounits": None, "nominalCostUsd": None})
+
+
 @pytest.mark.parametrize("zero_field", ["modelTokens", "costMicrounits"])
 def test_actual_durable_runtime_rejects_zero_budget_before_model_dispatch(tmp_path, zero_field):
     pytest.importorskip("fastapi")
