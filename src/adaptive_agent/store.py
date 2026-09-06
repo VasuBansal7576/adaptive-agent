@@ -468,6 +468,22 @@ class Store:
                 conn.rollback()
                 raise
 
+    def get_allocation(self, allocation_id: str) -> dict[str, Any] | None:
+        """Read a reserved allocation back (crash-after-allocation recovery).
+
+        Returns the row plus a decoded `task_ids` list, or None.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM evaluator_allocations WHERE allocation_id = ?",
+                (allocation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        out["task_ids"] = json.loads(row["task_ids_json"])
+        return out
+
     # ------------------------------------------------------------------ trusted development smoke gate
     def dev_smoke_ok(self, environment_id: str) -> bool:
         """True when the environment has at least one development-partition run
