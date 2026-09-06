@@ -114,7 +114,9 @@ class CapabilityBroker:
             cap = self._caps.get(capability_id)
             handler = self._handlers.get(capability_id)
         if cap is None:
-            raise SecurityViolation("capability is not granted")
+            raise SecurityViolation(
+                "capability is not granted; call capabilities.discover and use the exact current-run id"
+            )
         if not isinstance(arguments, Mapping):
             raise AdapterError("capability arguments must be an object")
         if self._authorizer is not None:
