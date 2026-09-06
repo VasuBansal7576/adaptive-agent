@@ -319,6 +319,10 @@ describe("qa regressions: createRun recovery and honesty", () => {
     const unknown = sourceLabelFor("mystery_env");
     expect(unknown.tag).toBe("source not specified");
     expect(unknown.provenance).toBe("Data source not specified.");
+    // case is NOT folded: user-defined casing stays unregistered
+    expect(sourceLabelFor("Finance").tag).toBe("source not specified");
+    expect(sourceLabelFor("APPWORLD").tag).toBe("source not specified");
+
   });
 
   it("renders the AppWorld source label in registry and workflow without claiming results", async () => {

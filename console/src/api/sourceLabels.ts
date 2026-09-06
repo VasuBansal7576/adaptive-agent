@@ -24,7 +24,9 @@ export type SourceLabel = {
 };
 
 export function sourceLabelFor(environmentId: string | undefined | null): SourceLabel {
-  const id = (environmentId ?? "").toLowerCase();
+  // use the received id AS-IS (no case folding): user-defined ids like
+  // "Finance" or "APPWORLD" are not registered ids and stay "not specified"
+  const id = environmentId ?? "";
   if (!id) {
     return {
       tag: "source not specified",
@@ -37,7 +39,7 @@ export function sourceLabelFor(environmentId: string | undefined | null): Source
       provenance: "Tasks use AppWorld, a published benchmark with simulated app data.",
     };
   }
-  if (BUILTIN_CATALOG_IDS.includes(id as (typeof BUILTIN_CATALOG_IDS)[number]) || SIM_VARIANTS.includes(id)) {
+  if (BUILTIN_CATALOG_IDS.some((known) => known === id) || SIM_VARIANTS.includes(id)) {
     return {
       tag: "simulated business fixture",
       provenance: "Tasks use the built-in simulated business fixture catalog.",
