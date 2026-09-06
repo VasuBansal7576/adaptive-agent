@@ -161,6 +161,39 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect(await screen.findByText(/Proposal validation passed — this is not a performance result/)).toBeInTheDocument();
   });
 
+  it("lists a run whose learningEligible flips true after the terminal outcome, without a full reload (QA run_a1662f…)", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const baseRun = (await sim.listRuns())[3]; // succeeded run
+    let eligible = false;
+    let calls = 0;
+    const transport: ConsoleTransport = {
+      ...sim,
+      // the server projects learningEligible only after the private trusted
+      // outcome commits; the console must pick that up on the Candidates-tab
+      // refresh, not a full reload
+      listRuns: async () => {
+        calls += 1;
+        const learningEligible = calls >= 2 ? true : eligible;
+        return [{ ...baseRun, learningEligible }];
+      },
+    };
+    render(<App transport={transport} />);
+    await screen.findAllByRole("button", { name: /run-sim-1004/ });
+    // opening Candidates forces an authoritative refresh: the server now
+    // reports learningEligible=true for the completed run
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    await user.click(await screen.findByRole("button", { name: "Run learning cycle" }));
+    const dialog = await screen.findByRole("dialog", { name: "Run learning cycle" });
+    // the dialog-open refresh lands; the select appears without a reload
+    await waitFor(() => expect(within(dialog).getByLabelText("Completed development run")).toBeInTheDocument(), { timeout: 4000 });
+    const select = within(dialog).getByLabelText("Completed development run");
+    await waitFor(() => expect(within(select).getAllByRole("option").length).toBeGreaterThanOrEqual(2));
+    const options = within(select).getAllByRole("option").map((o) => o.textContent ?? "");
+    expect(options.some((t) => t.includes(baseRun.runId))).toBe(true);
+    expect(calls).toBeGreaterThanOrEqual(2); // the refresh happened without a reload
+  });
+
   it("opens the learning-cycle dialog from the empty-candidates state (regression)", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
