@@ -1,6 +1,6 @@
 """Bounded execution primitives for Adaptive Agent."""
 
-from .prime_child_planner import ChildObservationSink, LunaChildPlanner
+from .prime_child_planner import ChildObservationSink, LunaChildPlanner, SharedLedgerModelClient
 from .prime_runtime import (
     AdapterError, ArtifactRef, Capability, CapabilityBroker, CapabilitySet,
     ChildPlan, ChildPlanRequest, ChildPlannerBudget, ExecutionMode, ExecutionResult, ModelObservation,
@@ -9,7 +9,7 @@ from .prime_runtime import (
 )
 
 __all__ = [
-    "AdapterError", "ArtifactRef", "Capability", "CapabilityBroker", "ChildObservationSink", "LunaChildPlanner",
+    "AdapterError", "ArtifactRef", "Capability", "CapabilityBroker", "ChildObservationSink", "LunaChildPlanner", "SharedLedgerModelClient",
     "CapabilitySet", "ChildPlan", "ChildPlanRequest", "ChildPlannerBudget", "ExecutionMode",
     "ExecutionResult", "ModelObservation", "PrimeRuntimeAdapter", "PrimeRuntimeConfig",
     "SecurityViolation", "SharedBudget",
