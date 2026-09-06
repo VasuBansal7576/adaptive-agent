@@ -9,12 +9,12 @@ Product acceptance and competition compliance remain unverified until implementa
 M0 and M1 completed the documentation phase.
 M0 is complete through the supplied product and official-rule clarification.
 M1 ends with a verified local commit containing only `SPEC.md`, `MILESTONES.md`, and `README.md`.
-The local `main` assembly of the committed backend, console, and documentation refs is authorized and complete.
+The local `main` assembly of the committed backend, console, and documentation refs is authorized and complete at the current root checkpoint below.
 M2 through M4 are active implementation and evaluation gates across the worker branches.
 M5 and M6 require future publication or submission authority appropriate to each action.
 This documentation worker did not install dependencies, create application code, or edit implementation branches.
-The committed local-main assembly is recorded below; dirty worker overlays remain excluded.
-Public remote creation, publication, pushes to public remotes, pull requests, and submission remain incomplete.
+Historical local-main assembly records and dirty worker overlays remain excluded from current evidence.
+The public GitHub repository is now visible and verified; public demo publication, deployment, pushes to other public remotes, pull requests, and submission remain incomplete or unauthorized.
 
 The dependency chain is M0 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6.
 After M2 fixes the contracts, environment fixtures and console work can proceed independently under assigned owners.
@@ -23,26 +23,33 @@ No additional workers are spawned during this documentation task.
 
 ## Current root checkpoint
 
-As of 2026-09-06, the current local `main` is `7c65f5b`.
-This checkpoint records one root-verified real path through the production UI, the authenticated Luna subscription, the Docker runtime, a broker write, and the trusted evaluator.
-The run used the clean Store and data directory `/private/tmp/adaptive-agent-main-20260906` and produced run `run_a1662f700a9a400b9e0f80b87a52f76e`.
+As of 2026-09-06, the verified public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent), and the clean root-committed `main` checkpoint is `2a54cf9`.
+This checkpoint includes the controller privacy fix; the prior backup remains retained.
 
-The run produced learning candidate `cand_a095170f9c6d4f58943deb7539270de0` from three broker references and 7,206 learning tokens.
-Candidate proposal validation passed.
-No heldout panel or performance result follows from that validation.
-Session 6 is fixing the full lifecycle 360/720 regression.
+Retained root evidence at `a882641` records the full synthetic 1,080-case run, restart coverage, and two authenticated reports passing in 48.25 seconds.
+The combined production bytes at `2a54cf9` reproduced that same full synthetic pass.
+Core and API verification recorded 64 passing checks, and the corrected privacy projection test passed separately.
+An earlier retained backend report recorded 240 passing checks.
+These are synthetic or bounded integration evidence, not a measured generalization result.
+
+The real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC and failed before the held-out phase after one successful task and five development budget exhaustions.
+It produced no learning result, validation result, final metrics, or measured improvement.
+M4 is not complete and must not be represented as passed.
+
+Independent fixes remain active in parallel: session 6 owns public tool-enum and error-contract defects, session 2 owns failed-attempt accounting and trusted negative outcomes, and session 7 owns provider-write effect fidelity.
 
 The strict provider output-token cap remains an accepted but unmet criterion.
 The SDK nominal cost is a proxy, and economic billing is unknown.
-No publication or submission is authorized.
+Public repository visibility is authorized and verified.
+Public demo posts, deployment, and submission remain unauthorized.
 
 This checkpoint updates the current status only.
 The historical evidence ledger, QA-data hold, delivery gates, and requirement traceability below remain preserved.
 
 ## Implementation and integration snapshot
 
-The following snapshot was read from the current worktrees on 2026-09-06.
-The refs identify the latest observed committed state, not a final merge result.
+The following snapshot was read from the worktrees on 2026-09-06 and is retained as dated provenance.
+The refs identify observed states at that time, not the current `main` checkpoint.
 Dirty worktrees contain additional uncommitted implementation changes, which are not counted as integrated evidence.
 
 | AO session | Observed ref and state | Implemented component status |
@@ -61,18 +68,19 @@ The Prime bridge investigation also verified `prime-agent --version`, `prime-age
 ## Evidence ledger and current gate status
 
 Real-run and fixture evidence remain separate.
-The following records are the fresh root-verified evidence for this checkpoint, followed by preserved historical smoke reports.
+The current checkpoint summary is above.
+The following table preserves dated evidence records, including the prior root path and historical smoke reports.
 
 | Evidence | Classification | What it establishes | What it does not establish |
 | --- | --- | --- | --- |
-| Root-verified production UI to authenticated Luna, Docker, broker write, and trusted evaluator on `/private/tmp/adaptive-agent-main-20260906`; run `run_a1662f700a9a400b9e0f80b87a52f76e`; candidate `cand_a095170f9c6d4f58943deb7539270de0` | Current real product evidence | A clean Store and data path completed the real execution chain, and candidate proposal validation used three broker references and 7,206 learning tokens | Heldout panels, a performance result, a completed candidate comparison, or a promotion decision |
-| Session-2 current probe and integration lineage at `f3785f0` with a reviewed dirty overlay; 171 backend tests passed | Current integration evidence | The current control-plane and evaluator-launch integration is test-covered at the reported checkpoint | A committed merge, real provider product run, heldout evaluation, or final performance result |
-| Actual Docker-backed EVAL-003 from the current session-2 lineage: 7 obligations passed on isolated temporary Store and data paths | Current boundary evidence | The seven obligations crossed the actual Docker runtime boundary while using an isolated fixture and no paid model call | General model safety, product acceptance, or sealed evaluator performance |
-| EVAL-003 safety hardening at `3261afc` atop `f423fac`; focused safety, core, and lifecycle tests 39 passed | Current safety evidence | Attacker-controlled public-document output, forged approval attempts, no-provider-write behavior, Docker-provenance requirements, fail-closed controller execution, and self-contained payload/content-hash receipts | A full pass without an injected Docker-backed Prime adapter, heldout evaluation, or paid-provider result |
-| Actual Docker-backed EVAL-005 at session-3 ref `6aabe2e`: `child_failure_recovery_and_cap` and `shared_model_cost_token_cap` passed | Current runtime-boundary evidence | Two parent-child, failure, and shared-cost runtime cases crossed the Docker boundary with bounded deterministic probe inputs | Paid-provider behavior, complete EVAL-005 acceptance, or final resource-budget evidence |
-| Session-4 Controller probe at `83d2e01`: EVAL-004 8/8 and EVAL-005 8/8 on an isolated temporary Store and data directory | Current control-boundary evidence | `promotion_crash_reopen_atomic`, `child_failure_propagated`, and `event_reconnect_resume`, including active-pointer preservation, persisted parent/child failure, and exact terminal SSE tail recovery | A sealed evaluation, cross-environment performance, or proof that historical root QAdata was isolated |
-| Session-5 console lineage `29afe35` through clean tip `ae482da`: 61/61 tests, TypeScript clean, and build clean; latest report had no live smoke | Current console evidence | Console parsing, evaluation status, learning eligibility, responsive master-detail behavior, and honest uncertainty states | Browser-width acceptance, live inference, or sealed evaluation |
-| Isolated development smoke at `/tmp/adaptive-run-2fc3c680.fiZAAA`: durable run `run_7f5b3196fff541129d4e9c8345d0ba75`, `finance-development-00`, seed 17, sequence 16; scoped verifier `0561041`; full pytest 147 passed with two dependency warnings | Current isolated development-smoke evidence | Trusted `evaluator_only` outcome with operator-visible `model_response`, resume completion, one candidate, one transfer run, pinned Docker execution, aggregate usage, and confirmed broker invoice/payment reads plus `apply_payment` | Heldout or final evaluation, performance, public reproducibility, or closure of M2-M4 |
+| Prior root-verified production UI to authenticated Luna, Docker, broker write, and trusted evaluator on `/private/tmp/adaptive-agent-main-20260906`; run `run_a1662f700a9a400b9e0f80b87a52f76e`; candidate `cand_a095170f9c6d4f58943deb7539270de0` | Dated prior real product evidence | A clean Store and data path completed the real execution chain, and candidate proposal validation used three broker references and 7,206 learning tokens | Heldout panels, a performance result, a completed candidate comparison, or a promotion decision |
+| Session-2 probe and integration lineage at `f3785f0` with a reviewed dirty overlay; 171 backend tests passed | Dated prior integration evidence | The control-plane and evaluator-launch integration was test-covered at the reported checkpoint | A committed merge, real provider product run, heldout evaluation, or final performance result |
+| Actual Docker-backed EVAL-003 from the session-2 lineage: 7 obligations passed on isolated temporary Store and data paths | Dated prior boundary evidence | The seven obligations crossed the actual Docker runtime boundary while using an isolated fixture and no paid model call | General model safety, product acceptance, or sealed evaluator performance |
+| EVAL-003 safety hardening at `3261afc` atop `f423fac`; focused safety, core, and lifecycle tests 39 passed | Dated prior safety evidence | Attacker-controlled public-document output, forged approval attempts, no-provider-write behavior, Docker-provenance requirements, fail-closed controller execution, and self-contained payload/content-hash receipts | A full pass without an injected Docker-backed Prime adapter, heldout evaluation, or paid-provider result |
+| Actual Docker-backed EVAL-005 at session-3 ref `6aabe2e`: `child_failure_recovery_and_cap` and `shared_model_cost_token_cap` passed | Dated prior runtime-boundary evidence | Two parent-child, failure, and shared-cost runtime cases crossed the Docker boundary with bounded deterministic probe inputs | Paid-provider behavior, complete EVAL-005 acceptance, or final resource-budget evidence |
+| Session-4 Controller probe at `83d2e01`: EVAL-004 8/8 and EVAL-005 8/8 on an isolated temporary Store and data directory | Dated prior control-boundary evidence | `promotion_crash_reopen_atomic`, `child_failure_propagated`, and `event_reconnect_resume`, including active-pointer preservation, persisted parent/child failure, and exact terminal SSE tail recovery | A sealed evaluation, cross-environment performance, or proof that historical root QAdata was isolated |
+| Session-5 console lineage `29afe35` through clean tip `ae482da`: 61/61 tests, TypeScript clean, and build clean; latest report had no live smoke | Dated prior console evidence | Console parsing, evaluation status, learning eligibility, responsive master-detail behavior, and honest uncertainty states | Browser-width acceptance, live inference, or sealed evaluation |
+| Isolated development smoke at `/tmp/adaptive-run-2fc3c680.fiZAAA`: durable run `run_7f5b3196fff541129d4e9c8345d0ba75`, `finance-development-00`, seed 17, sequence 16; scoped verifier `0561041`; full pytest 147 passed with two dependency warnings | Dated prior isolated development-smoke evidence | Trusted `evaluator_only` outcome with operator-visible `model_response`, resume completion, one candidate, one transfer run, pinned Docker execution, aggregate usage, and confirmed broker invoice/payment reads plus `apply_payment` | Heldout or final evaluation, performance, public reproducibility, or closure of M2-M4 |
 | Prime 0.9.2 session 3, ChatGPT subscription, `openai-codex/gpt-5.6-luna`, actual Python `2+2` result `4` | Real runtime smoke | Subscription authentication and a narrow Python execution path | Product bridge, evaluator, safety, or performance acceptance |
 | `prime-agent --print --no-tools --provider openai-codex --model openai-codex/gpt-5.6-luna` returned `MODEL_SPIKE_OK` in 10.24s | Real provider smoke | Model reachability through the authenticated path | A goal/tool/evaluator run or provider hard output cap |
 | Prime adapter state-sharing cells returned `42` then `41`; host bridge returned structured data; forbidden learner requests were denied | Real Prime/Docker boundary smoke | Persistent kernel state, broker boundary, and denial behavior in the adapter spike | Complete control-plane learning and promotion evidence |
@@ -97,12 +105,14 @@ The focused safety, core, and lifecycle verification was 39 passed, with no serv
 The session-4 probe closure did not modify the cost ledger, EVAL-003, or evaluator lifecycle.
 It used no services or paid calls.
 
-## Local-main assembly result
+## Prior local-main assembly record
 
-The authorized local-main assembly is complete for backend tip `feef752`, console tip `eea3bdc`, and documentation tip `eeb5f05`.
+The earlier authorized local-main assembly record remains historical provenance for backend tip `feef752`, console tip `eea3bdc`, and documentation tip `eeb5f05`.
 The backend tip contains the requested session-2 ancestry through `83d7e87`, `2168124`, `8fcb18a`, and `96a84d3`, plus `dbf412d` and `889a10f`.
 The console tip contains the requested session-5 lineage through `29afe35` and `ae482da`.
-Dirty worker overlays and uncommitted lock files were excluded from the assembly.
+Dirty worker overlays and uncommitted lock files were excluded from that assembly.
+
+The current public `main` checkpoint is `2a54cf9`, as recorded above, and includes the controller privacy fix.
 
 Post-assembly verification must use newly allocated temporary Store and data paths and must preserve the reported 171 backend tests and 61/61 console result as prior evidence rather than replaying paid or shared-data smoke.
 Cost accounting, the B0/L/A ablation, and the final report remain incomplete.
@@ -139,7 +149,8 @@ M0 and M1 are complete as documentation and local integration milestones.
 M2 now has a root-verified production UI to authenticated model, Docker, broker, and trusted-evaluator path, but remains unmet until the required candidate comparison, gate decision, and boundary evidence are retained together.
 M3 has core learning, storage, broker, candidate, and benchmark components, but the complete three-pack lifecycle and all required acceptance scenarios are not verified as one integrated product.
 M4 is unmet because there is no clean sealed four-environment B0/L/A evaluation, measured cross-domain result, or final resource-budget evidence.
-M5 and M6 have not started, and there are no public repository, social-demo, deployment, or submission claims.
+M5 and M6 remain incomplete.
+The public repository is visible and verified, but there are no public social-demo, deployment, or submission claims.
 Cost, ablation, and final-report gates remain incomplete, so this assembled tree is not release-ready.
 
 One user-accepted subscription limitation is still an UNMET criterion.
@@ -248,16 +259,21 @@ Confirm that the submission selects only Track 1.
 Verify whether the intended synthetic scenarios are acceptable because organizer feedback was tentative.
 Do not make sponsor integration a dependency unless it materially supports the product.
 
-Prepare a public GitHub repository, a public X or LinkedIn demo post, and the corresponding links for Devpost.
+The public GitHub repository [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent) is visible and verified.
+Prepare a public X or LinkedIn demo post and the corresponding links for Devpost only after explicit publication authority.
 Prepare a deployment URL only if deployment is chosen and authorized.
-Check public access without relying on a logged-in session.
+Public GitHub access was checked without relying on a logged-in session.
 Redact credentials, private data, sealed test answers, and unnecessary transcripts from all public artifacts.
 Keep authoritative evaluator fixtures or expected answers private when exposing them would undermine continued evaluation.
 Provide public reproduction instructions and non-sealed sample fixtures instead.
 
 The demo target is 3 minutes within the official 3 to 5 minute range.
-The proposed sequence is 0:00 to 0:20 for the problem and generic environment contract, 0:20 to 0:50 for a real run, and 0:50 to 1:30 for evidence-driven refinement and its measured decision.
-Use 1:30 to 2:10 for the three-domain and new-environment comparison, 2:10 to 2:30 for bad-refinement rejection and safe rollback, and 2:30 to 3:00 for AO sessions, contribution, and limitations.
+The prepared sequence is 0:00 to 0:20 for the problem and generic environment contract, 0:20 to 0:50 for the verified real run, and 0:50 to 1:30 for evidence-driven refinement.
+Show candidate validation honestly as `[PENDING: learning/validation result and promotion gate]` because the current benchmark ended before held-out evaluation.
+Use 1:30 to 2:10 for the three-domain and new-environment comparison, labeled `[PENDING: EVAL-001/EVAL-002/EVAL-006 accuracy, reliability, cost, speed, uncertainty, and exposure metrics]`.
+Use 2:10 to 2:30 for bad-refinement rejection and safe rollback, labeled `[PENDING: final integrated rejection/rollback evidence if not retained]`.
+Use 2:30 to 3:00 for AO session count, task ownership, contribution history, Prime Agent credit, and limitations, labeled `[PENDING: final AO history and submission record]`.
+Credit Prime Agent by Prime Intellect AI under the MIT License and point to [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
 Keep the recorded content truthful if a metric fails or a scenario remains unverified.
 
 | Rubric | Weight | Evidence to retain |

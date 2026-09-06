@@ -13,19 +13,26 @@ Read [MILESTONES.md](MILESTONES.md) for implementation evidence and delivery gat
 
 ## Current status
 
-The verified checkpoint covers the assembled control plane and console.
-The root-verified real path reached the production UI, the authenticated Luna subscription, the Docker runtime, a broker write, and the trusted evaluator on the clean Store and data directory `/private/tmp/adaptive-agent-main-20260906`.
-The run was `run_a1662f700a9a400b9e0f80b87a52f76e`.
+The public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent).
+The verified root-committed `main` checkpoint is `2a54cf9`, which preserves evaluator privacy in stored outcomes.
+The public repository and its `main` branch were verified at this checkpoint.
 
-The run produced learning candidate `cand_a095170f9c6d4f58943deb7539270de0` from three broker references and 7,206 learning tokens.
-Candidate proposal validation passed.
-No heldout panel or performance result has been run from this checkpoint.
+Retained root evidence at `a882641` records the full synthetic 1,080-case run, restart coverage, and two authenticated reports passing in 48.25 seconds.
+The combined production bytes at `2a54cf9` reproduced that same full synthetic pass.
+Core and API verification recorded 64 passing checks, and the corrected evaluator-privacy projection test passed separately.
+An earlier retained backend report recorded 240 passing checks.
+These are synthetic or bounded integration evidence, not a measured generalization result.
+
+A real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC and failed before the held-out phase after one successful task and five development budget exhaustions.
+It produced no learning result, validation result, final metrics, or measured improvement.
+M4 is therefore not complete.
 
 The accepted Luna-through-ChatGPT subscription path does not expose an API-key or provider switch.
 The trusted parent accounts actual model usage and rejects after aggregate token exhaustion.
 The strict provider output-token cap remains an accepted but unmet criterion.
 The SDK nominal cost is a proxy, and economic billing is unknown.
-No publication or submission is authorized.
+Public repository visibility is authorized and verified.
+Public demo posts, deployment, and submission remain unauthorized.
 
 ## Set up
 
@@ -219,7 +226,8 @@ Do not treat a fixture pass, a transport smoke, or a candidate proposal validati
 
 Adaptive Agent uses Prime Agent by Prime Intellect AI under the MIT License.
 The installed Prime `0.9.2` runtime is separate from the initial static-source review pinned at [Prime Agent commit `9c54a35dac3a2ad17910074d66664859ea175666`](https://github.com/PrimeIntellect-ai/prime-agent/tree/9c54a35dac3a2ad17910074d66664859ea175666).
-Retain the applicable Prime MIT notices in distributions.
+The exact applicable notice is retained in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+This notice applies to Prime Agent reuse only and does not grant a license to Adaptive Agent.
 
 ## Limitations
 
@@ -231,7 +239,8 @@ Retain the applicable Prime MIT notices in distributions.
 - SDK-reported nominal cost does not prove economic billing.
 - The default deployment is a single loopback operator.
   Real financial, customer, or production IT writes are outside the default evaluation profile.
-- Publication, deployment, and submission are not authorized.
+- Public repository visibility is verified.
+  Public demo posts, deployment, and submission are not authorized.
 
 This README summarizes the current implementation and evidence.
 It does not change any requirement, acceptance criterion, blocker, or pass meaning in [SPEC.md](SPEC.md).
