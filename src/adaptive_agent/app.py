@@ -205,13 +205,40 @@ class DurableRuntime:
     def list_candidates(self) -> list[dict[str, Any]]:
         out = []
         with self.controller.store.connect() as conn:
-            rows = conn.execute("SELECT candidate_json FROM candidates ORDER BY created_at").fetchall()
+            rows = conn.execute(
+                "SELECT candidate_id, state, base_bundle_hash, candidate_bundle_hash, candidate_json FROM candidates ORDER BY created_at"
+            ).fetchall()
         for row in rows:
             try:
-                value = json.loads(row["candidate_json"])
-                if "candidate_id" in value:
-                    value["candidateId"] = value.pop("candidate_id")
-                out.append(value)
+                payload = json.loads(row["candidate_json"])
+                if not isinstance(payload, dict):
+                    continue
+                def value_for(alias: str, snake: str, fallback: Any = None) -> Any:
+                    value = payload.get(alias, payload.get(snake, fallback))
+                    return value
+
+                operations = value_for("editOperations", "edit_operations", [])
+                if not isinstance(operations, list):
+                    operations = []
+                operations = [
+                    item if isinstance(item, str) else json.dumps(item, sort_keys=True, separators=(",", ":"))
+                    for item in operations
+                ]
+                changed = value_for("changedArtifactHashes", "changed_artifact_hashes", [])
+                supporting = value_for("supportingEvidenceIds", "supporting_evidence_ids", [])
+                out.append(
+                    {
+                        "candidateId": row["candidate_id"],
+                        "state": row["state"],
+                        "predictedEffect": value_for("predictedEffect", "predicted_effect", ""),
+                        "baseBundleHash": value_for("baseBundleHash", "base_bundle_hash", row["base_bundle_hash"]),
+                        "candidateBundleHash": value_for("candidateBundleHash", "candidate_bundle_hash", row["candidate_bundle_hash"]),
+                        "editOperations": operations,
+                        "changedArtifactHashes": changed if isinstance(changed, list) else [],
+                        "supportingEvidenceIds": supporting if isinstance(supporting, list) else [],
+                        "proposerVersion": value_for("proposerVersion", "proposer_version", ""),
+                    }
+                )
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
         return out

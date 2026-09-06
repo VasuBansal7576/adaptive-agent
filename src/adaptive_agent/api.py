@@ -176,7 +176,10 @@ class CreateRunRequest(ApiModel):
 
 class LearningRequest(ApiModel):
     run_id: str = Field(alias="runId", min_length=1)
-    predicted_effect: str = Field(alias="predictedEffect", min_length=1)
+    # The completed run is the sole source of learning evidence and proposal
+    # metadata.  Keep the legacy fields optional for older callers, but do not
+    # require operators to invent values that the durable runtime ignores.
+    predicted_effect: str = Field(default="", alias="predictedEffect")
     evidence_ids: list[str] = Field(default_factory=list, alias="evidenceIds")
 
 

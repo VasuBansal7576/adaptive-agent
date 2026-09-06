@@ -4,7 +4,7 @@ import json
 import pytest
 from types import SimpleNamespace
 
-from adaptive_agent.api import CandidateProposalRequest, ControlPlane, EvaluationRequest, create_app, make_authenticated_model_runner
+from adaptive_agent.api import CandidateProposalRequest, ControlPlane, EvaluationRequest, LearningRequest, create_app, make_authenticated_model_runner
 from adaptive_agent.app import _FixtureProvider, create_runtime_app
 from adaptive_agent.evaluation import Arm, EvaluationProtocol, EvaluationRunner, ModelProvenance, Partition, PromotionEvidenceRefused, RunObservation, build_environment_packages
 from adaptive_agent.evaluation_store import build_durable_evaluation_runner
@@ -228,6 +228,53 @@ def test_register_create_and_live_lifecycle():
 def test_model_token_default_is_shared_and_practical():
     api = client()
     assert api.get("/run-options").json()["budgetDefaults"]["modelTokens"] == DEFAULT_MODEL_TOKENS == 20_000
+
+
+def test_learning_request_accepts_run_id_only():
+    request = LearningRequest.model_validate({"runId": "development-run"})
+    assert request.run_id == "development-run"
+    assert request.predicted_effect == ""
+    assert request.evidence_ids == []
+
+
+def test_durable_candidates_emit_stable_projection_shape(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    runtime.controller.store.save_candidate(
+        "cand-projection",
+        {
+            "base_bundle_hash": "base-hash",
+            "candidate_bundle_hash": "candidate-hash",
+            "candidate_json": json.dumps(
+                {
+                    "candidateId": "cand-projection",
+                    "state": "validated",
+                    "predictedEffect": "reduce retries",
+                    "baseBundleHash": "base-hash",
+                    "candidateBundleHash": "candidate-hash",
+                    "editOperations": [{"path": "skills/x/procedure", "operation": "add", "value": "retry"}],
+                    "changedArtifactHashes": ["patch-hash"],
+                    "supportingEvidenceIds": ["evidence-1"],
+                    "proposerVersion": "planner-1",
+                }
+            ),
+            "state": "validated",
+            "created_at": "now",
+        },
+    )
+    assert runtime.list_candidates() == [
+        {
+            "candidateId": "cand-projection",
+            "state": "validated",
+            "predictedEffect": "reduce retries",
+            "baseBundleHash": "base-hash",
+            "candidateBundleHash": "candidate-hash",
+            "editOperations": ['{"operation":"add","path":"skills/x/procedure","value":"retry"}'],
+            "changedArtifactHashes": ["patch-hash"],
+            "supportingEvidenceIds": ["evidence-1"],
+            "proposerVersion": "planner-1",
+        }
+    ]
 
 
 def test_durable_launch_retry_does_not_reinvoke_model(tmp_path):
