@@ -59,6 +59,18 @@ def _effective_cost_microunits(
     return None
 
 
+def _has_usable_nominal_budget_proxy(payload: Mapping[str, Any]) -> bool:
+    """Return whether unknown billing has a trusted nominal budget charge."""
+    value = payload.get("costMicrounits")
+    return (
+        payload.get("costBasis") == "nominal_budget_proxy"
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and value >= 0
+    )
+
+
 @dataclass(frozen=True)
 class EvaluationJobResult:
     job_id: str
@@ -281,8 +293,9 @@ class EvaluationJob:
             tool_calls = payload.get("residualToolCalls", 0)
             wall_seconds = payload.get("residualWallSeconds", 0)
             cost_value = payload.get("residualCostMicrounits", 0)
-        unknown_cost = cost_value is None and payload.get("economicCostStatus") == "unknown"
-        if unknown_cost:
+        unknown_billing = payload.get("economicCostStatus") == "unknown"
+        unknown_cost = unknown_billing and not _has_usable_nominal_budget_proxy(payload)
+        if cost_value is None and unknown_billing:
             cost_value = 0
         if not isinstance(tool_calls, int) or isinstance(tool_calls, bool) or tool_calls < 0 or isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float)) or not math.isfinite(wall_seconds) or wall_seconds < 0 or isinstance(cost_value, bool) or not isinstance(cost_value, (int, float)) or not math.isfinite(cost_value) or cost_value < 0:
             raise EvaluationError("lifecycle accounting is malformed")
@@ -298,7 +311,7 @@ class EvaluationJob:
                 or budget["tool_calls"] > budget["max_tool_calls"]
                 or budget["wall_micros"] > budget["max_wall_micros"]
                 or budget["cost_microunits"] > budget["max_cost_microunits"]
-                or payload.get("economicCostStatus") == "unknown"
+                or unknown_cost
             ):
                 conn.execute("UPDATE evaluation_lifecycle_budget SET blocked = 1, updated_at = datetime('now') WHERE job_id = ?", (job_id,))
             conn.commit()
@@ -375,7 +388,8 @@ class EvaluationJob:
             usage = payload.get("usage")
             malformed = not isinstance(usage, Mapping) or any(not isinstance(usage.get(key), int) or isinstance(usage.get(key), bool) or usage[key] < 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]
             cost = payload.get("costMicrounits")
-            unknown_cost = cost is None and payload.get("economicCostStatus") == "unknown"
+            unknown_billing = payload.get("economicCostStatus") == "unknown"
+            unknown_cost = unknown_billing and not _has_usable_nominal_budget_proxy(payload)
             tool_calls = payload.get("toolCalls", 0)
             wall_seconds = payload.get("wallSeconds", 0)
             malformed = malformed or not isinstance(tool_calls, int) or isinstance(tool_calls, bool) or tool_calls < 0 or isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float)) or not math.isfinite(wall_seconds) or wall_seconds < 0 or (cost is None and not unknown_cost) or (cost is not None and (isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0))

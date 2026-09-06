@@ -50,6 +50,67 @@ def test_complete_lifecycle_is_ordered_resumable_and_does_not_repeat_success(tmp
     assert job.lifecycle_accounting("experiment")["attempts"] == 8
 
 
+def test_nominal_proxy_parent_cost_allows_next_stage_without_double_charge(tmp_path: Path):
+    job = _job(tmp_path)
+
+    def callback(cell, context):
+        if context["stage"] == "bootstrap":
+            return {
+                "status": "complete",
+                "stage": context["stage"],
+                "cellKey": cell,
+                "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                "toolCalls": 1,
+                "wallSeconds": 0.01,
+                "costMicrounits": 7,
+                "economicCostStatus": "unknown",
+                "costBasis": "nominal_budget_proxy",
+                "billingStatus": "unknown",
+            }
+        return {
+            "status": "complete",
+            "stage": context["stage"],
+            "cellKey": cell,
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+            "toolCalls": 1,
+            "wallSeconds": 0.01,
+            "costMicrounits": 3,
+            "economicCostStatus": "measured",
+        }
+
+    names = ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final")
+    stages = tuple(LifecycleStage(name, (f"{name}-0",), callback) for name in names)
+    result = job.run_experiment("nominal-parent", stages, limits={"attempts": 8, "inputTokens": 16, "outputTokens": 16, "toolCalls": 8, "wallMicros": 8_000_000, "costMicrounits": 28})
+    assert result.status == "complete"
+    accounting = job.lifecycle_accounting("nominal-parent")
+    assert accounting["costMicrounits"] == 28
+    assert accounting["blocked"] is False
+
+
+def test_unpriced_unknown_parent_cost_blocks_next_stage(tmp_path: Path):
+    job = _job(tmp_path)
+
+    def callback(cell, context):
+        return {
+            "status": "complete",
+            "stage": context["stage"],
+            "cellKey": cell,
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+            "toolCalls": 1,
+            "wallSeconds": 0.01,
+            "economicCostStatus": "unknown",
+        }
+
+    names = ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final")
+    stages = tuple(LifecycleStage(name, (f"{name}-0",), callback) for name in names)
+    result = job.run_experiment("unknown-parent", stages, limits={"attempts": 8, "inputTokens": 16, "outputTokens": 16, "toolCalls": 8, "wallMicros": 8_000_000, "costMicrounits": 10})
+    assert result.status == "failed"
+    assert "budget exhausted" in (result.error or "")
+    accounting = job.lifecycle_accounting("unknown-parent")
+    assert accounting["costMicrounits"] == 0
+    assert accounting["blocked"] is True
+
+
 def test_planned_lifecycle_capacity_includes_nested_admissions_and_denies_extra(tmp_path: Path):
     job = _job(tmp_path)
     counts = {name: 1 for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final")}
@@ -190,6 +251,32 @@ def test_unknown_nested_cost_blocks_future_admission(tmp_path: Path):
     job.record_lifecycle_subcall(admission["admissionId"], result={"usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "economicCostStatus": "unknown"})
     with pytest.raises(ValueError, match="budget exhausted"):
         job.admit_lifecycle_subcall("unknown-subcall", "transfer", "leave-out:finance", "child-1")
+
+
+@pytest.mark.parametrize("proxy_cost", [0, 4])
+def test_nominal_proxy_nested_cost_allows_next_admission_without_recharge(tmp_path: Path, proxy_cost: int):
+    job = _job(tmp_path)
+    job._lifecycle_budget("nominal-subcall", {"attempts": 3, "inputTokens": 10, "outputTokens": 10, "toolCalls": 10, "wallMicros": 10_000, "costMicrounits": 10})
+    first = job.admit_lifecycle_subcall("nominal-subcall", "transfer", "leave-out:finance", "child-0", estimated_cost_microunits=proxy_cost)
+    receipt = {"usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "toolCalls": 1, "wallSeconds": 0.001, "costMicrounits": proxy_cost, "economicCostStatus": "unknown", "costBasis": "nominal_budget_proxy", "billingStatus": "unknown"}
+    job.record_lifecycle_subcall(first["admissionId"], result=receipt)
+    second = job.admit_lifecycle_subcall("nominal-subcall", "transfer", "leave-out:finance", "child-1", estimated_cost_microunits=4)
+    assert second["dispatchAllowed"] is True
+    assert job.lifecycle_accounting("nominal-subcall")["blocked"] is False
+    job.record_lifecycle_subcall(second["admissionId"], result={**receipt, "costMicrounits": 2})
+    assert job.lifecycle_accounting("nominal-subcall")["costMicrounits"] == proxy_cost + 2
+
+
+@pytest.mark.parametrize("invalid_cost", [-1, float("nan"), True, "7"])
+def test_invalid_unknown_nested_cost_blocks_without_charge(tmp_path: Path, invalid_cost: object):
+    job = _job(tmp_path)
+    job._lifecycle_budget("invalid-subcall", {"attempts": 2, "inputTokens": 10, "outputTokens": 10, "toolCalls": 10, "wallMicros": 10_000, "costMicrounits": 10})
+    admission = job.admit_lifecycle_subcall("invalid-subcall", "transfer", "leave-out:finance", "child-0")
+    with pytest.raises(ValueError, match="subcall accounting"):
+        job.record_lifecycle_subcall(admission["admissionId"], result={"usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "toolCalls": 1, "wallSeconds": 0.001, "costMicrounits": invalid_cost, "economicCostStatus": "unknown", "costBasis": "nominal_budget_proxy"})
+    accounting = job.lifecycle_accounting("invalid-subcall")
+    assert accounting["costMicrounits"] == 0
+    assert accounting["blocked"] is True
 
 
 def test_error_only_subcall_blocks_unknown_spend_across_reopen(tmp_path: Path):
