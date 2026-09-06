@@ -611,6 +611,60 @@ class TestCandidateLifecycle:
         assert row["state"] == "promoted"
         assert '"promoted"' in row["candidate_json"]
 
+    def _external_report(self, cand: SkillBundle, base: SkillBundle, protocol: str, token: str) -> dict[str, Any]:
+        return {
+            "reportId": "external-report",
+            "comparison": "validation",
+            "protocolHash": protocol,
+            "candidateHash": cand.content_hash,
+            "baseHash": base.content_hash,
+            "validityStatus": "valid",
+            "promotionEligible": True,
+            "safetyPassed": True,
+            "metricCellsComplete": True,
+            "safetyCellsComplete": True,
+            "modelProvenanceComplete": True,
+            "attestation": token,
+            "evaluatorRefs": ["trusted-eval"],
+            "partitionHashes": {},
+            "armSummaries": {
+                "B0": {"accuracy": 0.5, "reliability": 0.5, "meanCostMicrounits": 1.0, "p95LatencySeconds": 1.0},
+                "L": {"accuracy": 0.9, "reliability": 0.9, "meanCostMicrounits": 1.0, "p95LatencySeconds": 1.0},
+            },
+            "environmentCells": {},
+            "confidenceIntervals": [{"metric": "accuracy", "lower95": 0.1}],
+            "missingPairs": 0,
+            "partitionLeak": False,
+            "invalidFixtureResets": 0,
+            "infrastructureFailures": [],
+        }
+
+    def test_external_promotion_requires_attestation_verifier(self, store: Store):
+        base = SkillBundle(skills=[])
+        manager = CandidateManager(store)
+        manager.initialize_active_bundle(base)
+        ev = _evidence(store, "run-ext-attest")
+        cand = self._candidate(base)
+        proposal = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
+        manager.submit_candidate(proposal, cand)
+        manager.start_evaluation(proposal.candidate_id)
+        manager.freeze_protocol(PromotionGate(protocolHash="proto-ext"), "trusted-eval", evaluator_refs=["trusted-eval"])
+        with pytest.raises(PromotionError, match="attestation verifier"):
+            manager.promote(proposal.candidate_id, self._external_report(cand, base, "proto-ext", "token"))
+
+    def test_external_promotion_rejects_failed_attestation(self, store: Store):
+        base = SkillBundle(skills=[])
+        manager = CandidateManager(store, report_verifier=lambda _report: False)
+        manager.initialize_active_bundle(base)
+        ev = _evidence(store, "run-ext-attest-fail")
+        cand = self._candidate(base)
+        proposal = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
+        manager.submit_candidate(proposal, cand)
+        manager.start_evaluation(proposal.candidate_id)
+        manager.freeze_protocol(PromotionGate(protocolHash="proto-ext-fail"), "trusted-eval", evaluator_refs=["trusted-eval"])
+        with pytest.raises(PromotionError, match="attestation failed"):
+            manager.promote(proposal.candidate_id, self._external_report(cand, base, "proto-ext-fail", "forged"))
+
     def test_gate_rejection_and_supersede(self, manager: CandidateManager, store: Store):
         base = self._base(manager, store)
         ev = _evidence(store, "run-g1")
