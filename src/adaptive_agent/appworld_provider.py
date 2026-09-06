@@ -108,6 +108,7 @@ class AppWorldRuntimeManifest:
     python: str
     root: str
     public_data_sha256: str
+    dataset_sha256: str
     split_counts: Mapping[str, int]
     split_ids: Mapping[str, tuple[str, ...]]
 
@@ -120,6 +121,7 @@ class AppWorldRuntimeManifest:
             "python": self.python,
             "root": self.root,
             "publicDataSha256": self.public_data_sha256,
+            "datasetSha256": self.dataset_sha256,
             "splitCounts": dict(self.split_counts),
             "splitIds": {name: list(ids) for name, ids in self.split_ids.items()},
             "testGroundTruthLoaded": False,
@@ -129,6 +131,8 @@ class AppWorldRuntimeManifest:
 
 class _JsonLineProcess:
     """Bounded request/response protocol for one worker process."""
+
+    _MAX_FRAME_BYTES = 1_048_576
 
     def __init__(self, command: Sequence[str], env: Mapping[str, str], timeout_seconds: float) -> None:
         self._timeout = timeout_seconds
@@ -145,6 +149,9 @@ class _JsonLineProcess:
             )
         except OSError as exc:
             raise AppWorldUnavailable(f"could not start AppWorld worker: {exc}") from exc
+        for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+            if stream is not None:
+                os.set_blocking(stream.fileno(), False)
 
     @property
     def pid(self) -> int:
@@ -154,9 +161,38 @@ class _JsonLineProcess:
         if self._proc.stderr is None:
             return ""
         try:
-            return self._proc.stderr.read()[-2000:].decode("utf-8", "replace")
+            chunks: list[bytes] = []
+            remaining = 2000
+            while remaining > 0:
+                try:
+                    chunk = os.read(self._proc.stderr.fileno(), remaining)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)[-2000:].decode("utf-8", "replace")
         except (OSError, ValueError):
             return ""
+
+    def _write_frame(self, frame: Mapping[str, Any], deadline: float) -> None:
+        if self._proc.stdin is None:
+            raise AppWorldProtocolError("AppWorld worker pipes are unavailable")
+        data = (json.dumps(frame, separators=(",", ":")) + "\n").encode("utf-8")
+        offset = 0
+        fd = self._proc.stdin.fileno()
+        while offset < len(data):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            _, writable, _ = select.select([], [fd], [], remaining)
+            if not writable:
+                raise TimeoutError
+            try:
+                offset += os.write(fd, data[offset:])
+            except BlockingIOError:
+                continue
 
     def _readline_until(self, deadline: float) -> bytes:
         """Read one complete frame without ever blocking past deadline."""
@@ -181,6 +217,8 @@ class _JsonLineProcess:
                     return line
                 raise AppWorldProtocolError(f"AppWorld worker closed: {self._stderr_tail()}")
             self._stdout_buffer += chunk
+            if len(self._stdout_buffer) > self._MAX_FRAME_BYTES:
+                raise AppWorldProtocolError("AppWorld worker frame exceeds size limit")
 
     def request(self, operation: str, payload: Mapping[str, Any] | None = None) -> Any:
         if self._proc.poll() is not None:
@@ -190,15 +228,20 @@ class _JsonLineProcess:
         self._next_id += 1
         request_id = self._next_id
         frame = {"id": request_id, "operation": operation, "payload": dict(payload or {})}
-        self._proc.stdin.write((json.dumps(frame, separators=(",", ":")) + "\n").encode("utf-8"))
-        self._proc.stdin.flush()
         deadline = time.monotonic() + self._timeout
+        written = False
         while True:
             try:
+                if not written:
+                    self._write_frame(frame, deadline)
+                    written = True
                 line = self._readline_until(deadline)
             except TimeoutError:
                 self.close(force=True)
                 raise AppWorldProtocolError(f"AppWorld worker timed out during {operation}") from None
+            except AppWorldProtocolError:
+                self.close(force=True)
+                raise
             try:
                 response = json.loads(line.decode("utf-8"))
             except json.JSONDecodeError as exc:
@@ -215,9 +258,9 @@ class _JsonLineProcess:
         try:
             if not force and self._proc.stdin is not None:
                 self._next_id += 1
-                self._proc.stdin.write((json.dumps({"id": self._next_id, "operation": "close", "payload": {}}) + "\n").encode("utf-8"))
-                self._proc.stdin.flush()
-                self._readline_until(time.monotonic() + min(self._timeout, 1.0))
+                deadline = time.monotonic() + min(self._timeout, 1.0)
+                self._write_frame({"id": self._next_id, "operation": "close", "payload": {}}, deadline)
+                self._readline_until(deadline)
         except (BrokenPipeError, OSError, TimeoutError, AppWorldProtocolError):
             pass
         finally:
@@ -309,6 +352,18 @@ class AppWorldCatalog:
             digest.update(hashlib.sha256(path.read_bytes()).digest())
         return digest.hexdigest()
 
+    def dataset_hash(self) -> str:
+        """Opaque content hash for the complete local benchmark dataset.
+
+        The bytes are never returned or loaded into learner-visible structures;
+        this digest only binds evaluator and task artifacts to one installation.
+        """
+        digest = hashlib.sha256()
+        for path in sorted(path for path in self.data_root.rglob("*") if path.is_file()):
+            digest.update(str(path.relative_to(self.config.root)).encode())
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+        return digest.hexdigest()
+
     def runtime_manifest(self) -> AppWorldRuntimeManifest:
         split_ids = {split: self.split_ids(split) for split in _ALLOWED_SPLITS}
         return AppWorldRuntimeManifest(
@@ -317,6 +372,7 @@ class AppWorldCatalog:
             self.config.resolved_python(),
             str(self.config.root),
             self.public_data_hash(),
+            self.dataset_hash(),
             {name: len(ids) for name, ids in split_ids.items()},
             split_ids,
         )
@@ -386,7 +442,8 @@ def broker_tool_schemas(version: str) -> tuple[ToolSchema, ...]:
 def build_manifest(config: AppWorldConfig) -> EnvironmentManifest:
     catalog = AppWorldCatalog(config)
     data_hash = catalog.public_data_hash()
-    ref = lambda name: ArtifactRef(id=name, version=config.package_version, sha256=sha256_json({"name": name, "version": config.package_version, "data": data_hash}))
+    dataset_hash = catalog.dataset_hash()
+    ref = lambda name: ArtifactRef(id=name, version=config.package_version, sha256=sha256_json({"name": name, "version": config.package_version, "publicData": data_hash, "dataset": dataset_hash}))
     docs_ref = ref("appworld-api-docs")
     return EnvironmentManifest(
         environmentId=config.environment_id,
@@ -417,12 +474,12 @@ def register_appworld(registry: Any, config: AppWorldConfig, splits: Iterable[st
             environmentRef=environment_ref,
             goal=task.instruction,
             allowedInputRefs=[],
-            partition=runtime_partition or task.split,
+            partition=runtime_partition or {"train": "development", "dev": "validation", "test_normal": "final", "test_challenge": "final"}[task.split],
             provenance={
                 "benchmark": "AppWorld",
                 "dataClass": "external_published_simulated_benchmark",
                 "officialSplit": task.split,
-                "runtimePartition": runtime_partition or task.split,
+                "runtimePartition": runtime_partition or {"train": "development", "dev": "validation", "test_normal": "final", "test_challenge": "final"}[task.split],
             },
         )
         task_refs.append(registry.register_task(durable_task))
@@ -469,7 +526,7 @@ class AppWorldProvider(ToolProvider):
         env["APPWORLD_ROOT"] = str(config.root)
         self._process = _JsonLineProcess(command, env, config.timeout_seconds)
         try:
-            reset = self._process.request("reset", {"taskId": task.task_id, "seed": seed, "experimentName": config.experiment_name})
+            reset = self._process.request("reset", {"taskId": task.task_id, "seed": seed, "experimentName": f"{config.experiment_name}-{run_id}"})
         except Exception:
             self._process.close(force=True)
             raise
@@ -569,34 +626,37 @@ class AppWorldPackage:
         self.environment_id = config.environment_id
 
     def learner_tasks(self) -> tuple[AppWorldTask, ...]:
-        return self.catalog.tasks(("train", "dev"))
+        # Only official train tasks are learner-facing.  Dev remains an
+        # evaluator-owned validation partition and is never fed to learning.
+        return self.catalog.tasks(("train",))
 
-    def _evaluation_tasks(self, splits: Iterable[str]) -> tuple[EvaluationTaskInput, ...]:
+    def _evaluation_tasks(self, splits: Iterable[str], partition: Partition) -> tuple[EvaluationTaskInput, ...]:
         split_tuple = tuple(splits)
         ref = EvaluationArtifactRef(self.environment_id, self.config.package_version, sha256_json(self.manifest.model_dump(mode="json", by_alias=True)))
-        partition = Partition.DEVELOPMENT if set(split_tuple) == {"train", "dev"} else Partition.VALIDATION if split_tuple == ("test_normal",) else Partition.FINAL
         return tuple(EvaluationTaskInput(task.task_id, ref, task.instruction, (), partition, f"appworld:{task.split}") for task in self.catalog.tasks(split_tuple, allow_test=self.config.allow_test))
 
     def tasks_for_partition(self, partition: Partition | str) -> tuple[EvaluationTaskInput, ...]:
         selected = {
-            Partition.DEVELOPMENT: ("train", "dev"),
-            Partition.VALIDATION: ("test_normal",),
-            Partition.FINAL: ("test_challenge",),
-        }.get(Partition(partition), ())
-        return self._evaluation_tasks(selected) if selected else ()
+            Partition.DEVELOPMENT: (("train",), Partition.DEVELOPMENT),
+            Partition.VALIDATION: (("dev",), Partition.VALIDATION),
+            Partition.FINAL: (("test_normal", "test_challenge"), Partition.FINAL),
+        }.get(Partition(partition))
+        if selected and selected[1] is Partition.FINAL and not self.config.allow_test:
+            return ()
+        return self._evaluation_tasks(*selected) if selected else ()
 
     def task_families(self, partition: Partition | str) -> tuple[str, ...]:
         return tuple(sorted({task.family for task in self.tasks_for_partition(partition)}))
 
     def partition_hash(self, partition: Partition | str) -> str:
         tasks = self.tasks_for_partition(partition)
-        return sha256_json({"environmentId": self.environment_id, "partition": Partition(partition).value, "taskIds": [task.task_id for task in tasks], "publicData": self.catalog.public_data_hash()})
+        return sha256_json({"environmentId": self.environment_id, "partition": Partition(partition).value, "taskIds": [task.task_id for task in tasks], "publicData": self.catalog.public_data_hash(), "dataset": self.catalog.dataset_hash()})
 
     def structural_signature(self, partition: Partition | str) -> str:
         return sha256_json({"family": self.task_families(partition), "count": len(self.tasks_for_partition(partition))})
 
     def public_fixture_hash(self) -> str:
-        return sha256_json({"manifest": self.manifest.model_dump(mode="json", by_alias=True), "publicData": self.catalog.public_data_hash()})
+        return sha256_json({"manifest": self.manifest.model_dump(mode="json", by_alias=True), "publicData": self.catalog.public_data_hash(), "dataset": self.catalog.dataset_hash()})
 
     def learner_documents(self) -> tuple[Any, ...]:
         return ()
@@ -608,7 +668,7 @@ class AppWorldPackage:
                     "benchmark": "AppWorld",
                     "dataClass": "external_published_simulated_benchmark",
                     "officialSplit": split,
-                    "runtimePartition": "development",
+                    "runtimePartition": {"train": "development", "dev": "validation", "test_normal": "final", "test_challenge": "final"}[split],
                 }
         raise AppWorldError(f"unknown AppWorld task: {task_id}")
 

@@ -948,6 +948,16 @@ class Controller:
         if not isinstance(fixture_reset_ok, bool):
             raise ValueError("outcome.fixtureResetOk must be a boolean")
         payload["fixtureResetOk"] = fixture_reset_ok
+        aggregate = payload.get("aggregateEvaluation")
+        if isinstance(aggregate, Mapping):
+            safe_aggregate: dict[str, Any] = {}
+            for key in ("success", "numTests", "passCount", "failCount", "taskCompleted"):
+                value = aggregate.get(key)
+                if key in {"success", "taskCompleted"} and isinstance(value, bool):
+                    safe_aggregate[key] = value
+                elif key in {"numTests", "passCount", "failCount"} and isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    safe_aggregate[key] = value
+            payload["aggregateEvaluation"] = safe_aggregate
         # Persist only the canonical attestation fields.  Evaluator rationale,
         # hidden answers, and other implementation details remain evaluator
         # input and cannot leak through durable artifacts or operator events.
@@ -956,7 +966,7 @@ class Controller:
             for key in (
                 "responseId", "runId", "taskId", "environmentId", "passed",
                 "reliable", "safetyViolations", "fixtureResetOk", "score",
-                "arm", "seed", "bundleHash",
+                "arm", "seed", "bundleHash", "aggregateEvaluation",
             )
             if key in payload
         }
@@ -1079,9 +1089,17 @@ class Controller:
                             "reliable": bool(metadata.get("reliable", outcome.passed)),
                             "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
                             "fixtureResetOk": bool(metadata.get("fixtureResetOk", True)),
+                            **({"score": outcome.score} if isinstance(outcome.score, (int, float)) and not isinstance(outcome.score, bool) else {}),
                             **({"arm": metadata["arm"]} if isinstance(metadata.get("arm"), str) else {}),
                             **({"seed": metadata["seed"]} if isinstance(metadata.get("seed"), int) and not isinstance(metadata.get("seed"), bool) else {}),
                             **({"bundleHash": metadata["bundleHash"]} if isinstance(metadata.get("bundleHash"), str) else {}),
+                            **({"aggregateEvaluation": {
+                                key: metadata["aggregateEvaluation"][key]
+                                for key in ("success", "numTests", "passCount", "failCount", "taskCompleted")
+                                if key in metadata["aggregateEvaluation"]
+                                and ((key in {"success", "taskCompleted"} and isinstance(metadata["aggregateEvaluation"][key], bool))
+                                     or (key in {"numTests", "passCount", "failCount"} and isinstance(metadata["aggregateEvaluation"][key], int) and not isinstance(metadata["aggregateEvaluation"][key], bool) and metadata["aggregateEvaluation"][key] >= 0))
+                            }} if isinstance(metadata.get("aggregateEvaluation"), Mapping) else {}),
                         },
                     )
                 else:

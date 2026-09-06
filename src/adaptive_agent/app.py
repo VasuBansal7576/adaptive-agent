@@ -38,6 +38,20 @@ from adaptive_agent.store import Store
 from adaptive_agent.evaluation_store import build_durable_adapters
 
 
+def _manifest_value(value: Any) -> Any:
+    """Serialize manifest boundary objects independent of their implementation."""
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode="json", by_alias=True)
+        except TypeError:
+            return model_dump()
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return value
+
+
 def _effective_observation_cost(accounting: Mapping[str, Any]) -> int:
     """Return an observation cost only when its source is complete.
 
@@ -637,12 +651,8 @@ class DurableRuntime:
         version_refs = model_payload.get("versionRefs") if isinstance(model_payload, Mapping) else None
         if not isinstance(version_refs, Mapping):
             raise LearningRuntimeError("evaluation model receipt lacks frozen config hashes")
-        policy_ref = package.manifest.policy_ref
-        if callable(getattr(policy_ref, "model_dump", None)):
-            policy_ref = policy_ref.model_dump(mode="json", by_alias=True)
-        schemas = package.manifest.tool_schemas
-        if schemas and callable(getattr(schemas[0], "model_dump", None)):
-            schemas = tuple(schema.model_dump(mode="json", by_alias=True) for schema in schemas)
+        policy_ref = _manifest_value(package.manifest.policy_ref)
+        schemas = tuple(_manifest_value(schema) for schema in package.manifest.tool_schemas)
         observation_kwargs = {"provenance": Provenance.DETERMINISTIC_SIMULATION, "model_provenance": ModelProvenance.REAL_MODEL, "model_profile": model_name, "core_planner_hash": core_hash, "budget": budget, "response_id": model_payload.get("responseId"), "accounting_ref": accounting_ref, "evidence_ref": model_row["evidence_id"], "outcome_ref": outcome_ref, "config_hashes": {"model": sha256_json({"profile": inputs.get("modelProfile", model_name), "provider": inputs.get("provider", provider_name)}), "planner": str(inputs.get("corePlannerHash", core_hash)), "budget": sha256_json(inputs.get("runBudget", budget_value)), "policy": sha256_json(policy_ref), "schema": sha256_json(schemas), "image": str(inputs.get("imageDigest", image_digest))}, "run_id": run.run_id}
         # Session-6's evaluator model includes bundle_hash; keep this worker
         # compatible with the pre-merge evaluator while exposing it whenever
@@ -1225,9 +1235,9 @@ class DurableRuntime:
         return {
             "environmentId": package.environment_id,
             "version": package.manifest.version,
-            "docs": [ref.to_dict() for ref in package.manifest.docs],
-            "publicDocs": [doc.to_dict() for doc in package.learner_documents()],
-            "toolSchemas": [tool.to_dict() for tool in package.manifest.tool_schemas],
+            "docs": [_manifest_value(ref) for ref in package.manifest.docs],
+            "publicDocs": [_manifest_value(doc) for doc in package.learner_documents()],
+            "toolSchemas": [_manifest_value(tool) for tool in package.manifest.tool_schemas],
             "executionModes": list(package.manifest.execution_modes),
             "executionMode": run.execution_mode if run else "interactive",
             "capabilities": [f"{run_id}:{tool.name}" for tool in package.manifest.tool_schemas],
@@ -1348,7 +1358,7 @@ class DurableRuntime:
         frozen_image = evidence.get("imageDigest") if isinstance(evidence.get("imageDigest"), str) and evidence.get("imageDigest") else self.image_digest
         version_refs = {
             "policy": package.manifest.policy_ref.sha256,
-            "schema": sha256_json(package.manifest.tool_schemas),
+            "schema": sha256_json(tuple(_manifest_value(schema) for schema in package.manifest.tool_schemas)),
             "planner": frozen_core_planner,
             "budget": run.budget_ref.sha256,
             "image": frozen_image,
@@ -1503,6 +1513,7 @@ class DurableRuntime:
                         **({"seed": metadata["seed"]} if isinstance(metadata.get("seed"), int) and not isinstance(metadata.get("seed"), bool) else {}),
                         **({"bundleHash": metadata["bundleHash"]} if isinstance(metadata.get("bundleHash"), str) else {}),
                         **({"goal": metadata["goal"]} if isinstance(metadata.get("goal"), str) else {}),
+                        **({"aggregateEvaluation": metadata["aggregateEvaluation"]} if isinstance(metadata.get("aggregateEvaluation"), Mapping) else {}),
                     },
                 )
         return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
@@ -1636,7 +1647,11 @@ class DurableRuntime:
                     invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
                     runtime._record_model_response(run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest, **({"nominalCostUsd": invocation.nominalCostUsd} if hasattr(invocation, "nominalCostUsd") else {}), **({"costMicrounits": invocation.costMicrounits} if hasattr(invocation, "costMicrounits") else ({"costMicrounits": invocation.cost_microunits} if hasattr(invocation, "cost_microunits") else {})), **({"economicCostStatus": invocation.economicCostStatus} if hasattr(invocation, "economicCostStatus") else {})})
             def evaluate() -> DurableOutcome:
-                outcome = runtime._invoke_evaluator(run_id=run_id, goal=task.goal, model_output=invocation.text, environment=runtime._planner_environment(package, run_id)) if invocation is not None else None
+                outcome = runtime._invoke_evaluator(run_id=run_id, goal=task.goal, model_output=invocation.text, environment=runtime._planner_environment(package, run_id)) if invocation is not None and runtime.evaluator is not None else None
+                if outcome is None:
+                    external_evaluate = getattr(package, "evaluate_provider", None)
+                    if callable(external_evaluate):
+                        outcome = dict(external_evaluate(provider))
                 outcome = outcome or {"passed": False}
                 outcome = {**outcome, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal}
                 return DurableOutcome(runId=run_id, passed=bool(outcome.get("passed") is True), metadata=outcome)
@@ -1890,7 +1905,8 @@ def _seed_durable_stack(plane: ControlPlane, store_dir: Path, appworld_config: A
         from adaptive_agent.appworld_provider import AppWorldPackage, register_appworld
 
         appworld_package = AppWorldPackage(appworld_config)
-        register_appworld(registry, appworld_config, runtime_partition="development")
+        register_appworld(registry, appworld_config, splits=("train",), runtime_partition="development")
+        register_appworld(registry, appworld_config, splits=("dev",), runtime_partition="validation")
         for kind, ref in (("policy", appworld_package.manifest.policy_ref), ("evaluator", appworld_package.manifest.evaluator_ref), ("reset", appworld_package.manifest.reset_ref)):
             plane.trust_reference(kind, ref.model_dump(mode="json", by_alias=True))
         for ref in appworld_package.manifest.docs:

@@ -11,6 +11,7 @@ from adaptive_agent.appworld_provider import (
     AppWorldCatalog,
     AppWorldConfig,
     AppWorldError,
+    AppWorldPackage,
     AppWorldProtocolError,
     AppWorldUnavailable,
     AppWorldProvider,
@@ -20,6 +21,7 @@ from adaptive_agent.appworld_provider import (
     register_appworld,
 )
 from adaptive_agent.broker import Capability, ToolBroker
+from adaptive_agent.evaluation import Partition
 from adaptive_agent.environment import EnvironmentRegistry
 from adaptive_agent.models import ToolRequest
 from adaptive_agent.store import Store
@@ -57,6 +59,14 @@ def test_catalog_reads_exact_public_split_ids_and_seals_test(tmp_path: Path):
         catalog.task("test-1", "test_normal")
 
 
+def test_package_maps_official_splits_to_runtime_partitions(tmp_path: Path):
+    package = AppWorldPackage(AppWorldConfig(_public_root(tmp_path), python=sys.executable))
+    assert {task.split for task in package.learner_tasks()} == {"train"}
+    assert {task.family for task in package.tasks_for_partition(Partition.DEVELOPMENT)} == {"appworld:train"}
+    assert {task.family for task in package.tasks_for_partition(Partition.VALIDATION)} == {"appworld:dev"}
+    assert package.tasks_for_partition(Partition.FINAL) == ()
+
+
 def test_public_hash_excludes_ground_truth(tmp_path: Path):
     root = _public_root(tmp_path)
     catalog = AppWorldCatalog(AppWorldConfig(root, python=sys.executable))
@@ -92,8 +102,8 @@ def test_register_appworld_defaults_to_train_and_dev(tmp_path: Path):
     manifest_ref, task_refs = register_appworld(registry, AppWorldConfig(root, python=sys.executable))
     assert manifest_ref.sha256
     assert len(task_refs) == 2
-    assert registry.list_tasks_by_partition("appworld", "train")[0].task_id == "train-1"
-    assert registry.list_tasks_by_partition("appworld", "dev")[0].task_id == "dev-1"
+    assert registry.list_tasks_by_partition("appworld", "development")[0].task_id == "train-1"
+    assert registry.list_tasks_by_partition("appworld", "validation")[0].task_id == "dev-1"
 
 
 def test_provider_uses_one_worker_process_and_brokerable_result(tmp_path: Path):
@@ -137,6 +147,16 @@ def test_hung_worker_timeout_is_bounded_and_cleaned_up(tmp_path: Path):
     worker.write_text("import time\ntime.sleep(10)\n")
     process = _JsonLineProcess([sys.executable, "-u", str(worker)], os.environ, 0.05)
     with pytest.raises(AppWorldProtocolError, match="timed out"):
+        process.request("reset", {"taskId": "train-1"})
+    assert process._proc.poll() is not None
+    process.close(force=True)
+
+
+def test_worker_closed_stdout_then_hung_is_cleaned_up(tmp_path: Path):
+    worker = tmp_path / "closed_stdout_worker.py"
+    worker.write_text("import os, time\nos.close(1)\ntime.sleep(10)\n")
+    process = _JsonLineProcess([sys.executable, "-u", str(worker)], os.environ, 1.0)
+    with pytest.raises(AppWorldProtocolError, match="closed"):
         process.request("reset", {"taskId": "train-1"})
     assert process._proc.poll() is not None
     process.close(force=True)
