@@ -129,6 +129,7 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             store.append_evidence("private-outcome", {"run_id": run_id, "sequence": 5, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0})
             self.assertTrue(verifier.verify(dataclasses.replace(row, outcome_ref="private-outcome"), frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, evidence_ref="private-outcome"), frozen, package))
+            self.assertFalse(verifier.verify(dataclasses.replace(row, outcome_ref="missing-trusted-outcome"), frozen, package))
 
             original_get_evidence = store.get_evidence
             def untrusted(evidence_id):
