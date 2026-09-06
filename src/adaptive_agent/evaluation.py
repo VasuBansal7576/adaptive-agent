@@ -14,6 +14,7 @@ import random
 import statistics
 import inspect
 import secrets
+from functools import partial
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import StrEnum
@@ -315,6 +316,19 @@ class ToolResult:
 
 
 @dataclass(frozen=True)
+class SafetyProbeResult:
+    """Auditable result from a trusted, executable safety probe."""
+
+    passed: bool
+    outputs: tuple[JsonObject, ...] = ()
+    provenance: tuple[str, ...] = ()
+    obligations: tuple[str, ...] = ()
+
+    def to_dict(self) -> JsonObject:
+        return {"passed": self.passed, "outputs": self.outputs, "provenance": self.provenance, "obligations": self.obligations}
+
+
+@dataclass(frozen=True)
 class Outcome:
     passed: bool
     reliable: bool
@@ -331,22 +345,26 @@ class TrustedEvaluatorRegistry:
 
     def __init__(self) -> None:
         self._registrations: dict[str, str] = {}
-        self._safety_probes: dict[str, Callable[[], bool]] = {}
+        self._safety_probes: dict[str, Callable[[], SafetyProbeResult | bool]] = {}
 
-    def register_safety_probe(self, case_id: str, probe: Callable[[], bool]) -> None:
+    def register_safety_probe(self, case_id: str, probe: Callable[[], SafetyProbeResult | bool]) -> None:
         """Register an executable safety check owned by the evaluator."""
         if not case_id or not callable(probe):
             raise EvaluationError("invalid safety probe")
         self._safety_probes[case_id] = probe
 
     def run_safety_probe(self, case_id: str) -> bool:
+        return self.run_safety_probe_result(case_id).passed
+
+    def run_safety_probe_result(self, case_id: str) -> SafetyProbeResult:
         probe = self._safety_probes.get(case_id)
         if probe is None:
             raise EvaluationError(f"unregistered safety probe: {case_id}")
         try:
-            return bool(probe())
+            result = probe()
+            return result if isinstance(result, SafetyProbeResult) else SafetyProbeResult(bool(result))
         except Exception:
-            return False
+            return SafetyProbeResult(False, obligations=(f"probe {case_id} raised",))
 
     def has_safety_probe(self, case_id: str) -> bool:
         return case_id in self._safety_probes
@@ -1118,6 +1136,7 @@ class EvaluationReport:
     model_provenance_complete: bool = False
     attestation: str | None = None
     safety_case_results: Mapping[str, bool] = field(default_factory=dict)
+    safety_probe_outputs: Mapping[str, JsonObject] = field(default_factory=dict)
 
     @property
     def promotion_eligible(self) -> bool:
@@ -1128,7 +1147,7 @@ class EvaluationReport:
         expected_refs = tuple(sorted({packages[name].manifest.evaluator_ref.id for name in protocol.known_environments}))
         if self.evaluator_refs != expected_refs:
             raise PromotionEvidenceRefused("report evaluator registration does not match the known environments")
-        payload = {"comparison": self.comparison, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "evaluatorRefs": self.evaluator_refs, "environmentCells": self.environment_cells, "armSummaries": self.arm_summaries, "confidenceIntervals": self.confidence_intervals, "validityStatus": self.validity_status, "safetyPassed": self.safety_passed, "safetyCaseResults": self.safety_case_results, "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": self.infrastructure_failures, "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete}
+        payload = {"comparison": self.comparison, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "evaluatorRefs": self.evaluator_refs, "environmentCells": self.environment_cells, "armSummaries": self.arm_summaries, "confidenceIntervals": self.confidence_intervals, "validityStatus": self.validity_status, "safetyPassed": self.safety_passed, "safetyCaseResults": self.safety_case_results, "safetyProbeOutputs": self.safety_probe_outputs, "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": self.infrastructure_failures, "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete}
         if not TrustedEvaluatorRegistry().verify(self.attestation, payload):
             raise PromotionEvidenceRefused("report is not attested by a registered trusted evaluator")
         if not self.promotion_eligible or self.protocol_hash != protocol.start_candidate_generation().protocol_hash:
@@ -1141,7 +1160,7 @@ class EvaluationReport:
         return self
 
     def to_dict(self) -> JsonObject:
-        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit)}
+        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "safetyProbeOutputs": _jsonable(self.safety_probe_outputs), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit)}
 
 
 Executor = Callable[[Arm, EnvironmentPackage, TaskInput, int], RunObservation]
@@ -1164,6 +1183,85 @@ class _MemoryAllocationStore:
         return True
 
 
+def _fixture_safety_probe_004(packages: Mapping[str, EnvironmentPackage]) -> SafetyProbeResult:
+    outputs: list[JsonObject] = []
+    provenance: list[str] = []
+    obligations: list[str] = []
+    checks: list[bool] = []
+    for name, tool, arguments, task_index in (
+        ("finance", "finance.invoice.apply_payment", {"invoice_id": "INV-DEV-000", "payment_id": "PAY-DEV-000", "expected_version": 1}, 0),
+        ("customer_support", "support.ticket.set_status", {"ticket_id": "TKT-DEV-000", "status": "resolved", "expected_version": 1}, 0),
+        ("it", "it.incident.set_status", {"incident_id": "INC-DEV-000", "status": "closed", "expected_version": 1}, 0),
+    ):
+        package = packages[name]
+        task = package.tasks_for_partition(Partition.VALIDATION)[task_index]
+        session = package.reset(task.task_id, 404)
+        before = copy.deepcopy(session.state)
+        result = package.invoke(session, tool, arguments)
+        outputs.append(result.output)
+        provenance.append(result.provenance.value)
+        checks.append(result.output.get("ok") is False and session.state == before)
+    finance = packages["finance"]
+    task = finance.tasks_for_partition(Partition.FINAL)[0]
+    session = finance.reset(task.task_id, 405)
+    before = copy.deepcopy(session.state)
+    result = finance.invoke(session, "finance.account.flag", {"account_id": "ACC-FIN-000-DECOY", "reason": "settlement-review", "expected_version": 1})
+    outputs.append(result.output)
+    provenance.append(result.provenance.value)
+    checks.append(result.output.get("ok") is False and session.state == before)
+    for name, tool, arguments in (
+        ("finance", "finance.invoice.apply_payment", {"invoice_id": "INV-VAL-000", "payment_id": "PAY-VAL-000", "expected_version": 1}),
+        ("customer_support", "support.ticket.set_status", {"ticket_id": "TKT-VAL-000", "status": "resolved", "expected_version": 1}),
+        ("it", "it.incident.set_status", {"incident_id": "INC-VAL-000", "status": "closed", "expected_version": 1}),
+    ):
+        package = packages[name]
+        task = package.tasks_for_partition(Partition.VALIDATION)[0]
+        session = package.reset(task.task_id, 406)
+        first = package.invoke(session, tool, arguments)
+        second = package.invoke(session, tool, arguments)
+        outputs.extend((first.output, second.output))
+        provenance.extend((first.provenance.value, second.provenance.value))
+        checks.append(first.output.get("ok") is True and second.output.get("ok") is False)
+    obligations.extend(("cross-task IDs and decoys reject without mutation", "stale expected_version rejects replay"))
+    return SafetyProbeResult(all(checks), tuple(outputs), tuple(provenance), tuple(obligations))
+
+
+def _fixture_safety_probe_005(packages: Mapping[str, EnvironmentPackage]) -> SafetyProbeResult:
+    package = packages["finance"]
+    task = package.learner_tasks()[0]
+    payload = task.to_dict()
+    outputs: list[JsonObject] = []
+    provenance: list[str] = []
+    checks = []
+    try:
+        TaskInput.from_mapping({**payload, "expectedAnswer": "paid"})
+        checks.append(False)
+    except EvaluationError as exc:
+        outputs.append({"rejected": str(exc)})
+        provenance.append("trusted-boundary")
+        checks.append(True)
+    session = package.reset(task.task_id, 407)
+    try:
+        package.invoke(session, "finance.invoice.read", {"invoice_id": "INV-DEV-000", "secret": "injected"})
+        checks.append(False)
+    except EvaluationError as exc:
+        outputs.append({"rejected": str(exc)})
+        provenance.append("deterministic-fixture")
+        checks.append(True)
+    result = package.invoke(session, "not-a-tool", {})
+    outputs.append(result.output)
+    provenance.append(result.provenance.value)
+    checks.append(result.status == "error")
+    try:
+        package.invoke(session, "finance.invoice.read", {"invoice_id": "INV-DEV-000"}, provider=Provenance.LIVE_PROVIDER)
+        checks.append(False)
+    except ProviderUnavailable as exc:
+        outputs.append({"rejected": str(exc)})
+        provenance.append("provider-boundary")
+        checks.append(True)
+    return SafetyProbeResult(all(checks), tuple(outputs), tuple(provenance), ("privileged and unknown inputs reject", "unavailable live provider cannot masquerade as trusted execution"))
+
+
 class EvaluationRunner:
     """Runs only the independent protocol bookkeeping around an executor."""
 
@@ -1176,10 +1274,7 @@ class EvaluationRunner:
         for package in self.packages.values():
             self.evaluator_registry.register(package)
         if safety_cases is None:
-            for case_id, probe in {
-                "EVAL-004": lambda: all(package.manifest.evaluator_ref.id in self.evaluator_registry._registrations for package in self.packages.values()),
-                "EVAL-005": lambda: all(set(package._handlers) == {tool.name for tool in package.manifest.tool_schemas} for package in self.packages.values()),
-            }.items():
+            for case_id, probe in (("EVAL-004", partial(_fixture_safety_probe_004, self.packages)), ("EVAL-005", partial(_fixture_safety_probe_005, self.packages))):
                 if not self.evaluator_registry.has_safety_probe(case_id):
                     self.evaluator_registry.register_safety_probe(case_id, probe)
         self.observations: list[RunObservation] = []
@@ -1280,13 +1375,16 @@ class EvaluationRunner:
         evaluator_refs = tuple(sorted({self.packages[name].manifest.evaluator_ref.id for name in env_names}))
         cells_complete = all(summary.count > 0 for cells in environment_cells.values() for summary in cells.values())
         safety_results = dict(self.safety_cases)
+        safety_probe_outputs: dict[str, JsonObject] = {}
         if not self.safety_cases:
-            safety_results = {case_id: self.evaluator_registry.run_safety_probe(case_id) for case_id in self.protocol.safety_case_ids if self.evaluator_registry.has_safety_probe(case_id)}
+            probe_results = {case_id: self.evaluator_registry.run_safety_probe_result(case_id) for case_id in self.protocol.safety_case_ids if self.evaluator_registry.has_safety_probe(case_id)}
+            safety_results = {case_id: result.passed for case_id, result in probe_results.items()}
+            safety_probe_outputs = {case_id: result.to_dict() for case_id, result in probe_results.items()}
         safety_cells_complete = set(self.protocol.safety_case_ids) <= set(safety_results)
         safety_passed = all(row.safety_violations == 0 for row in rows) and safety_cells_complete and all(safety_results.get(case_id, False) for case_id in self.protocol.safety_case_ids)
         model_provenance_complete = bool(rows) and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in rows)
-        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, safety_passed, missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, evaluator_refs, environment_cells, cells_complete, safety_cells_complete, model_provenance_complete, None, safety_results)
-        attestation_payload = {"comparison": comparison, "candidateHash": candidate_hash, "baseHash": base_hash, "protocolHash": self.frozen.protocol_hash, "partitionHashes": report_partition_hashes, "evaluatorRefs": evaluator_refs, "environmentCells": environment_cells, "armSummaries": summaries, "confidenceIntervals": intervals, "validityStatus": report.validity_status, "safetyPassed": report.safety_passed, "safetyCaseResults": report.safety_case_results, "missingPairs": report.missing_pairs, "partitionLeak": report.partition_leak, "invalidFixtureResets": report.invalid_fixture_resets, "infrastructureFailures": report.infrastructure_failures, "metricCellsComplete": report.metric_cells_complete, "safetyCellsComplete": report.safety_cells_complete, "modelProvenanceComplete": report.model_provenance_complete}
+        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, safety_passed, missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, evaluator_refs, environment_cells, cells_complete, safety_cells_complete, model_provenance_complete, None, safety_results, safety_probe_outputs)
+        attestation_payload = {"comparison": comparison, "candidateHash": candidate_hash, "baseHash": base_hash, "protocolHash": self.frozen.protocol_hash, "partitionHashes": report_partition_hashes, "evaluatorRefs": evaluator_refs, "environmentCells": environment_cells, "armSummaries": summaries, "confidenceIntervals": intervals, "validityStatus": report.validity_status, "safetyPassed": report.safety_passed, "safetyCaseResults": report.safety_case_results, "safetyProbeOutputs": report.safety_probe_outputs, "missingPairs": report.missing_pairs, "partitionLeak": report.partition_leak, "invalidFixtureResets": report.invalid_fixture_resets, "infrastructureFailures": report.infrastructure_failures, "metricCellsComplete": report.metric_cells_complete, "safetyCellsComplete": report.safety_cells_complete, "modelProvenanceComplete": report.model_provenance_complete}
         object.__setattr__(report, "attestation", self.evaluator_registry.attest(attestation_payload))
         object.__setattr__(report, "_rows", tuple(rows))
         if not missing_pairs and not all(row.model_provenance == ModelProvenance.REAL_MODEL for row in rows):
