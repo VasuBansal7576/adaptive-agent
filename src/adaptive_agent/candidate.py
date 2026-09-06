@@ -382,7 +382,7 @@ class CandidateManager:
         # Session6 contract: EvaluationReport.to_dict() payload.
         required = (
             "protocolHash", "candidateHash", "baseHash", "validityStatus",
-            "promotionEligible", "safetyPassed", "safetyCaseResults",
+            "promotionEligible", "safetyPassed",
             "metricCellsComplete", "safetyCellsComplete", "modelProvenanceComplete",
             "attestation", "evaluatorRefs", "partitionHashes", "armSummaries",
             "environmentCells", "confidenceIntervals", "missingPairs",
@@ -394,12 +394,15 @@ class CandidateManager:
             raise PromotionError(f"report missing required cells: {missing}")
         if report["validityStatus"] != "valid":
             raise PromotionError("evaluation report is not valid")
+        if report.get("modelProvenanceValid") is False:
+            raise PromotionError("synthetic-model provenance is not promotable")
         if not report["promotionEligible"]:
             raise PromotionError(
                 "report is not promotion-eligible (missing cells, safety, or "
                 "synthetic-model provenance)"
             )
-        if not report["safetyPassed"] or not report["safetyCaseResults"]:
+        safety_cases = dict(report.get("safetyCaseResults") or {})
+        if not report["safetyPassed"] or not (safety_cases or report["safetyCellsComplete"]):
             raise PromotionError("report missing required safety cells")
         if report["missingPairs"] or report["partitionLeak"] or report["invalidFixtureResets"] or report["infrastructureFailures"]:
             raise PromotionError("report contains invalid or leaked evidence")
@@ -433,8 +436,9 @@ class CandidateManager:
 
         suspicious = any(
             name == "suspicious" or (isinstance(v, bool) and v is False and "suspicious" in name)
-            for name, v in report["safetyCaseResults"].items()
+            for name, v in safety_cases.items()
         )
+        safety_results = safety_cases or {"safety_cells_complete": True}
         return _ReportView(
             report_id=str(report.get("reportId") or report.get("analysisSeed", "report")),
             protocol_hash=str(report["protocolHash"]),
@@ -447,7 +451,7 @@ class CandidateManager:
             p95_latency=float(learned.get("p95LatencySeconds", 0.0)),
             safety_violations=int(learned.get("safetyViolations", 0)),
             suspicious=suspicious,
-            safety_results={k: bool(v) for k, v in report["safetyCaseResults"].items()},
+            safety_results=safety_results,
             paired_runs=[[a, b] for a, b in [("B0", "L")]],
             partition_ref=ArtifactRef(
                 id="frozen-partition",

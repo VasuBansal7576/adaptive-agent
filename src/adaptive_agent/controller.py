@@ -9,6 +9,10 @@ evaluator identity, and the active bundle never enters the learner.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import re
 import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -56,6 +60,29 @@ class RunDriver(Protocol):
 
 
 ApprovalProvider = Callable[[ToolRequest], str | None]
+
+
+# Credential-shaped values are masked before learner-visible evidence is
+# recorded (sanitized feedback boundary; planner fix bec53f2).
+_SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|bearer)\s*[:=]\s*\S+"),
+)
+
+
+def _sanitize_for_learner(value: Any) -> Any:
+    if isinstance(value, str):
+        out = value
+        for pat in _SECRET_PATTERNS:
+            out = pat.sub("[REDACTED]", out)
+        return out
+    if isinstance(value, Mapping):
+        return {k: _sanitize_for_learner(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_learner(v) for v in value]
+    return value
 
 
 class DriverContext:
@@ -118,18 +145,29 @@ class Controller:
         self.approval_provider = approval_provider
 
     # ------------------------------------------------------------------ runs
-    def create_run(self, request: RunRequest, task: TaskInput, skill_bundle: SkillBundle | None = None) -> RunRecord:
-        """Idempotent run creation: same idempotency key returns the stored run."""
-        existing = self.store.get_run_by_idempotency_key(request.idempotency_key)
-        if existing:
-            return RunRecord.model_validate_json(existing["run_json"])
+    @staticmethod
+    def _request_fingerprint(request: RunRequest, task: TaskInput) -> str:
+        return sha256_json(
+            {
+                "taskRef": request.task_ref.model_dump(mode="json"),
+                "modelProfileRef": request.model_profile_ref.model_dump(mode="json"),
+                "budgetRef": request.budget_ref.model_dump(mode="json"),
+                "parentRunId": request.parent_run_id,
+                "taskId": task.task_id,
+                "environmentId": task.environment_ref.id,
+            }
+        )
 
-        if skill_bundle is None:
-            skill_bundle = self.candidates.get_active_bundle() or SkillBundle()
-        bundle_ref = self.store.put_artifact(skill_bundle.model_dump(mode="json", by_alias=True))
+    def create_run(self, request: RunRequest, task: TaskInput, skill_bundle: SkillBundle | None = None) -> RunRecord:
+        """Atomic run idempotency: same key + same request replays the stored run;
+        same key + different request raises RunIdempotencyConflict."""
+        fingerprint = self._request_fingerprint(request, task)
         manifest = self.registry.get_manifest(task.environment_ref.id)
         if manifest is None:
             raise KeyError(f"environment {task.environment_ref.id!r} not registered")
+        if skill_bundle is None:
+            skill_bundle = self.candidates.get_active_bundle() or SkillBundle()
+        bundle_ref = self.store.put_artifact(skill_bundle.model_dump(mode="json", by_alias=True))
 
         run = RunRecord(
             taskRef=request.task_ref,
@@ -141,20 +179,23 @@ class Controller:
             parentRunId=request.parent_run_id,
             status=RunStatus.queued,
         )
-        self.store.save_run(
-            run.run_id,
+        status, row = self.store.create_run_idempotent(
+            request.idempotency_key,
+            fingerprint,
             {
+                "run_id": run.run_id,
                 "parent_run_id": run.parent_run_id,
                 "task_id": task.task_id,
                 "environment_id": manifest.environment_id,
                 "bundle_id": skill_bundle.bundle_id,
                 "status": run.status.value,
-                "idempotency_key": request.idempotency_key,
                 "last_event_sequence": 0,
                 "created_at": run.created_at.isoformat(),
                 "run_json": run.model_dump_json(by_alias=True),
             },
         )
+        if status == "exists":
+            return RunRecord.model_validate_json(row["run_json"])
         self.append_event(run.run_id, "run_created", {"run_id": run.run_id}, "system", "learner")
         return run
 
@@ -227,6 +268,10 @@ class Controller:
 
     # ------------------------------------------------------------------ evidence / SSE
     def append_event(self, run_id: str, event_type: str, payload: dict[str, Any], trust_class: str, visibility: str) -> EvidenceRecord:
+        # Sanitized feedback boundary: learner-visible events never carry
+        # credential-shaped values.
+        if visibility == "learner":
+            payload = _sanitize_for_learner(payload)
         seq = self.store.next_event_sequence(run_id)
         ev = EvidenceRecord(
             runId=run_id,
@@ -282,6 +327,115 @@ class Controller:
                     yield ev
                 return
             time.sleep(poll_interval)
+
+    # ------------------------------------------------------------------ canonical trusted evidence
+    # Contract with session6's SQLiteRunEvidenceStore (e916487):
+    #   model_response evidence -> artifact: {responseId, usage{inputTokens,
+    #     outputTokens,totalTokens}, versionRefs{...}}; content_hash matches.
+    #   accounting artifact -> {responseId, runId, taskId, environmentId, usage,
+    #     costMicrounits, durationSeconds, versionRefs} (usage/versionRefs equal
+    #     the model_response payload).
+    #   trusted_outcome evidence -> artifact: {responseId, runId, taskId,
+    #     environmentId, passed, reliable, safetyViolations}.
+
+    @staticmethod
+    def _require_usage(usage: Any) -> dict[str, int]:
+        if not isinstance(usage, dict):
+            raise ValueError("usage must be an object")
+        for key in ("inputTokens", "outputTokens", "totalTokens"):
+            v = usage.get(key)
+            if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                raise ValueError(f"usage.{key} must be a non-negative integer")
+        if usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]:
+            raise ValueError("usage.totalTokens must equal input+output")
+        return usage
+
+    def _run_row(self, run_id: str) -> dict[str, Any]:
+        row = self.store.get_run(run_id)
+        if row is None:
+            raise KeyError(f"run {run_id!r} not found")
+        return row
+
+    def record_model_response(self, run_id: str, response: Mapping[str, Any]) -> EvidenceRecord:
+        """Record a trusted parent model observation (responseId + usage pinned)."""
+        self._run_row(run_id)
+        if not isinstance(response.get("responseId"), str) or not response["responseId"]:
+            raise ValueError("response.responseId is required")
+        self._require_usage(response.get("usage"))
+        if not isinstance(response.get("versionRefs"), dict) or not response["versionRefs"]:
+            raise ValueError("response.versionRefs must be a non-empty object")
+        return self.append_event(
+            run_id, "model_response", dict(response), "system", "operator"
+        )
+
+    def record_accounting(self, run_id: str, accounting: Mapping[str, Any], model_response: Mapping[str, Any]) -> ArtifactRef:
+        """Content-address an accounting record bound to a model response."""
+        row = self._run_row(run_id)
+        for key in ("responseId", "runId", "taskId", "environmentId"):
+            if not accounting.get(key):
+                raise ValueError(f"accounting.{key} is required")
+        if accounting["responseId"] != model_response.get("responseId"):
+            raise ValueError("accounting.responseId does not match model response")
+        if accounting["runId"] != run_id or accounting["taskId"] != row["task_id"] or accounting["environmentId"] != row["environment_id"]:
+            raise ValueError("accounting run/task/environment pins do not match the run")
+        if self._require_usage(accounting.get("usage")) != model_response.get("usage"):
+            raise ValueError("accounting.usage does not match model response usage")
+        if accounting.get("versionRefs") != model_response.get("versionRefs"):
+            raise ValueError("accounting.versionRefs does not match model response")
+        for key in ("costMicrounits", "durationSeconds"):
+            v = accounting.get(key)
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0 or v != v or v == float("inf"):
+                raise ValueError(f"accounting.{key} must be a finite non-negative number")
+        ref = self.store.put_artifact(dict(accounting))
+        self.append_event(run_id, "accounting_recorded", {"accountingRef": ref.model_dump(mode="json")}, "system", "operator")
+        return ref
+
+    def record_trusted_outcome(self, run_id: str, outcome: Mapping[str, Any]) -> EvidenceRecord:
+        """Record the evaluator-owned outcome bound to a model response."""
+        row = self._run_row(run_id)
+        for key in ("responseId", "runId", "taskId", "environmentId"):
+            if not outcome.get(key):
+                raise ValueError(f"outcome.{key} is required")
+        if outcome["runId"] != run_id or outcome["taskId"] != row["task_id"] or outcome["environmentId"] != row["environment_id"]:
+            raise ValueError("outcome run/task/environment pins do not match the run")
+        if not isinstance(outcome.get("passed"), bool) or not isinstance(outcome.get("reliable"), bool):
+            raise ValueError("outcome.passed/reliable must be booleans")
+        sv = outcome.get("safetyViolations")
+        if not isinstance(sv, int) or isinstance(sv, bool) or sv < 0:
+            raise ValueError("outcome.safetyViolations must be a non-negative integer")
+        ev = self.append_event(run_id, "trusted_outcome", dict(outcome), "evaluator", "operator")
+        self.record_outcome(run_id, bool(outcome["passed"]), None, dict(outcome))
+        return ev
+
+    # ------------------------------------------------------------------ EVAL-004/005 probe executor
+    def execute_probe(self, case_id: str) -> dict[str, Any]:
+        """Real Controller probe boundary for session6's trusted registry.
+
+        EVAL-004: every registered environment has a non-empty evaluator_ref.
+        EVAL-005: every declared tool schema is dispatchable (registered schema
+        with a declared effect), i.e. no manifest tool lacks a provider path.
+        Returns a SafetyProbeResult-shaped dict; never synthetic data.
+        """
+        envs = self.store.list_environments()
+        if case_id == "EVAL-004":
+            missing = []
+            for env in envs:
+                manifest = self.registry.get_manifest(env["id"])
+                ref = manifest.evaluator_ref if manifest else None
+                if not ref or not ref.id or not ref.sha256:
+                    missing.append(env["id"])
+            return {"caseId": case_id, "passed": not missing, "detail": {"unregistered": missing}, "obligations": []}
+        if case_id == "EVAL-005":
+            missing = []
+            for env in envs:
+                manifest = self.registry.get_manifest(env["id"])
+                if not manifest:
+                    continue
+                for ts in manifest.tool_schemas:
+                    if ts.effect not in ("read", "write") or not ts.input_schema or not ts.output_schema:
+                        missing.append(f"{env['id']}:{ts.name}")
+            return {"caseId": case_id, "passed": not missing, "detail": {"undispatchable": missing}, "obligations": []}
+        raise KeyError(f"unknown probe case {case_id!r}")
 
     # ------------------------------------------------------------------ outcomes / reconciliation
     def record_outcome(self, run_id: str, passed: bool, score: float | None = None, metadata: dict[str, Any] | None = None) -> Outcome:
@@ -351,3 +505,130 @@ class Controller:
 
     def list_promotions(self) -> list[dict[str, Any]]:
         return self.store.list_promotions()
+
+    # ------------------------------------------------------------------ Prime host_request seam
+    _HOST_FORBIDDEN = frozenset({
+        "harness.write", "policy.write", "evaluator.write",
+        "promotion.write", "credentials.read", "hidden.read",
+    })
+
+    def register_prime_capability(
+        self,
+        capability_id: str,
+        env_id: str,
+        capability: Capability,
+        provider: ToolProvider,
+    ) -> None:
+        """Bind a Prime-advertised capability id to an env/capability/provider.
+
+        Only requests carrying a registered capability id can reach dispatch —
+        everything else fails closed.
+        """
+        if not hasattr(self, "_prime_caps"):
+            self._prime_caps = {}
+            self._artifact_transfers = {}
+        self._prime_caps[capability_id] = (env_id, capability, provider)
+
+    def handle_host_request(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Narrow Prime ingress: capability discovery, brokered calls, and bounded
+        artifact transfer. Learner authority is never widened."""
+        request_type = payload.get("type")
+        if request_type in self._HOST_FORBIDDEN:
+            raise PermissionError(f"learner request denied: {request_type}")
+        if request_type == "capabilities.discover":
+            env_ids = {env for env, _, _ in getattr(self, "_prime_caps", {}).values()}
+            return {"environments": sorted(env_ids), "capabilities": sorted(getattr(self, "_prime_caps", {}).keys())}
+        if request_type == "broker.call":
+            return self._prime_broker_call(payload)
+        if request_type in {"artifact.begin", "artifact.chunk", "artifact.finish", "artifact.abort"}:
+            return self._artifact_transfer(payload)
+        raise PermissionError(f"unsupported host request: {request_type}")
+
+    def _prime_broker_call(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        cap_id = payload.get("capabilityId")
+        entry = getattr(self, "_prime_caps", {}).get(cap_id) if isinstance(cap_id, str) else None
+        if entry is None:
+            raise PermissionError("unknown capability")
+        env_id, capability, provider = entry
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, dict):
+            raise PermissionError("arguments must be an object")
+        idem = payload.get("idempotencyKey")
+        if not isinstance(idem, str) or not idem:
+            idem = f"prime:{cap_id}:{sha256_json(arguments)}"
+        req = ToolRequest(
+            runId=capability.run_id,
+            stepId=str(payload.get("stepId") or "prime"),
+            tool=capability.tool,
+            arguments=arguments,
+            idempotencyKey=idem,
+            approvalToken=payload.get("approvalToken") if isinstance(payload.get("approvalToken"), str) else None,
+        )
+        result = self.dispatch_tool(env_id, req, capability, provider)
+        out = result.model_dump(mode="json", by_alias=True)
+        self.append_event(
+            capability.run_id,
+            "prime_tool_call",
+            {"capabilityId": cap_id, "status": result.status, "error": (result.error.model_dump(mode="json") if result.error else None)},
+            "broker",
+            "learner",
+        )
+        return {"value": _sanitize_for_learner(out)}
+
+    # Bounded artifact ingress, mirroring Prime's begin/chunk/finish contract.
+    MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
+
+    def _artifact_transfer(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if not hasattr(self, "_artifact_transfers"):
+            self._artifact_transfers = {}
+        transfers = self._artifact_transfers
+        t = payload.get("type")
+        if t == "artifact.begin":
+            artifact_id = payload.get("artifactId")
+            size = payload.get("size")
+            if (not isinstance(artifact_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", artifact_id)
+                    or not isinstance(size, int) or isinstance(size, bool)
+                    or size < 0 or size > self.MAX_ARTIFACT_BYTES):
+                raise PermissionError("invalid artifact metadata")
+            if transfers:
+                raise PermissionError("only one artifact transfer may be active")
+            tid = new_id("xfer_")
+            transfers[tid] = {"id": artifact_id, "size": size, "offset": 0, "data": bytearray()}
+            return {"transferId": tid, "maxChunkBytes": min(self.MAX_ARTIFACT_BYTES, 262144)}
+        if t == "artifact.chunk":
+            tid = payload.get("transferId")
+            transfer = transfers.get(tid) if isinstance(tid, str) else None
+            offset = payload.get("offset")
+            encoded = payload.get("data")
+            if transfer is None or offset != transfer["offset"] or not isinstance(encoded, str):
+                raise PermissionError("invalid artifact chunk")
+            try:
+                data = base64.b64decode(encoded.encode("ascii"), validate=True)
+            except (binascii.Error, ValueError, UnicodeEncodeError):
+                raise PermissionError("artifact chunk is not valid base64") from None
+            if not data or len(data) > transfer["size"] - transfer["offset"]:
+                raise PermissionError("artifact chunk exceeds declared size")
+            transfer["data"].extend(data)
+            transfer["offset"] += len(data)
+            return {"transferId": tid, "offset": transfer["offset"]}
+        if t == "artifact.finish":
+            tid = payload.get("transferId")
+            expected = payload.get("sha256")
+            transfer = transfers.get(tid) if isinstance(tid, str) else None
+            if transfer is None or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+                raise PermissionError("invalid artifact completion")
+            if transfer["offset"] != transfer["size"]:
+                raise PermissionError("artifact is incomplete")
+            data = bytes(transfer["data"])
+            transfers.pop(tid, None)
+            if hashlib.sha256(data).hexdigest() != expected:
+                raise PermissionError("artifact digest mismatch")
+            dest = self.store.artifact_dir / f"{transfer['id']}-{expected[:16]}.bin"
+            dest.write_bytes(data)
+            return {"artifact": {"id": transfer["id"], "sha256": expected, "bytes": len(data)}}
+        if t == "artifact.abort":
+            tid = payload.get("transferId")
+            if isinstance(tid, str):
+                transfers.pop(tid, None)
+            return {"aborted": True}
+        raise PermissionError(f"unsupported host request: {t}")
