@@ -111,8 +111,12 @@ class ResumableEvaluationDriver:
 
     def _development_smoke_complete(self, benchmark_id: str) -> bool:
         with self.store._connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS count FROM benchmark_task_runs WHERE benchmark_id = ? AND partition = 'development' AND status = 'complete'", (benchmark_id,)).fetchone()
-        return bool(row and int(row["count"]) >= 1)
+            rows = conn.execute("SELECT task_id, environment_id, arm, seed FROM benchmark_task_runs WHERE benchmark_id = ? AND partition = 'development' AND status = 'complete' AND observation_json IS NOT NULL", (benchmark_id,)).fetchall()
+        for row in rows:
+            status = self._load(benchmark_id, row["task_id"], Arm(row["arm"]), int(row["seed"]))
+            if status and status.observation and self.evidence_store.verify(status.observation, self.protocol.start_candidate_generation(), self.packages[row["environment_id"]]):
+                return True
+        return False
 
     def _tasks_for_partition(self, benchmark_id: str, partition: Partition, base_hash: str, candidate_hash: str) -> dict[str, tuple[TaskInput, ...]]:
         if partition is Partition.VALIDATION:

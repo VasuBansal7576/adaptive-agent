@@ -17,16 +17,21 @@ class BenchmarkDriverTests(unittest.TestCase):
             calls = []
             def execute(task, frozen_config, bundle):
                 calls.append((task.task_id, frozen_config.arm, frozen_config.seed))
+                if task.partition is Partition.DEVELOPMENT:
+                    return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
                 raise RuntimeError("runtime unavailable")
-            driver = ResumableEvaluationDriver(store, protocol, packages, execute, object())
-            with store._connect() as conn:
-                conn.execute("INSERT INTO benchmark_task_runs(benchmark_id, task_id, environment_id, partition, arm, seed, status, error, observation_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))", ("bench-1", packages["finance"].tasks_for_partition(Partition.DEVELOPMENT)[0].task_id, "finance", "development", "B0", 17, "complete", None, None))
-                conn.commit()
+            class TrustedSmokeEvidence:
+                durable = True
+                def verify(self, observation, frozen, package):
+                    return True
+            driver = ResumableEvaluationDriver(store, protocol, packages, execute, object(), evidence_store=TrustedSmokeEvidence())
+            driver.run("bench-1", Partition.DEVELOPMENT)
+            calls.clear()
             first = driver.run("bench-1", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
             self.assertTrue(first.failed)
             first_panel = {task_id for task_id, _, _ in calls}
             calls.clear()
-            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, object())
+            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, object(), evidence_store=TrustedSmokeEvidence())
             second = resumed.run("bench-1", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
             self.assertTrue(second.failed)
             self.assertEqual(first_panel, {task_id for task_id, _, _ in calls})
