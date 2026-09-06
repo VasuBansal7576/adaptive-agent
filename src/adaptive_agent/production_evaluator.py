@@ -141,7 +141,7 @@ def _persist_or_verify_workload(store: Any, job_id: str, workload: dict[str, Any
             raise RuntimeError("job workload is already frozen with different counts")
 
 
-def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | None, source_run_id: str | None, *, a_hash: str | None = None, initialize: bool = False) -> tuple[Any, Any, Any]:
+def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | None, source_run_id: str | None, *, a_hash: str | None = None, initialize: bool = False, force_job: bool = False) -> tuple[Any, Any, Any]:
     """Build an evaluator job around the integrated durable runtime.
 
     The import is deliberately local: an evaluator process must resolve the
@@ -185,7 +185,7 @@ def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | No
         bundles[Arm.L] = learned
     if a_hash is not None:
         bundles[Arm.A] = _bundle_by_hash(runtime.controller.store, a_hash)
-    if candidate_id is None:
+    if candidate_id is None and not force_job:
         return app, protocol, runtime.build_evaluation_driver(protocol, bundles)
     job = runtime.build_evaluation_job(protocol, bundles)
     return app, protocol, job
@@ -196,6 +196,36 @@ def _workload(protocol: Any, candidate_count: int, training: int, transfer: int,
     return plan.to_dict()
 
 
+def _lifecycle_stages(runtime: Any, protocol: Any, declared_retries: int) -> tuple[Any, ...]:
+    """Bind the evaluator lifecycle to the runtime-owned stage callback."""
+    from adaptive_agent.evaluation_job import LifecycleStage
+
+    callback = getattr(runtime, "run_experiment_stage", None)
+    if not callable(callback):
+        raise RuntimeError("runtime does not expose the complete experiment stage callback")
+    known = tuple(protocol.known_environments)
+    training = tuple(
+        task.task_id
+        for environment_id in known
+        for task in runtime.packages[environment_id].tasks_for_partition("development")
+    )
+    cells = {
+        "bootstrap": ("pinned-development",),
+        "training": training,
+        "learning": ("candidate-generation",),
+        "transfer": tuple(f"leave-out:{environment_id}" for environment_id in known),
+        "adaptation": tuple(f"adapt:{environment_id}" for environment_id in known),
+        "safety": tuple(protocol.safety_case_ids),
+        "validation": tuple(f"validation:{index}" for index in range(protocol.validation_run_count)),
+        "final": tuple(f"final:{index}" for index in range(protocol.final_run_count)),
+    }
+
+    def invoke(cell_key: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
+        return callback(cell_key=cell_key, context={**dict(context), "declaredRetries": declared_retries, "sealedEnvironment": protocol.sealed_environment})
+
+    return tuple(LifecycleStage(name, cells[name], invoke) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final"))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the durable Luna evaluation entry point")
     parser.add_argument("--data-dir", required=True)
@@ -203,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--candidate-id")
     parser.add_argument("--source-run-id")
     parser.add_argument("--job", required=True)
-    parser.add_argument("--comparison", choices=("smoke", "validation", "final"), required=True)
+    parser.add_argument("--comparison", choices=("experiment", "smoke", "validation", "final"), required=True)
     parser.add_argument("--base-hash", default="")
     parser.add_argument("--candidate-hash", default="")
     parser.add_argument("--a-hash")
@@ -215,11 +245,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ablation-system-instructions")
     parser.add_argument("--ablation-retrieval-input", action="append", default=[])
     parser.add_argument("--initialize", action="store_true", help="create and freeze a new clean Store")
+    parser.add_argument("--resume", action="store_true", help="resume an existing experiment Store")
     args = parser.parse_args(argv)
 
-    if args.comparison != "smoke" and (not args.candidate_id or not args.source_data_dir or not args.source_run_id):
+    if args.initialize and args.resume:
+        parser.error("--initialize and --resume are mutually exclusive")
+
+    if args.comparison not in {"smoke", "experiment"} and (not args.candidate_id or not args.source_data_dir or not args.source_run_id):
         parser.error("held-out evaluation requires candidate/source store/source run bindings")
-    app, protocol, job = build_job(args.data_dir, args.source_data_dir, args.candidate_id, args.source_run_id, a_hash=args.a_hash, initialize=args.initialize)
+    app, protocol, job = build_job(args.data_dir, args.source_data_dir, args.candidate_id, args.source_run_id, a_hash=args.a_hash, initialize=args.initialize, force_job=args.comparison == "experiment")
     workload = _workload(protocol, args.candidate_count, args.training_runs, args.transfer_runs, args.safety_runs, args.retries)
     print(json.dumps({"job": args.job, "comparison": args.comparison, "workload": workload}, sort_keys=True))
     if workload["transferRuns"] < 1:
@@ -227,6 +261,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.comparison != "smoke" and args.training_runs < 1:
         parser.error("--training-runs must be positive for the complete frozen workload")
     _persist_or_verify_workload(app.state.durable_runtime.controller.store, args.job, workload, initialize=args.initialize)
+    if args.comparison == "experiment":
+        stages = _lifecycle_stages(app.state.durable_runtime, protocol, args.retries)
+        expected_counts = {stage.name: len(stage.cells) for stage in stages}
+        if args.candidate_count != 1 or args.training_runs != expected_counts["training"] or args.transfer_runs != expected_counts["transfer"] or args.safety_runs != expected_counts["safety"]:
+            parser.error(f"complete experiment requires execution counts training={expected_counts['training']}, transfer={expected_counts['transfer']}, safety={expected_counts['safety']}, candidate-count=1")
+        actual_attempts = sum(expected_counts.values()) + args.retries
+        limits = {
+            "attempts": actual_attempts,
+            "inputTokens": actual_attempts * protocol.run_budget.model_tokens,
+            "outputTokens": actual_attempts * protocol.run_budget.model_tokens,
+            "toolCalls": actual_attempts * protocol.run_budget.tool_calls,
+            "wallMicros": int(actual_attempts * protocol.run_budget.wall_time_seconds * 1_000_000),
+            "costMicrounits": actual_attempts * protocol.run_budget.cost_microunits,
+        }
+        result = job.run_experiment(args.job, stages, limits=limits, context={"resume": args.resume or not args.initialize})
+        print(json.dumps({"status": result.status, "error": result.error, "runtimeAccounting": result.runtime_accounting}, sort_keys=True, default=str))
+        return 0 if result.status == "complete" else 1
     if args.comparison != "smoke":
         job.max_total_attempts = workload["totalAttemptedRuns"]
         job.total_budget_microunits = workload["totalAttemptedRuns"] * protocol.run_budget.cost_microunits

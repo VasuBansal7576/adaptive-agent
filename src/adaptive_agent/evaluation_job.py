@@ -11,7 +11,7 @@ import importlib
 import json
 import time
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from adaptive_agent.benchmark import FrozenExecutionConfig, ResumableEvaluationDriver, TrustedTaskExecutor
 from adaptive_agent.controller import Controller
@@ -39,6 +39,25 @@ class EvaluationJobResult:
     decision: object | None = None
     error: str | None = None
     runtime_accounting: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class LifecycleStage:
+    """One resumable stage in the complete Track 1 experiment."""
+
+    name: str
+    cells: tuple[str, ...]
+    callback: Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
+    retries: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.cells or not callable(self.callback) or self.retries < 0:
+            raise EvaluationError("invalid lifecycle stage")
+        if len(set(self.cells)) != len(self.cells):
+            raise EvaluationError("lifecycle stage cells must be unique")
+
+
+LIFECYCLE_STAGE_ORDER = ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final")
 
 
 class EvaluationJob:
@@ -74,6 +93,145 @@ class EvaluationJob:
             if "runtime_accounting_json" not in columns:
                 conn.execute("ALTER TABLE evaluation_jobs ADD COLUMN runtime_accounting_json TEXT NOT NULL DEFAULT '{}'")
             conn.commit()
+
+    def _ensure_lifecycle_tables(self) -> None:
+        with self.store.connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS evaluation_lifecycle_budget (job_id TEXT PRIMARY KEY, max_attempts INTEGER NOT NULL, max_input_tokens INTEGER NOT NULL, max_output_tokens INTEGER NOT NULL, max_tool_calls INTEGER NOT NULL, max_wall_micros INTEGER NOT NULL, max_cost_microunits INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, wall_micros INTEGER NOT NULL DEFAULT 0, cost_microunits INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS evaluation_lifecycle_attempts (job_id TEXT NOT NULL, stage TEXT NOT NULL, cell_key TEXT NOT NULL, attempt INTEGER NOT NULL, status TEXT NOT NULL, result_json TEXT NOT NULL DEFAULT '{}', error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(job_id, stage, cell_key, attempt))"
+            )
+            conn.commit()
+
+    def _lifecycle_budget(self, job_id: str, limits: Mapping[str, int]) -> None:
+        self._ensure_lifecycle_tables()
+        with self.store.connect() as conn:
+            conn.execute(
+                "INSERT INTO evaluation_lifecycle_budget(job_id, max_attempts, max_input_tokens, max_output_tokens, max_tool_calls, max_wall_micros, max_cost_microunits, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(job_id) DO NOTHING",
+                (job_id, limits["attempts"], limits["inputTokens"], limits["outputTokens"], limits["toolCalls"], limits["wallMicros"], limits["costMicrounits"]),
+            )
+            row = conn.execute("SELECT max_attempts, max_input_tokens, max_output_tokens, max_tool_calls, max_wall_micros, max_cost_microunits FROM evaluation_lifecycle_budget WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None or tuple(row) != tuple(limits[key] for key in ("attempts", "inputTokens", "outputTokens", "toolCalls", "wallMicros", "costMicrounits")):
+                raise EvaluationError("lifecycle budget is already bound to different limits")
+            conn.commit()
+
+    def _reserve_lifecycle_launch(self, job_id: str, stage: str, cell_key: str, attempt: int) -> bool:
+        """Atomically claim one launch, enforcing cumulative attempt budget."""
+        with self.store.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            done = conn.execute("SELECT 1 FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = ? AND cell_key = ? AND status = 'complete'", (job_id, stage, cell_key)).fetchone()
+            if done is not None:
+                conn.commit()
+                return False
+            existing = conn.execute("SELECT status FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = ? AND cell_key = ? AND attempt = ?", (job_id, stage, cell_key, attempt)).fetchone()
+            if existing is not None:
+                conn.commit()
+                return False
+            budget = conn.execute("SELECT attempts, max_attempts, blocked FROM evaluation_lifecycle_budget WHERE job_id = ?", (job_id,)).fetchone()
+            if budget is None:
+                conn.rollback()
+                raise EvaluationError("lifecycle budget is not initialized")
+            if budget["blocked"] or budget["attempts"] >= budget["max_attempts"]:
+                conn.execute("UPDATE evaluation_lifecycle_budget SET blocked = 1, updated_at = datetime('now') WHERE job_id = ?", (job_id,))
+                conn.commit()
+                raise EvaluationError("lifecycle launch budget exhausted")
+            conn.execute("INSERT INTO evaluation_lifecycle_attempts(job_id, stage, cell_key, attempt, status, updated_at) VALUES (?, ?, ?, ?, 'running', datetime('now'))", (job_id, stage, cell_key, attempt))
+            conn.execute("UPDATE evaluation_lifecycle_budget SET attempts = attempts + 1, updated_at = datetime('now') WHERE job_id = ?", (job_id,))
+            conn.commit()
+            return True
+
+    def _finish_lifecycle_launch(self, job_id: str, stage: str, cell_key: str, attempt: int, status: str, result: Mapping[str, Any] | None = None, error: str | None = None) -> None:
+        payload = dict(result or {})
+        usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else payload
+        input_tokens = int(usage.get("inputTokens", 0) or 0)
+        output_tokens = int(usage.get("outputTokens", 0) or 0)
+        tool_calls = int(payload.get("toolCalls", 0) or 0)
+        wall_micros = int(float(payload.get("wallSeconds", 0) or 0) * 1_000_000)
+        cost = int(payload.get("costMicrounits", 0) or 0)
+        with self.store.connect() as conn:
+            conn.execute("UPDATE evaluation_lifecycle_attempts SET status = ?, result_json = ?, error = ?, updated_at = datetime('now') WHERE job_id = ? AND stage = ? AND cell_key = ? AND attempt = ?", (status, json.dumps(payload, sort_keys=True, default=str), error, job_id, stage, cell_key, attempt))
+            conn.execute("UPDATE evaluation_lifecycle_budget SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, tool_calls = tool_calls + ?, wall_micros = wall_micros + ?, cost_microunits = cost_microunits + ?, updated_at = datetime('now') WHERE job_id = ?", (input_tokens, output_tokens, tool_calls, wall_micros, cost, job_id))
+            budget = conn.execute("SELECT * FROM evaluation_lifecycle_budget WHERE job_id = ?", (job_id,)).fetchone()
+            if budget is not None and (
+                budget["input_tokens"] > budget["max_input_tokens"]
+                or budget["output_tokens"] > budget["max_output_tokens"]
+                or budget["tool_calls"] > budget["max_tool_calls"]
+                or budget["wall_micros"] > budget["max_wall_micros"]
+                or budget["cost_microunits"] > budget["max_cost_microunits"]
+            ):
+                conn.execute("UPDATE evaluation_lifecycle_budget SET blocked = 1, updated_at = datetime('now') WHERE job_id = ?", (job_id,))
+            conn.commit()
+
+    def lifecycle_accounting(self, job_id: str) -> dict[str, Any]:
+        self._ensure_lifecycle_tables()
+        with self.store.connect() as conn:
+            row = conn.execute("SELECT * FROM evaluation_lifecycle_budget WHERE job_id = ?", (job_id,)).fetchone()
+        if row is None:
+            return {}
+        return {"attempts": row["attempts"], "inputTokens": row["input_tokens"], "outputTokens": row["output_tokens"], "toolCalls": row["tool_calls"], "wallSeconds": row["wall_micros"] / 1_000_000, "costMicrounits": row["cost_microunits"], "blocked": bool(row["blocked"]), "maxAttempts": row["max_attempts"], "maxInputTokens": row["max_input_tokens"], "maxOutputTokens": row["max_output_tokens"], "maxToolCalls": row["max_tool_calls"], "maxWallSeconds": row["max_wall_micros"] / 1_000_000, "maxCostMicrounits": row["max_cost_microunits"]}
+
+    def run_experiment(self, job_id: str, stages: Sequence[LifecycleStage], *, limits: Mapping[str, int] | None = None, context: Mapping[str, Any] | None = None) -> EvaluationJobResult:
+        """Run the complete ordered lifecycle with durable per-cell resume.
+
+        Callbacks are runtime-owned.  This evaluator seam only claims launches,
+        records all attempts, and prevents held-out stages from being skipped.
+        """
+        names = tuple(stage.name for stage in stages)
+        if names != LIFECYCLE_STAGE_ORDER:
+            raise EvaluationError(f"lifecycle stages must be ordered as {LIFECYCLE_STAGE_ORDER}")
+        default_budget = self.protocol.run_budget
+        bound_limits = dict(limits or {
+            "attempts": sum(len(stage.cells) * (stage.retries + 1) for stage in stages),
+            "inputTokens": default_budget.model_tokens * sum(len(stage.cells) for stage in stages),
+            "outputTokens": default_budget.model_tokens * sum(len(stage.cells) for stage in stages),
+            "toolCalls": default_budget.tool_calls * sum(len(stage.cells) for stage in stages),
+            "wallMicros": default_budget.wall_time_seconds * 1_000_000 * sum(len(stage.cells) for stage in stages),
+            "costMicrounits": default_budget.cost_microunits * sum(len(stage.cells) for stage in stages),
+        })
+        required = {"attempts", "inputTokens", "outputTokens", "toolCalls", "wallMicros", "costMicrounits"}
+        if set(bound_limits) != required or any(not isinstance(value, int) or value < 0 for value in bound_limits.values()):
+            raise EvaluationError("lifecycle limits must be non-negative integer totals")
+        self._lifecycle_budget(job_id, bound_limits)
+        state = dict(context or {})
+        with self.store.connect() as conn:
+            completed_stages = []
+            for stage in stages:
+                completed = conn.execute("SELECT COUNT(*) AS count FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = ? AND status = 'complete'", (job_id, stage.name)).fetchone()["count"]
+                if completed == len(stage.cells):
+                    completed_stages.append(stage.name)
+        state["completedStages"] = tuple(completed_stages)
+        started = time.monotonic()
+        self._save(job_id, "experiment", "running", runtime_accounting=self.lifecycle_accounting(job_id))
+        try:
+            for stage in stages:
+                if stage.name in {"validation", "final"} and any(name not in state.get("completedStages", ()) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety") if name != stage.name):
+                    raise EvaluationError("held-out stage reached before complete development lifecycle")
+                for cell_key in stage.cells:
+                    result: Mapping[str, Any] | None = None
+                    for attempt in range(stage.retries + 1):
+                        try:
+                            if not self._reserve_lifecycle_launch(job_id, stage.name, cell_key, attempt):
+                                result = {"status": "complete", "resumed": True}
+                                break
+                            result = stage.callback(cell_key, {**state, "stage": stage.name, "attempt": attempt})
+                            if not isinstance(result, Mapping):
+                                raise EvaluationError("lifecycle callback must return an object")
+                            self._finish_lifecycle_launch(job_id, stage.name, cell_key, attempt, "complete", result)
+                            break
+                        except Exception as exc:
+                            self._finish_lifecycle_launch(job_id, stage.name, cell_key, attempt, "failed", result, str(exc))
+                            if attempt >= stage.retries:
+                                raise
+                    state.setdefault("results", {}).setdefault(stage.name, {})[cell_key] = dict(result or {})
+                state["completedStages"] = tuple((*state.get("completedStages", ()), stage.name))
+            accounting = self.lifecycle_accounting(job_id)
+            self._save(job_id, "experiment", "complete", runtime_accounting={**accounting, "wallDurationSeconds": time.monotonic() - started})
+            return EvaluationJobResult(job_id, "experiment", "complete", None, runtime_accounting={**accounting, "wallDurationSeconds": time.monotonic() - started})
+        except Exception as exc:
+            accounting = self.lifecycle_accounting(job_id)
+            self._save(job_id, "experiment", "failed", error=str(exc), runtime_accounting={**accounting, "wallDurationSeconds": time.monotonic() - started})
+            return EvaluationJobResult(job_id, "experiment", "failed", None, error=str(exc), runtime_accounting={**accounting, "wallDurationSeconds": time.monotonic() - started})
 
     def planned_workload(self, candidate_count: int = 1, *, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0):
         return self.protocol.workload(candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)
@@ -295,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if result.status in {"complete", "decided"} else 1
 
 
-__all__ = ["EvaluationJob", "EvaluationJobResult", "build_evaluation_job", "main", "run_evaluation_job"]
+__all__ = ["EvaluationJob", "EvaluationJobResult", "LifecycleStage", "LIFECYCLE_STAGE_ORDER", "build_evaluation_job", "main", "run_evaluation_job"]
 
 
 if __name__ == "__main__":
