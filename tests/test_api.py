@@ -7,8 +7,14 @@ from types import SimpleNamespace
 from adaptive_agent.api import CandidateProposalRequest, ControlPlane, EvaluationRequest, create_app, make_authenticated_model_runner
 from adaptive_agent.app import _FixtureProvider, create_runtime_app
 from adaptive_agent.evaluation import Arm, EvaluationProtocol, EvaluationRunner, ModelProvenance, Partition, RunObservation, build_environment_packages
+from adaptive_agent.evaluation_store import build_durable_evaluation_runner
+from adaptive_agent.store import Store
+from adaptive_agent.environment import EnvironmentRegistry
+from adaptive_agent.broker import ToolBroker
+from adaptive_agent.controller import Controller
 from adaptive_agent.planner import make_luna_model_runner
 from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
+from adaptive_agent.evaluation import sha256_json
 
 
 def manifest():
@@ -39,6 +45,156 @@ def model_runner(**kwargs):
 
 def evaluator(**kwargs):
     return {"passed": kwargs["model_output"] == "done", "score": 1.0}
+
+
+def _real_development_evidence(tmp_path):
+    """Create a content-addressed artifact and trusted DEVELOPMENT evidence."""
+    store = Store(tmp_path / "development-evidence")
+    registry = EnvironmentRegistry(store)
+    controller = Controller(store, registry, ToolBroker(store, registry))
+    run_id = "development-run"
+    task_ref = store.put_artifact(
+        {"taskId": "neutral-development-00", "environmentId": "neutral", "goal": "read the counter", "partition": "development"}
+    )
+    store.register_task(
+        "neutral-development-00",
+        "neutral",
+        "1",
+        task_ref.model_dump_json(by_alias=True),
+        "development",
+        "read the counter",
+    )
+    store.save_run(
+        run_id,
+        {
+            "task_id": "neutral-development-00",
+            "environment_id": "neutral",
+            "bundle_id": "bundle-active",
+            "status": "succeeded",
+            "idempotency_key": "development-run",
+            "last_event_sequence": 0,
+            "created_at": "now",
+            "run_json": "{}",
+        },
+    )
+    controller.append_event(
+        run_id,
+        "model_response",
+        {"responseId": "development-response", "runId": run_id, "taskId": "neutral-development-00", "environmentId": "neutral"},
+        "system",
+        "operator",
+    )
+    evidence = controller.record_trusted_outcome(
+        run_id,
+        {
+            "responseId": "development-response",
+            "runId": run_id,
+            "taskId": "neutral-development-00",
+            "environmentId": "neutral",
+            "passed": True,
+            "reliable": True,
+            "safetyViolations": 0,
+        },
+    )
+    artifact = store.put_artifact({"edit": "retry after VERSION_CONFLICT"})
+    return artifact.sha256, evidence.evidence_id
+
+
+def _persist_real_observation(store, frozen, package, arm, task, seed, index):
+    """Persist one evaluator receipt satisfying SQLiteRunEvidenceStore pins."""
+    from adaptive_agent.evaluation import BudgetSpec
+
+    run_id = f"evaluation-run-{index}"
+    response_id = f"evaluation-response-{index}"
+    version_refs = {
+        "policy": package.manifest.policy_ref.sha256,
+        "schema": sha256_json(package.manifest.tool_schemas),
+        "planner": str(frozen.inputs["corePlannerHash"]),
+        "budget": sha256_json(frozen.inputs["runBudget"]),
+        "image": str(frozen.inputs["imageDigest"]),
+    }
+    usage = {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
+    response = {
+        "responseId": response_id,
+        "provider": frozen.inputs["provider"],
+        "modelProfile": frozen.inputs["modelProfile"],
+        "status": "complete",
+        "usage": usage,
+        "versionRefs": version_refs,
+    }
+    response_ref = store.put_artifact(response)
+    accounting = {
+        "responseId": response_id,
+        "runId": run_id,
+        "taskId": task.task_id,
+        "environmentId": package.environment_id,
+        "usage": usage,
+        "versionRefs": version_refs,
+        "costMicrounits": 1,
+        "durationSeconds": 1.0,
+    }
+    accounting_ref = store.put_artifact(accounting)
+    outcome = {
+        "responseId": response_id,
+        "runId": run_id,
+        "taskId": task.task_id,
+        "environmentId": package.environment_id,
+        "passed": True,
+        "reliable": True,
+        "safetyViolations": 0,
+    }
+    outcome_ref = store.put_artifact(outcome)
+    store.save_run(
+        run_id,
+        {
+            "task_id": task.task_id,
+            "environment_id": package.environment_id,
+            "bundle_id": "bundle-active",
+            "status": "succeeded",
+            "idempotency_key": run_id,
+            "last_event_sequence": 2,
+            "created_at": "now",
+            "run_json": "{}",
+        },
+    )
+    store.append_evidence(
+        f"evaluation-evidence-{index}",
+        {"run_id": run_id, "sequence": 1, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0},
+    )
+    store.append_evidence(
+        f"evaluation-outcome-{index}",
+        {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0},
+    )
+    config_hashes = {
+        "model": sha256_json({"profile": frozen.inputs["modelProfile"], "provider": frozen.inputs["provider"]}),
+        "planner": str(frozen.inputs["corePlannerHash"]),
+        "budget": sha256_json(frozen.inputs["runBudget"]),
+        "policy": sha256_json(package.manifest.policy_ref),
+        "schema": sha256_json(package.manifest.tool_schemas),
+        "image": str(frozen.inputs["imageDigest"]),
+    }
+    return RunObservation(
+        task.task_id,
+        package.environment_id,
+        Partition.VALIDATION,
+        seed,
+        arm,
+        True,
+        True,
+        0,
+        1,
+        1.0,
+        model_provenance=ModelProvenance.REAL_MODEL,
+        model_profile=str(frozen.inputs["modelProfile"]),
+        core_planner_hash=str(frozen.inputs["corePlannerHash"]),
+        budget=BudgetSpec(),
+        response_id=response_id,
+        accounting_ref=accounting_ref.sha256,
+        evidence_ref=f"evaluation-evidence-{index}",
+        outcome_ref=f"evaluation-outcome-{index}",
+        config_hashes=config_hashes,
+        run_id=run_id,
+    )
 
 
 def client():
@@ -542,18 +698,19 @@ def test_cancelled_run_cannot_be_reopened_by_late_model_result():
     assert api.get(f"/runs/{run['runId']}").json()["status"] == "cancelled"
 
 
-def test_candidate_evaluation_decision_and_rollback_boundaries():
+def test_candidate_evaluation_decision_and_rollback_boundaries(tmp_path):
     plane = ControlPlane(model_runner=model_runner, evaluator=evaluator)
     api = TestClient(create_app(plane), base_url="http://127.0.0.1")
     api.get("/session/bootstrap")
     api.post("/environments/register", json=manifest())
+    artifact_hash, evidence_id = _real_development_evidence(tmp_path)
     candidate = api.post(
         "/candidates",
         json={
             "baseBundleHash": plane.active_bundle_hash,
             "editOperations": ["retry after VERSION_CONFLICT"],
-            "changedArtifactHashes": ["artifact-1"],
-            "supportingEvidenceIds": ["ev-1"],
+            "changedArtifactHashes": [artifact_hash],
+            "supportingEvidenceIds": [evidence_id],
             "predictedEffect": "fewer stale writes",
             "proposerVersion": "planner-1",
         },
@@ -570,29 +727,35 @@ def test_candidate_evaluation_decision_and_rollback_boundaries():
     assert api.post(f"/candidates/{candidate_id}/rollback", json={"reason": "operator safety rollback"}).status_code == 200
 
 
-def test_trusted_evaluation_runner_report_is_pinned_before_decision():
+def test_trusted_evaluation_runner_report_is_pinned_before_decision(tmp_path):
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
     protocol.freeze(packages)
-    runner = EvaluationRunner(protocol, packages, safety_cases={"EVAL-004": True, "EVAL-005": True})
+    eval_store = Store(tmp_path / "evaluation-evidence")
+    runner = build_durable_evaluation_runner(protocol, packages, eval_store)
+
+    index = 0
 
     def execute(arm, package, task, seed):
-        return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+        nonlocal index
+        index += 1
+        return _persist_real_observation(eval_store, protocol.start_candidate_generation(), package, arm, task, seed, index)
 
     plane = ControlPlane()
     base_hash = plane.active_bundle_hash
     candidate = plane.create_candidate(CandidateProposalRequest(
-        baseBundleHash=base_hash, editOperations=["bounded change"], changedArtifactHashes=["artifact"],
-        supportingEvidenceIds=["evidence"], predictedEffect="improves accuracy", proposerVersion="test",
+        baseBundleHash=base_hash, editOperations=["bounded change"], changedArtifactHashes=[eval_store.put_artifact({"edit": "bounded change"}).sha256],
+        supportingEvidenceIds=[_real_development_evidence(tmp_path)[1]], predictedEffect="improves accuracy", proposerVersion="test",
     ))
     report = runner.run_validation(base_hash=base_hash, candidate_hash=candidate["candidateId"], execute=execute)
+    report.require_promotion_evidence(protocol, packages)
     serialized = report.to_dict()
     assert serialized["promotionEligible"] is True
     assert serialized["exposure"][0]["environment_id"] == "finance"
 
     evaluation = plane.queue_evaluation(EvaluationRequest(
         candidateId=candidate["candidateId"], baseBundleHash=base_hash, protocolHash=report.protocol_hash,
-        partitionRef={"id": "validation", "version": "1", "sha256": "partition"},
+        partitionRef={"id": "validation", "version": "1", "sha256": report.partition_hashes["finance:validation"]},
     ))
     class ForgedCandidateReport:
         def to_dict(self):
@@ -624,7 +787,7 @@ def test_prime_bridge_records_parent_owned_model_observation():
     assert calls[0][1] is True
 
 
-def test_control_plane_runs_generic_luna_python_through_prime_capability_seam():
+def test_control_plane_runs_generic_luna_python_through_prime_capability_seam(tmp_path):
     class PlannerClient:
         def __init__(self):
             self.turn = 0
@@ -682,20 +845,26 @@ def test_control_plane_runs_generic_luna_python_through_prime_capability_seam():
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
     protocol.freeze(packages)
-    eval_runner = EvaluationRunner(protocol, packages, safety_cases={"EVAL-004": True, "EVAL-005": True})
+    eval_store = Store(tmp_path / "evaluation-evidence")
+    eval_runner = build_durable_evaluation_runner(protocol, packages, eval_store)
     base_hash = plane.active_bundle_hash
     candidate = plane.create_candidate(CandidateProposalRequest(
-        baseBundleHash=base_hash, editOperations=["bounded generic planner refinement"], changedArtifactHashes=["artifact-planner"],
-        supportingEvidenceIds=[run["runId"]], predictedEffect="improves verified task completion", proposerVersion="luna",
+        baseBundleHash=base_hash, editOperations=["bounded generic planner refinement"], changedArtifactHashes=[eval_store.put_artifact({"edit": "bounded generic planner refinement"}).sha256],
+        supportingEvidenceIds=[_real_development_evidence(tmp_path)[1]], predictedEffect="improves verified task completion", proposerVersion="luna",
     ))
 
+    index = 0
+
     def evaluate_row(arm, package, task, seed):
-        return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+        nonlocal index
+        index += 1
+        return _persist_real_observation(eval_store, protocol.start_candidate_generation(), package, arm, task, seed, index)
 
     report = eval_runner.run_validation(base_hash=base_hash, candidate_hash=candidate["candidateId"], execute=evaluate_row)
+    report.require_promotion_evidence(protocol, packages)
     evaluation = plane.queue_evaluation(EvaluationRequest(
         candidateId=candidate["candidateId"], baseBundleHash=base_hash, protocolHash=report.protocol_hash,
-        partitionRef={"id": "validation", "version": "1", "sha256": "partition"},
+        partitionRef={"id": "validation", "version": "1", "sha256": report.partition_hashes["finance:validation"]},
     ))
     recorded = plane.record_trusted_evaluation(evaluation["evaluationId"], report)
     assert recorded["promotionEligible"] is True
