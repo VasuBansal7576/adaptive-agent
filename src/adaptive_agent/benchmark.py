@@ -72,12 +72,14 @@ class BenchmarkSummary:
 class ResumableEvaluationDriver:
     """Execute exactly the frozen task panel and resume persisted work."""
 
-    def __init__(self, store: Store, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], execute_evaluation_task: TrustedTaskExecutor, bundle: object, allocation_store: SQLiteAllocationStore | None = None, evidence_store: SQLiteRunEvidenceStore | None = None) -> None:
+    def __init__(self, store: Store, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], execute_evaluation_task: TrustedTaskExecutor, bundle: object, allocation_store: SQLiteAllocationStore | None = None, evidence_store: SQLiteRunEvidenceStore | None = None, arm_bundles: Mapping[Arm | str, object] | None = None) -> None:
         self.store = store
         self.protocol = protocol
         self.packages = dict(packages)
         self.execute_evaluation_task = execute_evaluation_task
         self.bundle = bundle
+        self.arm_bundles = dict(arm_bundles or {})
+        self.arm_bundles.setdefault(Arm.B0, bundle)
         self.allocation_store = allocation_store or SQLiteAllocationStore(store)
         self.evidence_store = evidence_store or SQLiteRunEvidenceStore(store)
         self.owner_id = secrets.token_urlsafe(12)
@@ -114,7 +116,8 @@ class ResumableEvaluationDriver:
                                 statuses.append(existing)
                             continue
                         try:
-                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed), self.bundle)
+                            selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
+                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed), selected_bundle)
                             self._validate_observation(observation, task, environment_id, partition, seed, arm)
                             if not self.evidence_store.verify(observation, frozen, package):
                                 raise EvaluationError("runtime observation lacks trusted persisted evidence")
@@ -137,7 +140,11 @@ class ResumableEvaluationDriver:
 
     def _tasks_for_partition(self, benchmark_id: str, partition: Partition, base_hash: str, candidate_hash: str, frozen: FrozenProtocol) -> dict[str, tuple[TaskInput, ...]]:
         bundle_value = self.bundle.to_dict() if hasattr(self.bundle, "to_dict") else (self.bundle if isinstance(self.bundle, Mapping) else getattr(self.bundle, "bundle_id", self.bundle.__class__.__qualname__))
-        plan_fingerprint = sha256_json({"protocol": frozen.protocol_hash, "partition": partition.value, "base": base_hash, "candidate": candidate_hash, "bundle": sha256_json(bundle_value)})
+        arm_values = {}
+        for key, value in self.arm_bundles.items():
+            name = key.value if isinstance(key, Arm) else str(key)
+            arm_values[name] = value.to_dict() if hasattr(value, "to_dict") else (value if isinstance(value, Mapping) else getattr(value, "bundle_id", value.__class__.__qualname__))
+        plan_fingerprint = sha256_json({"protocol": frozen.protocol_hash, "partition": partition.value, "base": base_hash, "candidate": candidate_hash, "bundle": sha256_json(bundle_value), "armBundles": arm_values})
         with self.store._connect() as conn:
             plan = conn.execute("SELECT * FROM benchmark_plans WHERE benchmark_id = ? AND partition = ?", (benchmark_id, partition.value)).fetchone()
         if plan is not None:
