@@ -282,11 +282,16 @@ class DurableRuntime:
         model_client = self.learning_model_client
         if model_client is None and self.model_runner is not None:
             runner = self.model_runner
-            class RunnerClient:
-                def invoke(self, *, goal: str, environment: Mapping[str, Any], **_: Any) -> Mapping[str, Any]:
-                    invocation = runner(goal=goal, environment=dict(environment), emit=lambda *_args: None)
-                    return {"text": invocation.text, "provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)}
-            model_client = RunnerClient()
+            if callable(getattr(runner, "invoke", None)):
+                # A provider client can be injected directly.  Keeping this
+                # object intact preserves its own response/accounting seam.
+                model_client = runner
+            elif callable(runner):
+                class RunnerClient:
+                    def invoke(self, *, goal: str, environment: Mapping[str, Any], **_: Any) -> Mapping[str, Any]:
+                        invocation = runner(goal=goal, environment=dict(environment), emit=lambda *_args: None)
+                        return {"text": invocation.text, "provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)}
+                model_client = RunnerClient()
         # launch() owns claim, reset, Prime Docker, broker budget, retries, and
         # trusted outcome persistence for both API and benchmark executions.
         core_hash = str(inputs.get("corePlannerHash", self.core_planner_hash))

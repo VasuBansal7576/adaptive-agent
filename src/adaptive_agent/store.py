@@ -660,6 +660,129 @@ class Store:
         with self._connect() as conn:
             return [dict(row) for row in conn.execute(query, params).fetchall()]
 
+    def list_run_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
+        """Return a sanitized broker-call projection for one development run.
+
+        The projection joins prepared tool calls with broker result evidence.
+        It deliberately omits approval tokens and keeps only fields that the
+        learner may use for procedural improvement.
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            raise KeyError(f"run {run_id!r} not found")
+        task = self.get_task(run.get("task_id")) if isinstance(run.get("task_id"), str) else None
+        if not task or task.get("partition") != "development":
+            raise PermissionError("tool-call projection is development-partition only")
+
+        with self._connect() as conn:
+            calls = [dict(row) for row in conn.execute("SELECT * FROM tool_calls WHERE run_id = ? ORDER BY rowid", (run_id,)).fetchall()]
+        evidence_by_call: dict[str, dict[str, Any]] = {}
+        for event in self.list_evidence(run_id):
+            if event.get("event_type") != "tool_result":
+                continue
+            try:
+                ref = json.loads(event["source_ref"])
+                payload = self.get_artifact(ref["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("callId"), str):
+                evidence_by_call[payload["callId"]] = event
+
+        def safe(value: Any) -> Any:
+            if isinstance(value, str):
+                return value
+            if isinstance(value, dict):
+                return {str(key): safe(item) for key, item in value.items() if str(key).lower() not in {"approvaltoken", "secret", "token", "password", "credential", "authorization"}}
+            if isinstance(value, list):
+                return [safe(item) for item in value]
+            return value
+
+        out: list[dict[str, Any]] = []
+        matched: set[str] = set()
+        for call in calls:
+            try:
+                arguments = json.loads(call["arguments_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                arguments = {}
+            result: Any = None
+            status = error_code = retry = version = effect = result_hash = None
+            if isinstance(call.get("result_json"), str):
+                try:
+                    result = json.loads(call["result_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result = None
+            if isinstance(result, dict):
+                status = result.get("status")
+                output = result.get("output")
+                error = result.get("error")
+                version = result.get("toolVersion")
+                effect = result.get("effect") or call.get("effect")
+                if isinstance(error, dict):
+                    error_code, retry = error.get("code"), error.get("retry")
+                result_hash = sha256_json(result)
+            else:
+                output = None
+                effect = call.get("effect")
+            event = evidence_by_call.get(call["call_id"], {})
+            if event:
+                matched.add(call["call_id"])
+            out.append({
+                "callId": call["call_id"], "evidenceId": event.get("evidence_id"), "tool": call["tool"],
+                "input": safe(arguments), "result": safe(output), "status": status,
+                "errorCode": error_code, "retry": retry, "version": version, "effect": effect,
+                "idempotencyKey": call["idempotency_key"], "argumentsSha256": sha256_json(arguments),
+                "resultSha256": result_hash, "evidenceContentHash": event.get("content_hash"),
+                "runId": run_id, "taskId": run["task_id"], "environmentId": run["environment_id"],
+                "partition": "development", "visibility": "learner", "redacted": True,
+            })
+        # Older runtime versions persisted tool-result evidence without a
+        # prepared-call row. Preserve that history as a minimal safe record.
+        for event in self.list_evidence(run_id):
+            if event.get("event_type") != "tool_result":
+                continue
+            try:
+                ref = json.loads(event["source_ref"])
+                payload = self.get_artifact(ref["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                continue
+            call_id = payload.get("callId")
+            if isinstance(call_id, str) and call_id in matched:
+                continue
+            error = payload.get("error")
+            out.append({
+                "callId": call_id, "evidenceId": event.get("evidence_id"), "tool": payload.get("tool"),
+                "input": None, "result": safe(payload.get("output")), "status": payload.get("status"),
+                "errorCode": error.get("code") if isinstance(error, dict) else None,
+                "retry": error.get("retry") if isinstance(error, dict) else None,
+                "version": payload.get("toolVersion"), "effect": payload.get("effect"),
+                "idempotencyKey": None, "argumentsSha256": None, "resultSha256": sha256_json(payload),
+                "evidenceContentHash": event.get("content_hash"), "runId": run_id,
+                "taskId": run["task_id"], "environmentId": run["environment_id"],
+                "partition": "development", "visibility": "learner", "redacted": True,
+            })
+        return out
+
+    def list_learning_evidence(self, environment_id: str | None = None, run_id: str | None = None, include_broker_projection: bool = True) -> list[dict[str, Any]]:
+        """Return the bounded learner evidence feed joined to trusted runs."""
+        evidence = [dict(row, kind="evidence") for row in self.list_learner_evidence(environment_id, run_id)]
+        if not include_broker_projection:
+            return evidence
+        query = "SELECT r.run_id FROM runs r JOIN tasks t ON t.id = r.task_id WHERE t.partition = 'development'"
+        params: list[Any] = []
+        if environment_id is not None:
+            query += " AND r.environment_id = ?"
+            params.append(environment_id)
+        if run_id is not None:
+            query += " AND r.run_id = ?"
+            params.append(run_id)
+        with self._connect() as conn:
+            run_ids = [str(row["run_id"]) for row in conn.execute(query, params).fetchall()]
+        for rid in run_ids:
+            evidence.extend(dict(row, kind="broker_call") for row in self.list_run_tool_calls(rid))
+        return evidence
+
     # ------------------------------------------------------------------ tool calls / approvals
     def prepare_tool_call(self, data: dict[str, Any]) -> bool:
         """Insert a prepared (no-result) tool call. Returns False on (run_id,
