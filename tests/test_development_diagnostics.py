@@ -251,3 +251,57 @@ def test_diagnostic_uses_aggregate_final_accounting_over_last_turn_usage(
     result = runtime.diagnostics.run(diagnostic["diagnosticId"])
     assert result["state"] == "completed"
     assert all(item["totalTokens"] == 25462 * 3 for item in result["armSummaries"])
+
+
+def test_diagnostic_missing_observation_fails_projection_and_preserves_receipt(
+    tmp_path: Path,
+):
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    active = runtime.controller.get_active_bundle()
+    assert active is not None
+    _candidate(runtime, "cand_tamper", active.content_hash)
+    calls = 0
+    scripted = _scripted_executor(runtime, True)
+
+    def executor(task, config, bundle):
+        nonlocal calls
+        calls += 1
+        return scripted(task, config, bundle)
+
+    runtime.diagnostics.executor = executor
+    diagnostic = runtime.diagnostics.create("cand_tamper", active.content_hash)
+    diagnostic_id = diagnostic["diagnosticId"]
+    runtime.diagnostics.run(diagnostic_id)
+    with runtime.controller.store.connect() as conn:
+        original = conn.execute(
+            "SELECT result_json,receipt_ref FROM diagnostic_cells WHERE diagnostic_id=? LIMIT 1",
+            (diagnostic_id,),
+        ).fetchone()
+        cell_key = conn.execute(
+            "SELECT cell_key FROM diagnostic_cells WHERE diagnostic_id=? LIMIT 1",
+            (diagnostic_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE diagnostic_cells SET observation_json=NULL WHERE diagnostic_id=? AND cell_key=?",
+            (diagnostic_id, cell_key),
+        )
+        conn.execute(
+            "UPDATE diagnostics SET state='running' WHERE diagnostic_id=?",
+            (diagnostic_id,),
+        )
+        conn.commit()
+    projected = runtime.diagnostics.get(diagnostic_id)
+    assert projected["state"] == "failed"
+    assert projected["error"]
+    assert any(item["infrastructureErrors"] == 1 for item in projected["armSummaries"])
+    runtime.diagnostics.run(diagnostic_id)
+    assert calls == 6
+    with runtime.controller.store.connect() as conn:
+        preserved = conn.execute(
+            "SELECT result_json,receipt_ref,status FROM diagnostic_cells WHERE diagnostic_id=? AND cell_key=?",
+            (diagnostic_id, cell_key),
+        ).fetchone()
+    assert preserved["result_json"] == original["result_json"]
+    assert preserved["receipt_ref"] == original["receipt_ref"]
+    assert preserved["status"] == "failed"
