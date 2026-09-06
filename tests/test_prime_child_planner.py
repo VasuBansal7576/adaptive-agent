@@ -120,6 +120,7 @@ class CostGuardTests(unittest.TestCase):
         with self.assertRaises(SecurityViolation):
             planner(request(ledger))
         self.assertEqual(ledger.model_cost_microunits_used, 11)
+        self.assertEqual([item["costMicrounits"] for item in observations], [7, 4])
         self.assertEqual(len(observations), 2)
         with self.assertRaises(SecurityViolation):
             parent.invoke(goal="blocked", environment={}, messages=[], remaining_deadline=5)

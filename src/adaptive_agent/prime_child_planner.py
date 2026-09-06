@@ -73,6 +73,7 @@ class SharedLedgerModelClient:
                 "model": model,
                 "responseId": response_id,
                 "usage": dict(usage),
+                **({"costMicrounits": receipt.cost_microunits, "economicCostStatus": "measured"} if receipt.cost_microunits is not None else {}),
             })
         # Charge exactly once, immediately after the provider call. The
         # observation sink persists the response envelope before exhaustion.
@@ -242,6 +243,7 @@ class LunaChildPlanner:
             "model": MODEL_NAME if model == "gpt-5.6-luna" else model,
             "responseId": response_id,
             "usage": dict(usage),
+            **({"costMicrounits": receipt.cost_microunits, "economicCostStatus": "measured"} if receipt.cost_microunits is not None else {}),
         }
         # Persist the trusted receipt before parsing or enforcing the shared
         # cap. A malformed/over-cap plan must not erase provider evidence.
