@@ -86,6 +86,41 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect(sent[0].budget?.modelTokens).toBe(7777);
   });
 
+  it("moves focus to the run detail panel when a run is selected (768 master-detail)", async () => {
+    const user = userEvent.setup();
+    render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
+    await screen.findAllByRole("button", { name: /run-sim-1002/ });
+    await user.click(screen.getAllByRole("button", { name: /run-sim-1002/ })[0]);
+    // the detail region receives focus so keyboard users land in the new context
+    await waitFor(() =>
+      expect((document.activeElement as HTMLElement | null)?.getAttribute("aria-label")).toBe("Run details"),
+    );
+  });
+
+  it("launches evaluation from a validated candidate and surfaces backend errors", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const launched: Array<{ candidateId: string }> = [];
+    const transport: ConsoleTransport = {
+      ...sim,
+      launchEvaluation: async (input) => {
+        launched.push(input);
+        return { evaluationId: "eval-sim-900", state: "queued" };
+      },
+    };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    await user.click((await screen.findAllByRole("button", { name: "Launch evaluation" }))[0]);
+    expect(await screen.findByText(/Evaluation eval-sim-900 queued/)).toBeInTheDocument();
+    expect(launched[0].candidateId).toBe("cand-sim-204");
+  });
+
+  it("valid cards state proposal validation, never a performance claim", async () => {
+    render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
+    await userEvent.setup().click(await screen.findByRole("tab", { name: "Candidates" }));
+    expect(await screen.findByText(/Proposal validation passed — this is not a performance result/)).toBeInTheDocument();
+  });
+
   it("opens the learning-cycle dialog from the empty-candidates state (regression)", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });

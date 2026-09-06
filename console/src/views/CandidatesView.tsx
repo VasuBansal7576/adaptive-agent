@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ConsoleTransport, LearningCycleInput } from "../api/transport";
-import type { CandidateDiff, RunRecord } from "../api/types";
+import type { CandidateDiff, EvaluationJob, RunRecord } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
 import { Banner, EmptyState, LoadingState, Modal } from "../components/ui";
 
@@ -26,6 +26,40 @@ export function CandidatesView({
   const [cycleBusy, setCycleBusy] = useState(false);
   const [cycleRunId, setCycleRunId] = useState("");
   const [notice, setNotice] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
+  const [evalJobs, setEvalJobs] = useState<EvaluationJob[] | null>(null);
+  const [evalJobsError, setEvalJobsError] = useState<string | null>(null);
+
+  // evaluation job statuses follow the candidate list
+  useEffect(() => {
+    let cancelled = false;
+    setEvalJobsError(null);
+    transport
+      .listEvaluations()
+      .then((jobs) => {
+        if (!cancelled) setEvalJobs(jobs);
+      })
+      .catch((error) => {
+        if (!cancelled) setEvalJobsError(error instanceof Error ? error.message : "evaluation status unavailable");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [transport, candidates]);
+
+  const launchEvaluation = async (cand: CandidateDiff) => {
+    if (!cand.baseBundleHash) {
+      onActionError(`Evaluation launch unavailable for ${cand.candidateId}: the candidate has no base bundle hash.`);
+      return;
+    }
+    try {
+      const { evaluationId, state } = await transport.launchEvaluation({ candidateId: cand.candidateId, baseBundleHash: cand.baseBundleHash });
+      setNotice({ tone: "good", text: `✓ Evaluation ${evaluationId} queued (${state}) for ${cand.candidateId}.` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Evaluation launch failed";
+      const correlationId = (error as { correlationId?: string } | null)?.correlationId ?? null;
+      onActionError(`Evaluation launch failed for ${cand.candidateId}: ${message}`, correlationId);
+    }
+  };
 
   // eligible learning source: a COMPLETED development run the model can learn
   // from; the durable pipeline generates proposal + evidence from its attempts
@@ -100,8 +134,39 @@ export function CandidatesView({
         <article key={cand.candidateId} className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h3 className="break-all font-mono text-sm text-slate-100">{cand.candidateId}</h3>
-            <StatusBadge status={cand.state} />
+            <div className="flex items-center gap-2">
+              <StatusBadge status={cand.state} />
+              {cand.state === "validated" && (
+                <button
+                  type="button"
+                  onClick={() => void launchEvaluation(cand)}
+                  className="rounded-md border border-sky-700 px-3 py-1.5 text-xs font-medium text-sky-300 hover:bg-sky-950/60"
+                  title="Queue the trusted evaluation for this candidate"
+                >
+                  Launch evaluation
+                </button>
+              )}
+            </div>
           </div>
+          {cand.state === "validated" && (
+            <p className="mt-1 text-[11px] text-slate-500">
+              Proposal validation passed — this is not a performance result.
+            </p>
+          )}
+          {cand.state === "evaluating" && (
+            <p className="mt-1 text-[11px] text-slate-500">
+              {evalJobs === null && !evalJobsError
+                ? "Evaluation status loading…"
+                : evalJobsError
+                  ? `Evaluation status unavailable: ${evalJobsError}`
+                  : (() => {
+                      const jobs = evalJobs?.filter((j) => j.candidateId === cand.candidateId) ?? [];
+                      return jobs.length === 0
+                        ? "No evaluation job recorded for this candidate."
+                        : `Evaluation ${jobs[0].evaluationId}: ${jobs[0].state}${jobs[0].trusted ? " (trusted)" : ""}${jobs[0].reason ? ` — ${jobs[0].reason}` : ""}`;
+                    })()}
+            </p>
+          )}
           <p className="mt-1 text-xs text-slate-500 [overflow-wrap:anywhere]">
             {cand.baseBundleRef
               ? `base ${cand.baseBundleRef.id} v${cand.baseBundleRef.version} → candidate ${cand.candidateBundleRef?.id} v${cand.candidateBundleRef?.version}`

@@ -189,6 +189,19 @@ let skillCatalog: SkillVersionSummary[] = [
 
 let candidateCatalog: CandidateDiff[] = [
   {
+    candidateId: "cand-sim-204",
+    baseBundleHash: "a".repeat(64),
+    candidateBundleHash: "b".repeat(64),
+    editOperations: [
+      '{"operation":"modify","path":"skills/batch-reconcile/procedure","value":"Verify batch totals before appending; skip already-applied entries."}',
+    ],
+    changedArtifactHashes: ["c".repeat(64)],
+    supportingEvidenceIds: ["broker:ev_sim_77"],
+    proposerVersion: "1",
+    state: "validated" as const,
+    predictedEffect: "Fewer duplicate ledger entries per batch (prediction, not a score).",
+  },
+  {
     candidateId: "cand-sim-202",
     baseBundleRef: { id: "bundle-active", version: "7", sha256: hash(21) },
     candidateBundleRef: { id: "bundle-cand-202", version: "8", sha256: hash(22) },
@@ -362,6 +375,17 @@ export function createSimulationTransport(options?: {
       };
       environmentCatalog = [...environmentCatalog, summary];
       return structuredClone(summary);
+    },
+
+    async launchEvaluation(input: { candidateId: string; baseBundleHash: string }) {
+      const evaluationId = `eval-sim-${(learningActionCount += 1).toString().padStart(3, "0")}`;
+      return { evaluationId, state: "queued" as const };
+    },
+
+    async listEvaluations() {
+      return [
+        { evaluationId: "eval-sim-001", candidateId: "cand-sim-202", state: "valid" as const, trusted: true },
+      ];
     },
 
     async reconnect() {

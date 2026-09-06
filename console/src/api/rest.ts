@@ -1,4 +1,4 @@
-import type { RunEvent, RunRecord, SkillVersionSummary, CandidateDiff, EnvironmentPackageSummary, RunOptions, TaskOption } from "./types";
+import type { RunEvent, RunRecord, SkillVersionSummary, CandidateDiff, EnvironmentPackageSummary, RunOptions, TaskOption, EvaluationJob } from "./types";
 import type {
   ConsoleTransport,
   CreateRunInput,
@@ -70,6 +70,27 @@ export class ApiError extends Error {
     const corr = this.correlationId ? ` (correlation ${this.correlationId})` : "";
     return `${this.code}: ${this.message}${corr}`;
   }
+}
+
+function arr2evals(value: unknown): EvaluationJob[] {
+  if (!Array.isArray(value)) throw new SchemaError("evaluations");
+  return value.map((item, i) => {
+    const o = (item ?? {}) as Record<string, unknown>;
+    const evaluationId = typeof o.evaluationId === "string" ? o.evaluationId : "";
+    const candidateId = typeof o.candidateId === "string" ? o.candidateId : "";
+    const state = typeof o.state === "string" ? o.state : "";
+    if (!evaluationId || !candidateId || !["queued", "running", "valid", "invalid", "cancelled"].includes(state)) {
+      throw new SchemaError(`evaluations[${i}]`);
+    }
+    const job: EvaluationJob = { evaluationId, candidateId, state: state as EvaluationJob["state"] };
+    if (typeof o.trusted === "boolean") job.trusted = o.trusted;
+    if (typeof o.reason === "string") job.reason = o.reason;
+    if (o.error && typeof o.error === "object" && !Array.isArray(o.error)) {
+      const err = o.error as Record<string, unknown>;
+      if (typeof err.message === "string") job.reason = err.message;
+    }
+    return job;
+  });
 }
 
 /** Friendly operator-facing text; raw JSON/HTML error bodies never reach the UI. */
@@ -323,6 +344,24 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       if (!created) throw new ApiError({ code: "UNKNOWN", message: "registered environment missing from list" }, 200);
       return created;
     },
+
+    launchEvaluation: async (input: { candidateId: string; baseBundleHash: string }) => {
+      // protocolHash/partitionRef are control-plane-owned; the backend derives
+      // or rejects until the contract relaxation lands (coordinated with 2)
+      const action = (await json("/evaluations", {
+        method: "POST",
+        body: JSON.stringify({ candidateId: input.candidateId, baseBundleHash: input.baseBundleHash }),
+      })) as Record<string, unknown>;
+      const evaluationId = typeof action.evaluationId === "string" ? action.evaluationId : "";
+      const state = typeof action.state === "string" ? action.state : "queued";
+      if (!evaluationId) throw new SchemaError("evaluation.evaluationId");
+      return { evaluationId, state };
+    },
+
+    listEvaluations: () =>
+      validated(json("/evaluations"), (value) =>
+        arr2evals(value),
+      ),
 
     launchLearningCycle: async (input: LearningCycleInput) => {
       const action = (await json("/learning/launch", {

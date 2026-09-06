@@ -49,6 +49,16 @@ export function RunView({
   const [approval, setApproval] = useState<{ request: ApprovalRequest } | null>(null);
   const [newRunOpen, setNewRunOpen] = useState(false);
   const approvalShown = useRef<string | null>(null);
+  const detailRef = useRef<HTMLDivElement>(null);
+  const handleSelectRun = (runId: string) => {
+    onSelectRun(runId);
+    // small viewports stack the list above the details: bring the selected
+    // detail into view and move keyboard focus there (master-detail a11y)
+    requestAnimationFrame(() => {
+      detailRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      detailRef.current?.focus({ preventScroll: true });
+    });
+  };
 
   // surface the latest pending approval of the selected run as a dialog
   useEffect(() => {
@@ -98,7 +108,8 @@ export function RunView({
 
   return (
     <section aria-labelledby="runs-heading" className="grid min-w-0 gap-6 lg:grid-cols-[minmax(280px,380px)_minmax(0,1fr)]">
-      <div className="min-w-0">
+      <div className="min-w-0 lg:max-h-none">
+        <div className="max-h-[55vh] overflow-y-auto pr-1 lg:max-h-none">
         <div className="flex items-center justify-between gap-2">
           <h2 id="runs-heading" className="text-base font-semibold text-slate-100">
             Runs
@@ -116,7 +127,7 @@ export function RunView({
             <li key={run.runId}>
               <button
                 type="button"
-                onClick={() => onSelectRun(run.runId)}
+                onClick={() => handleSelectRun(run.runId)}
                 aria-current={run.runId === selectedRunId ? "true" : undefined}
                 className={`w-full min-w-0 rounded-lg border px-3 py-2.5 text-left text-sm transition-colors ${
                   run.runId === selectedRunId
@@ -137,9 +148,10 @@ export function RunView({
             </li>
           ))}
         </ul>
+        </div>
       </div>
 
-      <div className="min-w-0">
+      <div className="min-w-0" ref={detailRef} tabIndex={-1} aria-label="Run details">
         {selected ? (
           <div className="space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-700 bg-slate-900/60 p-4">

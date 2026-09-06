@@ -169,6 +169,15 @@ export type RunOptions = {
   budgetRef?: { id: string; version: string; sha256: string };
 };
 
+/** GET /evaluations row: durable evaluation job status per candidate. */
+export type EvaluationJob = {
+  evaluationId: string;
+  candidateId: string;
+  state: "queued" | "running" | "valid" | "invalid" | "cancelled";
+  trusted?: boolean;
+  reason?: string;
+};
+
 /** GET /environments/{id}/tasks: registered task goals a run may target. */
 export type TaskOption = {
   taskId: string;

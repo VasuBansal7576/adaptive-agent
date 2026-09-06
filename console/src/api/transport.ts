@@ -2,6 +2,7 @@ import type {
   ApprovalRequest,
   CandidateDiff,
   EnvironmentPackageSummary,
+  EvaluationJob,
   RunEvent,
   RunOptions,
   RunRecord,
@@ -51,6 +52,10 @@ export interface ConsoleTransport {
   registerEnvironment(manifest: EnvironmentRegistration): Promise<EnvironmentPackageSummary>;
   /** Stage an evidence-linked learning proposal (POST /learning/launch). */
   launchLearningCycle(input: LearningCycleInput): Promise<{ actionId: string; runId: string; status: string }>;
+  /** Queue a trusted evaluation for a validated candidate (POST /evaluations). */
+  launchEvaluation(input: { candidateId: string; baseBundleHash: string }): Promise<{ evaluationId: string; state: string }>;
+  /** Evaluation job statuses (GET /evaluations). */
+  listEvaluations(): Promise<EvaluationJob[]>;
   validateEnvironmentPackage(fields: EnvironmentPackageForm): Promise<{ ok: boolean; missingFields: string[] }>;
 }
 
