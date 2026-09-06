@@ -53,8 +53,12 @@ class DurableAppWorldAdapter:
         for arm in (Arm.B0, Arm.L, Arm.A):
             self._resolved_bundles[arm.value] = self._bundle(self.bundle_hashes[arm.value])
         a_bundle = self._resolved_bundles[Arm.A.value]
+        execution_config = getattr(a_bundle, "execution_config", None)
+        if getattr(a_bundle, "skills", None) or execution_config is None or getattr(execution_config, "skill_refs", None) or getattr(execution_config, "instruction_variant", "default") != "default":
+            raise ValueError("AppWorld arm A retains learned skills or instruction configuration")
         procedures = tuple(str(getattr(skill, "procedure", "")) for skill in getattr(a_bundle, "skills", ()))
-        self._a_audit = audit_ablation(AblationInput(a_bundle.content_hash, "", procedures))
+        config_payload = execution_config.model_dump(mode="json", by_alias=True) if callable(getattr(execution_config, "model_dump", None)) else vars(execution_config)
+        self._a_audit = audit_ablation(AblationInput(a_bundle.content_hash, canonical_json(config_payload), procedures))
         if not self._a_audit.passed:
             raise ValueError("AppWorld arm A memory-disabled audit failed")
 
@@ -67,12 +71,15 @@ class DurableAppWorldAdapter:
         actual_image = getattr(self.runtime, "image_digest", None)
         actual_provider = getattr(self.runtime, "provider", "openai-codex")
         actual_revision = getattr(self.runtime, "source_revision", None) or os.environ.get("ADAPTIVE_AGENT_SOURCE_REVISION")
+        actual_core = getattr(self.runtime, "core_planner_hash", None)
         if actual_image != self.protocol.image_digest or not isinstance(actual_image, str) or not actual_image or actual_image == "image-unpinned":
             raise ValueError("AppWorld runtime image digest does not match the frozen protocol")
         if actual_provider != self.protocol.provider or actual_provider != "openai-codex":
             raise ValueError("AppWorld runtime provider does not match the frozen protocol")
         if actual_revision != self.protocol.source_revision or not isinstance(actual_revision, str) or not actual_revision:
             raise ValueError("AppWorld runtime source revision does not match the frozen protocol")
+        if actual_core != self.protocol.core_planner_hash:
+            raise ValueError("AppWorld runtime core planner hash does not match the frozen protocol")
 
     def _frozen(self) -> FrozenProtocol:
         inputs = {"modelProfile": self.protocol.model_profile, "provider": self.protocol.provider, "corePlannerHash": self.protocol.core_planner_hash, "imageDigest": self.protocol.image_digest, "sourceRevision": self.protocol.source_revision, "runBudget": self.protocol.budget.to_dict()}

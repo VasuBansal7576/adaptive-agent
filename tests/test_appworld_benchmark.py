@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 import json
+import sqlite3
+import pytest
 
 from adaptive_agent.appworld_benchmark import AppWorldBenchmarkRunner, AppWorldCellResult, AppWorldProtocol, DurableAppWorldAdapter
-from adaptive_agent.evaluation import Arm, ModelProvenance, Partition, RunObservation
+from adaptive_agent.evaluation import Arm, ModelProvenance, Partition, RunObservation, sha256_json
 
 
 class Catalog:
@@ -119,3 +121,31 @@ def test_production_durable_runtime_adapter_reopens_without_dispatch(tmp_path, m
     fresh_adapter = DurableAppWorldAdapter(fresh_runtime, protocol, {key.value: value for key, value in bundles.items()})
     second = AppWorldBenchmarkRunner(tmp_path / "appworld", Package(), protocol, fresh_adapter).run("production", bundles)
     assert second.provenance_complete and model.calls == 3
+
+    # A cached usage edit is rejected against the fresh verified accounting,
+    # before the shared runtime can dispatch another model request.
+    with sqlite3.connect(tmp_path / "appworld" / "appworld-benchmark.sqlite3") as conn:
+        row = conn.execute("SELECT result_json FROM appworld_cells LIMIT 1").fetchone()
+        tampered = json.loads(row[0]); tampered["usage"]["inputTokens"] = 999
+        conn.execute("UPDATE appworld_cells SET result_json=?", (json.dumps(tampered),)); conn.commit()
+    with pytest.raises(ValueError, match="usage receipt does not reconcile"):
+        AppWorldBenchmarkRunner(tmp_path / "appworld", Package(), protocol, fresh_adapter).run("production", bundles)
+    assert model.calls == 3
+
+    from adaptive_agent.models import SkillBundle
+    learned_payload = {**active.model_dump(mode="json", by_alias=True, exclude={"contentHash"}), "skills": [{"skillId": "learned", "version": "1", "procedure": "arbitrary learned procedure"}]}
+    learned_hash = sha256_json(learned_payload)
+    learned_payload["contentHash"] = learned_hash
+    learned = SkillBundle.model_validate(learned_payload)
+    audit_adapter = DurableAppWorldAdapter(fresh_runtime, protocol)
+    original_bundle = audit_adapter._bundle
+    audit_adapter._bundle = lambda bundle_hash: learned if bundle_hash == learned_hash else original_bundle(bundle_hash)
+    retained = dict(bundles); retained[Arm.A] = learned_hash
+    with pytest.raises(ValueError, match="retains learned skills"):
+        audit_adapter.preflight_bundles({key.value: value for key, value in retained.items()})
+
+    # Planner identity is checked by the production adapter before any task
+    # is loaded from the catalog.
+    fresh_runtime.core_planner_hash = "mismatched-core"
+    with pytest.raises(ValueError, match="core planner hash"):
+        DurableAppWorldAdapter(fresh_runtime, protocol, {key.value: value for key, value in bundles.items()}).preflight_bundles({key.value: value for key, value in bundles.items()})
