@@ -83,6 +83,11 @@ class DurableBrokerLearningProjection:
             raise LearningProjectionError("broker history is not bound to the requested run")
         if not isinstance(task, Mapping) or task.get("environment_id") != environment_id or task.get("partition") != "development":
             raise LearningProjectionError("broker history requires a DEVELOPMENT task")
+        outcome = self.store.get_outcome_by_run_id(run_id)
+        if not isinstance(outcome, Mapping) or not isinstance(outcome.get("passed"), (bool, int)):
+            raise LearningProjectionError("broker history lacks a trusted evaluator outcome")
+        trusted_outcome = True
+        outcome_passed = bool(outcome["passed"])
         list_learning_evidence = getattr(self.store, "list_learning_evidence", None)
         if not callable(list_learning_evidence):
             raise LearningProjectionError("Store lacks unified learning evidence seam")
@@ -153,7 +158,7 @@ class DurableBrokerLearningProjection:
                 "contentHash": content_hash(content), "sourceContentHash": event.get("content_hash"),
                 "sourceEvidenceId": evidence_id, "sourceCallId": call_id,
                 "environmentId": environment_id, "runId": run_id, "taskId": task_id,
-                "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": True, "outcomePassed": outcome_passed,
+                "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": trusted_outcome, "outcomePassed": bool(outcome["passed"]),
             }
             self._persist_derived_evidence(evidence_id=record["sourceId"], run_id=run_id, content=content)
             records.append((f"learning-broker-{evidence_id}", record))
