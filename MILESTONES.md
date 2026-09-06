@@ -64,9 +64,11 @@ M4 is unmet because there is no sealed four-environment B0/L/A evaluation, measu
 M5 and M6 have not started, and there are no public repository, social-demo, deployment, or submission claims.
 
 One user-accepted subscription limitation is still an UNMET criterion.
-The `openai-codex` subscription path has no verified provider-enforced hard output-token cap.
-The implementation's local token ceilings, accounting, and post-response rejection are not equivalent to a hard provider output cap.
+The accepted Luna-through-ChatGPT subscription path has no API-key or provider switch.
+The trusted parent records actual model usage and rejects after aggregate token exhaustion.
+Local token limits and post-response rejection are not hard provider enforcement, so the strict per-call output-token-cap criterion remains UNMET.
 This remains a blocker for the resource-boundary acceptance work and must not be recorded as a pass.
+This limitation is recorded in the session-2 docs commit `356085e`.
 The acceptance criteria, blockers, and pass meanings in [SPEC.md](SPEC.md) are intentionally untouched.
 
 Prime reuse attribution is required in any later public artifact.

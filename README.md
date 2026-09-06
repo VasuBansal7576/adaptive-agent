@@ -47,6 +47,7 @@ Evaluation targets, source-review limitations, and acceptance meanings remain de
 No measured performance, full acceptance, public publication, or submission result is claimed.
 
 One explicit blocker remains unmet.
-The user-accepted `openai-codex` subscription path does not expose a verified provider-enforced hard output-token cap.
-Local token accounting and post-response rejection do not satisfy a provider-side hard cap, so this resource-boundary criterion remains UNMET.
+The user-accepted Luna-through-ChatGPT subscription path has no API-key or provider switch.
+The trusted parent records actual model usage and rejects after aggregate token exhaustion.
+Local token limits and post-response rejection are not hard provider enforcement, so the strict per-call output-token-cap criterion remains UNMET.
 This documentation does not alter the pass meaning of any requirement in [SPEC.md](SPEC.md).
