@@ -172,6 +172,8 @@ class ChildPlanRequest:
     depth: int
     remaining_seconds: float
     capabilities: tuple[str, ...]
+    cancel_event: threading.Event
+    budget: "ChildPlannerBudget"
 
 
 @dataclass(frozen=True)
@@ -191,6 +193,7 @@ class SharedBudget:
     max_artifact_bytes: int
     max_artifact_count: int
     max_child_runs: int = 0
+    max_model_tokens: int | None = None
     started_at: float = field(default_factory=time.monotonic)
     cancel_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -198,6 +201,7 @@ class SharedBudget:
     artifact_count: int = 0
     artifact_refs: dict[tuple[str, str, str], ArtifactRef] = field(default_factory=dict)
     child_runs_used: int = 0
+    model_tokens_used: int = 0
 
     def remaining_seconds(self) -> float:
         return max(0.0, self.max_wall_seconds - (time.monotonic() - self.started_at))
@@ -208,8 +212,44 @@ class SharedBudget:
                 raise SecurityViolation("shared child budget is exhausted or cancelled")
             self.child_runs_used += 1
 
+    def release_child(self) -> None:
+        with self.lock:
+            self.child_runs_used = max(0, self.child_runs_used - 1)
+
+    def record_model_usage(self, tokens: int) -> None:
+        if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+            raise AdapterError("model token usage must be a non-negative integer")
+        with self.lock:
+            if self.max_model_tokens is not None and self.model_tokens_used + tokens > self.max_model_tokens:
+                raise SecurityViolation("shared model token budget exhausted")
+            self.model_tokens_used += tokens
+
     def cancel(self) -> None:
         self.cancel_event.set()
+
+
+@dataclass(frozen=True)
+class ChildPlannerBudget:
+    """Trusted planner seam for cancellation and parent-owned accounting."""
+
+    ledger: SharedBudget
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        return self.ledger.cancel_event
+
+    @property
+    def remaining_seconds(self) -> float:
+        return self.ledger.remaining_seconds()
+
+    @property
+    def remaining_model_tokens(self) -> int | None:
+        if self.ledger.max_model_tokens is None:
+            return None
+        return max(0, self.ledger.max_model_tokens - self.ledger.model_tokens_used)
+
+    def record_model_usage(self, tokens: int) -> None:
+        self.ledger.record_model_usage(tokens)
 
 
 ChildPlanner = Callable[[ChildPlanRequest], ChildPlan | Mapping[str, Any] | str]
@@ -234,6 +274,7 @@ class PrimeRuntimeConfig:
     max_total_artifact_bytes: int = 64 * 1024 * 1024
     max_artifact_count: int = 128
     max_total_wall_seconds: float = 300.0
+    max_model_tokens: int | None = None
     max_child_depth: int = 1
     child_runs: int = 0
     require_docker: bool = True
@@ -684,7 +725,7 @@ class PrimeRuntimeAdapter:
             raise AdapterError("child depth exceeds configured maximum")
         self._budget = _shared_budget or SharedBudget(
             config.max_total_wall_seconds, config.max_total_artifact_bytes, config.max_artifact_count,
-            config.child_runs)
+            config.child_runs, config.max_model_tokens)
         self._artifact_store_root = _artifact_store_root or (self.root / "artifacts")
         self.kernel: _KernelProcess | None = None
         self._lock = threading.RLock()
@@ -810,6 +851,7 @@ class PrimeRuntimeAdapter:
                 max_total_artifact_bytes=self.config.max_total_artifact_bytes,
                 max_artifact_count=self.config.max_artifact_count,
                 max_total_wall_seconds=self.config.max_total_wall_seconds,
+                max_model_tokens=self.config.max_model_tokens,
                 max_child_depth=self.config.max_child_depth,
                 child_runs=0, require_docker=True, docker_image=self.config.docker_image,
                 ao_session_id=self.config.ao_session_id,
@@ -820,7 +862,7 @@ class PrimeRuntimeAdapter:
             _depth=self._depth + 1,
         )
         try:
-            result = child.execute(code, timeout=timeout)
+            result = child.execute(code, timeout=timeout, cancel=self._budget.cancel_event)
             result.provenance["parentRunId"] = self.config.task_id
             result.provenance["childDepth"] = self._depth + 1
             result.provenance["capabilities"] = []
@@ -830,6 +872,8 @@ class PrimeRuntimeAdapter:
 
     def execute_child(self, code: str, *, timeout: float | None = None) -> ExecutionResult:
         """Run one bounded child in a fresh Docker kernel with attenuated context."""
+        if self._depth >= self.config.max_child_depth:
+            raise SecurityViolation("child depth budget exhausted")
         self._budget.reserve_child()
         return self._execute_child_reserved(code, timeout=timeout)
 
@@ -870,8 +914,10 @@ class PrimeRuntimeAdapter:
         if not isinstance(prompt, str) or not prompt or len(prompt) > 16384:
             raise AdapterError("child prompt must be a bounded non-empty string")
         clean_kwargs = self._sanitize_child_kwargs(kwargs)
+        planner_budget = ChildPlannerBudget(self._budget)
         request = ChildPlanRequest(prompt, clean_kwargs, self.config.task_id, self._depth,
-                                   self._budget.remaining_seconds(), ())
+                                   planner_budget.remaining_seconds, (),
+                                   planner_budget.cancel_event, planner_budget)
         planned = self.child_planner(request)
         if isinstance(planned, ChildPlan):
             plan = planned
@@ -912,8 +958,16 @@ class PrimeRuntimeAdapter:
         if request_type == "rlm.run":
             if self.child_planner is None:
                 raise SecurityViolation("child run budget exhausted: trusted child planner is not configured")
-            plan, request = self._plan_child(payload)
+            if self._depth >= self.config.max_child_depth:
+                raise SecurityViolation("child depth budget exhausted")
+            # Reserve before invoking the potentially paid parent model. A
+            # malformed planner response refunds this reservation below.
             self._budget.reserve_child()
+            try:
+                plan, request = self._plan_child(payload)
+            except Exception:
+                self._budget.release_child()
+                raise
             result = self._execute_child_reserved(plan.code, timeout=min(self.config.max_cell_seconds, request.remaining_seconds))
             return {
                 "rlm_child_id": f"{self.config.task_id}-child-{self._children}",

@@ -98,13 +98,37 @@ class PrimeRuntimeTests(unittest.TestCase):
         followup = adapter.execute("6 * 7")
         self.assertEqual(followup.result, "42")
 
+    def test_child_budget_and_planner_errors_are_checked_before_paid_callback(self):
+        zero = self.make(child_runs=0)
+        calls = []
+        zero.child_planner = lambda _request: calls.append(True) or {"code": "42"}
+        result = zero.execute("from rlm import host_request\nawait host_request('rlm.run', {'prompt':'no', 'kwargs':{}})")
+        self.assertEqual(result.status, "error")
+        self.assertEqual(calls, [])
+
+        retry = self.make(child_runs=1)
+        attempts = []
+        def planner(request):
+            attempts.append(request)
+            if len(attempts) == 1:
+                raise RuntimeError("planner failed")
+            return {"code": "6 * 7"}
+        retry.child_planner = planner
+        first = retry.execute("from rlm import host_request\nawait host_request('rlm.run', {'prompt':'first', 'kwargs':{}})")
+        second = retry.execute("from rlm import host_request\nawait host_request('rlm.run', {'prompt':'second', 'kwargs':{}})")
+        self.assertEqual(first.status, "error")
+        self.assertEqual(second.status, "ok")
+        self.assertEqual(len(attempts), 2)
+
     def test_learner_requested_child_uses_trusted_planner_and_shared_budget(self):
         adapter = self.make(child_runs=1, max_child_depth=1)
         seen = {}
         def planner(request):
             seen.update({"prompt": request.prompt, "depth": request.depth,
                          "capabilities": request.capabilities,
-                         "remaining": request.remaining_seconds})
+                         "remaining": request.remaining_seconds,
+                         "cancel_same": request.cancel_event is request.budget.cancel_event,
+                         "tokens": request.budget.remaining_model_tokens})
             return {"name": "useful-child", "code": "answer = 40 + 2\nanswer"}
         adapter.child_planner = planner
         result = adapter.execute(
@@ -116,6 +140,7 @@ class PrimeRuntimeTests(unittest.TestCase):
         self.assertEqual(seen["prompt"], "compute the answer")
         self.assertEqual(seen["depth"], 0)
         self.assertEqual(seen["capabilities"], ())
+        self.assertTrue(seen["cancel_same"])
         second = adapter.execute(
             "from rlm import host_request\n"
             "await host_request('rlm.run', {'prompt':'again', 'kwargs':{}})"
@@ -137,10 +162,12 @@ class PrimeRuntimeTests(unittest.TestCase):
         while adapter.kernel is None and time.time() < deadline:
             time.sleep(0.01)
         time.sleep(0.2)
+        started_cancel = time.monotonic()
         adapter.cancel()
         worker.join(4)
         self.assertFalse(worker.is_alive())
         self.assertEqual(holder["result"].status, "aborted")
+        self.assertLess(time.monotonic() - started_cancel, 2.0)
 
     def test_cumulative_artifact_budget_allows_duplicates_but_rejects_new_bytes(self):
         adapter = self.make(max_artifact_bytes=16, max_total_artifact_bytes=5, max_artifact_count=2)
