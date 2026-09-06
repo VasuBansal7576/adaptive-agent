@@ -45,6 +45,12 @@ Select the small backend and runtime adapter based on those results.
 Use the specified isolated IPython fallback if Prime cannot meet the adapter boundary, and disclose the choice.
 An unavailable Prime API, provider, or safety boundary can delay the Prime path but cannot be hidden behind simulated evidence.
 
+The selected provider remains GPT-5.6 Luna through the existing ChatGPT subscription.
+No API key connection or provider switch is authorized for this scope.
+The trusted parent records actual usage and rejects later calls after the configured aggregate budget is exhausted.
+The subscription does not expose strict per-call token enforcement.
+Parent-side prompt and token limits are therefore accounting and admission controls, not hard provider limits, and the strict per-call token criterion remains unmet.
+
 The vertical slice uses one neutral package with documentation, a stateful tool, a policy rule, a reset fixture, and an objective outcome check.
 It includes a task whose first attempt can fail and whose verified outcome can support a bounded corrective proposal.
 A proposal goes through a real independent comparison with fresh fixture state and an enforced gate.
@@ -84,6 +90,7 @@ The final panel has 20 tasks per environment, three seeds per task, and fixed ba
 Training attempts, safety tests, rejected candidates, transfer experiments, and retries add to those totals.
 For `N` candidates, the predeclared total workload is `N * 360 + 720 + training + transfer + safety + retries` scored or attempted runs under one overall model, tool, wall-time, and cost budget.
 Freeze that overall budget before candidate generation and record every term, including cancelled, rejected, or provider-retry work.
+Treat the accepted Luna subscription limitation as an explicit evaluation condition: record measured usage and exhaustion decisions, while leaving any strict provider-side per-call token requirement unmet.
 Use the M2 measurements to calculate actual elapsed time and cost before reserving the run budget.
 If the panel cannot be completed, report incomplete evidence and withhold unsupported improvement claims.
 If the final performance target fails, M4 remains unmet even when all runs finished and the software checks pass.

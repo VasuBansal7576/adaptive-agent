@@ -24,6 +24,12 @@ Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully wit
 A bounded live neutral path now exercises authenticated Luna, Docker Prime, a read-only broker fixture, a trusted objective evaluator, and console-facing run events.
 Production Devin broker authority and the complete behavioral evaluation remain pending.
 
+The product continues to use `openai-codex/gpt-5.6-luna` through the existing ChatGPT subscription.
+No API key connection or provider switch is part of this scope.
+The trusted parent records actual usage, applies the configured aggregate budget, and rejects subsequent calls after exhaustion.
+The subscription path does not provide strict per-call provider token enforcement, so local prompt and token limits are parent-side controls and are not reported as hard provider limits.
+This accepted limitation leaves the strict per-call token criterion unmet.
+
 The active phase covers implementation, local verification, and M2-M4 coordination.
 Local specification commits, fast-forward integration into local `main`, and synchronization to the filesystem-only origin are complete.
 Public remote creation, publication, pushes to public remotes, pull requests, and submission require later authorization.
