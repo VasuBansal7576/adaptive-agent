@@ -77,8 +77,8 @@ export function Modal({
     restoreRef.current = document.activeElement as HTMLElement | null;
     const panel = panelRef.current;
     // initial focus prefers the first text field (DOM order) over buttons
-    const activePanel = panel;
-    activePanel?.querySelector<HTMLElement>("textarea, input, select, button, [tabindex]")?.focus();
+    // initial focus prefers the first text field (DOM order) over buttons
+    panel?.querySelector<HTMLElement>("textarea, input, select, button, [tabindex]")?.focus();
 
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -101,20 +101,14 @@ export function Modal({
         first.focus();
       }
     };
-    // Attach to BOTH the panel and the document. The panel listener covers
-    // keys pressed inside the focused dialog; the document listener covers
-    // synthetic/edge cases. Each effect removes exactly its own listeners.
-    activePanel?.addEventListener("keydown", onKey);
+    // ONE document-level listener: keydowns inside the focused dialog bubble
+    // here. A second (panel) listener would run the Tab wrap and Escape
+    // handling twice. The stable onCloseRef keeps the subscription per open.
     document.addEventListener("keydown", onKey);
     return () => {
-      activePanel?.removeEventListener("keydown", onKey);
       document.removeEventListener("keydown", onKey);
-      // restore focus to the invoking control. An explicitly marked
-      // focus-return target (set when the invoking control unmounts, e.g., a
-      // tab switch carried the action elsewhere) takes precedence; otherwise
-      // restore to the captured element when it is still connected.
-      // prefer the explicit return-focus target when provided and extant,
-      // then the element captured at open
+      // restore focus: prefer the explicit return-focus target when provided
+      // and still connected, then the element captured at open
       const explicit = returnFocusToRef.current?.current;
       if (explicit && explicit.isConnected) {
         explicit.focus();

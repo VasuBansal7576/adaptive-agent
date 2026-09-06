@@ -161,6 +161,56 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect(await screen.findByText(/Proposal validation passed — this is not a performance result/)).toBeInTheDocument();
   });
 
+  it("Modal directly: Escape fires onClose exactly once; Tab wraps last->first and Shift+Tab first->last", async () => {
+    const { Modal } = await import("../components/ui");
+    const onClose = vi.fn();
+    const firstRef = { current: null as HTMLInputElement | null };
+    const lastRef = { current: null as HTMLButtonElement | null };
+    const { rerender } = render(
+      <Modal open title="Unit" onClose={onClose} returnFocusTo={{ current: null }}>
+        <form>
+          <input
+            aria-label="First field"
+            ref={(el) => {
+              firstRef.current = el;
+            }}
+          />
+          <button
+            ref={(el) => {
+              lastRef.current = el;
+            }}
+            onClick={onClose}
+          >
+            Last control
+          </button>
+        </form>
+      </Modal>,
+    );
+    const dialog = screen.getByRole("dialog", { name: "Unit" });
+    expect(dialog).toBeInTheDocument();
+
+    // focus the LAST control, press Tab once: must land on the FIRST field (single wrap)
+    lastRef.current?.focus();
+    await userEvent.setup().keyboard("{Tab}");
+    expect(firstRef.current).toHaveFocus();
+
+    // focus the FIRST control, press Shift+Tab once: must land on the LAST control
+    firstRef.current?.focus();
+    await userEvent.setup().keyboard("{Shift>}{Tab}{/Shift}");
+    expect(lastRef.current).toHaveFocus();
+
+    // Escape fires onClose EXACTLY once even if pressed twice (dialog closed -> listener gone)
+    await userEvent.setup().keyboard("{Escape}");
+    rerender(
+      <Modal open={false} title="Unit" onClose={onClose}>
+        <form />
+      </Modal>,
+    );
+    await userEvent.setup().keyboard("{Escape}");
+    await userEvent.setup().keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("Modal Escape closes exactly once and Tab wraps one step per press", async () => {
     // use the new-run dialog: onClose count observable via the dialog state
     const user = userEvent.setup();

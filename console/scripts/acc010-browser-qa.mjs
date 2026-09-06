@@ -138,54 +138,24 @@ const carried = await browser_.evaluate(() => {
   return { dialogOpen, preselected: select && "value" in select ? select.value : null, onCandidatesTab: !!document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.includes("Candidates") };
 });
 console.log("learnCarry:", JSON.stringify(carried));
-const probe = await browser_.evaluate(() => {
-  let seen = 0;
-  const l = () => { seen += 1; };
-  document.addEventListener("keydown", l);
-  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-  document.removeEventListener("keydown", l);
-  return { seen, dialogs: [...document.querySelectorAll('[role="dialog"]')].map((d) => d.getAttribute("aria-label")) };
-});
-console.log("pageErrors:", JSON.stringify(pageErrors));
-// close with Escape; focus must return to the dialog's invoking control (Modal restore)
+// close with ONE trusted Escape; assert dialog closed + exact focus return
 await browser_.keyboard.press("Escape");
-await new Promise((r) => setTimeout(r, 300));
-const afterCdpEscape = await browser_.evaluate(() => ![...document.querySelectorAll('[role="dialog"][aria-label="Run learning cycle"]')].some((d) => d.isConnected));
-console.log("afterCdpEscape dialog closed:", afterCdpEscape);
-// diagnose: where is focus, and does a panel-targeted Escape close it?
-const diag = await browser_.evaluate(() => {
-  const dialog = [...document.querySelectorAll('[role="dialog"]')].find((d) => d.isConnected);
-  const active = document.activeElement;
-  const live = dialog;
-  return {
-    liveDialogPresent: !!live,
-    activeInside: live ? live.contains(active) : false,
-    activeTag: active?.tagName ?? "none",
-    connectedDialogs: [...document.querySelectorAll('[role="dialog"]')].filter((d) => d.isConnected).length,
-  };
-});
-console.log("escapeDiag:", JSON.stringify(diag));
-await browser_.evaluate(() => {
-  [...document.querySelectorAll('[role="dialog"]')].filter((d) => d.isConnected).forEach((d) => d.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
-});
 await new Promise((r) => setTimeout(r, 400));
-console.log("afterPanelEscape:", await browser_.evaluate(() => [...document.querySelectorAll('[role="dialog"]')].some((d) => d.isConnected)));
-// fallback: dispatch a synthetic Escape keydown inside the page
-await browser_.evaluate(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
-await new Promise((r) => setTimeout(r, 300));
-await new Promise((r) => setTimeout(r, 600));
-const focusReturn = await browser_.evaluate(() => {
-  const el = document.activeElement;
-  const invoker = [...document.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Learn from this run");
+const verify = await browser_.evaluate(() => {
+  const dialogGone = ![...document.querySelectorAll('[role="dialog"][aria-label="Run learning cycle"]')].some((d) => d.isConnected);
+  const learningButton = [...document.querySelectorAll("button")].find((b) => (b.getAttribute("title") ?? "").startsWith("Select a completed development run"));
+  const active = document.activeElement;
   return {
-    dialogGone: ![...document.querySelectorAll('[role="dialog"][aria-label="Run learning cycle"]')].some((d) => d.isConnected),
-    // the original invoker unmounts with the tab switch; the carried action's
-    // new home (the learning-cycle button) is the correct focus-return target
-    focusReturnedToInvoker: el === invoker || (el?.getAttribute("data-acc010-learning-cycle") ?? "") === "",
-    active: el ? `${el.tagName}:${(el.getAttribute("aria-label") ?? el.textContent ?? "").slice(0, 40)}` : "none",
+    dialogGone,
+    exactFocusReturn: !!learningButton && active === learningButton && learningButton.isConnected,
+    accessibleName: active === learningButton ? (learningButton.getAttribute("title") ?? "").slice(0, 60) : (active?.textContent ?? "").slice(0, 40),
   };
 });
-console.log("focusReturn:", JSON.stringify(focusReturn));
+console.log("verify:", JSON.stringify(verify));
+if (!verify.dialogGone || !verify.exactFocusReturn) {
+  console.error("ACC010-FAIL:", JSON.stringify(verify));
+  process.exit(1);
+}
 await browser_.screenshot({ path: `${OUT}focus-return-768.png` });
 
 // keyboard navigation: tab order reaches interactive controls; focus visible

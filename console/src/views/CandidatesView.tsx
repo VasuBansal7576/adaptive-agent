@@ -137,7 +137,7 @@ export function CandidatesView({
         </p>
       </div>
 
-      <LearningCycleButton busy={cycleBusy} onRun={() => { onRefreshRuns(); setCycleOpen(true); }} />
+      <LearningCycleButton busy={cycleBusy} buttonRef={learningButtonRef} onRun={() => { onRefreshRuns(); setCycleOpen(true); }} />
 
       {loading && <LoadingState label="Loading candidates…" />}
 
@@ -373,10 +373,11 @@ function renderEditOperations(cand: CandidateDiff): string {
     .join("\n\n");
 }
 
-function LearningCycleButton({ busy, onRun }: { busy: boolean; onRun: () => void }) {
+function LearningCycleButton({ busy, onRun, buttonRef }: { busy: boolean; onRun: () => void; buttonRef: React.MutableRefObject<HTMLButtonElement | null> }) {
   return (
     <div>
       <button
+        ref={buttonRef}
         type="button"
         onClick={onRun}
         disabled={busy}
@@ -413,7 +414,7 @@ function LearningCycleModal({
     if (open && preselectedRunId) setRunId(preselectedRunId);
   }, [open, preselectedRunId]);
   return (
-    <Modal open={open} title="Run learning cycle" onClose={onClose}>
+    <Modal open={open} title="Run learning cycle" onClose={onClose} returnFocusTo={returnFocusTo}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
