@@ -218,9 +218,11 @@ class SharedBudget:
         if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
             raise AdapterError("model token usage must be a non-negative integer")
         with self.lock:
-            if self.max_model_tokens is not None and self.model_tokens_used + tokens > self.max_model_tokens:
-                raise SecurityViolation("shared model token budget exhausted")
+            # A completed provider receipt is recorded in full before the
+            # ledger rejects further dispatch. Never lose over-cap usage.
             self.model_tokens_used += tokens
+            if self.max_model_tokens is not None and self.model_tokens_used > self.max_model_tokens:
+                raise SecurityViolation("shared model token budget exhausted")
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -878,6 +880,11 @@ class PrimeRuntimeAdapter:
             raise SecurityViolation("child depth budget exhausted")
         self._budget.reserve_child()
         return self._execute_child_reserved(code, timeout=timeout)
+
+    @property
+    def planner_budget(self) -> ChildPlannerBudget:
+        """Trusted shared model/cancellation ledger for parent model adapters."""
+        return ChildPlannerBudget(self._budget)
 
     def cancel(self, cell_id: str | None = None) -> None:
         self._budget.cancel()
