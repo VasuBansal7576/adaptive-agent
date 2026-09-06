@@ -85,9 +85,17 @@ class ResumableEvaluationDriver:
         self.packages = dict(packages)
         self.execute_evaluation_task = execute_evaluation_task
         self.bundle = bundle
-        # The positional bundle is the baseline arm for the development smoke
-        # and remains the default when callers do not provide an arm map.
-        self.arm_bundles = dict(arm_bundles or {Arm.B0: bundle})
+        # The positional bundle is the baseline arm for the development smoke.
+        # Opaque legacy callback fixtures have no candidate identity, so they
+        # may exercise lifecycle failure paths with the same placeholder arm;
+        # real SkillBundle values still require explicit L/A bundles.
+        if arm_bundles is None:
+            defaults: dict[Arm, object] = {Arm.B0: bundle}
+            if self._bundle_hash(bundle) is None:
+                defaults.update({Arm.L: bundle, Arm.A: bundle})
+            self.arm_bundles = defaults
+        else:
+            self.arm_bundles = dict(arm_bundles)
         self.allocation_store = allocation_store or SQLiteAllocationStore(store)
         self.evidence_store = evidence_store or SQLiteRunEvidenceStore(store)
         self.owner_id = secrets.token_urlsafe(12)
