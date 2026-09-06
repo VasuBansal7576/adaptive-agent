@@ -217,7 +217,8 @@ class AppWorldReport:
     limitations: tuple[str, ...]
     ablation_audit: Mapping[str, Any] | None = None
     def to_dict(self) -> dict[str, Any]:
-        return {"benchmark": "appworld", "protocol": self.protocol.to_dict(), "armSummaries": dict(self.arm_summaries), "confidenceIntervals": list(self.confidence_intervals), "pairedTaskCount": self.paired_task_count, "missingPairs": self.missing_pairs, "provenanceComplete": self.provenance_complete, "limitations": list(self.limitations), "ablationAudit": self.ablation_audit}
+        selected_arms = [arm for arm, summary in self.arm_summaries.items() if summary.get("count", 0) > 0]
+        return {"benchmark": "appworld", "protocol": self.protocol.to_dict(), "selectedArms": selected_arms, "armSummaries": dict(self.arm_summaries), "confidenceIntervals": list(self.confidence_intervals), "pairedTaskCount": self.paired_task_count, "missingPairs": self.missing_pairs, "provenanceComplete": self.provenance_complete, "limitations": list(self.limitations), "ablationAudit": self.ablation_audit}
 
 
 class AppWorldBenchmarkRunner:
@@ -230,7 +231,7 @@ class AppWorldBenchmarkRunner:
             conn.execute("CREATE TABLE IF NOT EXISTS appworld_cells (benchmark_id TEXT NOT NULL, task_id TEXT NOT NULL, split TEXT NOT NULL, arm TEXT NOT NULL, seed INTEGER NOT NULL, run_id TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT, error TEXT, PRIMARY KEY(benchmark_id, task_id, arm, seed))")
             conn.commit()
 
-    def _plan(self, benchmark_id: str, bundles: Mapping[Arm | str, str]) -> dict[str, str]:
+    def _plan(self, benchmark_id: str, bundles: Mapping[Arm | str, str], arms: Sequence[Arm]) -> dict[str, str]:
         if self.package.catalog.dataset_hash() != self.protocol.dataset_content_hash:
             raise ValueError("AppWorld dataset hash changed since protocol freeze")
         protocol_payload = self.protocol.to_dict()
@@ -240,7 +241,9 @@ class AppWorldBenchmarkRunner:
         normalized = {Arm(k).value: v for k, v in bundles.items()}
         if set(normalized) != {a.value for a in (Arm.B0, Arm.L, Arm.A)} or any(not isinstance(v, str) or not v for v in normalized.values()):
             raise ValueError("AppWorld requires pinned B0, L, and A bundle hashes")
-        binding = {"protocol": self.protocol.to_dict(), "protocolHash": self.protocol.protocol_hash, "bundles": normalized, "dataset": self.protocol.dataset_content_hash, "modelProfile": self.protocol.model_profile, "corePlannerHash": self.protocol.core_planner_hash}
+        if self.protocol.official_split == "train" and tuple(arms) != (Arm.B0,):
+            raise ValueError("AppWorld training is restricted to the B0 arm")
+        binding = {"protocol": self.protocol.to_dict(), "protocolHash": self.protocol.protocol_hash, "bundles": normalized, "arms": [arm.value for arm in arms], "dataset": self.protocol.dataset_content_hash, "modelProfile": self.protocol.model_profile, "corePlannerHash": self.protocol.core_planner_hash}
         encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"))
         with sqlite3.connect(self.db) as conn:
             row = conn.execute("SELECT binding_json FROM appworld_plans WHERE benchmark_id=?", (benchmark_id,)).fetchone()
@@ -272,10 +275,10 @@ class AppWorldBenchmarkRunner:
                 raise ValueError("runtime usage receipt does not reconcile")
 
     def run(self, benchmark_id: str, bundles: Mapping[Arm | str, str], *, arms: Sequence[Arm] = (Arm.B0, Arm.L, Arm.A)) -> AppWorldReport:
-        bundle_hashes = self._plan(benchmark_id, bundles)
         selected_arms = tuple(arms)
         if not selected_arms or any(arm not in (Arm.B0, Arm.L, Arm.A) for arm in selected_arms) or len(set(selected_arms)) != len(selected_arms):
             raise ValueError("AppWorld arms must be a non-empty subset of B0, L, and A")
+        bundle_hashes = self._plan(benchmark_id, bundles, selected_arms)
         self._selected_arms = selected_arms
         split_by_id, results = dict(self.protocol.split_by_task_id), []
         for task_id in self.protocol.sampled_task_ids:
