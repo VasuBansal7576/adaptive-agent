@@ -86,9 +86,11 @@ class Runtime:
         self.controller = Controller()
         self.packages = {name: Package(name) for name in ("known-a", "known-b", "known-c", "sealed")}
         self.calls = []
+        self.configs = []
 
     def execute_evaluation_task(self, task, config, bundle):
         self.calls.append((task.task_id, config.arm, config.seed, bundle.content_hash))
+        self.configs.append(config)
         return SimpleNamespace(
             run_id=f"run-{len(self.calls)}",
             evidence_ref="model-1",
@@ -135,6 +137,7 @@ def test_default_runner_executes_real_receipt_bound_training_cell():
     assert result["runIds"] == ["run-1"]
     assert result["usage"] == {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}
     assert runtime.calls == [("known-a-development-0", "B0", 17, "base")]
+    assert runtime.configs[0].protocol.inputs["modelProfile"] == "openai-codex/gpt-5.6-luna"
 
 
 def test_panel_mapping_keeps_frozen_validation_and_final_counts_without_duplication():
@@ -240,6 +243,28 @@ def test_partial_known_cost_remains_unknown():
     assert "costMicrounits" not in receipt
 
 
+def test_learning_receipt_preserves_nominal_proxy_and_wall_time(monkeypatch):
+    runtime = Runtime()
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 4, "outputTokens": 3, "totalTokens": 7}, ["learning-ref"]))
+
+    receipt = runner._learning_receipt(
+        "learning",
+        "dev-run",
+        {
+            "candidate": {"candidateId": "candidate", "candidateBundleHash": "candidate", "baseBundleHash": "base"},
+            "wallSeconds": 1.25,
+            "nominalCostUsd": 0.000004,
+        },
+        bind_primary=True,
+    )
+
+    assert receipt["wallSeconds"] == 1.25
+    assert receipt["costMicrounits"] == 4
+    assert receipt["costBasis"] == "nominal_budget_proxy"
+    assert receipt["billingStatus"] == "unknown"
+
+
 def test_event_type_only_evidence_is_not_accepted():
     runtime = Runtime()
     runtime.verify_evaluation_observation = lambda *_args: False
@@ -300,3 +325,37 @@ def test_nested_learning_reuses_durable_checkpoint_without_relaunch():
     )
 
     assert receipt is recovered
+
+
+def test_actual_durable_runtime_rejects_unfrozen_execution_before_model_dispatch():
+    pytest.importorskip("fastapi")
+    pytest.importorskip("adaptive_agent.constants")
+    from adaptive_agent.app import DurableRuntime, LearningRuntimeError
+
+    class Package:
+        def reset(self, *_args, **_kwargs):
+            return object()
+
+        def evaluate(self, *_args, **_kwargs):
+            return object()
+
+    class ModelClient:
+        calls = 0
+
+        def invoke(self, **_kwargs):
+            self.calls += 1
+            return {}
+
+    runtime = DurableRuntime.__new__(DurableRuntime)
+    runtime.packages = {"known-a": Package()}
+    runtime.learning_model_client = ModelClient()
+    task = SimpleNamespace(
+        task_id="known-a-development-0",
+        environment_ref=SimpleNamespace(id="known-a", version="1"),
+        goal="probe",
+    )
+    config = SimpleNamespace(protocol=SimpleNamespace(), arm="B0", seed=17, bundle_hash="base")
+
+    with pytest.raises(LearningRuntimeError, match="not frozen"):
+        runtime.execute_evaluation_task(task, config, Bundle("base"))
+    assert runtime.learning_model_client.calls == 0

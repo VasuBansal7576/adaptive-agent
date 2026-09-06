@@ -48,7 +48,10 @@ def _required_string(value: Any, label: str) -> str:
 
 
 def _protocol_inputs(protocol: Any) -> Mapping[str, Any]:
-    frozen = protocol.start_candidate_generation()
+    return _frozen_inputs(protocol.start_candidate_generation())
+
+
+def _frozen_inputs(frozen: Any) -> Mapping[str, Any]:
     inputs = _mapping(getattr(frozen, "inputs", None), "frozen protocol inputs")
     for key in ("provider", "modelProfile", "corePlannerHash", "imageDigest", "runBudget"):
         if key not in inputs:
@@ -128,7 +131,7 @@ def _pins(runtime: Any, protocol: Any, inputs: Mapping[str, Any], base_hash: str
     return pins
 
 
-def _accounting(runtime: Any, observation: Any) -> tuple[dict[str, int], int, float, int | None, str | None]:
+def _accounting(runtime: Any, observation: Any) -> tuple[dict[str, int], int, float, int | None, str | None, float | None]:
     ref = getattr(observation, "accounting_ref", None)
     if not isinstance(ref, str) or not ref:
         raise ExperimentRuntimeError("observation lacks a durable accounting reference")
@@ -152,7 +155,10 @@ def _accounting(runtime: Any, observation: Any) -> tuple[dict[str, int], int, fl
         raise ExperimentRuntimeError("accounting cost is malformed")
     economic = accounting.get("economicCost")
     economic_status = economic.get("status") if isinstance(economic, Mapping) else None
-    return {key: int(value) for key, value in fields.items()}, int(calls), float(wall), int(cost) if cost is not None else None, economic_status
+    nominal = accounting.get("nominalCostUsd")
+    if nominal is not None and (not isinstance(nominal, (int, float)) or isinstance(nominal, bool) or nominal < 0):
+        raise ExperimentRuntimeError("accounting nominal cost is malformed")
+    return {key: int(value) for key, value in fields.items()}, int(calls), float(wall), int(cost) if cost is not None else None, economic_status, float(nominal) if nominal is not None else None
 
 
 def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: list[Any], pins: Mapping[str, str], *, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -164,6 +170,8 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
     cost = 0
     cost_seen = False
     economic_unknown = False
+    nominal = 0.0
+    nominal_seen = False
     run_ids: list[str] = []
     evidence_refs: list[str] = []
     outcome_refs: list[str] = []
@@ -176,7 +184,7 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
         run_ids.append(run_id)
         evidence_refs.append(evidence)
         outcome_refs.append(outcome)
-        current_usage, current_calls, current_wall, current_cost, economic_status = _accounting(runtime, observation)
+        current_usage, current_calls, current_wall, current_cost, economic_status, current_nominal = _accounting(runtime, observation)
         for key in usage:
             usage[key] += current_usage[key]
         tool_calls += current_calls
@@ -185,6 +193,9 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
             cost += current_cost
             cost_seen = True
         economic_unknown = economic_unknown or economic_status == "unknown" or current_cost is None
+        if current_nominal is not None:
+            nominal += current_nominal
+            nominal_seen = True
     receipt: dict[str, Any] = {
         "stage": stage,
         "cellKey": cell_key,
@@ -201,6 +212,10 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
     }
     if cost_seen and not economic_unknown:
         receipt["costMicrounits"] = cost
+    elif nominal_seen:
+        receipt["costMicrounits"] = int(round(nominal * 1_000_000))
+        receipt["costBasis"] = "nominal_budget_proxy"
+        receipt["billingStatus"] = "unknown"
     else:
         receipt["economicCostStatus"] = "unknown"
     if extra:
@@ -214,7 +229,8 @@ class DefaultExperimentStageRunner:
     def __init__(self, runtime: Any, protocol: Any) -> None:
         self.runtime = runtime
         self.protocol = protocol
-        self.inputs = _protocol_inputs(protocol)
+        self.frozen_protocol = protocol.start_candidate_generation()
+        self.inputs = _frozen_inputs(self.frozen_protocol)
         self.base_bundle = _active_bundle(runtime)
         self.base_hash = _bundle_hash(self.base_bundle)
         self.pins = _pins(runtime, protocol, self.inputs, self.base_hash)
@@ -288,7 +304,7 @@ class DefaultExperimentStageRunner:
         return tasks[index]
 
     def _execute(self, task: Any, arm: str, seed: int, bundle: Any, attempt: int) -> Any:
-        config = _ExecutionConfig(self.protocol, arm, seed, _bundle_hash(bundle), attempt)
+        config = _ExecutionConfig(self.frozen_protocol, arm, seed, _bundle_hash(bundle), attempt)
         observation = self.runtime.execute_evaluation_task(task, config, bundle)
         if getattr(observation, "run_id", None) is None or getattr(observation, "outcome_ref", None) is None:
             raise ExperimentRuntimeError("runtime execution returned an unbound observation")
@@ -468,14 +484,14 @@ class DefaultExperimentStageRunner:
         else:
             self._rotation_candidates[cell_key] = (candidate_id, candidate_hash)
         learning_usage, learning_refs = self._learning_observation_usage(run_id, prior_refs=prior_learning_refs)
-        return {
+        learning_accounting = self._learning_accounting(run_id, learning_refs, result)
+        receipt: dict[str, Any] = {
             "stage": "learning",
             "cellKey": cell_key,
             "status": "complete",
             "usage": learning_usage,
             "toolCalls": 0,
-            "wallSeconds": 0,
-            "economicCostStatus": "unknown",
+            "wallSeconds": learning_accounting["wallSeconds"],
             "pins": dict(self.pins),
             "candidateId": candidate_id,
             "candidateBundleHash": candidate_hash,
@@ -484,6 +500,15 @@ class DefaultExperimentStageRunner:
             "nestedAdmissions": [],
             "nestedCheckpoints": list(learning_refs),
         }
+        if learning_accounting.get("costMicrounits") is not None:
+            receipt["costMicrounits"] = learning_accounting["costMicrounits"]
+        elif learning_accounting.get("nominalCostUsd") is not None:
+            receipt["costMicrounits"] = int(round(float(learning_accounting["nominalCostUsd"]) * 1_000_000))
+            receipt["costBasis"] = "nominal_budget_proxy"
+            receipt["billingStatus"] = "unknown"
+        else:
+            receipt["economicCostStatus"] = "unknown"
+        return receipt
 
     def _candidate_for_excluded_environment(self, context: Mapping[str, Any], excluded: str) -> tuple[Any, Mapping[str, Any]]:
         """Generate a leave-one-environment-out candidate from eligible runs."""
@@ -540,6 +565,63 @@ class DefaultExperimentStageRunner:
             for evidence_id in (row.get("evidence_id"),)
             if isinstance(evidence_id, str) and evidence_id
         }
+
+    def _learning_accounting(self, run_id: str, refs: list[str], result: Any) -> dict[str, Any]:
+        wall = 0.0
+        wall_seen = False
+        nominal = 0.0
+        nominal_seen = False
+        cost = 0.0
+        cost_seen = False
+        billing_unknown = False
+        rows = self.runtime.controller.store.list_evidence(run_id)
+        wanted = set(refs)
+        for row in rows:
+            if row.get("evidence_id") not in wanted or row.get("event_type") != "learning_model_observation":
+                continue
+            source = row.get("source_ref")
+            if not isinstance(source, str):
+                continue
+            try:
+                source_data = json.loads(source)
+                payload = self.runtime.controller.store.get_artifact(source_data["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            duration = payload.get("wallSeconds", payload.get("durationSeconds", payload.get("inferenceDurationSeconds")))
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
+                wall += float(duration)
+                wall_seen = True
+            value = payload.get("nominalCostUsd")
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                nominal += float(value)
+                nominal_seen = True
+            value = payload.get("costMicrounits")
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                cost += float(value)
+                cost_seen = True
+            economic = payload.get("economicCost")
+            billing_unknown = billing_unknown or isinstance(economic, Mapping) and economic.get("status") == "unknown"
+        if isinstance(result, Mapping):
+            duration = result.get("wallSeconds")
+            if not wall_seen and isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
+                wall = float(duration)
+                wall_seen = True
+            value = result.get("nominalCostUsd")
+            if not nominal_seen and isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                nominal = float(value)
+                nominal_seen = True
+            value = result.get("costMicrounits")
+            if not cost_seen and isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                cost = float(value)
+                cost_seen = True
+        output: dict[str, Any] = {"wallSeconds": wall if wall_seen else 0.0}
+        if cost_seen and not billing_unknown:
+            output["costMicrounits"] = int(round(cost))
+        elif nominal_seen:
+            output["nominalCostUsd"] = nominal
+        return output
 
     def _candidate(self, context: Mapping[str, Any]) -> Any:
         candidate_hash = self._candidate_hash
@@ -659,6 +741,9 @@ class DefaultExperimentStageRunner:
         else:
             merged.pop("costMicrounits", None)
             merged["economicCostStatus"] = "unknown"
+        if receipt.get("billingStatus") == "unknown" or nested.get("billingStatus") == "unknown":
+            merged["billingStatus"] = "unknown"
+            merged["costBasis"] = "nominal_budget_proxy"
         merged["nestedRunIds"] = list(nested.get("runIds", []))
         merged["nestedEvidenceRefs"] = list(nested.get("modelObservationRefs", []))
         return merged
