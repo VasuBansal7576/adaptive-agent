@@ -7,6 +7,7 @@ candidates, frozen evaluation protocols, promotions, and the active-bundle linea
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -254,16 +255,16 @@ class Store:
         path = self.artifact_dir / f"{sha}.json"
         if not path.exists():
             raise KeyError(f"artifact {sha} not found")
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != sha:
+            raise ValueError(f"artifact {sha} failed content-hash verification")
+        return json.loads(raw.decode("utf-8"))
 
     def has_artifact(self, sha: str) -> bool:
         return (self.artifact_dir / f"{sha}.json").exists()
 
     def put_immutable_bytes(self, data: bytes) -> ArtifactRef:
         """Content-addressed immutable blob store (arbitrary bytes)."""
-        import hashlib
-
         sha = hashlib.sha256(data).hexdigest()
         path = self.artifact_dir / f"{sha}.bin"
         if not path.exists():
@@ -277,7 +278,10 @@ class Store:
         path = self.artifact_dir / f"{sha}.bin"
         if not path.exists():
             raise KeyError(f"blob {sha} not found")
-        return path.read_bytes()
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != sha:
+            raise ValueError(f"blob {sha} failed content-hash verification")
+        return data
 
     # ------------------------------------------------------------------ resumable task runs (benchmark seam)
     def claim_task_run(
