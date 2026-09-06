@@ -363,7 +363,7 @@ class DefaultExperimentStageRunner:
                 bool(outcome_meta.get("reliable", outcome_payload.get("reliable", True))),
                 int(outcome_meta.get("safetyViolations", outcome_payload.get("safetyViolations", 0)) or 0),
                 int(cost), float(duration),
-                status=str(run.get("status", "complete")),
+                status="complete" if run.get("status") == "succeeded" else str(run.get("status", "complete")),
                 fixture_reset_ok=bool(outcome_meta.get("fixtureResetOk", True)),
                 infrastructure_failure=outcome_meta.get("infrastructureFailure") if isinstance(outcome_meta.get("infrastructureFailure"), str) else None,
                 provenance=Provenance.DETERMINISTIC_SIMULATION,
