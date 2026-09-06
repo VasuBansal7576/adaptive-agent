@@ -23,12 +23,13 @@ No additional workers are spawned during this documentation task.
 
 ## Current root checkpoint
 
-As of 2026-09-06, the verified public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent), and the clean root-committed `main` checkpoint is `ccf3b3a`.
+As of 2026-09-07, the verified public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent), and the clean root-committed `main` checkpoint is `ec2cad7`.
 This checkpoint is public and verified; the prior backend and console checks remain historical evidence.
 
-The current checkpoint records 86 focused tests passed.
-A full raw Prime scripted production lifecycle passed in 224.41 seconds across 60 training, 360 validation, and 720 final runs, including restart and tamper checks.
-This is lifecycle evidence, not an achieved improvement claim.
+The current checkpoint records 55 combined tests passed in 72.87 seconds, with source bytes verified.
+This is integration evidence, not an achieved performance claim.
+
+Historical verification at `ccf3b3a` recorded 86 focused tests and a full raw Prime scripted production lifecycle passing in 224.41 seconds across 60 training, 360 validation, and 720 final runs, including restart and tamper checks.
 
 Earlier backend and console checks remain historical evidence, including 123 focused backend checks, 71 console tests, clean TypeScript and production-build checks, and a real local API browser pass at 375, 768, and 1440 pixel widths with no overflow or page errors.
 
@@ -42,17 +43,23 @@ An earlier real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC a
 It produced no learning result, validation result, final metrics, or measured improvement.
 M4 is not complete and must not be represented as passed.
 
-The AppWorld adapter is integrated at `ccf3b3a` with installed AppWorld `0.1.3.post1`.
-A real TRAIN run produced a strict receipt but exhausted its 20,000-token task budget.
-The full AppWorld CLI workload of 8 train tasks, 20 dev tasks times 3, and 20 test tasks times 3 remains under review.
+The AppWorld adapter and CLI are integrated with installed AppWorld `0.1.3.post1`.
+A separate actual AppWorld experiment remains RUNNING against frozen source `28baed7`.
+Its 8 train cells and 16 completed dev cells have all ended with observed model-budget failures; no final report or achieved improvement claim is available, and immutable jobs continue.
 
 Multi-run learning is integrated.
 On frozen source `15e1624`, actual training completed 60 tasks, with 48 successes and 12 budget failures.
 The learner selected a bounded set of 8 sources.
 Learner usage of 6,678 input and 582 output tokens produced an unpromoted candidate; receipt accounting then failed, and that failure was fixed generically.
 
-A fresh actual original full experiment has been RUNNING against frozen source `ccf3b3a` since 2026-09-06 17:57 UTC.
-No new held-out report is available, so M4 remains unproven.
+The original full experiment against frozen source `ccf3b3a` stopped at 2026-09-06 18:53 UTC.
+Its 60-task training stage completed with 50 successes and 10 model-budget failures, learning generated an unpromoted candidate, and 3 transfer, 3 adaptation, and 3 safety cells completed.
+Validation reached 116 completed cells and 1 infrastructure failure, then failed closed; no validation report or final 720-cell panel exists, so M4 remains unmet.
+
+A generic-error evaluation run did not produce trusted model and outcome evidence.
+The operator error was that the Prime CLI JSON stream did not contain a final assistant message.
+The upstream cause was not retained and is not known.
+The Prime JSON terminal-error parsing gap is being fixed separately for a future source revision; the zero-retry frozen run was not restarted or edited.
 
 The strict provider output-token cap remains an accepted but unmet criterion.
 The SDK nominal cost is a proxy, and economic billing is unknown.
