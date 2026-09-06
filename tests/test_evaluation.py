@@ -166,6 +166,12 @@ class EvaluationTests(unittest.TestCase):
     report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=[])
     self.assertEqual(report.safety_case_results, {"EVAL-004": True, "EVAL-005": False})
     self.assertFalse(report.safety_passed)
+    def incomplete_probe():
+        return True
+    registry.register_safety_probe("incomplete", incomplete_probe)
+    incomplete = registry.run_safety_probe_result("incomplete")
+    self.assertFalse(incomplete.passed)
+    self.assertIn("incomplete evidence", incomplete.obligations[0])
 
   def test_default_safety_probes_execute_fixture_attacks_and_are_attested(self):
     packages = build_environment_packages()
@@ -266,7 +272,7 @@ class EvaluationTests(unittest.TestCase):
         return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
     for index in range(3):
         report = runner.run_validation(base_hash="base", candidate_hash=f"candidate-{index}", execute=execute)
-        self.assertTrue(report.promotion_eligible)
+        self.assertFalse(report.promotion_eligible)
     with self.assertRaisesRegex(EvaluationError, "limit exhausted"):
         runner.run_validation(base_hash="base", candidate_hash="candidate-3", execute=execute)
     allocations = [set(task_id for env, task_id, arm in seen[index * 120:index * 120 + 120]) for index in range(3)]
@@ -286,6 +292,38 @@ class EvaluationTests(unittest.TestCase):
     with self.assertRaisesRegex(EvaluationError, "durably reserved"):
         runner.run_validation(base_hash="base", candidate_hash="candidate", execute=fail_before_result)
 
+  def test_failed_allocation_burns_panel_across_runner_restart(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    class DurableAllocations:
+        durable = True
+        def __init__(self):
+            self.next_index = {}
+            self.ids = set()
+        def reserve_next(self, scope_id, allocation_id, panels, limit):
+            if allocation_id in self.ids:
+                return None
+            index = self.next_index.get(scope_id, 0)
+            if index >= limit:
+                return None
+            self.next_index[scope_id] = index + 1
+            self.ids.add(allocation_id)
+            return index
+    allocations = DurableAllocations()
+    first = EvaluationRunner(protocol, packages, allocation_store=allocations)
+    def fail(arm, package, task, seed):
+        raise RuntimeError("executor interrupted")
+    with self.assertRaises(RuntimeError):
+        first.run_validation(base_hash="base", candidate_hash="candidate-0", execute=fail)
+    second = EvaluationRunner(protocol, packages, allocation_store=allocations)
+    seen = []
+    def execute(arm, package, task, seed):
+        seen.append(task.task_id)
+        return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0)
+    report = second.run_validation(base_hash="base", candidate_hash="candidate-1", execute=execute)
+    self.assertEqual(report.validity_status, "invalid")
+    self.assertTrue(any(task_id.endswith("-20") for task_id in seen))
   def test_promotion_requires_attested_registered_report_not_caller_gate_fields(self):
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
@@ -295,7 +333,7 @@ class EvaluationTests(unittest.TestCase):
     def execute(arm, package, task, seed):
         return RunObservation(task.task_id, package.environment_id, Partition.VALIDATION, seed, arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
     report = runner.run_validation(base_hash="base-v1", candidate_hash="candidate-v1", execute=execute)
-    self.assertTrue(report.promotion_eligible)
+    self.assertFalse(report.promotion_eligible)
     self.assertEqual(report.base_hash, "base-v1")
     forged = dataclasses.replace(report, validity_status="valid", safety_passed=True, candidate_hash="candidate-v2")
     with self.assertRaises(PromotionEvidenceRefused):
