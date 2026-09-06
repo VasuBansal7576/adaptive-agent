@@ -240,7 +240,7 @@ class EvaluationJob:
             raise EvaluationError("lifecycle limits must be non-negative integer totals")
         self._lifecycle_budget(job_id, bound_limits)
         state = dict(context or {})
-        binding = {"protocol": self.protocol.start_candidate_generation().to_dict(), "stages": [{"name": stage.name, "cells": list(stage.cells), "retries": stage.retries} for stage in stages]}
+        binding = {"protocol": self.protocol.start_candidate_generation().to_dict(), "context": dict(context or {}), "stages": [{"name": stage.name, "cells": list(stage.cells), "retries": stage.retries} for stage in stages]}
         encoded_binding = json.dumps(binding, sort_keys=True, default=str)
         with self.store.connect() as conn:
             existing_binding = conn.execute("SELECT binding_json FROM evaluation_lifecycle_bindings WHERE job_id = ?", (job_id,)).fetchone()
