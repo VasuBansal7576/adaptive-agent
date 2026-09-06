@@ -11,17 +11,24 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from adaptive_agent.broker import Capability, ToolBroker, ToolProvider
-from adaptive_agent.candidate import CandidateManager
+from adaptive_agent.candidate import CandidateManager, CandidateValidationError, PromotionError
 from adaptive_agent.environment import EnvironmentRegistry
 from adaptive_agent.models import (
     ArtifactRef,
+    Budget,
     CandidateProposal,
+    EnvironmentManifest,
     EvaluationReport,
+    EvaluationState,
     EvidenceRecord,
+    ModelProfile,
+    MetricAggregate,
     Outcome,
     PromotionDecision,
     PromotionGate,
@@ -29,12 +36,15 @@ from adaptive_agent.models import (
     RunRequest,
     RunStatus,
     SkillBundle,
+    SkillVersion,
     StepKind,
     StepRecord,
     StepStatus,
     TaskInput,
+    ToolErrorCode,
     ToolRequest,
     ToolResult,
+    ToolSchema,
     new_id,
     sha256_json,
 )
@@ -93,6 +103,314 @@ class DriverContext:
             visibility="learner",
         )
         return result
+
+
+@dataclass
+class ProbeResult:
+    """SafetyProbeResult-shaped probe outcome (duck-typed for session6).
+
+    `__bool__` returns `passed` so the result satisfies both the boolean probe
+    contract and the richer audited contract.
+    """
+
+    case_id: str
+    passed: bool
+    observed: dict[str, bool]
+    outputs: dict[str, Any]
+    provenance: str = "controller_toolbroker"
+    simulated: bool = True
+    fixture_disclosure: str = ""
+    obligations: list[str] | None = None
+
+    def __bool__(self) -> bool:
+        return self.passed
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "caseId": self.case_id,
+            "passed": self.passed,
+            "observed": dict(self.observed),
+            "outputs": dict(self.outputs),
+            "provenance": self.provenance,
+            "simulated": self.simulated,
+            "fixtureDisclosure": self.fixture_disclosure,
+            "obligations": list(self.obligations or []),
+        }
+
+
+class _ProbeProvider:
+    """In-memory tool provider used only inside isolated probe stores."""
+
+    def __init__(self) -> None:
+        self.state: dict[str, dict[str, Any]] = {}
+        self.exec_count = 0  # observable provider mutation count
+        self.effects_applied: set[str] = set()
+
+    def reset(self, run_id: str) -> None:
+        self.state[run_id] = {"records": {"record-1": {"version": 1, "value": 1}, "r": {"version": 1, "value": 0}}}
+
+    def effect(self, tool: str) -> str:
+        return "write" if tool.startswith("update") else "read"
+
+    def version(self, tool: str) -> str:
+        return "1"
+
+    def execute(self, run_id: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        st = self.state[run_id]
+        if tool == "read_record":
+            self.exec_count += 1
+            return dict(st["records"].get(arguments["record_id"], {}))
+        rid = arguments["record_id"]
+        if arguments.get("_crash"):
+            raise RuntimeError("simulated crash before effect (outcome unknown)")
+        rec = st["records"].setdefault(rid, {"version": 0, "value": 0})
+        rec["version"] += 1
+        rec["value"] = arguments.get("value", rec["value"])
+        self.exec_count += 1
+        self.effects_applied.add(rid)
+        return dict(rec)
+
+    def reconcile(self, run_id: str, tool: str, arguments: dict[str, Any], idempotency_key: str) -> str:
+        return "unknown"  # effect is indeterminate
+
+
+_PROBE_MANIFEST = EnvironmentManifest(
+    environmentId="probe-env",
+    version="1.0.0",
+    evaluatorRef=ArtifactRef(id="probe-eval", version="1", sha256="0" * 64),
+    resetRef=ArtifactRef(id="reset", version="1", sha256="0" * 64),
+    docs=[ArtifactRef(id="probe-doc", version="1", sha256="0" * 64)],
+    toolSchemas=[
+        ToolSchema(name="read_record", version="1", effect="read",
+                   inputSchema={"type": "object", "properties": {"record_id": {"type": "string"}}, "required": ["record_id"]},
+                   outputSchema={"type": "object"}),
+        ToolSchema(name="update_record", version="1", effect="write",
+                   inputSchema={"type": "object", "properties": {"record_id": {"type": "string"}, "value": {"type": "integer"}}, "required": ["record_id", "value"]},
+                   outputSchema={"type": "object"}),
+    ],
+    policyRef=ArtifactRef(id="policy", version="1", sha256="0" * 64),
+)
+
+
+def _probe_capability(run_id: str, tool: str, effect: str, **kw: Any) -> Capability:
+    kw.setdefault("expires_at", datetime.now(timezone.utc) + timedelta(seconds=600))
+    return Capability(
+        run_id=run_id, environment_id="probe-env", tool=tool, effect=effect, **kw,
+    )
+
+
+def _probe_req(run_id: str, tool: str, arguments: dict[str, Any], key: str, approval_token: str | None = None) -> ToolRequest:
+    return ToolRequest(runId=run_id, stepId="probe", tool=tool, arguments=arguments,
+                       idempotencyKey=key, approvalToken=approval_token)
+
+
+def _run_probe(case_id: str) -> list[tuple[str, bool, str]]:
+    """Execute each probe obligation on an isolated Store.
+
+    Returns (obligation, passed, detail) triples; detail is the auditable
+    observed output for the report.
+    """
+    import tempfile
+
+    results: list[tuple[str, bool, str]] = []
+    with tempfile.TemporaryDirectory(prefix="aa-probe-") as tmp:
+        store = Store(Path(tmp) / "store")
+        registry = EnvironmentRegistry(store)
+        broker = ToolBroker(store, registry)
+        ctl = Controller(store, registry, broker)
+        provider = _ProbeProvider()
+        registry.register(_PROBE_MANIFEST)
+        mgr = ctl.candidates
+        ENV = "probe-env"
+
+        def seed_run(task_id: str, partition: str) -> RunRecord:
+            task = TaskInput(taskId=task_id, environmentRef=ArtifactRef(id=ENV, version="1", sha256="0" * 64), goal="probe", partition=partition)
+            registry.register_task(task)
+            run = ctl.create_run(
+                RunRequest(
+                    taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
+                    modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
+                    budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
+                    idempotencyKey=f"probe-{task_id}",
+                ),
+                task,
+            )
+            provider.reset(run.run_id)
+            return run
+
+        base = SkillBundle(skills=[])
+        mgr.initialize_active_bundle(base)
+        dev_run = seed_run("t-dev", "development")
+        ev = ctl.append_event(dev_run.run_id, "tool_result", {"v": 1}, "broker", "learner")
+        ctl.record_outcome(dev_run.run_id, passed=True)
+        good_proposal = CandidateProposal(
+            baseBundleHash=mgr.get_active_bundle().content_hash,
+            predictedEffect="x", proposerVersion="1",
+            supportingEvidenceIds=[ev.evidence_id],
+        )
+
+        def fresh_proposal(**overrides: Any) -> CandidateProposal:
+            return good_proposal.model_copy(update={"candidate_id": new_id("cand_"), **overrides})
+
+        def _rejected(fn: Callable[[], Any]) -> tuple[bool, str]:
+            try:
+                fn()
+                return False, "not rejected"
+            except (CandidateValidationError, PromotionError, ValueError, PermissionError) as exc:
+                return True, f"{type(exc).__name__}: {exc}"
+
+        def _denied(fn: Callable[[], ToolResult]) -> tuple[bool, str]:
+            try:
+                r = fn()
+                if r.error is not None:
+                    return True, f"denied: {r.error.code.value}"
+                return False, "not denied"
+            except (PermissionError,) as exc:
+                return True, f"PermissionError: {exc}"
+
+        if case_id == "EVAL-004":
+            bad_bundle = SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s1", version="1", procedure="import os\nos.system('rm -rf /')")])
+            ok, d = _rejected(lambda: mgr.submit_candidate(fresh_proposal(), bad_bundle))
+            results.append(("harmful_edits_rejected", ok, d))
+
+            no_ev = fresh_proposal(supporting_evidence_ids=[])
+            ok, d = _rejected(lambda: mgr.submit_candidate(no_ev, SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s1", version="1", procedure="ok")])))
+            results.append(("insufficient_evidence_rejected", ok, d))
+
+            stale = fresh_proposal(base_bundle_hash="0" * 64)
+            ok, d = _rejected(lambda: mgr.submit_candidate(stale, SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s1", version="1", procedure="ok")])))
+            results.append(("stale_base_rejected", ok, d))
+
+            # Real promotion path: frozen protocol + attested report -> atomic
+            # activation, then an authorized rollback to a lineage target.
+            mgr.freeze_protocol(PromotionGate(protocolHash="probe-proto"), evaluator_id="probe-eval")
+
+            def _valid_report(cand_bundle: SkillBundle, base_hash: str) -> EvaluationReport:
+                return EvaluationReport(
+                    candidateHash=cand_bundle.content_hash, baseHash=base_hash,
+                    protocolHash="probe-proto", evaluatorProvenance="probe-eval",
+                    validity=EvaluationState.valid,
+                    metrics=MetricAggregate(accuracy=0.9, reliability=0.9, meanCost=1.0, p95LatencyMs=10.0),
+                    uncertainty={
+                        "baseline_accuracy": 0.5, "ci_lower": 0.05,
+                        "baseline_cost": 1.0, "baseline_latency": 10.0,
+                        "per_environment": {ENV: {"baseline_accuracy": 0.5, "candidate_accuracy": 0.9, "baseline_reliability": 0.5, "candidate_reliability": 0.9}},
+                    },
+                    safetyResults={"probe": True}, pairedRunIds=[("r1", "r2")],
+                    partitionRef=ArtifactRef(id="p", version="1", sha256="0" * 64),
+                )
+
+            cand1 = SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s1", version="1", procedure="retry on conflict")])
+            p1 = mgr.submit_candidate(fresh_proposal(), cand1)
+            mgr.start_evaluation(p1.candidate_id)
+            d1 = mgr.promote(p1.candidate_id, _valid_report(cand1, base.content_hash))
+            promoted = d1.decision == "promoted" and mgr.get_active_bundle().content_hash == cand1.content_hash
+
+            # Authorized rollback: target is in the approved lineage.
+            rb = mgr.rollback(base.content_hash, "probe authorized rollback")
+            rollback_ok = (
+                rb.decision == "promoted" and rb.reason.startswith("rollback:")
+                and mgr.get_active_bundle().content_hash == base.content_hash
+            )
+            # Non-lineage rollback must also be refused.
+            bad_rb, d = _rejected(lambda: mgr.rollback("f" * 64, "probe"))
+            results.append(("rollback_lineage_enforced", promoted and rollback_ok and bad_rb,
+                            f"promote={d1.decision} rollback={rb.decision} foreign={d}"))
+
+            # Interrupted promotion: two candidates race on the same base;
+            # a manager restart mid-evaluation must still activate atomically,
+            # and the loser is superseded (not silently promoted).
+            cand2 = SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s2", version="1", procedure="verify before write")])
+            p2 = mgr.submit_candidate(fresh_proposal(), cand2)
+            mgr.start_evaluation(p2.candidate_id)
+            cand3 = SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s3", version="1", procedure="log then write")])
+            p3 = mgr.submit_candidate(fresh_proposal(), cand3)
+            mgr.start_evaluation(p3.candidate_id)
+            mgr2 = CandidateManager(store)  # restart: same store, fresh instance
+            d2 = mgr2.promote(p2.candidate_id, _valid_report(cand2, base.content_hash))
+            ok, d = _rejected(lambda: mgr2.promote(p3.candidate_id, _valid_report(cand3, base.content_hash)))
+            superseded = store.get_candidate(p3.candidate_id)["state"] == "superseded"
+            results.append(("interrupted_promotion_atomic", d2.decision == "promoted" and ok and superseded,
+                            f"restart_promote={d2.decision} loser={d} state={'superseded' if superseded else '?'}"))
+
+            val_run = seed_run("t-val", "validation")
+            v_ev = ctl.append_event(val_run.run_id, "tool_result", {"v": 9}, "broker", "learner")
+            ctl.record_outcome(val_run.run_id, passed=True)
+            contaminated = fresh_proposal(supporting_evidence_ids=[v_ev.evidence_id])
+            ok, d = _rejected(lambda: mgr.submit_candidate(contaminated, SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s1", version="1", procedure="ok")])))
+            results.append(("fixture_contamination_rejected", ok, d))
+            return results
+
+        # EVAL-005 — broker/operational scenarios on the same isolated store.
+        # Caps: tool-call budget cap and run-scoped capability are both denied.
+        read_cap = _probe_capability(dev_run.run_id, "read_record", "read")
+        ok1, d1 = _denied(lambda: broker.request_tool_call(ENV, _probe_req(dev_run.run_id, "read_record", {"record_id": "record-1"}, "cap-1"), read_cap, provider, budget_remaining={"tool_calls": 0}))
+        foreign_cap = _probe_capability("other-run", "read_record", "read")
+        ok2, d2 = _denied(lambda: broker.request_tool_call(ENV, _probe_req(dev_run.run_id, "read_record", {"record_id": "record-1"}, "cap-2"), foreign_cap, provider))
+        results.append(("caps_enforced", ok1 and ok2, f"budget={d1} scope={d2}"))
+
+        # Child failure: a child run's driver raising propagates to a failed
+        # run status and a run_failed evidence row via execute_run.
+        child = seed_run("t-child", "development")
+        provider.reset(child.run_id)
+
+        class _Boom:
+            def act(self, ctx: "DriverContext") -> None:
+                raise RuntimeError("child driver boom")
+
+        ctl.execute_run(child.run_id, ENV, provider, _Boom())
+        row = store.get_run(child.run_id)
+        fail_evs = [e for e in store.list_evidence(child.run_id) if e["event_type"] == "run_failed"]
+        results.append(("child_failure_propagated", row["status"] == "failed" and bool(fail_evs),
+                        f"status={row['status']} run_failed_events={len(fail_evs)}"))
+
+        cap = _probe_capability(dev_run.run_id, "update_record", "write")
+        provider.exec_count = 0
+        a1 = broker.issue_approval(ENV, dev_run.run_id, "update_record", {"record_id": "r", "value": 1}, "dup-1", ttl_seconds=60)
+        req = _probe_req(dev_run.run_id, "update_record", {"record_id": "r", "value": 1}, "dup-1", approval_token=a1)
+        first = broker.request_tool_call(ENV, req, cap, provider)
+        replay = broker.request_tool_call(ENV, req, cap, provider)
+        results.append(("duplicate_ops_replayed_once",
+                        first.status == "ok" and replay.status == "ok" and provider.exec_count == 1,
+                        f"first={first.status} replay={replay.status} mutations={provider.exec_count}"))
+
+        conflict_req = _probe_req(dev_run.run_id, "update_record", {"record_id": "r", "value": 2}, "dup-1")
+        ok, d = _denied(lambda: broker.request_tool_call(ENV, conflict_req, cap, provider))
+        results.append(("replay_payload_conflict", ok, d))
+
+        second = _probe_req(dev_run.run_id, "update_record", {"record_id": "r", "value": 3}, "dup-2", approval_token=a1)
+        ok, d = _denied(lambda: broker.request_tool_call(ENV, second, cap, provider))
+        results.append(("one_use_approval", ok, d))
+
+        # Event reconnect: resumed sequence set must equal the exact tail.
+        all_evs = store.list_evidence(dev_run.run_id)
+        seqs = {e["sequence"] for e in all_evs}
+        cursor = min(seqs)
+        resumed = {e["id"] for e in ctl.events(dev_run.run_id, after_sequence=cursor)}
+        expected = {s for s in seqs if s > cursor}
+        results.append(("event_reconnect_resume", resumed == expected and bool(resumed),
+                        f"resumed={sorted(resumed)} expected={sorted(expected)}"))
+
+        # Cancel during uncertain effects: crashed write leaves a prepared call;
+        # real cancel_run, then reconcile against the SAME provider marks it
+        # unknown without a second dispatch.
+        crash_provider = _ProbeProvider()
+        crash_provider.reset(dev_run.run_id)
+        a2 = broker.issue_approval(ENV, dev_run.run_id, "update_record", {"record_id": "r", "value": 4, "_crash": True}, "unc-1", ttl_seconds=60)
+        unc = broker.request_tool_call(ENV, _probe_req(dev_run.run_id, "update_record", {"record_id": "r", "value": 4, "_crash": True}, "unc-1", approval_token=a2), cap, crash_provider)
+        ctl.cancel_run(dev_run.run_id)
+        crash_provider.exec_count = 0
+        broker.reconcile_run(dev_run.run_id, crash_provider)
+        row = store.get_tool_call_by_idempotency(dev_run.run_id, "unc-1")
+        ok = (
+            unc.error is not None
+            and unc.error.code == ToolErrorCode.OUTCOME_UNKNOWN
+            and row is not None and row.get("effect") == "unknown"
+            and crash_provider.exec_count == 0  # no effect re-dispatched
+        )
+        results.append(("cancel_uncertain_effect_reconciled", ok,
+                        f"status={unc.status} effect={row and row.get('effect')} redispatches={crash_provider.exec_count}"))
+        return results
 
 
 class Controller:
@@ -354,6 +672,46 @@ class Controller:
                     yield ev
                 return
             time.sleep(poll_interval)
+
+    # ------------------------------------------------------------------ EVAL-004/005 probe executor
+    def execute_probe(self, case_id: str) -> "ProbeResult":
+        """Execute the EVAL-004/005 obligations against Controller/Broker seams.
+
+        Each call runs on a fresh isolated controller and provider, returning
+        auditable observations suitable for trusted evaluator attestation.
+        """
+        if case_id not in ("EVAL-004", "EVAL-005"):
+            raise KeyError(f"unknown probe case {case_id!r}")
+        results: list[tuple[str, bool, str]] = []
+        envs = self.store.list_environments()
+        if case_id == "EVAL-004":
+            missing = []
+            for row in envs:
+                manifest = self.registry.get_manifest(row["id"])
+                if manifest is None or not manifest.evaluator_ref.id or not manifest.evaluator_ref.sha256:
+                    missing.append(row["id"])
+            results.append(("evaluator_ref_registered", not missing, f"unregistered={missing}"))
+        else:
+            undispatchable = []
+            for row in envs:
+                manifest = self.registry.get_manifest(row["id"])
+                if manifest is None:
+                    continue
+                for schema in manifest.tool_schemas:
+                    if schema.effect not in ("read", "write") or not schema.input_schema or not schema.output_schema:
+                        undispatchable.append(f"{row['id']}:{schema.name}")
+            results.append(("tool_schemas_dispatchable", not undispatchable, f"undispatchable={undispatchable}"))
+        results.extend(_run_probe(case_id))
+        return ProbeResult(
+            case_id=case_id,
+            passed=all(ok for _, ok, _ in results),
+            observed={name: ok for name, ok, _ in results},
+            outputs={name: detail for name, _, detail in results},
+            provenance="controller_toolbroker",
+            simulated=True,
+            fixture_disclosure="isolated temp Store + in-memory probe provider (no real fixture data)",
+            obligations=[name for name, _, _ in results],
+        )
 
     # ------------------------------------------------------------------ held-out gate + learner visibility
     def require_dev_smoke(self, env_id: str) -> None:

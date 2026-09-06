@@ -356,6 +356,11 @@ class Store:
     def get_environment(self, env_id: str) -> dict[str, Any] | None:
         return self._get_json("environments", "id", env_id)
 
+    def list_environments(self) -> list[dict[str, Any]]:
+        """List registered environment rows for controller diagnostics."""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM environments ORDER BY id").fetchall()]
+
     def register_task(self, task_id: str, environment_id: str, version: str, task_ref: str, partition: str, goal: str) -> None:
         with self._connect() as conn:
             conn.execute(

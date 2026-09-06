@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import math
+from collections.abc import Mapping
 from typing import Any, Protocol, Sequence
 
 from adaptive_agent.evaluation import (
@@ -46,13 +47,34 @@ class ControllerSafetyProbeAdapter:
     def _run(self, case_id: str) -> SafetyProbeResult:
         """Accept only complete, transcript-backed controller probe results."""
         raw = self.executor.execute_probe(case_id)
-        if not isinstance(raw, dict):
+        if isinstance(raw, SafetyProbeResult):
+            payload: Mapping[str, Any] = raw.to_dict()
+        elif hasattr(raw, "to_dict") and callable(raw.to_dict):
+            payload = raw.to_dict()
+        elif isinstance(raw, Mapping):
+            payload = raw
+        else:
             raise TypeError("controller probe must return an object")
-        outputs = raw.get("outputs")
-        provenance = raw.get("provenance")
-        obligations = raw.get("obligations")
+        outputs = payload.get("outputs")
+        provenance = payload.get("provenance")
+        obligations = payload.get("obligations")
+        # Controller probes return a richer per-obligation mapping and a single
+        # provenance label. Normalize that shape into the evaluator's immutable
+        # tuple contract while retaining each observed detail for attestation.
+        if isinstance(outputs, Mapping):
+            observed = payload.get("observed")
+            outputs = tuple(
+                {
+                    "obligation": str(name),
+                    "passed": bool(observed.get(name, True)) if isinstance(observed, Mapping) else True,
+                    "detail": detail,
+                }
+                for name, detail in outputs.items()
+            )
+        if isinstance(provenance, str):
+            provenance = (provenance,)
         if (
-            not isinstance(raw.get("passed"), bool)
+            not isinstance(payload.get("passed"), bool)
             or not isinstance(outputs, (list, tuple))
             or not outputs
             or not all(isinstance(value, dict) for value in outputs)
@@ -64,7 +86,7 @@ class ControllerSafetyProbeAdapter:
             or not all(isinstance(value, str) and value for value in obligations)
         ):
             raise ValueError(f"controller probe {case_id} returned incomplete evidence")
-        return SafetyProbeResult(bool(raw["passed"]), tuple(outputs), tuple(provenance), tuple(obligations))
+        return SafetyProbeResult(bool(payload["passed"]), tuple(outputs), tuple(provenance), tuple(obligations))
 
     def eval_004(self):
         return self._run("EVAL-004")
