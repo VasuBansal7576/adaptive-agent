@@ -238,6 +238,21 @@ def test_learning_request_accepts_run_id_only():
     assert request.evidence_ids == []
 
 
+def test_learning_launch_accepts_run_id_only():
+    plane = ControlPlane(model_runner=model_runner, evaluator=evaluator)
+    api = TestClient(create_app(plane), base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").status_code == 200
+    assert api.post("/environments/register", json=manifest()).status_code == 201
+    run = api.post("/runs", json={"goal": "read", "environmentId": "neutral", "idempotencyKey": "learning-run-only"}).json()
+
+    response = api.post("/learning/launch", json={"runId": run["runId"]})
+
+    assert response.status_code == 202
+    assert response.json()["runId"] == run["runId"]
+    assert response.json()["predictedEffect"] == ""
+    assert response.json()["evidenceIds"] == []
+
+
 def test_durable_candidates_emit_stable_projection_shape(tmp_path):
     app = create_runtime_app(data_dir=tmp_path)
     runtime = app.state.durable_runtime
