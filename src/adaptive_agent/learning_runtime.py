@@ -179,6 +179,7 @@ class LearningRuntime:
             environment_id=environment_id,
             run_id=run_id,
             task_id=run_row["task_id"] if isinstance(run_row, Mapping) else "",
+            outcome_passed=outcome_passed,
         )
         for record_id, record in projected:
             persist(record_id, record)

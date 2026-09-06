@@ -24,7 +24,7 @@ def test_projection_joins_call_and_redacts_hidden_values(tmp_path: Path):
     store.prepare_tool_call({"call_id": call_id, "run_id": RUN, "step_id": "step-1", "environment_id": ENVIRONMENT, "tool": "read", "arguments_json": json.dumps({"invoice_id": "INV-DEV-000", "apiKey": "sk-secret"}), "idempotency_key": "projection-1"})
     result = _broker_event(store, evidence_id="ev-projection", call_id=call_id)
     store.save_tool_result(call_id, json.dumps(result, sort_keys=True, separators=(",", ":")), "none")
-    records = DurableBrokerLearningProjection(store).project(environment_id=ENVIRONMENT, run_id=RUN, task_id="task-durable")
+    records = DurableBrokerLearningProjection(store).project(environment_id=ENVIRONMENT, run_id=RUN, task_id="task-durable", outcome_passed=True)
     assert len(records) == 1
     record = records[0][1]
     assert '"tool":"read"' in record["content"]
@@ -46,5 +46,22 @@ def test_projection_drops_call_from_other_run(tmp_path: Path):
     call_id = "call-wrong-run"
     store.prepare_tool_call({"call_id": call_id, "run_id": "other-run", "step_id": "step-1", "environment_id": ENVIRONMENT, "tool": "read", "arguments_json": json.dumps({"invoice_id": "INV-DEV-000"}), "idempotency_key": "projection-wrong"})
     _broker_event(store, evidence_id="ev-wrong-run", call_id=call_id)
-    assert DurableBrokerLearningProjection(store).project(environment_id=ENVIRONMENT, run_id=RUN, task_id="task-durable") == []
+    assert DurableBrokerLearningProjection(store).project(environment_id=ENVIRONMENT, run_id=RUN, task_id="task-durable", outcome_passed=False) == []
     assert store.get_evidence("broker:ev-wrong-run") is None
+
+
+def test_projection_excludes_evaluator_visibility_and_tampered_source(tmp_path: Path):
+    store, _, _ = _setup_store(tmp_path)
+    call_id = "call-hidden"
+    store.prepare_tool_call({"call_id": call_id, "run_id": RUN, "step_id": "step-1", "environment_id": ENVIRONMENT, "tool": "read", "arguments_json": json.dumps({"invoice_id": "INV-DEV-000"}), "idempotency_key": "projection-hidden"})
+    payload = _broker_event(store, evidence_id="ev-hidden", call_id=call_id)
+    hidden = store.get_evidence("ev-hidden")
+    hidden.pop("evidence_id", None)
+    hidden["visibility"] = "evaluator_only"
+    store.append_evidence("ev-hidden", hidden)
+    assert DurableBrokerLearningProjection(store).project(environment_id=ENVIRONMENT, run_id=RUN, task_id="task-durable", outcome_passed=False) == []
+
+    tampered = store.put_artifact(payload)
+    tampered_event = {"run_id": RUN, "sequence": 9, "event_type": "tool_result", "content_hash": "0" * 64, "source_ref": tampered.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0}
+    store.append_evidence("ev-tampered", tampered_event)
+    assert DurableBrokerLearningProjection(store).project(environment_id=ENVIRONMENT, run_id=RUN, task_id="task-durable", outcome_passed=False) == []

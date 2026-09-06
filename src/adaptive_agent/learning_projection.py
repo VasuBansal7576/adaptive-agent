@@ -88,7 +88,7 @@ class DurableBrokerLearningProjection:
             "trust_class": "broker", "visibility": "learner", "redacted": 1,
         })
 
-    def project(self, *, environment_id: str, run_id: str, task_id: str) -> list[tuple[str, Mapping[str, Any]]]:
+    def project(self, *, environment_id: str, run_id: str, task_id: str, outcome_passed: bool) -> list[tuple[str, Mapping[str, Any]]]:
         run = self.store.get_run(run_id)
         task = self.store.get_task(task_id)
         if not isinstance(run, Mapping) or run.get("environment_id") != environment_id or run.get("task_id") != task_id:
@@ -98,13 +98,18 @@ class DurableBrokerLearningProjection:
         schemas = self._tool_schemas(environment_id)
         records: list[tuple[str, Mapping[str, Any]]] = []
         for event in self.store.list_evidence(run_id):
-            if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker":
+            if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker" or event.get("visibility") not in {"learner", "operator"}:
                 continue
             source_ref = event.get("source_ref")
             if not isinstance(source_ref, str):
                 continue
             ref = json.loads(source_ref)
-            payload = self.store.get_artifact(ref["sha256"])
+            try:
+                payload = self.store.get_artifact(ref["sha256"])
+            except (KeyError, ValueError):
+                continue
+            if not isinstance(ref.get("sha256"), str) or hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest() != ref["sha256"] or event.get("content_hash") != ref["sha256"]:
+                continue
             if not isinstance(payload, Mapping) or not isinstance(payload.get("callId"), str):
                 continue
             call = self._tool_call(payload["callId"])
@@ -139,7 +144,7 @@ class DurableBrokerLearningProjection:
                 "contentHash": content_hash(content), "sourceContentHash": event.get("content_hash"),
                 "sourceEvidenceId": event["evidence_id"], "sourceCallId": payload["callId"],
                 "environmentId": environment_id, "runId": run_id, "taskId": task_id,
-                "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": True,
+                "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": True, "outcomePassed": outcome_passed,
             }
             self._persist_derived_evidence(evidence_id=record["sourceId"], run_id=run_id, content=content)
             records.append((f"learning-broker-{event['evidence_id']}", record))
