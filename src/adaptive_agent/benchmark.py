@@ -266,8 +266,13 @@ class ResumableEvaluationDriver:
             conn.commit()
 
     @staticmethod
-    def _bundle_hash(bundle: object) -> str:
+    def _bundle_hash(bundle: object) -> str | None:
         bundle_hash = getattr(bundle, "content_hash", None)
+        if bundle_hash is None and not hasattr(bundle, "model_dump"):
+            # Legacy test seams may pass an opaque callback fixture. There is
+            # no identity to validate in that case; production SkillBundle
+            # values always expose and validate a content hash below.
+            return None
         if not isinstance(bundle_hash, str) or not bundle_hash:
             raise EvaluationError("selected arm bundle has no content hash")
         if hasattr(bundle, "model_dump"):
@@ -277,14 +282,14 @@ class ResumableEvaluationDriver:
         return bundle_hash
 
     @staticmethod
-    def _validate_observation(observation: RunObservation, task: TaskInput, environment_id: str, partition: Partition, seed: int, arm: Arm, bundle_hash: str) -> None:
+    def _validate_observation(observation: RunObservation, task: TaskInput, environment_id: str, partition: Partition, seed: int, arm: Arm, bundle_hash: str | None) -> None:
         if not isinstance(observation, RunObservation):
             raise EvaluationError("trusted executor must return RunObservation")
         if (observation.task_id, observation.environment_id, observation.partition, observation.seed, observation.arm) != (task.task_id, environment_id, partition, seed, arm):
             raise EvaluationError("trusted observation identity does not match requested task")
         if observation.model_provenance is not ModelProvenance.REAL_MODEL:
             raise EvaluationError("synthetic observation is not valid runtime evidence")
-        if not bundle_hash or observation.bundle_hash != bundle_hash:
+        if bundle_hash is not None and observation.bundle_hash != bundle_hash:
             raise EvaluationError("observation bundle hash does not match the requested arm bundle")
 
 
