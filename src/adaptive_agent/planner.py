@@ -175,6 +175,43 @@ def _message_text(message: Mapping[str, Any]) -> str:
     )
 
 
+def _parse_message_end_event(event: Mapping[str, Any], *, max_output_chars: int) -> Mapping[str, Any] | None:
+    """Parse one assistant terminal event without treating provider errors as text."""
+    if event.get("type") != "message_end":
+        return None
+    message = event.get("message")
+    if not isinstance(message, Mapping) or message.get("role") != "assistant":
+        return None
+
+    stop_reason = message.get("stopReason", message.get("stop_reason"))
+    if stop_reason is None:
+        stop_reason = event.get("stopReason", event.get("stop_reason"))
+    if isinstance(stop_reason, str) and stop_reason.casefold() in {"error", "aborted"}:
+        details = {
+            "stopReason": stop_reason,
+            "errorMessage": message.get("errorMessage", message.get("error_message", event.get("errorMessage"))),
+            "error": message.get("error", event.get("error")),
+            "responseId": message.get("responseId", message.get("response_id")),
+        }
+        detail = _bounded_text(_redact(details), min(max_output_chars, 4_096))
+        raise PlannerError(f"Prime CLI assistant terminated with stopReason={stop_reason}: {detail}")
+
+    text = _message_text(message)
+    if not text:
+        return None
+    provider, model = _canonical_model(message.get("provider"), message.get("model"))
+    response_id = message.get("responseId", message.get("response_id"))
+    if not isinstance(response_id, str) or not response_id.strip():
+        return None
+    return {
+        "provider": provider,
+        "model": model,
+        "responseId": _bounded_text(response_id, 512),
+        "text": _bounded_text(text, max_output_chars),
+        "usage": dict(_bounded_usage(message.get("usage"))),
+    }
+
+
 class PrimeCliModelClient:
     """Invoke the authenticated Prime CLI through a bounded one-shot process.
 
@@ -285,25 +322,10 @@ class PrimeCliModelClient:
                 event = json.loads(line.decode("utf-8", errors="replace"))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return
-            if not isinstance(event, Mapping) or event.get("type") != "message_end":
-                return
-            message = event.get("message")
-            if not isinstance(message, Mapping) or message.get("role") != "assistant":
-                return
-            text = _message_text(message)
-            if not text:
-                return
-            provider, model = _canonical_model(message.get("provider"), message.get("model"))
-            response_id = message.get("responseId", message.get("response_id"))
-            if not isinstance(response_id, str) or not response_id.strip():
-                return
-            final = {
-                "provider": provider,
-                "model": model,
-                "responseId": _bounded_text(response_id, 512),
-                "text": _bounded_text(text, self.max_output_chars),
-                "usage": dict(_bounded_usage(message.get("usage"))),
-            }
+            if isinstance(event, Mapping):
+                parsed = _parse_message_end_event(event, max_output_chars=self.max_output_chars)
+                if parsed is not None:
+                    final = parsed
 
         def stop_process() -> None:
             if process.poll() is None:
@@ -370,11 +392,19 @@ class PrimeCliModelClient:
         except (PlannerCancelled, PlannerTimedOut):
             stop_process()
             raise
+        except PlannerError:
+            stop_process()
+            raise
         if process.returncode != 0:
-            detail = bytes(stderr_tail).decode("utf-8", errors="replace").strip()[-2_000:]
+            detail = _bounded_text(
+                _redact(bytes(stderr_tail).decode("utf-8", errors="replace").strip()),
+                2_000,
+            )
             raise PlannerError(f"Prime CLI exited with status {process.returncode}: {detail}")
         if final is None:
-            raise PlannerError("Prime CLI JSON stream did not contain a final assistant message")
+            detail = _bounded_text(_redact(bytes(stderr_tail).decode("utf-8", errors="replace").strip()), 2_000)
+            suffix = f"; stderr: {detail}" if detail else ""
+            raise PlannerError(f"Prime CLI JSON stream did not contain a final assistant message{suffix}")
         return final
 
     @staticmethod
@@ -385,15 +415,10 @@ class PrimeCliModelClient:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(event, Mapping) or event.get("type") != "message_end":
-                continue
-            message = event.get("message")
-            if not isinstance(message, Mapping) or message.get("role") != "assistant":
-                continue
-            text = _message_text(message)
-            if text:
-                provider, model = _canonical_model(message.get("provider"), message.get("model"))
-                final = {"provider": provider, "model": model, "responseId": message.get("responseId"), "text": text, "usage": message.get("usage")}
+            if isinstance(event, Mapping):
+                parsed = _parse_message_end_event(event, max_output_chars=65_536)
+                if parsed is not None:
+                    final = parsed
         if final is None:
             raise PlannerError("Prime CLI JSON stream did not contain a final assistant message")
         return final
