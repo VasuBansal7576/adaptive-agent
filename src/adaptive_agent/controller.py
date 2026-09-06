@@ -241,7 +241,7 @@ def _run_probe(case_id: str) -> list[tuple[str, bool, str]]:
         base = SkillBundle(skills=[])
         mgr.initialize_active_bundle(base)
         dev_run = seed_run("t-dev", "development")
-        ev = ctl.append_event(dev_run.run_id, "tool_result", {"v": 1}, "broker", "learner")
+        ev = ctl.append_broker_result(dev_run.run_id, {"v": 1}, development=True)
         ctl.record_outcome(dev_run.run_id, passed=True)
         good_proposal = CandidateProposal(
             baseBundleHash=mgr.get_active_bundle().content_hash,
@@ -334,7 +334,7 @@ def _run_probe(case_id: str) -> list[tuple[str, bool, str]]:
                             f"restart_promote={d2.decision} loser={d} state={'superseded' if superseded else '?'}"))
 
             val_run = seed_run("t-val", "validation")
-            v_ev = ctl.append_event(val_run.run_id, "tool_result", {"v": 9}, "broker", "learner")
+            v_ev = ctl.append_broker_result(val_run.run_id, {"v": 9}, development=True)
             ctl.record_outcome(val_run.run_id, passed=True)
             contaminated = fresh_proposal(supporting_evidence_ids=[v_ev.evidence_id])
             ok, d = _rejected(lambda: mgr.submit_candidate(contaminated, SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s1", version="1", procedure="ok")])))
