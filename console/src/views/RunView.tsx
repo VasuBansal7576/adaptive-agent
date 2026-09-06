@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ConsoleTransport, CreateRunInput } from "../api/transport";
-import { EXECUTION_MODES, newIdempotencyKey } from "../api/transport";
+import { newIdempotencyKey } from "../api/transport";
 import { describeToolError } from "../api/errors";
 import type { ApprovalRequest, EnvironmentPackageSummary, RunEvent, RunRecord } from "../api/types";
 import type { ConnectionState } from "../state/consoleStore";
@@ -40,7 +40,7 @@ export function RunView({
   environments: EnvironmentPackageSummary[];
   onSelectRun: (runId: string) => void;
   onCancel: (run: RunRecord) => void;
-  onCreateRun: (input: CreateRunInput) => void;
+  onCreateRun: (input: CreateRunInput) => Promise<boolean>;
   onActionError: (message: string, correlationId?: string | null) => void;
 }) {
   const selected = runs.find((r) => r.runId === selectedRunId) ?? null;
@@ -80,11 +80,7 @@ export function RunView({
           open={newRunOpen}
           onClose={() => setNewRunOpen(false)}
           environments={environments}
-          transport={transport}
-          onCreateRun={(input) => {
-            setNewRunOpen(false);
-            onCreateRun(input);
-          }}
+          onCreateRun={onCreateRun}
         />
       </div>
     );
@@ -240,11 +236,7 @@ export function RunView({
         open={newRunOpen}
         onClose={() => setNewRunOpen(false)}
         environments={environments}
-        transport={transport}
-        onCreateRun={(input) => {
-          setNewRunOpen(false);
-          onCreateRun(input);
-        }}
+        onCreateRun={onCreateRun}
       />
 
       <ApprovalDialog
@@ -291,24 +283,23 @@ function BudgetBar({ label, used, ceiling, unit }: { label: string; used: number
   );
 }
 
-/** Model profiles offered by the control plane; Luna via subscription is the
- *  verified provider path. Default is preselected so one click starts a run. */
+/** Model profiles offered by the control plane. The id is the AUTHORITATIVE
+ *  trusted-plane model reference ("model-profile"); the Luna label reflects
+ *  the configured planner (openai-codex/gpt-5.6-luna via subscription). */
 export const MODEL_PROFILES = [
-  { id: "openai-codex/gpt-5.6-luna", label: "GPT-5.6 Luna (subscription)" },
+  { id: "model-profile", label: "GPT-5.6 Luna (subscription)" },
 ];
 
 function NewRunDialog({
   open,
   onClose,
   environments,
-  transport,
   onCreateRun,
 }: {
   open: boolean;
   onClose: () => void;
   environments: EnvironmentPackageSummary[];
-  transport: ConsoleTransport;
-  onCreateRun: (input: CreateRunInput) => void;
+  onCreateRun: (input: CreateRunInput) => Promise<boolean>;
 }) {
   const [goal, setGoal] = useState("");
   const [environmentId, setEnvironmentId] = useState("");
@@ -318,7 +309,21 @@ function NewRunDialog({
   const [wallSecondsCeiling, setWallSecondsCeiling] = useState("900");
   const [modelTokenCeiling, setModelTokenCeiling] = useState("20000");
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  // one idempotency key per dialog session: reused across recovery retries so a
+  // transient failure can never produce a duplicate run
+  const [idempotencyKey, setIdempotencyKey] = useState(() => newIdempotencyKey());
+  const [submitNotice, setSubmitNotice] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const goalRef = useRef<HTMLTextAreaElement>(null);
+
+  const selectedEnv = environments.find((e) => e.environmentId === environmentId);
+  // only modes the selected environment's manifest declares; when the summary
+  // does not project modes, all four remain selectable
+  const supportedModes = (
+    selectedEnv?.executionModes ?? ["dry_run", "interactive", "batch", "replay"]
+  ).filter((m): m is CreateRunInput["executionMode"] =>
+    ["dry_run", "interactive", "batch", "replay"].includes(m),
+  );
 
   useEffect(() => {
     if (open) {
@@ -328,6 +333,14 @@ function NewRunDialog({
       return () => clearTimeout(t);
     }
   }, [open, environments]);
+
+  // keep the chosen mode within the environment's declared modes
+  useEffect(() => {
+    if (supportedModes.length > 0 && !supportedModes.includes(executionMode)) {
+      setExecutionMode(supportedModes.includes("interactive") ? "interactive" : supportedModes[0]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [environmentId]);
 
   const validate = (): boolean => {
     const errors: Record<string, string> = {};
@@ -344,14 +357,17 @@ function NewRunDialog({
     return Object.keys(errors).length === 0;
   };
 
-  const submit = (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!validate()) return;
-    onCreateRun({
+    setSubmitting(true);
+    setSubmitNotice(null);
+    const ok = await onCreateRun({
       environmentId,
       goal: goal.trim(),
       modelProfile: modelProfile.trim(),
-      idempotencyKey: newIdempotencyKey(),
+      // same key across recovery retries within this dialog session
+      idempotencyKey,
       budget: {
         toolCallCeiling: Number(toolCallCeiling),
         wallSecondsCeiling: Number(wallSecondsCeiling),
@@ -359,10 +375,21 @@ function NewRunDialog({
       },
       executionMode,
     });
-    setGoal("");
-    setModelProfile("");
-    setModelTokenCeiling("");
-    setFieldErrors({});
+    setSubmitting(false);
+    if (ok) {
+      // success: fresh key for the next dialog session
+      setGoal("");
+      setModelTokenCeiling("20000");
+      setFieldErrors({});
+      setSubmitNotice(null);
+      setIdempotencyKey(newIdempotencyKey());
+      onClose();
+    } else {
+      // transient failure: every choice is preserved; the same key is reused
+      setSubmitNotice(
+        "Run creation did not complete. Your goal, environment, and budget choices are preserved. The API may have accepted the run; retrying reuses the same idempotency key and cannot create a duplicate.",
+      );
+    }
   };
 
   return (
@@ -443,11 +470,19 @@ function NewRunDialog({
             onChange={(e) => setExecutionMode(e.target.value as CreateRunInput["executionMode"])}
             className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
           >
-            {EXECUTION_MODES.map((mode) => (
-              <option key={mode.value} value={mode.value}>{mode.value}</option>
+            {supportedModes.map((mode) => (
+              <option key={mode} value={mode}>{mode}</option>
             ))}
           </select>
+          {selectedEnv?.executionModes && (
+            <p className="mt-1 text-[11px] text-slate-500">
+              Modes declared by {selectedEnv.environmentId}: {selectedEnv.executionModes.join(", ")}
+            </p>
+          )}
         </div>
+        {submitNotice && (
+          <Banner tone="warn" title={submitNotice} />
+        )}
         <div className="flex justify-end gap-2 pt-1">
           <button
             type="button"
@@ -458,9 +493,10 @@ function NewRunDialog({
           </button>
           <button
             type="submit"
-            className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500"
+            disabled={submitting}
+            className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-60"
           >
-            Create run
+            {submitting ? "Creating…" : "Create run"}
           </button>
         </div>
       </form>

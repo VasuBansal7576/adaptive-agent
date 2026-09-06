@@ -124,6 +124,9 @@ export function parseRun(value: unknown, field: string): RunRecord {
   }
   if (o.environmentId !== undefined) run.environmentId = optStr(o.environmentId, `${field}.environmentId`);
   if (o.goal !== undefined) run.goal = optStr(o.goal, `${field}.goal`);
+  if (o.executionModes !== undefined) {
+    run.executionModes = arr(o.executionModes, `${field}.executionModes`).map((m) => str(m, `${field}.executionModes[]`));
+  }
   if (o.budgetUsed !== undefined) {
     const b = obj(o.budgetUsed, `${field}.budgetUsed`);
     run.budgetUsed = {

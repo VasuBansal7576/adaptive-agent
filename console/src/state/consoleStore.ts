@@ -8,7 +8,7 @@ export type ConsoleState = {
   loading: boolean;
   loadError: string | null;
   /** last failed operator action, surfaced until dismissed or retried */
-  actionError: { message: string; correlationId: string | null } | null;
+  actionError: { message: string; correlationId: string | null; mayHaveCommitted?: boolean } | null;
   environments: EnvironmentPackageSummary[];
   runs: RunRecord[];
   skills: SkillVersionSummary[];
@@ -48,7 +48,7 @@ export type ConsoleAction =
   | { type: "runAdded"; run: RunRecord }
   | { type: "environmentAdded"; environment: EnvironmentPackageSummary }
   | { type: "candidateAdded"; candidate: CandidateDiff }
-  | { type: "actionError"; message: string; correlationId?: string | null }
+  | { type: "actionError"; message: string; correlationId?: string | null; mayHaveCommitted?: boolean }
   | { type: "actionErrorCleared" };
 
 /**
@@ -109,7 +109,10 @@ export function reducer(state: ConsoleState, action: ConsoleAction): ConsoleStat
     case "transport":
       return resetForMode(action.mode);
     case "loadStart":
-      return { ...state, loading: true, loadError: null, actionError: null };
+      // keep actionError visible across background refreshes; it is dismissed
+      // explicitly. A refresh with existing data stays silent so open dialogs
+      // and their state are never torn down mid-flow.
+      return { ...state, loading: state.runs.length === 0, loadError: null };
     case "loadOk": {
       // the selected run must exist in the CURRENT mode's runs; never carry a
       // stale selection (and its events) across a mode boundary
@@ -125,6 +128,9 @@ export function reducer(state: ConsoleState, action: ConsoleAction): ConsoleStat
         skills: action.skills,
         candidates: action.candidates,
         selectedRunId: selection,
+        // with no runs to stream, the transport itself is what the badge reports:
+        // successful load means connected, never an indefinite Connecting state
+        connection: action.runs.length === 0 ? "live" : state.connection,
       };
     }
     case "loadError":
@@ -160,7 +166,14 @@ export function reducer(state: ConsoleState, action: ConsoleAction): ConsoleStat
         actionError: null,
       };
     case "actionError":
-      return { ...state, actionError: { message: action.message, correlationId: action.correlationId ?? null } };
+      return {
+        ...state,
+        actionError: {
+          message: action.message,
+          correlationId: action.correlationId ?? null,
+          mayHaveCommitted: action.mayHaveCommitted ?? false,
+        },
+      };
     case "actionErrorCleared":
       return { ...state, actionError: null };
     default:

@@ -11,7 +11,7 @@ const RUN = {
   taskRef: { id: "task", version: "1", sha256: "h" },
   environmentRef: { id: "env", version: "1", sha256: "h" },
   policyRef: { id: "p", version: "1", sha256: "h" },
-  modelProfileRef: { id: "openai-codex/gpt-5.6-luna", version: "1", sha256: "h" },
+  modelProfileRef: { id: "model-profile", version: "1", sha256: "h" },
   skillBundleRef: { id: "b", version: "1", sha256: "h" },
   budgetRef: { id: "budget-x", version: "1", sha256: "h" },
   status: "queued",
@@ -62,9 +62,12 @@ describe("live wire contract", () => {
         if (u.endsWith("/runs") && init?.method === "POST") {
           created = true;
           const body = JSON.parse(String(init.body));
-          expect(body.modelProfileRef).toEqual({ id: "openai-codex/gpt-5.6-luna", version: "1" });
+          expect(body.modelProfileRef).toBeTypeOf("object");
+          expect(body.modelProfileRef.id).toBe("model-profile");
+          expect(body.modelProfileRef.sha256).toMatch(/^[0-9a-f]{64}$/); // authoritative ref: hashed, never bare
           expect(body.budgetRef).toBeTypeOf("object");
           expect(body.budgetRef.id).toMatch(/^budget-/);
+          expect(body.budgetRef.sha256).toMatch(/^[0-9a-f]{64}$/);
           expect(typeof body.idempotencyKey).toBe("string");
           return new Response(JSON.stringify(RUN), { status: 201 });
         }
@@ -79,7 +82,7 @@ describe("live wire contract", () => {
     await transport.createRun({
       environmentId: "env",
       goal: "wire contract",
-      modelProfile: "openai-codex/gpt-5.6-luna",
+      modelProfile: "model-profile",
       idempotencyKey: newIdempotencyKey(),
       budget: { toolCallCeiling: 100, wallSecondsCeiling: 900, modelTokenCeiling: 20000 },
       executionMode: "interactive",

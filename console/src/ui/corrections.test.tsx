@@ -33,9 +33,12 @@ describe("ghost-data regression: mode switch clears prior-mode state", () => {
     await screen.findAllByRole("button", { name: /run-sim-1001/ });
     await user.click(screen.getByRole("button", { name: "Switch to live control API" }));
     // live API is unreachable in this test: friendly disconnected state, no ghost runs
-    expect(await screen.findByText(/Console not connected/)).toBeInTheDocument();
+    expect(await screen.findByText(/Console cannot refresh data/)).toBeInTheDocument();
     expect(await screen.findByText(/API unavailable/)).toBeInTheDocument();
     expect(await screen.findByText("Disconnected")).toBeInTheDocument();
+    // the display failure does not falsely claim the API changed nothing
+    expect(screen.queryByText(/nothing was changed/)).not.toBeInTheDocument();
+    expect(await screen.findByText(/already accepted by the API/)).toBeInTheDocument();
     expect(screen.queryAllByText(/run-sim-/)).toHaveLength(0);
     expect(screen.queryByText(/SIMULATED — development fixture/)).not.toBeInTheDocument();
   });
@@ -76,7 +79,7 @@ describe("createRun, learning cycle, and registration", () => {
     await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
     const dialog = await screen.findByRole("dialog", { name: "Create run" });
     // Luna profile preselected; token budget prefilled nonzero
-    expect(within(dialog).getByLabelText("Model")).toHaveValue("openai-codex/gpt-5.6-luna");
+    expect(within(dialog).getByLabelText("Model")).toHaveValue("model-profile");
     expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000);
     // goal is focused for immediate typing
     await waitFor(() => expect(within(dialog).getByLabelText("Goal")).toHaveFocus());
