@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 from .learning import LearningProposal, LearningService, PlannerLearningAdapter
 from .learning_store import CandidateManagerLearningAdapter, DurableLearningSourceAdapter, LearningStoreError
 from .learning_projection import DurableBrokerLearningProjection, LearningProjectionError
+from .models import canonical_usage
 from .retrieval import AccessFilteredRetriever, InMemorySourceProvider, canonical_json, content_hash
 
 
@@ -71,7 +72,14 @@ class StoreModelObservationSink:
             raise LearningRuntimeError("model observations require trusted parent provenance")
         if not isinstance(evidence.get("responseId"), str) or not isinstance(evidence.get("usage"), Mapping):
             raise LearningRuntimeError("model observation provenance is incomplete")
-        usage = dict(evidence["usage"])
+        raw_usage = evidence["usage"]
+        try:
+            # Prime reports short-form input/output fields.  Keep the raw
+            # provider fields, including cost and cache metadata, while
+            # adding the canonical fields consumed by durable receipts.
+            usage = {**dict(raw_usage), **canonical_usage(raw_usage)}
+        except ValueError as exc:
+            raise LearningRuntimeError(str(exc)) from exc
         duration = evidence.get("durationSeconds")
         if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(float(duration)) or duration < 0:
             raise LearningRuntimeError("model observation duration is malformed")
