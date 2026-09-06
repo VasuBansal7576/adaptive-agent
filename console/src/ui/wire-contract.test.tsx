@@ -65,7 +65,8 @@ describe("live wire contract", () => {
           // modelProfileRef comes from the /run-options projection verbatim;
           // budget is the operator's validated object; no browser-computed hashes
           expect(body.modelProfileRef).toEqual({ id: "model-profile", version: "1", sha256: "server-provided" });
-          expect(body.budgetRef).toBeUndefined();
+          // server-advertised trusted budget ref submitted verbatim (2b3fc75)
+          expect(body.budgetRef).toEqual({ id: "budget-default", version: "1", sha256: "server-provided" });
           expect(body.budget).toEqual({
             modelTokens: 7777,
             toolCalls: 32,
@@ -90,6 +91,7 @@ describe("live wire contract", () => {
       goal: "wire contract",
       modelProfile: "Luna",
       modelProfileRef: { id: "model-profile", version: "1", sha256: "server-provided" },
+      budgetRef: { id: "budget-default", version: "1", sha256: "server-provided" },
       idempotencyKey: newIdempotencyKey(),
       budget: { toolCallCeiling: 32, wallSecondsCeiling: 90, modelTokenCeiling: 7777 },
       executionMode: "interactive",

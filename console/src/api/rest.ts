@@ -287,9 +287,13 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       }
       const taskRef: Record<string, unknown> = { goal: input.goal, environmentId: input.environmentId };
       if (input.taskId) taskRef.id = input.taskId;
-      const body = {
+      const body: Record<string, unknown> = {
         taskRef,
         modelProfileRef: input.modelProfileRef,
+        // authoritative trusted budget ref from /run-options, submitted
+        // verbatim (never computed client-side); the budget object carries
+        // the operator's validated values for the durable artifact path
+        ...(input.budgetRef ? { budgetRef: input.budgetRef } : {}),
         budget: {
           modelTokens: input.budget.modelTokenCeiling,
           toolCalls: input.budget.toolCallCeiling,

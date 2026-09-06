@@ -61,6 +61,9 @@ export type CreateRunInput = {
   taskId?: string;
   /** server-provided authoritative model ref from run-options (preferred) */
   modelProfileRef?: { id: string; version: string; sha256: string };
+  /** server-provided authoritative budget ref from run-options (2b3fc75);
+   *  submitted verbatim alongside the validated budget object */
+  budgetRef?: { id: string; version: string; sha256: string };
   modelProfile: string;
   /** idempotency key supplied by the console; reused verbatim on retry */
   idempotencyKey: string;

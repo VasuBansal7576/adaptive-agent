@@ -85,6 +85,8 @@ async function main() {
       ? { id: task.taskId, goal: task.goal, environmentId }
       : { goal: "console smoke: verify create/launch/events/cancel", environmentId },
     modelProfileRef: modelRef,
+    // server-advertised trusted budget ref (verbatim when present)
+    ...(runOptions.budgetDefaults?.budgetRef ? { budgetRef: runOptions.budgetDefaults.budgetRef } : {}),
     // validated budget object; the backend hashes and stores it
     budget: {
       modelTokens: runOptions.budgetDefaults?.modelTokens ?? 4000,

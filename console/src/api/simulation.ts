@@ -286,7 +286,15 @@ export function createSimulationTransport(options?: {
             model: "openai-codex/gpt-5.6-luna",
           },
         ],
-        budgetDefaults: { modelTokens: 4000, toolCalls: 32, childRuns: 0, wallTimeSeconds: 90, costMicrounits: 100000, currency: "USD" },
+        budgetDefaults: {
+          modelTokens: 4000,
+          toolCalls: 32,
+          childRuns: 0,
+          wallTimeSeconds: 90,
+          costMicrounits: 100000,
+          currency: "USD",
+          budgetRef: { id: "budget-default", version: "1", sha256: await sha256Hex(JSON.stringify("budget-default")) },
+        },
       };
     },
 

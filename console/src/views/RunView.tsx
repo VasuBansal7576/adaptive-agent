@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ConsoleTransport, CreateRunInput } from "../api/transport";
 import { newIdempotencyKey } from "../api/transport";
 import { describeToolError } from "../api/errors";
-import type { ApprovalRequest, EnvironmentPackageSummary, RunEvent, RunRecord, TaskOption } from "../api/types";
+import type { ApprovalRequest, EnvironmentPackageSummary, RunEvent, RunOptions, RunRecord, TaskOption } from "../api/types";
 import type { ConnectionState } from "../state/consoleStore";
 import { StatusBadge } from "../components/StatusBadge";
 import { Banner, EmptyState, LoadingState, Modal } from "../components/ui";
@@ -383,6 +383,7 @@ function NewRunDialog({
   const [tasks, setTasks] = useState<TaskOption[]>([]);
   const [modelProfile, setModelProfile] = useState(MODEL_PROFILES[0].label);
   const [modelProfiles, setModelProfiles] = useState<Array<{ ref: { id: string; version: string; sha256: string }; label: string }>>(MODEL_PROFILES);
+  const [advertisedBudgetRef, setAdvertisedBudgetRef] = useState<RunOptions["budgetDefaults"]["budgetRef"]>(undefined);
   const [executionMode, setExecutionMode] = useState<CreateRunInput["executionMode"]>("interactive");
   const [toolCallCeiling, setToolCallCeiling] = useState(String(BUDGET_FALLBACK.toolCalls));
   const [wallSecondsCeiling, setWallSecondsCeiling] = useState(String(BUDGET_FALLBACK.wallTimeSeconds));
@@ -427,6 +428,7 @@ function NewRunDialog({
           setWallSecondsCeiling(String(options.budgetDefaults.wallTimeSeconds));
           setModelTokenCeiling(String(options.budgetDefaults.modelTokens));
         }
+        setAdvertisedBudgetRef(options.budgetDefaults.budgetRef);
       })
       .catch(() => {
         /* fallback constants remain; never block the dialog on this */
@@ -498,6 +500,7 @@ function NewRunDialog({
       goal: goal.trim(),
       taskId: taskId || undefined,
       modelProfileRef: modelProfiles.find((p) => p.label === modelProfile)?.ref,
+      budgetRef: advertisedBudgetRef,
       modelProfile: modelProfile,
       // same key across recovery retries within this dialog session
       idempotencyKey,
