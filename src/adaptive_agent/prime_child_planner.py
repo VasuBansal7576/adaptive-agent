@@ -77,7 +77,7 @@ class SharedLedgerModelClient:
 
 
 def _usage_tokens(usage: Mapping[str, Any]) -> int:
-    for key in ("totalTokens", "total_tokens"):
+    for key in ("totalTokens", "total_tokens", "outputTokens", "output_tokens"):
         value = usage.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return value
