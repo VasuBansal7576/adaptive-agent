@@ -113,3 +113,36 @@ def test_malformed_accounting_is_not_charged_or_double_counted(tmp_path: Path):
     assert seen == 1
     assert job.lifecycle_accounting("malformed")["inputTokens"] == 0
     assert job.lifecycle_accounting("malformed")["costMicrounits"] == 0
+
+
+def test_nested_subcall_admission_retains_failed_usage_once(tmp_path: Path):
+    job = _job(tmp_path)
+    stages = list(_stages([]))
+    original = stages[0].callback
+    subcalls = 0
+
+    def with_subcall(cell, context):
+        nonlocal subcalls
+        subcalls += 1
+        admission = context["admitSubcall"]("child-0", estimated_input_tokens=3, estimated_output_tokens=2, estimated_tool_calls=1, estimated_cost_microunits=5)
+        context["recordSubcall"](admission["admissionId"], result={"usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}, "toolCalls": 1, "wallSeconds": 0.01, "costMicrounits": 5}, error="child infrastructure failure")
+        return original(cell, context)
+
+    stages[0] = LifecycleStage("bootstrap", ("bootstrap-0",), with_subcall)
+    limits = {"attempts": 8, "inputTokens": 16, "outputTokens": 16, "toolCalls": 16, "wallMicros": 8_000_000, "costMicrounits": 16}
+    first = job.run_experiment("subcalls", tuple(stages), limits=limits)
+    second = job.run_experiment("subcalls", tuple(stages), limits=limits)
+    assert first.status == second.status == "complete"
+    assert subcalls == 1
+    assert job.lifecycle_accounting("subcalls")["subcalls"] == 1
+    assert job.lifecycle_accounting("subcalls")["inputTokens"] == 11
+
+
+def test_malformed_nested_subcall_accounting_is_not_charged(tmp_path: Path):
+    job = _job(tmp_path)
+    job._lifecycle_budget("bad-subcall", {"attempts": 1, "inputTokens": 10, "outputTokens": 10, "toolCalls": 10, "wallMicros": 10_000, "costMicrounits": 10})
+    admission = job.admit_lifecycle_subcall("bad-subcall", "bootstrap", "bootstrap-0", "child-0")
+    with pytest.raises(ValueError, match="subcall accounting"):
+        job.record_lifecycle_subcall(admission["admissionId"], result={"usage": {"inputTokens": -1, "outputTokens": 0, "totalTokens": -1}, "costMicrounits": 1})
+    assert job.lifecycle_accounting("bad-subcall")["inputTokens"] == 0
+    assert job.lifecycle_accounting("bad-subcall")["costMicrounits"] == 0
