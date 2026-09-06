@@ -428,6 +428,11 @@ class TestControllerSeam:
         assert allocation["task_ids"] == ["c", "d"]
         assert store2.get_allocation("missing") is None
 
+        # Crash-after-allocation recovery: read the reserved panel back.
+        alloc = store2.get_allocation("alloc-2")
+        assert alloc["panel_index"] == 1 and alloc["task_ids"] == ["c", "d"]
+        assert store2.get_allocation("nope") is None
+
     def test_benchmark_task_run_owner_semantics(self, store: Store, workspace):
         claimed, row = store.claim_benchmark_task_run(
             "btr-1", benchmark_id="bench-1", environment_id=ENV,
