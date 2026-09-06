@@ -42,6 +42,7 @@ class FrozenExecutionConfig:
     # Distinct retry identity while preserving compatibility with legacy
     # four-field callers.
     attempt: int = 0
+    arm_bundles: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.attempt, bool) or not isinstance(self.attempt, int) or self.attempt < 0:
