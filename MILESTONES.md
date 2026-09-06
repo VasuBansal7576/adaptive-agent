@@ -52,12 +52,22 @@ The following records are the fresh root-verified evidence for this checkpoint, 
 | Actual Docker-backed EVAL-005 at session-3 ref `6aabe2e`: `child_failure_recovery_and_cap` and `shared_model_cost_token_cap` passed | Current runtime-boundary evidence | Two parent-child, failure, and shared-cost runtime cases crossed the Docker boundary with bounded deterministic probe inputs | Paid-provider behavior, complete EVAL-005 acceptance, or final resource-budget evidence |
 | Four isolated Controller probe executions at session-4 ref `83d2e01` covering EVAL-004 and EVAL-005 passed on fresh temporary Stores and data directories | Current control-boundary evidence | Controller, Broker, candidate, evidence, replay, failure, and reconnect obligations exercised with isolated persistence | A sealed evaluation, cross-environment performance, or proof that historical root QAdata was isolated |
 | Session-5 console ref `ae482da`: 61/61 tests, TypeScript clean, and build clean; latest report had no live smoke | Current console evidence | Console parsing, evaluation status, learning eligibility, responsive master-detail behavior, and honest uncertainty states | Browser-width acceptance, live inference, or sealed evaluation |
+| Isolated development smoke at `/tmp/adaptive-run-2fc3c680.fiZAAA`: durable run `run_7f5b3196fff541129d4e9c8345d0ba75`, `finance-development-00`, seed 17, sequence 16; scoped verifier `0561041`; full pytest 147 passed with two dependency warnings | Current isolated development-smoke evidence | Trusted `evaluator_only` outcome with operator-visible `model_response`, resume completion, one candidate, one transfer run, pinned Docker execution, aggregate usage, and confirmed broker invoice/payment reads plus `apply_payment` | Heldout or final evaluation, performance, public reproducibility, or closure of M2-M4 |
 | Prime 0.9.2 session 3, ChatGPT subscription, `openai-codex/gpt-5.6-luna`, actual Python `2+2` result `4` | Real runtime smoke | Subscription authentication and a narrow Python execution path | Product bridge, evaluator, safety, or performance acceptance |
 | `prime-agent --print --no-tools --provider openai-codex --model openai-codex/gpt-5.6-luna` returned `MODEL_SPIKE_OK` in 10.24s | Real provider smoke | Model reachability through the authenticated path | A goal/tool/evaluator run or provider hard output cap |
 | Prime adapter state-sharing cells returned `42` then `41`; host bridge returned structured data; forbidden learner requests were denied | Real Prime/Docker boundary smoke | Persistent kernel state, broker boundary, and denial behavior in the adapter spike | Complete control-plane learning and promotion evidence |
 | Session-5 `bun run api:smoke` worker report: live FastAPI session, registration, create/launch, SSE cursor, and cancellation smoke PASS | Real control-plane transport with synthetic task | Live API/session/SSE/cancellation wiring | Real model inference or sealed evaluator evidence; the script's smoke environment is synthetic |
 | Earlier session-4 SQLite and session-6 backend reports | Historical synthetic/local evidence | Earlier Store, Broker, Controller, learning, and benchmark contract checks | The current final2 integration, real provider behavior, or product acceptance |
 | Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes | Real build-agent smoke | Those agent sessions could execute a basic command | Any product behavior |
+
+The isolated development-smoke receipt used `/tmp/adaptive-run-2fc3c680.fiZAAA` and durable run `run_7f5b3196fff541129d4e9c8345d0ba75`.
+It recorded `finance-development-00` baseline seed 17, `lastEventSequence=16`, bundle `507a47cc70856f5e680d689ad3400b92f67daa4dbc9bc1e1209b5ae78a1e7b6`, protocol `1cced7b2...`, core `54b3b7...`, Docker image `adaptive-prime-runtime@sha256:e1242afd...`, analysis `3e5371a...`, budget `5f3b9d...`, and model `efaeffc...`.
+Aggregate usage was 8407 input, 1088 output, and 9495 total tokens.
+The resume smoke completed with `completed=true`, `status=complete`, `candidateCount=1`, and `transferRuns=1` against expected 1.
+The scoped `0561041` verifier accepted trusted outcome visibility as `evaluator_only` while requiring `model_response` visibility as operator.
+Broker invoice and payment reads plus `apply_payment` were confirmed.
+The full post-fix pytest report was 147 passed with two dependency warnings.
+This receipt is isolated development-smoke evidence only, with no heldout, final, public, or performance claim.
 
 ## Local-main assembly plan
 

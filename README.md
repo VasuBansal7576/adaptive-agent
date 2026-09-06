@@ -43,6 +43,15 @@ Four isolated Controller probe executions covering EVAL-004 and EVAL-005 passed 
 The latest session-5 console ref is `ae482da`, with 61/61 tests, TypeScript, and build clean; its latest report did not include live smoke.
 These results do not establish a product-wide run, heldout performance, or final evaluation success.
 
+A newer isolated development smoke used Store and data path `/tmp/adaptive-run-2fc3c680.fiZAAA`.
+Under scoped verifier fix `0561041`, the trusted outcome was visible as `evaluator_only` while the required `model_response` remained operator-visible.
+The durable run was `run_7f5b3196fff541129d4e9c8345d0ba75` for `finance-development-00`, baseline seed 17, with `lastEventSequence=16`, a trusted and reliable outcome, and `bundleHash=507a47cc70856f5e680d689ad3400b92f67daa4dbc9bc1e1209b5ae78a1e7b6a`.
+Its recorded pins were protocol `1cced7b2...`, core `54b3b7...`, Docker image `adaptive-prime-runtime@sha256:e1242afd...`, analysis `3e5371a...`, budget `5f3b9d...`, and model `efaeffc...`.
+The aggregate receipt recorded 8407 input, 1088 output, and 9495 total tokens, with broker invoice and payment reads plus `apply_payment` confirmed.
+Resume smoke completed with `status=complete`, `candidateCount=1`, and `transferRuns=1` matching the expected value of 1.
+The full post-fix pytest report was 147 passed with two dependency warnings.
+This is isolated development-smoke evidence only and makes no heldout, final, public, or performance claim.
+
 QA data-integrity hold: the original real evidence for `run_2fc` is contaminated by appended synthetic `model_response` rows at sequences 20 and 21, named `learning-model-fake-resp-1` and `learning-model-r20`.
 All history must be preserved, but those rows must not be erased, relabeled, or counted as real evidence.
 No transport smoke may target the root QAdata or port 8000 because the real authenticated path invokes the paid model.
