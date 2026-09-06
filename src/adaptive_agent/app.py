@@ -773,7 +773,10 @@ class DurableRuntime:
                 evaluator_id="|".join(evaluator_refs),
                 evaluator_refs=evaluator_refs,
                 fixture_hashes=dict(frozen.fixture_hashes),
-                partition_hashes=dict(frozen.partition_hashes),
+                partition_hashes={
+                    f"{name}:validation": frozen.partition_hashes[f"{name}:validation"]
+                    for name in protocol.known_environments
+                },
                 protocol_inputs=dict(frozen.inputs),
                 phase_evaluator_refs=phase_evaluator_refs,
             )
@@ -808,7 +811,9 @@ class DurableRuntime:
                 return False
             known = tuple(known_value)
             validation_key = f"{known[0]}:validation"
-            partition_hashes = json.loads(frozen["partition_hashes_json"] or "{}")
+            partition_hashes = inputs.get("partitionHashes")
+            if not isinstance(partition_hashes, Mapping):
+                return False
         except (AttributeError, IndexError, KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
             return False
         row = {
@@ -842,7 +847,6 @@ class DurableRuntime:
             if not isinstance(partition_ref, Mapping) or partition_ref.get("id") not in {"validation", "final"}:
                 return False
             phase = str(partition_ref["id"])
-            frozen_partitions = json.loads(frozen["partition_hashes_json"] or "{}")
             inputs = json.loads(frozen["protocol_inputs_json"] or "{}")
             known_value = inputs.get("knownEnvironments")
             sealed = inputs.get("sealedEnvironment")
@@ -850,6 +854,9 @@ class DurableRuntime:
                 return False
             known = tuple(known_value)
             environments = known if phase == "validation" else (*known, sealed)
+            frozen_partitions = inputs.get("partitionHashes")
+            if not isinstance(frozen_partitions, Mapping):
+                return False
             expected_keys = tuple(f"{name}:{phase}" for name in environments)
             expected_partitions = {key: frozen_partitions[key] for key in expected_keys}
             if not expected_partitions:

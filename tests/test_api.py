@@ -693,6 +693,25 @@ def test_runtime_binds_default_stage_runner_and_clean_pins(monkeypatch, tmp_path
     assert runtime.experiment_stage_runner is not None
 
 
+def test_runtime_persists_phase_bindings_for_gate_and_fresh_publication(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    protocol = EvaluationProtocol()
+    protocol.freeze(runtime.packages)
+    active = runtime.controller.get_active_bundle()
+    assert active is not None
+
+    runtime.build_evaluation_job(protocol, {Arm.B0: active})
+    frozen = runtime.controller.store.get_frozen_protocol(protocol.start_candidate_generation().protocol_hash)
+    assert frozen is not None
+    gate_partitions = json.loads(frozen["partition_hashes_json"])
+    assert set(gate_partitions) == {f"{name}:validation" for name in protocol.known_environments}
+    durable_inputs = json.loads(frozen["protocol_inputs_json"])
+    assert durable_inputs["partitionHashes"] == protocol.start_candidate_generation().partition_hashes
+    assert json.loads(frozen["phase_evaluator_refs_json"])["validation"]
+    assert json.loads(frozen["phase_evaluator_refs_json"])["final"]
+
+
 def test_runtime_strict_observation_verifier_delegates_to_durable_adapter(tmp_path, monkeypatch):
     app = create_runtime_app(data_dir=tmp_path)
     runtime = app.state.durable_runtime
