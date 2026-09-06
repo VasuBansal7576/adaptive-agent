@@ -80,7 +80,7 @@ describe("createRun, learning cycle, and registration", () => {
     const dialog = await screen.findByRole("dialog", { name: "Create run" });
     // Luna profile preselected via /run-options; token budget prefilled from budgetDefaults
     expect(within(dialog).getByLabelText("Model")).toHaveValue("Luna");
-    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000));
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000));
     // goal is focused for immediate typing
     await waitFor(() => expect(within(dialog).getByLabelText("Goal")).toHaveFocus(), { timeout: 3000 });
     fireEvent.change(within(dialog).getByLabelText("Goal"), { target: { value: "Sim end-to-end goal" } });

@@ -287,7 +287,7 @@ export function createSimulationTransport(options?: {
           },
         ],
         budgetDefaults: {
-          modelTokens: 4000,
+          modelTokens: 20000,
           toolCalls: 32,
           childRuns: 0,
           wallTimeSeconds: 90,

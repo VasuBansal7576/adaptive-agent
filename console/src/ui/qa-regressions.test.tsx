@@ -77,7 +77,7 @@ describe("qa regressions: createRun recovery and honesty", () => {
     // wait for the run-options response to land (Model label flips to "Luna"),
     // then edit the token budget so no late prefill can race the edit
     await waitFor(() => expect(within(dialog).getByLabelText("Model")).toHaveValue("Luna"), { timeout: 3000 });
-    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000));
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000));
     fireEvent.change(within(dialog).getByLabelText("Token budget"), { target: { value: "7777" } });
     await user.type(within(dialog).getByLabelText("Goal"), "budget application probe");
     await user.click(within(dialog).getByRole("button", { name: "Create run" }));
@@ -91,8 +91,8 @@ describe("qa regressions: createRun recovery and honesty", () => {
     await screen.findAllByRole("button", { name: /run-sim-1001/ });
     await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
     let dialog = await screen.findByRole("dialog", { name: "Create run" });
-    // server-advertised default (sim /run-options: 4000 in the fixture; live is 20000)
-    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000), { timeout: 3000 });
+    // server-advertised default (fixture mirrors the authoritative 20,000 default)
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000), { timeout: 3000 });
     await user.type(within(dialog).getByLabelText("Goal"), "advertised reset probe");
     await user.click(within(dialog).getByRole("button", { name: "Create run" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
@@ -100,7 +100,7 @@ describe("qa regressions: createRun recovery and honesty", () => {
     // proving the reset path follows the server value rather than a literal
     await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
     dialog = await screen.findByRole("dialog", { name: "Create run" });
-    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000), { timeout: 3000 });
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000), { timeout: 3000 });
   });
 
   it("restricts mode choices to the selected environment's declared modes", async () => {

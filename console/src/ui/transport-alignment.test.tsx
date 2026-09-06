@@ -144,7 +144,7 @@ describe("run-options and registered tasks in the new-run dialog", () => {
     await waitFor(() => expect(within(dialog).getByLabelText("Model")).toHaveValue("Luna"));
     await waitFor(() => expect(within(dialog).getByLabelText("Tool-call limit")).toHaveValue(32));
     await waitFor(() => expect(within(dialog).getByLabelText("Time limit (s)")).toHaveValue(90));
-    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000));
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000));
   });
 
   it("accepts the top-level budgetRef from /run-options (01f2462 shape)", async () => {
