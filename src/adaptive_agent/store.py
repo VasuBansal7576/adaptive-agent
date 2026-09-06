@@ -394,6 +394,62 @@ class Store:
             ).fetchone()
             return row is not None
 
+    # ------------------------------------------------------------------ learning projection (session7 seam)
+    def get_public_docs(self, environment_id: str) -> list[dict[str, Any]]:
+        """Public document contents for a manifest's doc refs.
+
+        Only artifacts without a restricted classification are returned;
+        artifacts classified 'operator' or 'evaluator_only' are excluded so no
+        hidden evaluator content reaches the learner.
+        """
+        row = self.get_environment(environment_id)
+        if not row:
+            return []
+        manifest_ref = ArtifactRef.model_validate_json(row["manifest_ref"])
+        manifest = self.get_artifact(manifest_ref)
+        out: list[dict[str, Any]] = []
+        for doc in manifest.get("docs", []):
+            ref = doc if isinstance(doc, dict) else {}
+            sha = ref.get("sha256")
+            if not sha or not self.has_artifact(sha):
+                continue
+            payload = self.get_artifact(sha)
+            if isinstance(payload, dict) and payload.get("classification") in ("operator", "evaluator_only"):
+                continue
+            out.append({"id": ref.get("id"), "version": ref.get("version"), "sha256": sha, "content": payload})
+        return out
+
+    def list_learner_evidence(
+        self,
+        environment_id: str | None = None,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Redacted learner-visible DEVELOPMENT evidence joined to run/task and
+        the trusted outcome (when present). Never returns operator or
+        evaluator_only rows, and never non-development partitions."""
+        query = (
+            "SELECT e.evidence_id, e.run_id, e.sequence, e.event_type, e.content_hash, "
+            "e.trust_class, e.visibility, e.redacted, "
+            "r.task_id, r.environment_id, t.partition, "
+            "o.passed AS outcome_passed, o.score AS outcome_score, o.checked_at AS outcome_checked_at "
+            "FROM evidence e "
+            "JOIN runs r ON r.run_id = e.run_id "
+            "JOIN tasks t ON t.id = r.task_id "
+            "LEFT JOIN outcomes o ON o.run_id = e.run_id "
+            "WHERE e.visibility = 'learner' AND e.redacted = 1 AND t.partition = 'development'"
+        )
+        params: list[Any] = []
+        if environment_id is not None:
+            query += " AND r.environment_id = ?"
+            params.append(environment_id)
+        if run_id is not None:
+            query += " AND e.run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY e.run_id, e.sequence"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
     # ------------------------------------------------------------------ learning records (session7 seam)
     def save_learning_record(self, record_id: str, environment_id: str, run_id: str, record_json: str) -> None:
         with self._connect() as conn:

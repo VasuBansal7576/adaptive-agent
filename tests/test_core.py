@@ -659,6 +659,67 @@ class TestControllerSeam:
         })
         ctl.require_dev_smoke(ENV)  # now allowed
 
+    def test_learning_projection(self, store, registry, broker):
+        """Session7 seam: public docs, redacted development evidence + trusted
+        outcome, patch bytes. No hidden evaluator content."""
+        from adaptive_agent.controller import Controller
+        from adaptive_agent.models import Budget, ModelProfile, RunRequest
+
+        registry.register(NEUTRAL_MANIFEST)
+        ctl = Controller(store, registry, broker)
+
+        # Public docs: only non-restricted artifacts.
+        pub = store.put_artifact({"title": "public doc"})
+        hidden_doc = store.put_artifact({"classification": "evaluator_only", "data": "secret"})
+        manifest_dump = NEUTRAL_MANIFEST.model_dump(mode="json", by_alias=True)
+        manifest_dump["docs"] = [
+            pub.model_dump(mode="json"), hidden_doc.model_dump(mode="json"),
+        ]
+        store.register_environment(ENV, "1.0.0", store.put_artifact(manifest_dump))
+        docs = store.get_public_docs(ENV)
+        assert len(docs) == 1 and docs[0]["content"]["title"] == "public doc"
+
+        dev = TaskInput(taskId="t-proj", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g", partition="development")
+        fin = TaskInput(taskId="t-proj-final", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g", partition="final")
+        registry.register_task(dev)
+        registry.register_task(fin)
+        run = ctl.create_run(
+            RunRequest(
+                taskRef=store.put_artifact(dev.model_dump(mode="json", by_alias=True)),
+                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
+                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
+                idempotencyKey="idem-proj",
+            ),
+            dev,
+        )
+        ctl.append_event(run.run_id, "tool_result", {"v": 1}, "broker", "learner")
+        ctl.append_event(run.run_id, "internal", {"v": 2}, "broker", "operator")  # excluded
+        ctl.record_trusted_outcome(run.run_id, {
+            "responseId": "r1", "runId": run.run_id, "taskId": "t-proj",
+            "environmentId": ENV, "passed": True, "reliable": True, "safetyViolations": 0,
+        })
+        proj = store.list_learner_evidence(ENV, run.run_id)
+        assert len(proj) == 2  # run_created + tool_result (learner, redacted)
+        assert all(r["visibility"] == "learner" and r["redacted"] == 1 and r["partition"] == "development" for r in proj)
+        assert proj[-1]["outcome_passed"] == 1
+        # Final-partition runs are never projected.
+        fin_run = ctl.create_run(
+            RunRequest(
+                taskRef=store.put_artifact(fin.model_dump(mode="json", by_alias=True)),
+                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
+                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
+                idempotencyKey="idem-proj-final",
+            ),
+            fin,
+        )
+        ctl.append_event(fin_run.run_id, "tool_result", {"v": 3}, "broker", "learner")
+        assert all(r["partition"] == "development" for r in store.list_learner_evidence(ENV))
+
+        # Exact patch bytes round-trip.
+        patch = b"diff --git a/f b/f\n+line\n"
+        pref = store.put_immutable_bytes(patch)
+        assert store.get_immutable_bytes(pref) == patch
+
 
 class TestCandidateLifecycle:
     def _base(self, manager: CandidateManager, store: Store) -> SkillBundle:
