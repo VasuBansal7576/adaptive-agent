@@ -164,7 +164,10 @@ class ResumableEvaluationDriver:
                                 statuses.append(existing)
                             continue
                         try:
-                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash), selected_bundle)
+                            # Keep the callback contract limited to the frozen
+                            # protocol, arm, and seed. Bundle identity remains
+                            # enforced by the driver's post-call validation.
+                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed), selected_bundle)
                             self._validate_observation(observation, task, environment_id, partition, seed, arm, bundle_hash)
                             if not self.evidence_store.verify(observation, frozen, package):
                                 raise EvaluationError("runtime observation lacks trusted persisted evidence")
