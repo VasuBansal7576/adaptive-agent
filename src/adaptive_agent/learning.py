@@ -449,7 +449,7 @@ class LearningService:
             raise LearningError("candidate patch exceeds the byte bound")
         patch_hash = hashlib.sha256(patch_bytes).hexdigest()
         declared_hashes = parsed.get("changedArtifactHashes")
-        if declared_hashes is not None and declared_hashes != [patch_hash]:
+        if declared_hashes not in (None, []) and declared_hashes != [patch_hash]:
             raise LearningError("changed artifact hash does not match the proposed patch")
         persist = getattr(self.candidate_sink, "persist_candidate_patch", None)
         if not callable(persist):

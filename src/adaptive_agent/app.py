@@ -223,7 +223,10 @@ class DurableRuntime:
             return invocation
         service = LearningService(source.retriever(environment_id=stored["environment_id"], run_id=payload.run_id), learning_runner, candidate_sink, lambda: self.controller.candidates.get_active_bundle().content_hash if self.controller.candidates.get_active_bundle() else "")
         proposal = service.propose(run_id=payload.run_id, environment_id=stored["environment_id"], goal=task.goal, environment=self._planner_environment(package, payload.run_id), feedback={"status": run.status.value}, emit=lambda kind, summary, detail=None: self.controller.append_event(payload.run_id, kind, {"summary": summary, "detail": detail}, "learner", "operator"))
-        return {"actionId": f"learn_{__import__('uuid').uuid4().hex}", "runId": payload.run_id, "predictedEffect": proposal.candidate_payload["predictedEffect"], "evidenceIds": proposal.candidate_payload["supportingEvidenceIds"], "proposalRef": self.controller.store.put_artifact(proposal.bundle_patch).model_dump(mode="json", by_alias=True), "candidate": dict(proposal.authoritative_candidate), "status": "staged", "createdAt": __import__("adaptive_agent.api", fromlist=["_now"])._now()}
+        candidate = dict(proposal.authoritative_candidate)
+        if "candidate_id" in candidate:
+            candidate["candidateId"] = candidate.pop("candidate_id")
+        return {"actionId": f"learn_{__import__('uuid').uuid4().hex}", "runId": payload.run_id, "predictedEffect": proposal.candidate_payload["predictedEffect"], "evidenceIds": proposal.candidate_payload["supportingEvidenceIds"], "proposalRef": self.controller.store.put_artifact(proposal.bundle_patch).model_dump(mode="json", by_alias=True), "candidate": candidate, "status": "staged", "createdAt": __import__("adaptive_agent.api", fromlist=["_now"])._now()}
 
     def list_environments(self) -> list[dict[str, Any]]:
         registered = {task.environment_ref.id for task in self._tasks.values()}
