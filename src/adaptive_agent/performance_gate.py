@@ -25,6 +25,23 @@ class GateConfig:
     max_latency_seconds: float = 90.0
     require_per_environment_non_regression: bool = True
 
+    @classmethod
+    def from_frozen_inputs(cls, inputs: Mapping[str, Any]) -> "GateConfig":
+        """Build gate settings only from the immutable protocol snapshot."""
+        thresholds = inputs.get("thresholds")
+        budget = inputs.get("runBudget")
+        if not isinstance(thresholds, Mapping) or not isinstance(budget, Mapping):
+            raise ValueError("frozen protocol is missing gate thresholds or run budget")
+        return cls(
+            min_accuracy_gain=thresholds.get("accuracy_gain", 0.05),
+            ci_lower_bound=thresholds.get("ci_lower_bound", 0.0),
+            max_cost_ratio=thresholds.get("cost_ratio", 1.10),
+            max_latency_ratio=thresholds.get("latency_ratio", 1.10),
+            max_cost_microunits=thresholds.get("max_cost_microunits", budget.get("costMicrounits")),
+            max_latency_seconds=thresholds.get("max_latency_seconds", budget.get("wallTimeSeconds")),
+            require_per_environment_non_regression=thresholds.get("require_per_environment_non_regression", True),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "minBalancedAccuracyGain": self.min_accuracy_gain,
@@ -79,6 +96,7 @@ def evaluate_performance_gate(
     accuracy_ci_lower: Any,
     environment_cells: Mapping[str, Any] | None,
     required_environments: Sequence[str],
+    required_safety_case_ids: Sequence[str],
     safety_passed: Any,
     safety_violations: Any,
     safety_case_results: Mapping[str, Any] | None,
@@ -140,8 +158,15 @@ def evaluate_performance_gate(
         reasons.append("observed safety violations are non-zero")
     if safety_case_results is None:
         reasons.append("required safety case results are missing")
-    elif any(value is not True for value in safety_case_results.values()):
-        reasons.append("a required safety case did not pass")
+    else:
+        expected_safety = tuple(dict.fromkeys(required_safety_case_ids))
+        actual_safety = tuple(safety_case_results)
+        if not expected_safety or len(expected_safety) != len(tuple(required_safety_case_ids)) or any(not isinstance(case_id, str) or not case_id for case_id in expected_safety):
+            reasons.append("required safety case list is missing")
+        if set(actual_safety) != set(expected_safety) or len(actual_safety) != len(expected_safety):
+            reasons.append("required safety case coverage is incomplete or unexpected")
+        if any(value is not True for value in safety_case_results.values()):
+            reasons.append("a required safety case did not pass")
 
     if all(key in values for key in ("baseline:accuracy", "candidate:accuracy")):
         gain = values["candidate:accuracy"] - values["baseline:accuracy"]
@@ -156,7 +181,7 @@ def evaluate_performance_gate(
             reasons.append("per-environment metric cells are missing")
         else:
             expected = tuple(dict.fromkeys(required_environments))
-            if not expected:
+            if not expected or len(expected) != len(tuple(required_environments)) or any(not isinstance(environment, str) or not environment for environment in expected):
                 reasons.append("required environment list is missing")
             for environment in expected:
                 env = cells.get(environment)
@@ -173,8 +198,16 @@ def evaluate_performance_gate(
                     candidate_value = _metric(env_candidate, metric)
                     if base_value is None or candidate_value is None:
                         reasons.append(f"per-environment {metric} is missing or invalid for {environment}")
+                    elif not 0 <= base_value <= 1 or not 0 <= candidate_value <= 1:
+                        reasons.append(f"per-environment {metric} is outside [0, 1] for {environment}")
                     elif candidate_value < base_value:
                         reasons.append(f"observed {metric} regression in environment {environment}")
+
+    for label in ("baseline", "candidate"):
+        for metric in ("accuracy", "reliability"):
+            value = values.get(f"{label}:{metric}")
+            if value is not None and not 0 <= value <= 1:
+                reasons.append(f"{label} {metric} is outside [0, 1]")
 
     cost = values.get("candidate:meanCostMicrounits")
     baseline_cost = values.get("baseline:meanCostMicrounits")

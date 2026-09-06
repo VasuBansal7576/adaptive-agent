@@ -1034,20 +1034,14 @@ class EvaluationProtocol:
 
     @property
     def gate_config(self) -> GateConfig:
-        """Return the gate frozen with this protocol's thresholds and budget."""
-        thresholds = dict(self.thresholds)
-        return GateConfig(
-            min_accuracy_gain=float(thresholds.get("accuracy_gain", 0.05)),
-            ci_lower_bound=float(thresholds.get("ci_lower_bound", 0.0)),
-            max_cost_ratio=float(thresholds.get("cost_ratio", 1.10)),
-            max_latency_ratio=float(thresholds.get("latency_ratio", 1.10)),
-            max_cost_microunits=float(thresholds.get("max_cost_microunits", self.run_budget.cost_microunits)),
-            max_latency_seconds=float(thresholds.get("max_latency_seconds", self.run_budget.wall_time_seconds)),
-            require_per_environment_non_regression=bool(thresholds.get("require_per_environment_non_regression", True)),
-        )
+        """Return gate settings from the immutable frozen protocol snapshot."""
+        return GateConfig.from_frozen_inputs(self.start_candidate_generation().inputs)
 
     def assert_integrity(self, packages: Mapping[str, EnvironmentPackage]) -> None:
         frozen = self.start_candidate_generation()
+        current_inputs = self.to_dict(include_frozen=False)
+        if any(frozen.inputs.get(key) != value for key, value in current_inputs.items()):
+            raise PromotionEvidenceRefused("protocol inputs changed after freeze")
         for name, expected in frozen.fixture_hashes.items():
             if name not in packages or packages[name].public_fixture_hash() != expected:
                 raise PromotionEvidenceRefused(f"fixture hash changed for {name}")
@@ -1057,7 +1051,7 @@ class EvaluationProtocol:
                 raise PromotionEvidenceRefused(f"partition hash changed for {key}")
 
     def to_dict(self, *, include_frozen: bool = True) -> JsonObject:
-        value: JsonObject = {"modelProfile": self.model_profile, "modelTier": self.model_tier, "provider": self.provider, "imageDigest": self.image_digest, "corePlannerHash": self.core_planner_hash, "analysisCodeHash": self.analysis_code_hash, "retrievalEngineVersion": self.retrieval_engine_version, "seeds": list(self.seeds), "tasksPerEnvironment": self.tasks_per_environment, "bootstrapDraws": self.bootstrap_draws, "analysisSeed": self.analysis_seed, "validationCandidateLimit": self.validation_candidate_limit, "runBudget": self.run_budget.to_dict(), "concurrencyLimit": self.concurrency_limit, "knownEnvironments": list(self.known_environments), "sealedEnvironment": self.sealed_environment, "thresholds": dict(self.thresholds)}
+        value: JsonObject = {"modelProfile": self.model_profile, "modelTier": self.model_tier, "provider": self.provider, "imageDigest": self.image_digest, "corePlannerHash": self.core_planner_hash, "analysisCodeHash": self.analysis_code_hash, "retrievalEngineVersion": self.retrieval_engine_version, "seeds": list(self.seeds), "tasksPerEnvironment": self.tasks_per_environment, "bootstrapDraws": self.bootstrap_draws, "analysisSeed": self.analysis_seed, "validationCandidateLimit": self.validation_candidate_limit, "runBudget": self.run_budget.to_dict(), "concurrencyLimit": self.concurrency_limit, "knownEnvironments": list(self.known_environments), "sealedEnvironment": self.sealed_environment, "thresholds": dict(self.thresholds), "safetyCaseIds": list(self.safety_case_ids)}
         if include_frozen and self._frozen is not None:
             value["protocolHash"] = self._frozen.protocol_hash
         return value
@@ -1233,6 +1227,7 @@ class EvaluationReport:
     billing_basis: str = "SDK nominal usage cost; subscription billing not measured"
     gate_config: GateConfig = field(default_factory=GateConfig)
     expected_environments: tuple[str, ...] = ()
+    required_safety_case_ids: tuple[str, ...] = ()
 
     @property
     def final_gate_result(self) -> GateResult:
@@ -1283,6 +1278,7 @@ class EvaluationReport:
             accuracy_ci_lower=next((item.lower95 for item in self.confidence_intervals if item.metric == "accuracy"), None),
             environment_cells=self.environment_cells,
             required_environments=expected,
+            required_safety_case_ids=self.required_safety_case_ids,
             safety_passed=self.safety_passed,
             safety_violations=sum(summary.safety_violations for summary in self.arm_summaries.values()) if self.arm_summaries else None,
             safety_case_results=self.safety_case_results,
@@ -1308,12 +1304,17 @@ class EvaluationReport:
         expected_refs = tuple(sorted({packages[name].manifest.evaluator_ref.id for name in protocol.known_environments}))
         if self.evaluator_refs != expected_refs:
             raise PromotionEvidenceRefused("report evaluator registration does not match the known environments")
-        payload = {"comparison": self.comparison, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "evaluatorRefs": self.evaluator_refs, "environmentCells": self.environment_cells, "armSummaries": self.arm_summaries, "confidenceIntervals": self.confidence_intervals, "validityStatus": self.validity_status, "safetyPassed": self.safety_passed, "safetyCaseResults": self.safety_case_results, "safetyProbeOutputs": self.safety_probe_outputs, "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": self.infrastructure_failures, "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "gateConfig": self.gate_config.to_dict()}
+        partition = "validation" if self.comparison == "validation" else "final"
+        expected_environments = protocol.known_environments if self.comparison == "validation" else (*protocol.known_environments, protocol.sealed_environment)
+        if self.expected_environments != expected_environments:
+            raise PromotionEvidenceRefused("report expected environments do not match the frozen allocation")
+        if self.required_safety_case_ids != protocol.safety_case_ids:
+            raise PromotionEvidenceRefused("report required safety cases do not match the frozen protocol")
+        payload = {"comparison": self.comparison, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "evaluatorRefs": self.evaluator_refs, "environmentCells": self.environment_cells, "armSummaries": self.arm_summaries, "confidenceIntervals": self.confidence_intervals, "validityStatus": self.validity_status, "safetyPassed": self.safety_passed, "safetyCaseResults": self.safety_case_results, "safetyProbeOutputs": self.safety_probe_outputs, "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": self.infrastructure_failures, "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "gateConfig": self.gate_config.to_dict(), "expectedEnvironments": self.expected_environments, "requiredSafetyCaseIds": self.required_safety_case_ids}
         if self.attestation_ledger is None or not self.attestation_ledger.durable or not TrustedEvaluatorRegistry(self.attestation_ledger).verify(self.attestation, payload):
             raise PromotionEvidenceRefused("report is not attested by a registered trusted evaluator")
         if not self.promotion_eligible or self.protocol_hash != protocol.start_candidate_generation().protocol_hash:
             raise PromotionEvidenceRefused("evaluation report is incomplete, invalid, unsafe, or not tied to frozen protocol")
-        partition = "validation" if self.comparison == "validation" else "final"
         environments = protocol.known_environments if self.comparison == "validation" else (*protocol.known_environments, protocol.sealed_environment)
         expected = {f"{name}:{partition}": value for name in environments for key, value in protocol.start_candidate_generation().partition_hashes.items() if key == f"{name}:{partition}"}
         if dict(self.partition_hashes) != dict(expected):
@@ -1321,7 +1322,7 @@ class EvaluationReport:
         return self
 
     def to_dict(self) -> JsonObject:
-        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "finalGatePassed": self.final_gate_passed, "finalGateReasons": list(self.final_gate_reasons), "finalGate": self.final_gate_result.to_dict(), "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "safetyProbeOutputs": _jsonable(self.safety_probe_outputs), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit), "actualInputTokens": self.actual_input_tokens, "actualOutputTokens": self.actual_output_tokens, "nominalCostUsd": self.nominal_cost_usd, "wallDurationSeconds": self.wall_duration_seconds, "billingBasis": self.billing_basis, "gateConfig": self.gate_config.to_dict(), "expectedEnvironments": list(self.expected_environments)}
+        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "finalGatePassed": self.final_gate_passed, "finalGateReasons": list(self.final_gate_reasons), "finalGate": self.final_gate_result.to_dict(), "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "safetyProbeOutputs": _jsonable(self.safety_probe_outputs), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit), "actualInputTokens": self.actual_input_tokens, "actualOutputTokens": self.actual_output_tokens, "nominalCostUsd": self.nominal_cost_usd, "wallDurationSeconds": self.wall_duration_seconds, "billingBasis": self.billing_basis, "gateConfig": self.gate_config.to_dict(), "expectedEnvironments": list(self.expected_environments), "requiredSafetyCaseIds": list(self.required_safety_case_ids)}
 
 
 Executor = Callable[[Arm, EnvironmentPackage, TaskInput, int], RunObservation]
@@ -1587,8 +1588,9 @@ class EvaluationRunner:
             attestation_ledger=self.evaluator_registry.ledger,
             gate_config=self.protocol.gate_config,
             expected_environments=tuple(env_names),
+            required_safety_case_ids=tuple(self.protocol.safety_case_ids),
         )
-        attestation_payload = {"comparison": comparison, "candidateHash": candidate_hash, "baseHash": base_hash, "protocolHash": self.frozen.protocol_hash, "partitionHashes": report_partition_hashes, "evaluatorRefs": evaluator_refs, "environmentCells": environment_cells, "armSummaries": summaries, "confidenceIntervals": intervals, "validityStatus": report.validity_status, "safetyPassed": report.safety_passed, "safetyCaseResults": report.safety_case_results, "safetyProbeOutputs": report.safety_probe_outputs, "missingPairs": report.missing_pairs, "partitionLeak": report.partition_leak, "invalidFixtureResets": report.invalid_fixture_resets, "infrastructureFailures": report.infrastructure_failures, "metricCellsComplete": report.metric_cells_complete, "safetyCellsComplete": report.safety_cells_complete, "modelProvenanceComplete": report.model_provenance_complete, "gateConfig": report.gate_config.to_dict()}
+        attestation_payload = {"comparison": comparison, "candidateHash": candidate_hash, "baseHash": base_hash, "protocolHash": self.frozen.protocol_hash, "partitionHashes": report_partition_hashes, "evaluatorRefs": evaluator_refs, "environmentCells": environment_cells, "armSummaries": summaries, "confidenceIntervals": intervals, "validityStatus": report.validity_status, "safetyPassed": report.safety_passed, "safetyCaseResults": report.safety_case_results, "safetyProbeOutputs": report.safety_probe_outputs, "missingPairs": report.missing_pairs, "partitionLeak": report.partition_leak, "invalidFixtureResets": report.invalid_fixture_resets, "infrastructureFailures": report.infrastructure_failures, "metricCellsComplete": report.metric_cells_complete, "safetyCellsComplete": report.safety_cells_complete, "modelProvenanceComplete": report.model_provenance_complete, "gateConfig": report.gate_config.to_dict(), "expectedEnvironments": report.expected_environments, "requiredSafetyCaseIds": report.required_safety_case_ids}
         object.__setattr__(report, "attestation", self.evaluator_registry.attest(attestation_payload))
         object.__setattr__(report, "_rows", tuple(rows))
         if not missing_pairs and not all(row.model_provenance == ModelProvenance.REAL_MODEL for row in rows):

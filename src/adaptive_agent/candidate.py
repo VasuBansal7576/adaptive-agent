@@ -89,6 +89,8 @@ class _ReportView:
     partition_ref: ArtifactRef
     uncertainty: dict[str, Any]
     required_environments: tuple[str, ...]
+    required_safety_case_ids: tuple[str, ...]
+    serialized_contract: bool
     raw: Any
 
 
@@ -347,6 +349,14 @@ class CandidateManager:
             raise PromotionError(
                 "report partition hashes do not match the frozen allocation"
             )
+        if view.serialized_contract:
+            inputs = json.loads(row["protocol_inputs_json"] or "{}")
+            known = inputs.get("knownEnvironments")
+            sealed = inputs.get("sealedEnvironment")
+            expected_environments = known if view.uncertainty.get("comparison") == "validation" else [*(known or []), sealed]
+            expected_safety = inputs.get("safetyCaseIds")
+            if view.required_environments != tuple(expected_environments) or view.required_safety_case_ids != tuple(expected_safety or ()):
+                raise PromotionError("report allocation or safety cases do not match frozen protocol")
         return PromotionGate.model_validate_json(row["gate_json"])
 
     # ------------------------------------------------------------------ report normalization
@@ -393,6 +403,8 @@ class CandidateManager:
                 partition_ref=report.partition_ref,
                 uncertainty=uncertainty,
                 required_environments=tuple(uncertainty.get("required_environments", uncertainty.get("per_environment", {}).keys())),
+                required_safety_case_ids=tuple(uncertainty.get("required_safety_case_ids", report.safety_results)),
+                serialized_contract=False,
                 raw=report,
             )
 
@@ -407,7 +419,7 @@ class CandidateManager:
             "attestation", "evaluatorRefs", "partitionHashes", "armSummaries",
             "environmentCells", "confidenceIntervals", "missingPairs",
             "partitionLeak", "invalidFixtureResets", "infrastructureFailures",
-            "comparison",
+            "comparison", "expectedEnvironments", "requiredSafetyCaseIds",
         )
         missing = [k for k in required if k not in report]
         if missing:
@@ -436,6 +448,31 @@ class CandidateManager:
         if report["missingPairs"] or report["partitionLeak"] or report["invalidFixtureResets"] or report["infrastructureFailures"]:
             raise PromotionError("report contains invalid or leaked evidence")
 
+        required_safety_case_ids = report.get("requiredSafetyCaseIds")
+        if not isinstance(required_safety_case_ids, (list, tuple)) or any(not isinstance(case_id, str) or not case_id for case_id in required_safety_case_ids) or len(set(required_safety_case_ids)) != len(required_safety_case_ids):
+            raise PromotionError("report required safety case IDs are missing or invalid")
+        expected_environments = report.get("expectedEnvironments")
+        if not isinstance(expected_environments, (list, tuple)) or any(not isinstance(environment, str) or not environment for environment in expected_environments) or len(set(expected_environments)) != len(expected_environments):
+            raise PromotionError("report expected environments are missing or invalid")
+        env_cells = report["environmentCells"]
+        if not isinstance(env_cells, Mapping) or tuple(env_cells) != tuple(expected_environments):
+            raise PromotionError("report environment metric cells do not match expected environments")
+        for environment in expected_environments:
+            cells = env_cells.get(environment)
+            if not isinstance(cells, Mapping):
+                raise PromotionError(f"report environment metric cells are invalid for {environment}")
+            for arm_name in ("B0", "L"):
+                summary = cells.get(arm_name)
+                if not isinstance(summary, Mapping):
+                    raise PromotionError(f"report {arm_name} metric cells are missing for {environment}")
+                count = summary.get("count")
+                if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                    raise PromotionError(f"report {arm_name} metric count is missing or invalid for {environment}")
+                for metric in ("accuracy", "reliability"):
+                    value = summary.get(metric)
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0 <= float(value) <= 1:
+                        raise PromotionError(f"report {arm_name} {metric} is missing or invalid for {environment}")
+
         arms = report["armSummaries"]
         if not isinstance(arms, Mapping):
             raise PromotionError("report arm summaries are missing or invalid")
@@ -446,9 +483,13 @@ class CandidateManager:
         for arm_name, summary in (("B0", b0), ("L", learned)):
             if isinstance(summary.get("count"), bool) or not isinstance(summary.get("count"), int) or summary["count"] <= 0:
                 raise PromotionError(f"report {arm_name} metric count is missing or invalid")
-            for metric in ("accuracy", "reliability", "meanCostMicrounits", "p95LatencySeconds"):
+            for metric in ("accuracy", "reliability", "meanCostMicrounits", "p95LatencySeconds", "safetyViolations"):
                 value = summary.get(metric)
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    raise PromotionError(f"report {arm_name} {metric} is missing or invalid")
+                if metric in {"accuracy", "reliability"} and not 0 <= float(value) <= 1:
+                    raise PromotionError(f"report {arm_name} {metric} is outside [0, 1]")
+                if metric == "safetyViolations" and (not isinstance(value, int) or value < 0):
                     raise PromotionError(f"report {arm_name} {metric} is missing or invalid")
 
         # Confidence intervals: use the accuracy lower bound as the gate CI.
@@ -458,9 +499,6 @@ class CandidateManager:
                 ci_lower = est.get("lower95")
                 break
 
-        env_cells = report["environmentCells"]
-        if not isinstance(env_cells, Mapping):
-            raise PromotionError("report environment metric cells are missing or invalid")
         per_env = {}
         for env, cells in env_cells.items():
             if not isinstance(cells, Mapping):
@@ -479,6 +517,8 @@ class CandidateManager:
             for name, v in safety_cases.items()
         )
         safety_results = safety_cases
+        if set(safety_results) != set(required_safety_case_ids) or len(safety_results) != len(required_safety_case_ids):
+            raise PromotionError("report safety case coverage does not match required safety cases")
         return _ReportView(
             report_id=str(report.get("reportId") or report.get("analysisSeed", "report")),
             protocol_hash=str(report["protocolHash"]),
@@ -512,6 +552,8 @@ class CandidateManager:
                 "comparison": report["comparison"],
             },
             required_environments=tuple(report.get("expectedEnvironments") or env_cells),
+            required_safety_case_ids=tuple(required_safety_case_ids),
+            serialized_contract=True,
             raw=report,
         )
 
@@ -660,6 +702,7 @@ class CandidateManager:
                 for env, values in view.uncertainty.get("per_environment", {}).items()
             },
             required_environments=view.required_environments,
+            required_safety_case_ids=view.required_safety_case_ids,
             safety_passed=all(value is True for value in view.safety_results.values()) and bool(view.safety_results),
             safety_violations=view.safety_violations,
             safety_case_results=view.safety_results,

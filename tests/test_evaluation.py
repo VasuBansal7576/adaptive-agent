@@ -47,6 +47,7 @@ class EvaluationTests(unittest.TestCase):
         accuracy_ci_lower=ci,
         environment_cells=environments,
         required_environments=tuple(environments),
+        required_safety_case_ids=("EVAL-004",),
         safety_passed=safety,
         safety_violations=0,
         safety_case_results={"EVAL-004": True} if safety_cases is None else safety_cases,
@@ -75,14 +76,23 @@ class EvaluationTests(unittest.TestCase):
     self.assertFalse(missing.passed)
     self.assertFalse(self._gate(safety=False).passed)
     self.assertFalse(self._gate(integrity=("report has missing pairs",)).passed)
+    self.assertFalse(self._gate(candidate={"accuracy": 1.1, "reliability": 0.8, "meanCostMicrounits": 105.0, "p95LatencySeconds": 10.0, "count": 10}).passed)
+    self.assertFalse(self._gate(safety_cases={"EVAL-005": True}).passed)
 
   def test_protocol_freezes_nondefault_gate_thresholds(self):
     protocol = EvaluationProtocol(thresholds=(("accuracy_gain", 0.20), ("ci_lower_bound", 0.05), ("cost_ratio", 1.05), ("latency_ratio", 1.05)))
+    packages = build_environment_packages()
+    protocol.freeze(packages)
     self.assertEqual(protocol.gate_config.min_accuracy_gain, 0.20)
     self.assertEqual(protocol.gate_config.ci_lower_bound, 0.05)
     self.assertEqual(protocol.gate_config.max_cost_ratio, 1.05)
     self.assertEqual(protocol.gate_config.max_latency_ratio, 1.05)
     self.assertFalse(self._gate(config=protocol.gate_config).passed)
+    object.__setattr__(protocol, "thresholds", (("accuracy_gain", 0.01), ("cost_ratio", 9.0), ("latency_ratio", 9.0)))
+    object.__setattr__(protocol, "run_budget", BudgetSpec(cost_microunits=1, wall_time_seconds=1))
+    self.assertEqual(protocol.gate_config.min_accuracy_gain, 0.20)
+    with self.assertRaisesRegex(PromotionEvidenceRefused, "changed after freeze"):
+      protocol.assert_integrity(packages)
 
   def test_final_report_serializes_attested_verdict_without_using_ablation_arm(self):
     summary = lambda accuracy, reliability, cost, latency: MetricSummary(accuracy, reliability, cost, latency, latency, 0, 10)
@@ -112,6 +122,7 @@ class EvaluationTests(unittest.TestCase):
         safety_case_results={"EVAL-004": True},
         safety_probe_outputs={"EVAL-004": {"passed": True}},
         expected_environments=("finance",),
+        required_safety_case_ids=("EVAL-004",),
     )
     self.assertTrue(report.final_gate_passed)
     payload = report.to_dict()

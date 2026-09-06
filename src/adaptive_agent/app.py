@@ -761,18 +761,18 @@ class DurableRuntime:
             phase: sorted(self.packages[name].manifest.evaluator_ref.id for name in environments)
             for phase, environments in phase_environments.items()
         }
-        thresholds = dict(protocol.thresholds)
+        gate_config = protocol.gate_config
         if self.controller.store.get_frozen_protocol(frozen.protocol_hash) is None:
             self.controller.candidates.freeze_protocol(
                 PromotionGate(
                     protocolHash=frozen.protocol_hash,
-                    minBalancedAccuracyGain=float(thresholds["accuracy_gain"]),
-                    ciLowerBound=float(thresholds.get("ci_lower_bound", 0.0)),
-                    maxCostRatio=float(thresholds["cost_ratio"]),
-                    maxLatencyRatio=float(thresholds["latency_ratio"]),
-                    maxCostMicrounits=float(thresholds.get("max_cost_microunits", protocol.run_budget.cost_microunits)),
-                    maxLatencySeconds=float(thresholds.get("max_latency_seconds", protocol.run_budget.wall_time_seconds)),
-                    requirePerEnvironmentNonRegression=bool(thresholds.get("require_per_environment_non_regression", True)),
+                    minBalancedAccuracyGain=gate_config.min_accuracy_gain,
+                    ciLowerBound=gate_config.ci_lower_bound,
+                    maxCostRatio=gate_config.max_cost_ratio,
+                    maxLatencyRatio=gate_config.max_latency_ratio,
+                    maxCostMicrounits=gate_config.max_cost_microunits,
+                    maxLatencySeconds=gate_config.max_latency_seconds,
+                    requirePerEnvironmentNonRegression=gate_config.require_per_environment_non_regression,
                 ),
                 evaluator_id="|".join(evaluator_refs),
                 evaluator_refs=evaluator_refs,
@@ -858,6 +858,15 @@ class DurableRuntime:
                 return False
             known = tuple(known_value)
             environments = known if phase == "validation" else (*known, sealed)
+            safety_case_ids = inputs.get("safetyCaseIds")
+            if not isinstance(safety_case_ids, list) or any(not isinstance(case_id, str) or not case_id for case_id in safety_case_ids) or len(set(safety_case_ids)) != len(safety_case_ids):
+                return False
+            if report.get("comparison") != phase:
+                return False
+            if report.get("expectedEnvironments") != list(environments):
+                return False
+            if report.get("requiredSafetyCaseIds") != safety_case_ids:
+                return False
             frozen_partitions = inputs.get("partitionHashes")
             if not isinstance(frozen_partitions, Mapping):
                 return False
@@ -900,6 +909,8 @@ class DurableRuntime:
                 "safetyCellsComplete": report.get("safetyCellsComplete"),
                 "modelProvenanceComplete": report.get("modelProvenanceComplete"),
                 "gateConfig": report.get("gateConfig"),
+                "expectedEnvironments": report.get("expectedEnvironments"),
+                "requiredSafetyCaseIds": report.get("requiredSafetyCaseIds"),
             }
             required = tuple(attestation_payload)
             if any(key not in report for key in required):
