@@ -11,6 +11,7 @@ const BASE = process.env.FIXTURE_BASE ?? "http://127.0.0.1:8910";
 const OUT = new URL("../qa/acc010/", import.meta.url).pathname;
 const WIDTHS = [375, 768, 1440];
 
+const pageErrors = [];
 const browser = await puppeteer.launch({
   executablePath: CHROME,
   headless: "new",
@@ -19,6 +20,7 @@ const browser = await puppeteer.launch({
 
 const findings = [];
 const browser_ = await browser.newPage();
+browser_.on("pageerror", (e) => pageErrors.push(String(e).slice(0, 140)));
 
 for (const width of WIDTHS) {
   await browser_.setViewport({ width, height: 1000 });
@@ -136,8 +138,6 @@ const carried = await browser_.evaluate(() => {
   return { dialogOpen, preselected: select && "value" in select ? select.value : null, onCandidatesTab: !!document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.includes("Candidates") };
 });
 console.log("learnCarry:", JSON.stringify(carried));
-const pageErrors = [];
-browser_.on("pageerror", (e) => pageErrors.push(String(e).slice(0, 140)));
 const probe = await browser_.evaluate(() => {
   let seen = 0;
   const l = () => { seen += 1; };
@@ -147,22 +147,10 @@ const probe = await browser_.evaluate(() => {
   return { seen, dialogs: [...document.querySelectorAll('[role="dialog"]')].map((d) => d.getAttribute("aria-label")) };
 });
 console.log("pageErrors:", JSON.stringify(pageErrors));
-console.log("escapeProbe:", JSON.stringify(probe));
-// CDP: inspect document keydown listeners
-try {
-  const client = await browser_.createCDPSession();
-  const { result: docObj } = await client.send("Runtime.evaluate", { expression: "document" });
-  const { listeners } = await client.send("DOMDebugger.getEventListeners", { objectId: docObj.objectId });
-  const keydowns = listeners.filter((l) => l.type === "keydown");
-  console.log("docKeydownListeners:", keydowns.length, JSON.stringify(keydowns.map((l) => ({ line: l.lineNumber, column: l.columnNumber }))));
-  await client.detach();
-} catch (e) {
-  console.log("cdpError:", String(e).slice(0, 120));
-}
 // close with Escape; focus must return to the dialog's invoking control (Modal restore)
 await browser_.keyboard.press("Escape");
 await new Promise((r) => setTimeout(r, 300));
-const afterCdpEscape = await browser_.evaluate(() => ![...document.querySelectorAll('[role="dialog"]')].some((d) => d.isConnected));
+const afterCdpEscape = await browser_.evaluate(() => ![...document.querySelectorAll('[role="dialog"][aria-label="Run learning cycle"]')].some((d) => d.isConnected));
 console.log("afterCdpEscape dialog closed:", afterCdpEscape);
 // diagnose: where is focus, and does a panel-targeted Escape close it?
 const diag = await browser_.evaluate(() => {
@@ -190,7 +178,7 @@ const focusReturn = await browser_.evaluate(() => {
   const el = document.activeElement;
   const invoker = [...document.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Learn from this run");
   return {
-    dialogGone: ![...document.querySelectorAll('[role="dialog"]')].some((d) => d.isConnected),
+    dialogGone: ![...document.querySelectorAll('[role="dialog"][aria-label="Run learning cycle"]')].some((d) => d.isConnected),
     // the original invoker unmounts with the tab switch; the carried action's
     // new home (the learning-cycle button) is the correct focus-return target
     focusReturnedToInvoker: el === invoker || (el?.getAttribute("data-acc010-learning-cycle") ?? "") === "",

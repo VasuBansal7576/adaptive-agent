@@ -107,18 +107,21 @@ export function Modal({
       // focus-return target (set when the invoking control unmounts, e.g., a
       // tab switch carried the action elsewhere) takes precedence; otherwise
       // restore to the captured element when it is still connected.
+      // prefer the explicitly marked target (if still extant), then the
+      // carried action's learning-cycle control, then the captured element
       const marked = document.querySelector<HTMLElement>("[data-acc010-focus-return]");
       if (marked?.isConnected) {
         marked.focus();
         marked.removeAttribute("data-acc010-focus-return");
         return;
       }
-      const restore = restoreRef.current;
-      if (restore && restore.isConnected) {
-        restore.focus();
+      const cycle = document.querySelector<HTMLElement>("[data-acc010-learning-cycle]");
+      if (cycle?.isConnected) {
+        cycle.focus();
         return;
       }
-      document.querySelector<HTMLElement>("[data-acc010-learning-cycle]")?.focus();
+      const restore = restoreRef.current;
+      if (restore?.isConnected) restore.focus();
     };
   }, [open]);
 
