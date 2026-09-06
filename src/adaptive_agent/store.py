@@ -569,6 +569,41 @@ class Store:
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
 
+    def list_learning_evidence(
+        self,
+        environment_id: str | None = None,
+        run_id: str | None = None,
+        include_broker_projection: bool = True,
+    ) -> list[dict[str, Any]]:
+        """The runtime's development evidence feed.
+
+        Returns sanitized learner-visible evidence rows (kind="evidence",
+        joined to trusted outcome) plus, per development run in scope, the
+        broker call/evidence join rows from list_run_tool_calls
+        (kind="broker_call") — canonical safe fields only, never raw
+        operator/evaluator_only rows.
+        """
+        evidence = [dict(r, kind="evidence") for r in self.list_learner_evidence(environment_id, run_id)]
+        if not include_broker_projection:
+            return evidence
+        query = (
+            "SELECT r.run_id FROM runs r JOIN tasks t ON t.id = r.task_id "
+            "WHERE t.partition = 'development'"
+        )
+        params: list[Any] = []
+        if environment_id is not None:
+            query += " AND r.environment_id = ?"
+            params.append(environment_id)
+        if run_id is not None:
+            query += " AND r.run_id = ?"
+            params.append(run_id)
+        with self._connect() as conn:
+            run_ids = [r["run_id"] for r in conn.execute(query, params).fetchall()]
+        calls: list[dict[str, Any]] = []
+        for rid in run_ids:
+            calls.extend(dict(r, kind="broker_call") for r in self.list_run_tool_calls(rid))
+        return evidence + calls
+
     # ------------------------------------------------------------------ broker call/evidence join (session7 seam)
     def list_run_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
         """Read-only sanitized projection of one DEVELOPMENT run's broker calls

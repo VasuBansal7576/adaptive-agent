@@ -768,6 +768,16 @@ class TestControllerSeam:
         assert "[REDACTED]" in flat
         assert orphan["input"] is None and orphan["argumentsSha256"] is None
 
+        # Unified runtime feed: evidence + broker_call kinds, no raw operator rows.
+        feed = store.list_learning_evidence(environment_id=ENV, run_id=run.run_id)
+        kinds = {r["kind"] for r in feed}
+        assert "broker_call" in kinds
+        assert all(r["partition"] == "development" for r in feed)
+        flat_feed = json.dumps(feed)
+        assert "sk-live1234567890abcdef" not in flat_feed and "hunter2secret" not in flat_feed
+        without = store.list_learning_evidence(environment_id=ENV, run_id=run.run_id, include_broker_projection=False)
+        assert {r["kind"] for r in without} == {"evidence"}
+
     def test_learning_projection(self, store, registry, broker):
         """Session7 seam: public docs, redacted development evidence + trusted
         outcome, patch bytes. No hidden evaluator content."""
