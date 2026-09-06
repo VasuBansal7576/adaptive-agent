@@ -813,14 +813,20 @@ class DurableRuntime:
                 return False
             if report.get("validityStatus") != "valid":
                 return False
-            environments = tuple(getattr(protocol, "known_environments", ()))
-            expected_partitions = {f"{name}:validation": frozen.partition_hashes[f"{name}:validation"] for name in environments}
-            if report.get("partitionHashes") != expected_partitions:
-                return False
             partition_ref = row.get("partition_ref")
             if isinstance(partition_ref, str):
                 partition_ref = json.loads(partition_ref)
-            if not isinstance(partition_ref, Mapping) or partition_ref.get("id") != "validation" or partition_ref.get("sha256") != next(iter(expected_partitions.values())):
+            if not isinstance(partition_ref, Mapping) or partition_ref.get("id") not in {"validation", "final"}:
+                return False
+            phase = str(partition_ref["id"])
+            environments = tuple(getattr(protocol, "known_environments", ()))
+            if phase == "final":
+                environments = (*environments, protocol.sealed_environment)
+            expected_partitions = {f"{name}:{phase}": frozen.partition_hashes[f"{name}:{phase}"] for name in environments}
+            if report.get("partitionHashes") != expected_partitions:
+                return False
+            first_partition = f"{environments[0]}:{phase}"
+            if partition_ref.get("sha256") != expected_partitions[first_partition]:
                 return False
             expected_refs = tuple(sorted({self.packages[name].manifest.evaluator_ref.id for name in environments if name in self.packages}))
             refs = report.get("evaluatorRefs")
@@ -889,6 +895,12 @@ class DurableRuntime:
             if "validity" in value and "validityStatus" not in value:
                 value["validityStatus"] = value.pop("validity")
             canonical = bool(row is not None and self._verify_evaluation_report(value, row))
+            if "candidateId" not in value:
+                candidate_hash = value.get("candidateHash")
+                if isinstance(candidate_hash, str):
+                    candidate = self.controller.store.get_candidate_by_bundle_hash(candidate_hash)
+                    if candidate is not None:
+                        value["candidateId"] = candidate.get("candidate_id")
             raw_state = value.get("state")
             if raw_state in {"completed", "complete", "decided", "failed", "error", "incomplete"}:
                 value["state"] = "valid" if canonical else "invalid"
@@ -906,6 +918,16 @@ class DurableRuntime:
                         value["reason"] = error
                     else:
                         value["reason"] = value["trustReason"]
+            if isinstance(payload.get("comparison"), str) and payload["comparison"] in {"validation", "final"}:
+                safe_keys = {
+                    "comparison", "validityStatus", "promotionEligible", "candidateHash", "baseHash", "protocolHash",
+                    "armSummaries", "confidenceIntervals", "safetyPassed", "missingPairs", "metricCellsComplete",
+                    "safetyCellsComplete", "modelProvenanceComplete", "infrastructureFailures", "analysisSeed",
+                    "nominalCostUsd", "actualInputTokens", "actualOutputTokens", "wallDurationSeconds", "billingBasis",
+                }
+                value["report"] = {key: value[key] for key in safe_keys if key in value}
+                for key in ("attestation", "exposure", "safetyProbeOutputs", "environmentCells", "workload"):
+                    value.pop(key, None)
             return value
 
         for row in self.controller.store.list_evaluations():

@@ -1180,6 +1180,14 @@ class Store:
     def get_candidate(self, candidate_id: str) -> dict[str, Any] | None:
         return self._get_json("candidates", "candidate_id", candidate_id)
 
+    def get_candidate_by_bundle_hash(self, bundle_hash: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM candidates WHERE candidate_bundle_hash = ? ORDER BY created_at DESC LIMIT 1",
+                (bundle_hash,),
+            ).fetchone()
+            return dict(row) if row else None
+
     def update_candidate(self, candidate_id: str, state: str, candidate_json: str) -> None:
         """Keep the state column and candidate_json payload synchronized."""
         with self._connect() as conn:

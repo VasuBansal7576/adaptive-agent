@@ -697,6 +697,29 @@ class EvaluationJob:
                 (job_id, comparison, status, report_ref, validation_ref, final_ref, error, accounting_json),
             )
             conn.commit()
+        for phase in ("validation", "final"):
+            phase_report = report_values.get(phase)
+            if not isinstance(phase_report, EvaluationReport):
+                continue
+            payload = phase_report.to_dict()
+            partition_hashes = payload.get("partitionHashes")
+            if not isinstance(partition_hashes, Mapping):
+                raise EvaluationError(f"{phase} report lacks partition hashes")
+            partition_key = next((key for key in sorted(partition_hashes) if key.endswith(f":{phase}")), None)
+            if partition_key is None:
+                raise EvaluationError(f"{phase} report lacks its frozen partition")
+            report_id = f"{job_id}:{phase}"
+            self.store.save_evaluation(
+                report_id,
+                {
+                    "candidate_hash": phase_report.candidate_hash,
+                    "base_hash": phase_report.base_hash,
+                    "protocol_hash": phase_report.protocol_hash,
+                    "partition_ref": json.dumps({"id": phase, "version": "1", "sha256": partition_hashes[partition_key]}, sort_keys=True),
+                    "report_json": json.dumps(payload, sort_keys=True),
+                    "validity": phase_report.validity_status,
+                },
+            )
 
     def readback(self, job_id: str) -> EvaluationJobResult | None:
         with self.store.connect() as conn:

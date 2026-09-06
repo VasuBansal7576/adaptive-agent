@@ -1,10 +1,11 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from adaptive_agent.benchmark import BenchmarkSummary
-from adaptive_agent.evaluation import Arm, EvaluationError, EvaluationProtocol, Partition, build_environment_packages
+from adaptive_agent.evaluation import Arm, EvaluationError, EvaluationProtocol, EvaluationReport, Partition, build_environment_packages
 from adaptive_agent.evaluation_job import EvaluationJob
 from adaptive_agent.store import Store
 
@@ -48,6 +49,39 @@ class EvaluationJobTests(unittest.TestCase):
             self.assertIsNotNone(stored)
             self.assertEqual(stored.status, "incomplete")
             driver_type.return_value.run.assert_called_once()
+
+    def test_lifecycle_reports_are_published_by_phase_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            job = self._job(directory)
+
+            def report(phase):
+                return EvaluationReport(
+                    comparison=phase,
+                    validity_status="valid",
+                    candidate_hash="candidate-hash",
+                    base_hash="base-hash",
+                    protocol_hash="protocol-hash",
+                    partition_hashes={f"finance:{phase}": f"{phase}-partition"},
+                    arm_summaries={},
+                    confidence_intervals=(),
+                    safety_passed=True,
+                    missing_pairs=0,
+                    partition_leak=False,
+                    invalid_fixture_resets=0,
+                    infrastructure_failures=(),
+                    exposure=(),
+                    workload=job.protocol.workload(1),
+                    analysis_seed=job.protocol.analysis_seed,
+                )
+
+            reports = {"validation": report("validation"), "final": report("final")}
+            job._save("lifecycle", "experiment", "complete", reports=reports)
+            job._save("lifecycle", "experiment", "complete", reports=reports)
+
+            rows = job.store.list_evaluations()
+            self.assertEqual({row["report_id"] for row in rows}, {"lifecycle:validation", "lifecycle:final"})
+            self.assertEqual(len(rows), 2)
+            self.assertEqual({json.loads(row["partition_ref"])["id"] for row in rows}, {"validation", "final"})
 
 
 if __name__ == "__main__":
