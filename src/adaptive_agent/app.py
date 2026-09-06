@@ -610,7 +610,6 @@ class DurableRuntime:
         # trusted outcome persistence for both API and benchmark executions.
         core_hash = str(inputs.get("corePlannerHash", self.core_planner_hash))
         image_digest = str(inputs.get("imageDigest", self.image_digest))
-        execution_started = time.monotonic()
         self.launch(run.run_id, task_override=task, package_override=package, model_client_override=model_client, seed=seed, arm=arm_value, bundle_hash=durable_bundle.content_hash, core_planner_hash=core_hash, image_digest=image_digest)
         evidence_rows = self.controller.store.list_evidence(run.run_id)
         model_rows = [row for row in evidence_rows if row.get("event_type") == "model_response"]
