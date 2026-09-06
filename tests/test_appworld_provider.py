@@ -57,16 +57,14 @@ def test_catalog_reads_exact_public_split_ids_and_seals_test(tmp_path: Path):
     manifest = catalog.runtime_manifest().to_dict()
     assert manifest["splitCounts"] == {"train": 1, "dev": 1, "test_normal": 1, "test_challenge": 1}
     assert manifest["catalog"] == {
-        "publicTaskSpecsLoaded": True,
-        "testTaskSpecsLoaded": False,
-        "groundTruthLoaded": False,
-        "taskReportsLoaded": False,
+        "groundTruthAccess": "none",
+        "taskReportAccess": "none",
+        "testTaskAccess": "sealed_until_explicitly_enabled",
     }
     assert manifest["isolatedEvaluator"] == {
-        "groundTruthLoaded": True,
         "groundTruthMode": "minimal",
         "groundTruthVisibility": "evaluator_only",
-        "taskReportsLoaded": False,
+        "responseVisibility": "aggregate_only",
     }
     assert "testGroundTruthLoaded" not in manifest
     assert catalog.task("train-1", "train").instruction == "read the clock"

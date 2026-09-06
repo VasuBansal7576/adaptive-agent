@@ -126,16 +126,14 @@ class AppWorldRuntimeManifest:
             "splitCounts": dict(self.split_counts),
             "splitIds": {name: list(ids) for name, ids in self.split_ids.items()},
             "catalog": {
-                "publicTaskSpecsLoaded": True,
-                "testTaskSpecsLoaded": False,
-                "groundTruthLoaded": False,
-                "taskReportsLoaded": False,
+                "groundTruthAccess": "none",
+                "taskReportAccess": "none",
+                "testTaskAccess": "sealed_until_explicitly_enabled",
             },
             "isolatedEvaluator": {
-                "groundTruthLoaded": True,
                 "groundTruthMode": "minimal",
                 "groundTruthVisibility": "evaluator_only",
-                "taskReportsLoaded": False,
+                "responseVisibility": "aggregate_only",
             },
         }
 
