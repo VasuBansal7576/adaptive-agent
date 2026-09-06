@@ -762,6 +762,17 @@ function ApprovalDialog({
  *  the action when the server declares learningEligible; later stages point
  *  to the Candidates tab where evaluation gates activation. No stage is ever
  *  marked complete without server data. */
+/** Exhaustive, plain status phrasing for the workflow strip. */
+const RUN_STATUS_PHRASE: Record<RunRecord["status"], string> = {
+  queued: "is queued",
+  running: "is in progress",
+  awaiting_approval: "is awaiting approval",
+  succeeded: "completed",
+  failed: "failed",
+  cancelled: "was cancelled",
+  timed_out: "timed out",
+};
+
 function WorkflowStrip({
   selected,
   onLearnFromRun,
@@ -774,30 +785,31 @@ function WorkflowStrip({
       label: "1. Execute goal",
       caption: (
         <>
-          Run {selected.status === "succeeded" ? "completed" : selected.status === "failed" ? "failed" : `in progress (${selected.status})`} · outcome recorded by the trusted
-          evaluator. Tasks come from the built-in simulated business fixture catalog; model execution does not change data provenance.
+          Run {RUN_STATUS_PHRASE[selected.status] ?? `in progress (${selected.status})`}
+          {selected.outcomeRef ? " with a recorded outcome." : "."} Tasks come from the built-in simulated
+          business fixture catalog; model execution does not change data provenance.
         </>
       ),
     },
     {
       label: "2. Learn from verified attempt",
-      caption:
-        selected.learningEligible ? (
-          <>This run is server-declared eligible.{" "}
-            <button
-              type="button"
-              onClick={() => onLearnFromRun(selected.runId)}
-              className="rounded-md border border-sky-700 px-2.5 py-1 text-[11px] font-medium text-sky-300 hover:bg-sky-950/60"
-            >
-              Learn from this run
-            </button>
-          </>
-        ) : (
-          <>Eligible after a server-verified outcome (declared per run).</>
-        ),
+      caption: selected.learningEligible ? (
+        <>
+          This run is eligible for learning.{" "}
+          <button
+            type="button"
+            onClick={() => onLearnFromRun(selected.runId)}
+            className="rounded-md border border-sky-700 px-2.5 py-1 text-[11px] font-medium text-sky-300 hover:bg-sky-950/60"
+          >
+            Learn from this run
+          </button>
+        </>
+      ) : (
+        <>Becomes eligible after a verified outcome.</>
+      ),
     },
     { label: "3. Evaluate candidate", caption: <>Staged candidates are compared against the base by the trusted evaluator in the Candidates tab.</> },
-    { label: "4. Activate only if gate passes", caption: <>Activation happens solely on a passing trusted gate; the run record above is never a score.</> },
+    { label: "4. Activate only if gate passes", caption: <>A candidate activates only when the trusted gate passes.</> },
   ];
   return (
     <nav aria-label="Adaptive workflow" className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
