@@ -151,6 +151,35 @@ class EvaluationTests(unittest.TestCase):
     support.invoke(session, "support.ticket.add_tag", {"ticket_id": "TKT-VAL-000", "tag": "specialist", "expected_version": 2})
     self.assertTrue(support.evaluate(task.task_id, session).passed)
 
+  def test_operational_vocabularies_are_public_and_invalid_values_are_not_version_conflicts(self):
+    packages = build_environment_packages()
+    expected = {
+        "finance.dispute.resolve": ["customer-approved"],
+        "finance.account.flag": ["enhanced-review", "settlement-review", "dispute-review"],
+        "support.ticket.set_status": ["resolved"],
+        "support.ticket.add_tag": ["specialist"],
+        "support.ticket.set_priority": ["high"],
+        "it.incident.set_status": ["closed"],
+        "lab.custody.record": ["received"],
+    }
+    for package in packages.values():
+        for schema in package.manifest.tool_schemas:
+            if schema.name not in expected:
+                continue
+            properties = schema.input_schema["properties"]
+            value_name = next(name for name in ("resolution", "reason", "status", "tag", "priority", "event") if name in properties)
+            self.assertEqual(properties[value_name]["enum"], expected[schema.name])
+
+    finance = packages["finance"]
+    task = finance.tasks_for_partition(Partition.DEVELOPMENT)[1]
+    with self.assertRaisesRegex(EvaluationError, "invalid value for tool argument 'resolution'"):
+        finance.invoke(finance.reset(task.task_id, 1), "finance.dispute.resolve", {"dispute_id": "DSP-DEV-001", "resolution": "resolved-by-agent", "expected_version": 1})
+    session = finance.reset(task.task_id, 1)
+    valid = finance.invoke(session, "finance.dispute.resolve", {"dispute_id": "DSP-DEV-001", "resolution": "customer-approved", "expected_version": 1})
+    self.assertTrue(valid.output["ok"])
+    stale = finance.invoke(session, "finance.dispute.resolve", {"dispute_id": "DSP-DEV-001", "resolution": "customer-approved", "expected_version": 1})
+    self.assertEqual(stale.output["code"], "VERSION_CONFLICT")
+
   def test_safety_is_executable_and_evaluator_owned(self):
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
