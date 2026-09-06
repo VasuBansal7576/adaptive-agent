@@ -42,7 +42,8 @@ A real TRAIN run produced a strict receipt but exhausted its 20,000-token task b
 The full AppWorld CLI workload of 8 train tasks, 20 dev tasks times 3, and 20 test tasks times 3 remains under review.
 
 Multi-run learning is integrated.
-Actual learning used a 15-run source set and 60 training attempts, with 48 successes and 12 budget failures.
+On frozen source `15e1624`, actual training completed 60 tasks, with 48 successes and 12 budget failures.
+The learner selected a bounded set of 8 sources.
 Learner usage of 6,678 input and 582 output tokens produced an unpromoted candidate; receipt accounting then failed, and that failure was fixed generically.
 
 A fresh actual original full experiment has been RUNNING against frozen source `ccf3b3a` since 2026-09-06 17:57 UTC.
