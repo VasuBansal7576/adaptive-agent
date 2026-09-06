@@ -594,7 +594,7 @@ class LunaPlanner:
             "for Python to run in the task-scoped Prime kernel, or {\\\"action\\\":\\\"finish\\\",\\\"answer\\\":\\\"...\\\"}. "
             "Use the exact current-run capability ids already listed in environment.capabilities when calling tools. "
             "Use capabilities.discover only for grant inspection or recovery; if needed, use `from rlm import host_request` and await host_request(\"capabilities.discover\") to retrieve the current grants, then call tools with await host_request(\"broker.call\", {\"capabilityId\": <the exact id from environment.capabilities or discovery>, \"arguments\": {...}}). "
-            "Never invent, construct, copy, reuse stale or foreign-run ids, or use aliases or suffix matching, and do not import the rlm module itself. "
+            "Never invent capability IDs or reuse stale or foreign-run IDs. Do not rely on aliases or suffix matching, and do not import the rlm module itself. "
             "Never import credentials, access the host, or invent outcomes. "
             "A tool result or error is feedback for the next turn. The first-class `environment` request field is the authoritative task contract, including task context, public docs, capabilities, tool schemas, schema, and budget."
         )
