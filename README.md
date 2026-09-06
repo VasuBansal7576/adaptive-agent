@@ -13,14 +13,16 @@ This is procedural adaptation, not model-weight training or a promise of univers
 - [MILESTONES.md](MILESTONES.md) defines the runnable vertical slice, full delivery gates, AO ownership, and submission traceability.
 
 Implementation is active from this clean integration branch.
-The repository still has no application commands, installed project dependencies, configured package manager, or application CI until the first reviewed M2 code lands.
+The Python control-plane package, Prime adapter, Luna planner, evaluator, and integration tests are now present and configured through `pyproject.toml`.
+The durable production Store/Broker, reviewed console transport, and application CI remain separate delivery work.
 The proposed stack is React, Tailwind, Vite, and Bun with a small backend selected by a bounded Prime API bridge spike.
 Prime is the proposed runtime, with isolated IPython as a documented fallback if its interfaces cannot support the required boundaries.
 
 The verified smoke path uses Prime 0.9.2 session 3 with a ChatGPT subscription, `openai-codex/gpt-5.6-luna`, and an actual Python `2+2` result of `4`.
 Default Prime Inference returned HTTP 402 for lack of balance, while the subscription provider worked.
 Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
-The product bridge, safety isolation, and behavioral evaluation remain unverified.
+A bounded live neutral path now exercises authenticated Luna, Docker Prime, a read-only broker fixture, a trusted objective evaluator, and console-facing run events.
+Production Devin broker authority and the complete behavioral evaluation remain pending.
 
 The active phase covers implementation, local verification, and M2-M4 coordination.
 Local specification commits, fast-forward integration into local `main`, and synchronization to the filesystem-only origin are complete.
