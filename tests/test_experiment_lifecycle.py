@@ -155,3 +155,26 @@ def test_unknown_nested_cost_blocks_future_admission(tmp_path: Path):
     job.record_lifecycle_subcall(admission["admissionId"], result={"usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "economicCostStatus": "unknown"})
     with pytest.raises(ValueError, match="budget exhausted"):
         job.admit_lifecycle_subcall("unknown-subcall", "transfer", "leave-out:finance", "child-1")
+
+
+def test_error_only_subcall_is_recoverable_without_fake_accounting(tmp_path: Path):
+    job = _job(tmp_path)
+    job._lifecycle_budget("error-only", {"attempts": 1, "inputTokens": 10, "outputTokens": 10, "toolCalls": 10, "wallMicros": 10_000, "costMicrounits": 10})
+    admission = job.admit_lifecycle_subcall("error-only", "adaptation", "adapt:finance", "child-0")
+    recorded = job.record_lifecycle_subcall(admission["admissionId"], error="runtime crashed before receipt")
+    replay = job.admit_lifecycle_subcall("error-only", "adaptation", "adapt:finance", "child-0")
+    assert recorded["status"] == replay["status"] == "failed"
+    assert replay["result"] == {}
+    assert replay["error"] == "runtime crashed before receipt"
+    assert job.lifecycle_accounting("error-only")["inputTokens"] == 0
+
+
+def test_reused_complete_subcall_returns_persisted_result(tmp_path: Path):
+    job = _job(tmp_path)
+    job._lifecycle_budget("recovery", {"attempts": 1, "inputTokens": 10, "outputTokens": 10, "toolCalls": 10, "wallMicros": 10_000, "costMicrounits": 10})
+    admission = job.admit_lifecycle_subcall("recovery", "transfer", "leave-out:finance", "child-0")
+    result = {"responseId": "child-response", "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "costMicrounits": 1}
+    job.record_lifecycle_subcall(admission["admissionId"], result=result)
+    replay = job.admit_lifecycle_subcall("recovery", "transfer", "leave-out:finance", "child-0")
+    assert replay["status"] == "complete"
+    assert replay["result"] == result
