@@ -781,10 +781,10 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
                 "wallTimeSeconds": 90,
                 "costMicrounits": 100000,
                 "currency": "USD",
-                # The browser must submit this trusted reference verbatim when
-                # it does not provide an inline budget object.
-                "budgetRef": plane.default_budget_ref,
             },
+            # The browser submits the budget object separately and can use
+            # this trusted reference alongside it.
+            "budgetRef": plane.default_budget_ref,
         }
 
     @app.post("/environments/validate")
