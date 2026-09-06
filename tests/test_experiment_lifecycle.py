@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from adaptive_agent.evaluation import EvaluationProtocol, build_environment_packages
-from adaptive_agent.evaluation_job import EvaluationJob, LifecycleStage
+from adaptive_agent.evaluation_job import EvaluationJob, LifecycleStage, _effective_cost_microunits
 from adaptive_agent.production_evaluator import _lifecycle_execution_plan
 from adaptive_agent.store import Store
 
@@ -25,6 +25,14 @@ def _stages(seen: list[tuple[str, str]]) -> tuple[LifecycleStage, ...]:
         return {"status": "complete", "stage": context["stage"], "cellKey": cell, "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "toolCalls": 1, "wallSeconds": 0.01, "costMicrounits": 1}
 
     return tuple(LifecycleStage(name, (f"{name}-0",), callback) for name in names)
+
+
+def test_effective_cost_requires_complete_nominal_coverage():
+    complete = {"knownReceipts": 1, "totalReceipts": 1}
+    partial = {"knownReceipts": 1, "totalReceipts": 2}
+    assert _effective_cost_microunits(17, 0.000021) == 17
+    assert _effective_cost_microunits(None, 0.000021, nominal_status="complete", nominal_coverage=complete) == 21
+    assert _effective_cost_microunits(None, 0.000021, nominal_status="partial", nominal_coverage=partial) is None
 
 
 def test_complete_lifecycle_is_ordered_resumable_and_does_not_repeat_success(tmp_path: Path):

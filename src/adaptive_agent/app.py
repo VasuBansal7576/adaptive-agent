@@ -38,6 +38,33 @@ from adaptive_agent.store import Store
 from adaptive_agent.evaluation_store import build_durable_adapters
 
 
+def _effective_observation_cost(accounting: Mapping[str, Any]) -> int:
+    """Return an observation cost only when its source is complete.
+
+    Measured microunits are authoritative when present.  A nominal USD value
+    is usable as a clearly labeled proxy only when the accounting artifact
+    explicitly states complete, non-empty receipt coverage.
+    """
+    cost = accounting.get("costMicrounits")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(float(cost)) and cost >= 0:
+        return int(round(float(cost)))
+    nominal = accounting.get("nominalCostUsd")
+    coverage = accounting.get("nominalCostCoverage")
+    complete_coverage = (
+        accounting.get("nominalCostStatus") == "complete"
+        and isinstance(coverage, Mapping)
+        and isinstance(coverage.get("knownReceipts"), int)
+        and not isinstance(coverage.get("knownReceipts"), bool)
+        and isinstance(coverage.get("totalReceipts"), int)
+        and not isinstance(coverage.get("totalReceipts"), bool)
+        and coverage["totalReceipts"] > 0
+        and coverage["knownReceipts"] == coverage["totalReceipts"]
+    )
+    if complete_coverage and isinstance(nominal, (int, float)) and not isinstance(nominal, bool) and math.isfinite(float(nominal)) and nominal >= 0:
+        return int(round(float(nominal) * 1_000_000))
+    raise LearningRuntimeError("evaluation accounting lacks complete economic or nominal cost")
+
+
 def _freeze_core_planner_hash() -> str:
     """Hash the executable planner sources once for this process.
 
@@ -603,7 +630,10 @@ class DurableRuntime:
                 observation_kwargs["bundle_hash"] = durable_bundle.content_hash
         except TypeError:
             pass
-        return RunObservation(task_id, env_id, Partition(getattr(getattr(task, "partition", None), "value", getattr(task, "partition", "development"))), seed, Arm(arm_value), passed, reliable, safety_violations, int(accounting.get("costMicrounits") or 0), float(accounting.get("durationSeconds", 1e-6)), **observation_kwargs)
+        duration = accounting.get("durationSeconds")
+        if not isinstance(duration, (int, float)) or isinstance(duration, bool) or not math.isfinite(float(duration)) or duration < 0:
+            raise LearningRuntimeError("evaluation accounting lacks complete duration")
+        return RunObservation(task_id, env_id, Partition(getattr(getattr(task, "partition", None), "value", getattr(task, "partition", "development"))), seed, Arm(arm_value), passed, reliable, safety_violations, _effective_observation_cost(accounting), float(duration), **observation_kwargs)
 
     def run_evaluation_job(self, task: Mapping[str, Any], frozen_config: Mapping[str, Any] | None, bundle: Mapping[str, Any] | None) -> None:
         """Run one trusted evaluation task and durably record its result.
