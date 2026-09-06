@@ -1,93 +1,178 @@
 # Adaptive Agent
 
-A domain-agnostic agent for Syndicate Track 1 that discovers workflows in unfamiliar environments and learns reusable procedures from its own attempts and verified outcomes.
-Each environment supplies goals, docs, tools, policy, and an evaluator without changing the core planner.
-Finance, support, and IT are evaluation packs, with a genuinely new fourth environment reserved for final testing.
+Adaptive Agent is a domain-agnostic control plane that runs tasks in unfamiliar environments and learns bounded procedural changes from verified development outcomes.
+An environment provides its documentation, tools, policy, tasks, reset behavior, and trusted evaluator.
+The planner stays the same across environments.
 
-The learning loop records evidence, proposes a bounded change, independently compares baseline and candidate, and automatically promotes or rejects the change.
-Policies, credentials, evaluators, and hidden answers remain outside the learner's authority.
-Versioning and rollback protect the active skill bundle.
-This is procedural adaptation, not model-weight training or a promise of universal capability.
+The learning loop records a run, receives a redacted trusted outcome, proposes an evidence-linked candidate, compares the candidate with the pinned baseline, and promotes only a passing candidate.
+Rejected and quarantined candidates remain inactive.
+This project changes procedures and execution configuration, not model weights.
 
-- [SPEC.md](SPEC.md) defines requirements, contracts, architecture, learning, evaluation, security, and acceptance.
-- [MILESTONES.md](MILESTONES.md) defines the runnable vertical slice, full delivery gates, AO ownership, and submission traceability.
+Read [SPEC.md](SPEC.md) for the requirements, contracts, security rules, evaluation protocol, and acceptance meanings.
+Read [MILESTONES.md](MILESTONES.md) for implementation evidence and delivery gates.
 
-The authorized local-main assembly is complete for the committed session-2 backend tip `feef752`, session-5 console tip `eea3bdc`, and documentation tip `eeb5f05`.
-Dirty worker overlays were not included, and no heldout, final, or public release is implied.
-The exact branch refs, dirty-worktree status, and component ownership are tracked in [MILESTONES.md](MILESTONES.md).
+## Current status
 
-The Python package is configured through `pyproject.toml` on the implementation branches.
-Its implemented entry points are `adaptive-agent` for the FastAPI control plane and operator-console backend, and `adaptive-agent-plan` for the authenticated Luna planner loop.
-The console package is configured through `package.json` and uses React, Tailwind, Vite, and Bun.
-The implemented console commands are `bun run dev`, `bun run test`, `bun run build`, `bunx tsc --noEmit`, and `bun run api:smoke`.
-`adaptive-agent` and `adaptive-agent-plan` are branch-local implementation commands until the corresponding branch work is integrated.
+The current local `main` is `7c65f5b`.
+The root-verified real path reached the production UI, the authenticated Luna subscription, the Docker runtime, a broker write, and the trusted evaluator on the clean Store and data directory `/private/tmp/adaptive-agent-main-20260906`.
+The run was `run_a1662f700a9a400b9e0f80b87a52f76e`.
 
-The verified Prime smoke path uses Prime 0.9.2 session 3 with a ChatGPT subscription, `openai-codex/gpt-5.6-luna`, and an actual Python `2+2` result of `4`.
-Default Prime Inference returned HTTP 402 for lack of balance, while the subscription provider worked.
-The bounded Prime runtime adapter also recorded persistent kernel results `42` and `41`, a structured host-bridge response, and denied learner requests for harness, policy, evaluator, credential, and hidden-data access.
-Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
-The console worker reported a live FastAPI session, registration, create/launch, SSE cursor, and cancellation smoke as passing.
-That smoke used a synthetic neutral environment and does not establish a real model-to-tool-to-evaluator product run.
-It remains historical transport evidence only until its Store and data target are proven isolated from root QAdata.
+The run produced learning candidate `cand_a095170f9c6d4f58943deb7539270de0` from three broker references and 7,206 learning tokens.
+Candidate proposal validation passed.
+No heldout panel or performance result has been run from this checkpoint.
+Session 6 is fixing the full lifecycle 360/720 regression.
 
-Tests and fixture runs are not interchangeable with those real-run checks.
-The backend and benchmark tests use synthetic providers, drivers, and deterministic fixtures, while console tests use simulation fixtures and captured wire frames.
-The current checkpoint has not produced a sealed four-environment evaluation, a measured performance result, or a complete behavioral acceptance result.
+The accepted Luna-through-ChatGPT subscription path does not expose an API-key or provider switch.
+The trusted parent accounts actual model usage and rejects after aggregate token exhaustion.
+The strict provider output-token cap remains an accepted but unmet criterion.
+The SDK nominal cost is a proxy, and economic billing is unknown.
+No publication or submission is authorized.
 
-Root-verified current evidence beyond `d8e9293` is bounded integration and safety evidence only.
-The current session-2 probe and integration lineage is committed at `f3785f0` with a dirty overlay still requiring review before assembly.
-The final2 integration reports 171 backend tests passed.
-Actual Docker-backed EVAL-003 passed all 7 obligations on isolated temporary Store and data paths.
-The EVAL-003 safety path was further hardened at commit `3261afc` atop `f423fac`.
-It now uses attacker-controlled public-document output to attempt forged write approval, verifies that no provider write occurs, and exercises `broker.call` escalation, `evaluator.write`, `harness.write`, and filesystem access through `run_prime_runtime_safety_probe`.
-The full safety pass requires an injected `PrimeRuntimeAdapter` whose provenance contains Docker, while `Controller.execute_probe` fails closed when that adapter is absent.
-The `require_runtime=False` option is reserved for control-plane unit mode and is not a full EVAL-003 result.
-Default probe results include self-contained evidence receipts with payload and content hash, and do not expose the hidden answer.
-The focused safety, core, and lifecycle test report was 39 passed with no services or paid calls.
-Actual Docker-backed EVAL-005 passed its two runtime cases, `child_failure_recovery_and_cap` and `shared_model_cost_token_cap`, using the deterministic probe model rather than a paid model call.
-The current session-4 Controller probe at `83d2e01` passed EVAL-004 8/8 and EVAL-005 8/8 on an isolated temporary Store and data directory.
-It closes `promotion_crash_reopen_atomic`, `child_failure_propagated`, and `event_reconnect_resume`: reopening preserves the active pointer, evaluating state, and promotion count; a failed child remains linked by `parentRunId` with both rows and the failed step persisted; and terminal SSE resume yields the exact remaining event tail.
-This probe evidence did not change the cost ledger, EVAL-003, or evaluator lifecycle, and used no services or paid calls.
-The latest session-5 console tip is `ae482da`, following `29afe35`, with 61/61 tests, TypeScript, and build clean; its latest report did not include live smoke.
-These results do not establish a product-wide run, heldout performance, or final evaluation success.
+## Set up
 
-A newer isolated development smoke used Store and data path `/tmp/adaptive-run-2fc3c680.fiZAAA`.
-Under scoped verifier fix `0561041`, the trusted outcome was visible as `evaluator_only` while the required `model_response` remained operator-visible.
-The durable run was `run_7f5b3196fff541129d4e9c8345d0ba75` for `finance-development-00`, baseline seed 17, with `lastEventSequence=16`, a trusted and reliable outcome, and `bundleHash=507a47cc70856f5e680d689ad3400b92f67daa4dbc9bc1e1209b5ae78a1e7b6a`.
-Its recorded pins were protocol `1cced7b2...`, core `54b3b7...`, Docker image `adaptive-prime-runtime@sha256:e1242afd...`, analysis `3e5371a...`, budget `5f3b9d...`, and model `efaeffc...`.
-The aggregate receipt recorded 8407 input, 1088 output, and 9495 total tokens, with broker invoice and payment reads plus `apply_payment` confirmed.
-Resume smoke completed with `status=complete`, `candidateCount=1`, and `transferRuns=1` matching the expected value of 1.
-The full post-fix pytest report was 147 passed with two dependency warnings.
-This is isolated development-smoke evidence only and makes no heldout, final, public, or performance claim.
+Requirements are Python 3.12 or later, [uv](https://docs.astral.sh/uv/), and [Bun](https://bun.sh/).
 
-QA data-integrity hold: the original real evidence for `run_2fc` is contaminated by appended synthetic `model_response` rows at sequences 20 and 21, named `learning-model-fake-resp-1` and `learning-model-r20`.
-All history must be preserved, but those rows must not be erased, relabeled, or counted as real evidence.
-No transport smoke may target the root QAdata or port 8000 because the real authenticated path invokes the paid model.
-Every test and probe must use an isolated temporary Store and data directory.
+Install the backend and development dependencies from the project metadata.
 
-The repository contains no literal occurrence of the run or row identifiers, so the source and ownership of those specific append operations are not established here.
-The related evaluator-owned probe path observed on session 2 is `Controller.execute_probe`, authored in the session-2 probe commits `59adfb5` and `f423fac`.
-That path creates `tempfile.TemporaryDirectory(prefix="aa-probe-")` and a `Store` under its temporary directory, but this code-level property does not prove that `run_2fc` was isolated.
-Session 6 must create clean independent evaluation data, regenerate and validate real development evidence and its candidate, and retain exact path-level isolation proof before any sealed panel runs.
+```sh
+uv sync --extra dev
+```
 
-The documentation phase and authorized local-main assembly are complete.
-The assembly used only committed session-2 backend integration, session-5 console, and documentation refs.
-Post-assembly isolated backend and console checks, cost accounting, ablation, and report validation remain required before reassessing M2-M4.
-Session 3, session 4, session 6, and session 7 work remains separate evidence or follow-up input and is not part of that assembly plan.
-Implementation, local verification, and M2-M4 coordination remain active across the worker branches.
-Public remote creation, publication, pushes to public remotes, pull requests, and submission remain unauthorized and incomplete.
-The official build window closes on 2026-09-07 at 03:30 IST.
-Public repository and social-demo obligations are recorded in the milestones and are not yet fulfilled.
+Install the console dependencies from `package.json`.
 
-Prime source reuse must preserve the verified MIT attribution and notices.
-The reused source is Prime Agent by Prime Intellect AI, pinned for the initial static review at commit [`9c54a35dac3a2ad17910074d66664859ea175666`](https://github.com/PrimeIntellect-ai/prime-agent/tree/9c54a35dac3a2ad17910074d66664859ea175666), under the MIT License.
-The installed Prime 0.9.2 runtime smoke is separate from that pinned static-source review.
-Backpass and Vision inform evidence handling and bounded edits, but are not required dependencies or autonomous evaluators.
-Evaluation targets, source-review limitations, and acceptance meanings remain defined by the specification.
-No measured performance, full acceptance, public publication, or submission result is claimed.
+```sh
+bun install
+```
 
-One explicit blocker remains unmet.
-The user-accepted Luna-through-ChatGPT subscription path has no API-key or provider switch.
-The trusted parent records actual model usage and rejects after aggregate token exhaustion.
-Local token limits and post-response rejection are not hard provider enforcement, so the strict per-call output-token-cap criterion remains UNMET.
-This documentation does not alter the pass meaning of any requirement in [SPEC.md](SPEC.md).
+## Run locally
+
+Start the control API in one terminal.
+
+```sh
+uv run adaptive-agent --data-dir .adaptive-agent
+```
+
+The API listens on `127.0.0.1:8000` by default.
+The `--data-dir` option selects the SQLite database and content-addressed artifacts directory.
+
+Start the Vite console in a second terminal.
+
+```sh
+bun run dev
+```
+
+Open the URL printed by Vite, usually `http://localhost:5173`.
+The development server proxies `/api` to the API at `http://127.0.0.1:8000`.
+The console uses the live API by default.
+
+To serve a built console from the Python process, build it first.
+
+```sh
+bun run build
+uv run adaptive-agent --data-dir .adaptive-agent --console-dist console/dist
+```
+
+Open `http://127.0.0.1:8000` after the API starts.
+The API accepts `--host`, `--port`, `--data-dir`, and `--console-dist`.
+
+The authenticated planner entry point is available for an adapter that implements the source contract.
+
+```sh
+uv run adaptive-agent-plan \
+  --goal "<goal>" \
+  --environment @path/to/environment.json \
+  --adapter module:factory
+```
+
+The adapter factory must return a model client, kernel, and evidence sink.
+
+## Verify changes
+
+Run the backend and console checks from the repository root.
+
+```sh
+uv run pytest
+bun run test
+bunx tsc --noEmit
+bun run build
+```
+
+With the API already running, exercise the live session, run, event-stream, and cancellation contract.
+
+```sh
+bun run api:smoke
+```
+
+Set `API_BASE` to target another API URL.
+The smoke command exits successfully with a skip message when the API is unreachable, so check its output.
+
+## Architecture
+
+The repository uses one Python control plane and one React console.
+
+| Component | Responsibility |
+| --- | --- |
+| `src/adaptive_agent/api.py` and `app.py` | FastAPI routes, session bootstrap, run lifecycle, learning, evaluation, and static console serving |
+| `Store` and content-addressed artifacts | SQLite metadata, immutable references, event history, evidence, candidates, and activation history |
+| Environment registry and packages | Documentation, task inputs, tool schemas, policy, reset behavior, fixture handlers, and trusted evaluator bindings |
+| Planner and Prime runtime adapter | Model calls, persistent task kernel state, optional bounded children, and runtime provenance |
+| Broker and controller | Capability checks, schema validation, approvals, idempotency, budgets, dispatch, reconciliation, and event recording |
+| Learning, evaluation, and promotion services | Redacted evidence retrieval, bounded candidate construction, independent baseline/candidate evaluation, mechanical gating, quarantine, and rollback |
+| `console/` | React, Tailwind, and Vite operator views over REST and cursor-based SSE |
+
+An operator registers an environment, creates a run with a model and budget, and launches it.
+The executor discovers a plan and sends tool requests through the broker.
+The evaluator records the trusted outcome outside the learner.
+Development evidence can produce a bounded candidate.
+The evaluation controller compares the candidate with a reset baseline before the promotion service changes the active pointer.
+Each run stays pinned to its starting bundle.
+
+## Trust boundary
+
+The learner, retrieved documentation, skills, model output, and tool output are untrusted relative to policy and evaluator authority.
+
+- The control API, broker, evaluator, and promotion service run outside the learner runtime.
+- The Docker runtime receives a writable task directory and approved read-only inputs, without host credentials or evaluator answers.
+- The learner cannot write active skills, policy, evaluator state, promotion records, or host files.
+- The broker is the only path to external tools.
+  It validates the run capability, schema, resource scope, approval token, idempotency key, and policy immediately before dispatch.
+- Trusted outcomes use `evaluator_only` visibility and enter learner-visible evidence only after redaction.
+- The console escapes untrusted evidence and cannot manufacture a passing evaluation.
+- The default service binds to loopback and uses a same-origin operator session.
+  Non-loopback hosting needs an explicit authentication and tenant-isolation design.
+
+Documentation can describe a tool but cannot grant permission.
+A skill precondition cannot replace a fresh policy check or live-state check.
+An uncertain external effect becomes `OUTCOME_UNKNOWN` and blocks automatic repetition until reconciliation.
+
+## Fixtures and real execution
+
+Fixture and real execution are separate evidence classes.
+
+| Mode | What it uses | What it proves |
+| --- | --- | --- |
+| Backend tests and probes | Deterministic providers, in-memory handlers, isolated temporary Stores, and synthetic reports | Controller, broker, storage, safety, and lifecycle behavior at the tested boundary |
+| Console simulation | Deterministic UI fixtures, enabled only with `?sim=1` in a development build or the development toggle | Console rendering and interaction states; it is not model inference |
+| Live console and API | REST and SSE against the Python control plane | API and console transport behavior when the API is reachable |
+| Real product run | Authenticated Luna, Docker runtime, broker dispatch, isolated Store and data paths, and the trusted evaluator | A model-to-tool-to-evaluator run with retained provenance for that run |
+
+The live console defaults to the real API.
+The simulation mode always shows a simulation label and never presents stream connectivity as model inference.
+Tests and probes must use newly allocated temporary Store and data paths.
+Do not treat a fixture pass, a transport smoke, or a candidate proposal validation as a heldout performance result.
+
+## Limitations
+
+- The current candidate has passed proposal validation only.
+  It has not passed an independent heldout comparison.
+- No sealed four-environment B0/L/A panel or measured performance claim exists.
+- Session 6 is fixing the full lifecycle 360/720 regression before the complete workload can be accepted.
+- The strict per-call provider output-token cap is unmet because the accepted subscription path exposes no hard provider switch or API-key boundary.
+  Aggregate trusted accounting and local post-response checks do not prove provider enforcement.
+- SDK-reported nominal cost does not prove economic billing.
+- The default deployment is a single loopback operator.
+  Real financial, customer, or production IT writes are outside the default evaluation profile.
+- Publication, deployment, and submission are not authorized.
+
+This README summarizes the current implementation and evidence.
+It does not change any requirement, acceptance criterion, blocker, or pass meaning in [SPEC.md](SPEC.md).
