@@ -693,6 +693,61 @@ class TestControllerSeam:
         })
         ctl.require_dev_smoke(ENV)  # now allowed
 
+    def test_run_tool_call_projection(self, store, registry, broker, provider):
+        """Session7 seam: sanitized broker call/evidence join for one
+        DEVELOPMENT run — canonical fields only, no credentials or hidden data."""
+        from adaptive_agent.controller import Controller
+        from adaptive_agent.models import Budget, ModelProfile, RunRequest
+
+        registry.register(NEUTRAL_MANIFEST)
+        ctl = Controller(store, registry, broker)
+        task = TaskInput(taskId="t-join", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g", partition="development")
+        registry.register_task(task)
+        run = ctl.create_run(
+            RunRequest(
+                taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
+                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
+                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
+                idempotencyKey="idem-join",
+            ),
+            task,
+        )
+        provider.reset(run.run_id)
+        cap = _cap(run_id=run.run_id, tool="read_record", effect="read")
+        req = _req("read_record", {"record_id": "record-1"}, run=run.run_id, key="jc-1")
+        res = ctl.dispatch_tool(ENV, req, cap, provider)
+        assert res.status == "ok"
+        ctl.record_broker_tool_result(run.run_id, res.model_dump(mode="json", by_alias=True))
+
+        rows = store.list_run_tool_calls(run.run_id)
+        assert len(rows) == 1
+        r0 = rows[0]
+        assert r0["callId"] == res.call_id and r0["tool"] == "read_record"
+        assert r0["input"] == {"record_id": "record-1"}
+        assert r0["status"] == "ok" and r0["errorCode"] is None
+        assert r0["runId"] == run.run_id and r0["taskId"] == "t-join" and r0["environmentId"] == ENV
+        assert r0["partition"] == "development" and r0["visibility"] == "learner" and r0["redacted"] is True
+        assert r0["evidenceId"] is not None and r0["evidenceContentHash"]
+        assert "approval" not in r0  # approval tokens never projected
+        assert r0["argumentsSha256"] and r0["resultSha256"]
+
+        # Non-development runs fail closed.
+        fin = TaskInput(taskId="t-join-final", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g", partition="final")
+        registry.register_task(fin)
+        fin_run = ctl.create_run(
+            RunRequest(
+                taskRef=store.put_artifact(fin.model_dump(mode="json", by_alias=True)),
+                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
+                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
+                idempotencyKey="idem-join-final",
+            ),
+            fin,
+        )
+        with pytest.raises(PermissionError):
+            store.list_run_tool_calls(fin_run.run_id)
+        with pytest.raises(KeyError):
+            store.list_run_tool_calls("run-missing")
+
     def test_learning_projection(self, store, registry, broker):
         """Session7 seam: public docs, redacted development evidence + trusted
         outcome, patch bytes. No hidden evaluator content."""

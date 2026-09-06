@@ -75,25 +75,7 @@ ApprovalProvider = Callable[[ToolRequest], str | None]
 
 # Credential-shaped values are masked before learner-visible evidence is
 # recorded (sanitized feedback boundary; planner fix bec53f2).
-_SECRET_PATTERNS = (
-    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
-    re.compile(r"AKIA[0-9A-Z]{16}"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|bearer)\s*[:=]\s*\S+"),
-)
-
-
-def _sanitize_for_learner(value: Any) -> Any:
-    if isinstance(value, str):
-        out = value
-        for pat in _SECRET_PATTERNS:
-            out = pat.sub("[REDACTED]", out)
-        return out
-    if isinstance(value, Mapping):
-        return {k: _sanitize_for_learner(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_for_learner(v) for v in value]
-    return value
+from adaptive_agent.store import sanitize_for_learner as _sanitize_for_learner
 
 
 class DriverContext:
