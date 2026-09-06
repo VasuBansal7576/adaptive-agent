@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Mapping
@@ -136,51 +137,63 @@ class ResumableEvaluationDriver:
             first_environment = next(iter(tasks_by_env))
             tasks_by_env = {first_environment: tasks_by_env[first_environment][:1]}
         seeds = (self.protocol.seeds[0],) if partition is Partition.DEVELOPMENT else self.protocol.seeds
-        statuses: list[BenchmarkTaskStatus] = []
-        for environment_id, tasks in tasks_by_env.items():
-            package = self.packages[environment_id]
-            for task in tasks:
-                for seed in seeds:
-                    for arm in arms:
-                        selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value))
-                        bundle_hash = self._bundle_hash(selected_bundle)
-                        prior = self._load(benchmark_id, task.task_id, arm, seed)
-                        if prior is not None and prior.status == "complete":
-                            if prior.observation is not None:
-                                try:
-                                    self._validate_observation(prior.observation, task, environment_id, partition, seed, arm, bundle_hash)
-                                except EvaluationError:
-                                    pass
-                                else:
-                                    if self.evidence_store.verify(prior.observation, frozen, package):
-                                        statuses.append(prior)
-                                        continue
-                            self._save(benchmark_id, task, arm, seed, "failed", "persisted evidence no longer verifies", None)
-                        if not self._claim(benchmark_id, task, arm, seed):
-                            existing = self._load(benchmark_id, task.task_id, arm, seed)
-                            if existing is not None:
-                                statuses.append(existing)
-                            continue
-                        try:
-                            attempt = self._next_attempt(benchmark_id, task, arm, seed)
-                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash, attempt), selected_bundle)
-                            self._validate_observation(observation, task, environment_id, partition, seed, arm, bundle_hash)
-                            if not self.evidence_store.verify(observation, frozen, package):
-                                raise EvaluationError("runtime observation lacks trusted persisted evidence")
-                            self._save(benchmark_id, task, arm, seed, "complete", None, observation)
-                            statuses.append(BenchmarkTaskStatus(task.task_id, environment_id, partition, arm, seed, "complete", observation=observation))
-                        except Exception as exc:
-                            self._save(benchmark_id, task, arm, seed, "failed", str(exc), None)
-                            statuses.append(BenchmarkTaskStatus(task.task_id, environment_id, partition, arm, seed, "failed", error=str(exc)))
-                        except BaseException as exc:
-                            # A process interruption leaves the cell outcome
-                            # unknown. Persist that attempt before propagating
-                            # the interruption so a same-owner retry receives a
-                            # fresh attempt number and history remains auditable.
-                            self._save(benchmark_id, task, arm, seed, "uncertain", str(exc), None)
-                            raise
+        cells = [
+            (environment_id, task, seed, arm)
+            for environment_id, tasks in tasks_by_env.items()
+            for task in tasks
+            for seed in seeds
+            for arm in arms
+        ]
+        # Claims and receipt writes remain the serialization boundary. Workers
+        # only overlap independent cells, and each cell is independently
+        # resumable after a crash or provider failure.
+        worker_count = min(max(1, self.protocol.concurrency_limit), max(1, len(cells)))
+        if worker_count == 1:
+            # Keep interruption behavior deterministic when concurrency is
+            # disabled. A thread pool may start the next queued cell before
+            # the caller observes an exception from the current cell.
+            statuses = [self._run_cell(benchmark_id, partition, frozen, *cell) for cell in cells]
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="evaluation-cell") as executor:
+                statuses = list(executor.map(lambda cell: self._run_cell(benchmark_id, partition, frozen, *cell), cells))
         expected_count = sum(len(tasks) for tasks in tasks_by_env.values()) * len(seeds) * len(arms)
         return BenchmarkSummary(benchmark_id, partition, tuple(statuses), expected_count)
+
+    def _run_cell(self, benchmark_id: str, partition: Partition, frozen: FrozenProtocol, environment_id: str, task: TaskInput, seed: int, arm: Arm) -> BenchmarkTaskStatus:
+        package = self.packages[environment_id]
+        selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value))
+        bundle_hash = self._bundle_hash(selected_bundle)
+        prior = self._load(benchmark_id, task.task_id, arm, seed)
+        if prior is not None and prior.status == "complete":
+            if prior.observation is not None:
+                try:
+                    self._validate_observation(prior.observation, task, environment_id, partition, seed, arm, bundle_hash)
+                except EvaluationError:
+                    pass
+                else:
+                    if self.evidence_store.verify(prior.observation, frozen, package):
+                        return prior
+            self._save(benchmark_id, task, arm, seed, "failed", "persisted evidence no longer verifies", None)
+        if not self._claim(benchmark_id, task, arm, seed):
+            existing = self._load(benchmark_id, task.task_id, arm, seed)
+            return existing or BenchmarkTaskStatus(task.task_id, environment_id, partition, arm, seed, "pending", error="cell claim unavailable")
+        try:
+            attempt = self._next_attempt(benchmark_id, task, arm, seed)
+            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash, attempt), selected_bundle)
+            self._validate_observation(observation, task, environment_id, partition, seed, arm, bundle_hash)
+            if not self.evidence_store.verify(observation, frozen, package):
+                raise EvaluationError("runtime observation lacks trusted persisted evidence")
+            self._save(benchmark_id, task, arm, seed, "complete", None, observation)
+            return BenchmarkTaskStatus(task.task_id, environment_id, partition, arm, seed, "complete", observation=observation)
+        except Exception as exc:
+            self._save(benchmark_id, task, arm, seed, "failed", str(exc), None)
+            return BenchmarkTaskStatus(task.task_id, environment_id, partition, arm, seed, "failed", error=str(exc))
+        except BaseException as exc:
+            # A process interruption leaves the cell outcome unknown. Persist
+            # that attempt before propagating so a same-owner retry advances
+            # its immutable attempt identity.
+            self._save(benchmark_id, task, arm, seed, "uncertain", str(exc), None)
+            raise
 
     def _next_attempt(self, benchmark_id: str, task: TaskInput, arm: Arm, seed: int) -> int:
         """Return the next immutable attempt number for one benchmark cell."""

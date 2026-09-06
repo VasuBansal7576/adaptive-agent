@@ -359,7 +359,12 @@ class Store:
         task_id: str, partition: str, arm: str | None = None,
         seed: int | None = None, owner_id: str,
     ) -> tuple[bool, dict[str, Any]]:
-        """Claim a benchmark task once and refuse foreign-owner takeover."""
+        """Claim a benchmark task, allowing recovery of terminal attempts.
+
+        A running cell remains fenced to its original owner. Failed or
+        uncertain cells are safe to retry after a process restart, so a new
+        owner may atomically take those cells over.
+        """
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone()
@@ -368,6 +373,12 @@ class Store:
                 if (row["environment_id"], row["task_id"], row["partition"], row.get("benchmark_id"), row.get("arm"), row.get("seed")) != (environment_id, task_id, partition, benchmark_id, arm, seed):
                     conn.rollback()
                     raise ValueError("task run id is already bound to different benchmark inputs")
+                if row["status"] in {"failed", "uncertain"}:
+                    conn.execute(
+                        "UPDATE task_runs SET owner_id = ?, status = 'running', updated_at = ? WHERE task_run_id = ? AND status IN ('failed', 'uncertain')",
+                        (owner_id, _utcnow(), task_run_id),
+                    )
+                    row = dict(conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone())
                 conn.commit()
                 return False, row
             conn.execute(
