@@ -24,7 +24,7 @@ try:
 except ImportError as exc:
     pytest.skip(f"durable core is unavailable in this isolated worker: {exc}", allow_module_level=True)
 
-from tests.test_learning_store_integration import ENVIRONMENT, RUN, _setup_store  # noqa: E402
+from test_learning_store_integration import ENVIRONMENT, RUN, _setup_store  # noqa: E402
 
 
 class FakeClient:
