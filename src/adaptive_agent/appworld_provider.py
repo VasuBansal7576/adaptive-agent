@@ -409,6 +409,23 @@ def _schema_like(value: Any) -> bool:
     return isinstance(value, Mapping) and (isinstance(value.get("type"), str) or "properties" in value or "items" in value)
 
 
+def _example_shape(value: Any) -> dict[str, Any]:
+    """Describe only the JSON shape demonstrated by one public example."""
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "boolean"}
+    if isinstance(value, int):
+        return {"type": "integer"}
+    if isinstance(value, float):
+        return {"type": "number"}
+    if isinstance(value, str):
+        return {"type": "string"}
+    if isinstance(value, list):
+        return {"type": "array", "items": {}}
+    return {"type": "object", "additionalProperties": True}
+
+
 def _response_schema(entry: Mapping[str, Any]) -> dict[str, Any]:
     """Return a JSON schema while retaining published response examples."""
     raw = entry.get("response_schemas", entry.get("responseSchemas"))
@@ -421,13 +438,20 @@ def _response_schema(entry: Mapping[str, Any]) -> dict[str, Any]:
         if _schema_like(candidate):
             return dict(candidate)
     # AppWorld's standard format historically called concrete response examples
-    # "response_schemas". Keep those public examples available to callers while
-    # exposing a conservative object schema for validation.
-    return {
-        "type": "object",
-        "additionalProperties": True,
-        "examples": list(raw.values()),
-    }
+    # "response_schemas". Preserve those examples and describe their observed
+    # JSON shapes instead of claiming every response is an object.
+    examples = list(raw.values())
+    shapes: list[dict[str, Any]] = []
+    for example in examples:
+        shape = _example_shape(example)
+        if shape not in shapes:
+            shapes.append(shape)
+    if len(shapes) == 1:
+        schema = shapes[0]
+    else:
+        schema = {"anyOf": shapes}
+    schema["examples"] = examples
+    return schema
 
 
 def _schema_from_function_doc(doc: Mapping[str, Any], version: str, standard: Mapping[str, Any] | None = None) -> ToolSchema:
@@ -606,6 +630,21 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _public_supervisor(value: Any) -> dict[str, str]:
+    """Keep only the public supervisor identity fields used for discovery."""
+    if not isinstance(value, Mapping):
+        return {}
+    fields = {"firstName", "lastName", "email", "phoneNumber"}
+    return {key: item for key, item in value.items() if key in fields and isinstance(item, str) and item}
+
+
+def _public_app_descriptions(value: Any) -> dict[str, str]:
+    """Keep public app descriptions bounded to string metadata."""
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(name): description for name, description in value.items() if isinstance(description, str)}
+
+
 class AppWorldProvider(ToolProvider):
     """Broker provider backed by one isolated AppWorld episode."""
 
@@ -652,6 +691,8 @@ class AppWorldProvider(ToolProvider):
             "split": self.task.split,
             "instruction": self.task.instruction,
             "allowedApps": [item for item in allowed_apps if isinstance(item, str)],
+            "supervisor": _public_supervisor(self._reset.get("supervisor") if isinstance(self._reset, dict) else None),
+            "appDescriptions": _public_app_descriptions(self._reset.get("appDescriptions") if isinstance(self._reset, dict) else None),
             "apiSchemas": [schema.model_dump(mode="json", by_alias=True) for schema in schemas],
         }
 
