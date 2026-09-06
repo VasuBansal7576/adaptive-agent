@@ -228,7 +228,18 @@ class DurableRuntime:
                 self._record_model_response(payload.run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)})
             return invocation
         service = LearningService(source.retriever(environment_id=stored["environment_id"], run_id=payload.run_id), learning_runner, candidate_sink, lambda: self.controller.candidates.get_active_bundle().content_hash if self.controller.candidates.get_active_bundle() else "")
-        proposal = service.propose(run_id=payload.run_id, environment_id=stored["environment_id"], goal=task.goal, environment=self._planner_environment(package, payload.run_id), feedback={"status": run.status.value}, emit=lambda kind, summary, detail=None: self.controller.append_event(payload.run_id, kind, {"summary": summary, "detail": detail}, "learner", "operator"))
+        budget_data: Mapping[str, Any] = {}
+        try:
+            loaded_budget = self.controller.store.get_artifact(run.budget_ref)
+            if isinstance(loaded_budget, Mapping):
+                budget_data = loaded_budget
+        except (KeyError, TypeError, ValueError):
+            pass
+        wall_seconds = budget_data.get("wallTimeSeconds", 90)
+        token_cap = budget_data.get("modelTokens", DEFAULT_MODEL_TOKENS)
+        remaining_deadline = float(wall_seconds) if isinstance(wall_seconds, (int, float)) and not isinstance(wall_seconds, bool) else 90.0
+        bounded_tokens = int(token_cap) if isinstance(token_cap, int) and not isinstance(token_cap, bool) else DEFAULT_MODEL_TOKENS
+        proposal = service.propose(run_id=payload.run_id, environment_id=stored["environment_id"], goal=task.goal, environment=self._planner_environment(package, payload.run_id), feedback={"status": run.status.value}, emit=lambda kind, summary, detail=None: self.controller.append_event(payload.run_id, kind, {"summary": summary, "detail": detail}, "learner", "operator"), remaining_deadline=remaining_deadline, token_cap=bounded_tokens, max_repair_attempts=1)
         candidate = dict(proposal.authoritative_candidate)
         if "candidate_id" in candidate:
             candidate["candidateId"] = candidate.pop("candidate_id")
