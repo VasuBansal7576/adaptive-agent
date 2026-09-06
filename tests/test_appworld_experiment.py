@@ -47,6 +47,7 @@ class _Process:
 
 class _Model:
     calls = 0
+    evaluation_calls = 0
     def __init__(self, **kwargs): pass
     def invoke(self, *, goal, environment, messages=None, **kwargs):
         type(self).calls += 1
@@ -55,8 +56,9 @@ class _Model:
             procedure = "Reuse the observed date-reading procedure."
             payload = {"predictedEffect": "reuse procedure", "editOperations": [{"path": "skills/appworld/procedure", "operation": "add", "value": procedure}], "supportingEvidenceIds": [evidence], "proposerVersion": "test", "skill": {"procedure": procedure}}
             return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"learn-{self.calls}", "text": json.dumps(payload), "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5}}
+        type(self).evaluation_calls += 1
         capability = next(item for item in environment["capabilities"] if item.endswith("appworld__call_read"))
-        if self.calls % 2:
+        if type(self).evaluation_calls % 2:
             code = f'result = host_request({json.dumps({"capabilityId": capability, "arguments": {"apiName": "phone__get_current_date_and_time", "arguments": {}}})})'
             text = json.dumps({"action": "execute", "code": code})
         else:
@@ -93,10 +95,19 @@ def test_cli_runs_and_resumes_real_runtime_panels(tmp_path, monkeypatch):
     monkeypatch.setenv("ADAPTIVE_AGENT_SOURCE_REVISION", "source")
     monkeypatch.setenv("ADAPTIVE_AGENT_IMAGE_DIGEST", "sha256:image")
     root = _root(tmp_path)
+    from adaptive_agent.appworld_provider import AppWorldConfig, AppWorldError, AppWorldPackage
+    with pytest.raises(AppWorldError, match="sealed"):
+        AppWorldPackage(AppWorldConfig(root, python=sys.executable)).catalog.task("test_normal-0", "test_normal")
     args = build_parser().parse_args(["--initialize", "--data-dir", str(tmp_path / "run"), "--appworld-root", str(root), "--appworld-python", sys.executable, "--source-revision", "source", "--image-digest", "sha256:image", "--core-planner-hash", "core"])
     monkeypatch.setenv("ADAPTIVE_AGENT_CORE_PLANNER_HASH", "core")
     first = run_experiment(args)
-    assert [report["armSummaries"]["B0"]["count"] for report in first["reports"]] == [20, 20]
+    assert [report["selectedArms"] for report in first["reports"]] == [["B0", "L", "A"], ["B0", "L", "A"]]
+    assert all(all(report["armSummaries"][arm]["count"] == 20 for arm in ("B0", "L", "A")) for report in first["reports"])
+    for report in first["reports"]:
+        for arm in ("B0", "L", "A"):
+            summary = report["armSummaries"][arm]
+            assert summary["totalTokens"] == summary["inputTokens"] + summary["outputTokens"]
+    assert _Model.evaluation_calls == 2 * (8 + 20 * 3 + 20 * 3)
     calls = _Model.calls
     resume = build_parser().parse_args(["--resume", "--data-dir", str(tmp_path / "run"), "--appworld-root", str(root), "--appworld-python", sys.executable, "--source-revision", "source", "--image-digest", "sha256:image", "--core-planner-hash", "core"])
     second = run_experiment(resume)
