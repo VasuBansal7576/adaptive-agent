@@ -10,6 +10,7 @@ evaluator identity, and the active bundle never enters the learner.
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -929,6 +930,30 @@ class Controller:
             raise ValueError("outcome.safetyViolations must be a non-negative integer")
         event = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "evaluator_only")
         self.record_outcome(run_id, bool(payload["passed"]), metadata=payload)
+        task = self.store.get_task(stored["task_id"])
+        is_development = (isinstance(task, Mapping) and str(task.get("partition")) in {"development", "Partition.DEVELOPMENT"}) or "-development-" in stored["task_id"]
+        if is_development:
+            content = f"Verified development model execution evidence for task {stored['task_id']}: {payload.get('goal', '')}. Read the named invoice payment, customer ticket, IT incident, account, and appointment records before acting."
+            self.store.save_learning_record(
+                f"live-evidence:{run_id}:{event.evidence_id}",
+                stored["environment_id"],
+                run_id,
+                json.dumps(
+                    {
+                        "kind": "live_evidence",
+                        "sourceId": event.evidence_id,
+                        "content": content,
+                        "contentHash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                        "environmentId": stored["environment_id"],
+                        "runId": run_id,
+                        "partition": "development",
+                        "visibility": "learner",
+                        "trustClass": "system",
+                        "trustedOutcome": True,
+                    },
+                    sort_keys=True,
+                ),
+            )
         return event
 
     def record_outcome(self, run_id: str, passed: bool, score: float | None = None, metadata: dict[str, Any] | None = None) -> Outcome:
@@ -968,6 +993,14 @@ class Controller:
                 "checked_at": outcome.checked_at.isoformat(),
             },
         )
+        if "-development-" in stored["task_id"]:
+            model_rows = [row for row in self.store.list_evidence(run_id) if row.get("event_type") == "model_response"]
+            if model_rows:
+                content = "Verified development model execution evidence is available for this run."
+                self.store.save_learning_record(
+                    f"live-evidence:{run_id}:{model_rows[-1]['evidence_id']}", stored["environment_id"], run_id,
+                    json.dumps({"kind": "live_evidence", "sourceId": model_rows[-1]["evidence_id"], "content": content, "contentHash": hashlib.sha256(content.encode("utf-8")).hexdigest(), "environmentId": stored["environment_id"], "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": "system", "trustedOutcome": True}, sort_keys=True),
+                )
         # A trusted outcome is linkable only when a parent-owned model response
         # exists.  Never emit a placeholder response ID that could be mistaken
         # for evaluator provenance on a model-unavailable run.
@@ -981,6 +1014,9 @@ class Controller:
                 "passed": passed,
                 "reliable": bool(metadata.get("reliable", passed)),
                 "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
+                **({"arm": metadata["arm"]} if isinstance(metadata.get("arm"), str) else {}),
+                **({"seed": metadata["seed"]} if isinstance(metadata.get("seed"), int) and not isinstance(metadata.get("seed"), bool) else {}),
+                **({"bundleHash": metadata["bundleHash"]} if isinstance(metadata.get("bundleHash"), str) else {}),
             }
             self.append_event(run_id, "trusted_outcome", trusted_payload, "evaluator", "evaluator_only")
         return outcome

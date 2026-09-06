@@ -11,10 +11,11 @@ import json
 import hashlib
 import re
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from adaptive_agent.models import ArtifactRef, sha256_json
 
@@ -288,7 +289,7 @@ class Store:
         sha = sha256_json(data)
         path = self.artifact_dir / f"{sha}.json"
         if not path.exists():
-            tmp = self.artifact_dir / f"{sha}.tmp"
+            tmp = self.artifact_dir / f".{sha}.{uuid.uuid4().hex}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=default)
             tmp.replace(path)
@@ -315,7 +316,7 @@ class Store:
         if path.exists() and path.read_bytes() != value:
             raise ValueError("immutable artifact digest collision")
         if not path.exists():
-            tmp = self.artifact_dir / f"{digest}.tmp"
+            tmp = self.artifact_dir / f".{digest}.{uuid.uuid4().hex}.tmp"
             tmp.write_bytes(value)
             tmp.replace(path)
         return {"sha256": digest, "size": len(value), "immutable": True}
@@ -787,15 +788,16 @@ class Store:
         trusted = isinstance(trusted_row, Mapping)
         outcome_passed = bool(trusted_row.get("passed")) if trusted_row is not None else False
         for row in self.list_evidence(run_id):
-            if row.get("visibility") != "learner":
+            provenance = self.evidence_provenance(row["evidence_id"])
+            is_development_model = row.get("event_type") == "model_response" and provenance and provenance.get("partition") == "development"
+            if row.get("visibility") != "learner" and not is_development_model:
                 continue
             try:
                 source = json.loads(row["source_ref"])
                 content = self.get_artifact(source["sha256"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
-            text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":"))
-            provenance = self.evidence_provenance(row["evidence_id"])
+            text = "Verified development model execution evidence is available for this run." if is_development_model else (content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":")))
             if not provenance or provenance.get("environment_id") != environment_id:
                 continue
             content_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()

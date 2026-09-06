@@ -13,7 +13,6 @@ import os
 import re
 import subprocess
 from pathlib import Path
-<<<<<<< HEAD
 from typing import Any, Mapping, Sequence
 
 

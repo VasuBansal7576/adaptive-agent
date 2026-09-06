@@ -554,19 +554,10 @@ class DurableRuntime:
             persisted["run_json"] = json.dumps(run_payload, sort_keys=True)
             self.controller.store.save_run(run.run_id, persisted)
 
-        model_client = self.learning_model_client
-        if model_client is None and self.model_runner is not None:
-            runner = self.model_runner
-            if callable(getattr(runner, "invoke", None)):
-                # A provider client can be injected directly.  Keeping this
-                # object intact preserves its own response/accounting seam.
-                model_client = runner
-            elif callable(runner):
-                class RunnerClient:
-                    def invoke(self, *, goal: str, environment: Mapping[str, Any], **_: Any) -> Mapping[str, Any]:
-                        invocation = runner(goal=goal, environment=dict(environment), emit=lambda *_args: None)
-                        return {"text": invocation.text, "provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)}
-                model_client = RunnerClient()
+        # Learning and evaluation have separate model-boundary clients.  A
+        # callable evaluation runner must stay on the direct authenticated
+        # path even when a learning client is configured on the runtime.
+        model_client = self.model_runner if self.model_runner is not None and callable(getattr(self.model_runner, "invoke", None)) else None
         # launch() owns claim, reset, Prime Docker, broker budget, retries, and
         # trusted outcome persistence for both API and benchmark executions.
         core_hash = str(inputs.get("corePlannerHash", self.core_planner_hash))
@@ -1155,13 +1146,16 @@ class DurableRuntime:
         nominal_cost_usd = sum(nominal_values) if nominal_values else None
         nominal_coverage = {"knownReceipts": len(nominal_values), "totalReceipts": len(all_receipts)}
         nominal_status = "complete" if nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"] else "partial"
+        accounting_cost = aggregate_cost if explicit_cost else (
+            round(nominal_cost_usd * 1_000_000) if nominal_status == "complete" and nominal_cost_usd is not None else None
+        )
         usage = dict(canonical_usage(evidence.get("usage")))
         if all_receipts:
             usage.update({key: value for key, value in all_receipts[-1]["usage"].items() if key in cache_keys or key == "cost"})
         frozen_core_planner = evidence.get("corePlannerHash") if isinstance(evidence.get("corePlannerHash"), str) and evidence.get("corePlannerHash") else self.core_planner_hash
         frozen_image = evidence.get("imageDigest") if isinstance(evidence.get("imageDigest"), str) and evidence.get("imageDigest") else self.image_digest
         version_refs = {
-            "policy": run.policy_ref.sha256,
+            "policy": package.manifest.policy_ref.sha256,
             "schema": sha256_json(package.manifest.tool_schemas),
             "planner": frozen_core_planner,
             "budget": run.budget_ref.sha256,
@@ -1224,7 +1218,7 @@ class DurableRuntime:
             "seed": seed,
             "bundleHash": bundle_hash,
             "versionRefs": version_refs,
-            "costMicrounits": aggregate_cost if explicit_cost else None,
+            "costMicrounits": accounting_cost,
             "economicCost": {"status": economic_status, "microunits": aggregate_cost if explicit_cost and not aggregate_cost_unknown else None, "coverage": {"knownReceipts": sum(1 for item in all_receipts if "costMicrounits" in item), "totalReceipts": len(all_receipts)}},
             "nominalCostUsd": nominal_cost_usd,
             "nominalCostStatus": nominal_status,
@@ -1311,6 +1305,10 @@ class DurableRuntime:
                         "passed": bool(outcome.passed),
                         "reliable": bool(metadata.get("reliable", outcome.passed)),
                         "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
+                        **({"arm": metadata["arm"]} if isinstance(metadata.get("arm"), str) else {}),
+                        **({"seed": metadata["seed"]} if isinstance(metadata.get("seed"), int) and not isinstance(metadata.get("seed"), bool) else {}),
+                        **({"bundleHash": metadata["bundleHash"]} if isinstance(metadata.get("bundleHash"), str) else {}),
+                        **({"goal": metadata["goal"]} if isinstance(metadata.get("goal"), str) else {}),
                     },
                 )
         return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
@@ -1437,10 +1435,11 @@ class DurableRuntime:
                 def act(self, _ctx: Any) -> None:
                     nonlocal invocation
                     invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
-                    runtime._record_model_response(run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest})
+                    runtime._record_model_response(run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest, **({"nominalCostUsd": invocation.nominalCostUsd} if hasattr(invocation, "nominalCostUsd") else {}), **({"economicCostStatus": invocation.economicCostStatus} if hasattr(invocation, "economicCostStatus") else {})})
             def evaluate() -> DurableOutcome:
                 outcome = runtime._invoke_evaluator(run_id=run_id, goal=task.goal, model_output=invocation.text, environment=runtime._planner_environment(package, run_id)) if invocation is not None else None
                 outcome = outcome or {"passed": False}
+                outcome = {**outcome, "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal}
                 return DurableOutcome(runId=run_id, passed=bool(outcome.get("passed") is True), metadata=outcome)
             self._execute_run(run_id, package.environment_id, provider, DirectDriver(), evaluate)
             self._cancel_events.pop(run_id, None)
