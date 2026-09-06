@@ -146,3 +146,12 @@ def test_malformed_nested_subcall_accounting_is_not_charged(tmp_path: Path):
         job.record_lifecycle_subcall(admission["admissionId"], result={"usage": {"inputTokens": -1, "outputTokens": 0, "totalTokens": -1}, "costMicrounits": 1})
     assert job.lifecycle_accounting("bad-subcall")["inputTokens"] == 0
     assert job.lifecycle_accounting("bad-subcall")["costMicrounits"] == 0
+
+
+def test_unknown_nested_cost_blocks_future_admission(tmp_path: Path):
+    job = _job(tmp_path)
+    job._lifecycle_budget("unknown-subcall", {"attempts": 2, "inputTokens": 10, "outputTokens": 10, "toolCalls": 10, "wallMicros": 10_000, "costMicrounits": 10})
+    admission = job.admit_lifecycle_subcall("unknown-subcall", "transfer", "leave-out:finance", "child-0")
+    job.record_lifecycle_subcall(admission["admissionId"], result={"usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "economicCostStatus": "unknown"})
+    with pytest.raises(ValueError, match="budget exhausted"):
+        job.admit_lifecycle_subcall("unknown-subcall", "transfer", "leave-out:finance", "child-1")
