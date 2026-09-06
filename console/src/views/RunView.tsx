@@ -29,6 +29,7 @@ export function RunView({
   onCancel,
   onCreateRun,
   onActionError,
+  onReconnect,
 }: {
   transport: ConsoleTransport;
   runs: RunRecord[];
@@ -42,6 +43,7 @@ export function RunView({
   onCancel: (run: RunRecord) => void;
   onCreateRun: (input: CreateRunInput) => Promise<boolean>;
   onActionError: (message: string, correlationId?: string | null) => void;
+  onReconnect: () => void;
 }) {
   const selected = runs.find((r) => r.runId === selectedRunId) ?? null;
   const [approval, setApproval] = useState<{ request: ApprovalRequest } | null>(null);
@@ -155,7 +157,14 @@ export function RunView({
 
             {connection === "stale" && (
               <Banner tone="warn" title="Event stream stale — reconnecting from the last acknowledged cursor" role="alert">
-                Status shown may be behind. Events resume from cursor {cursor}; no duplicates will be introduced.
+                Status shown may be behind. Events resume from cursor {cursor}; no duplicates will be introduced.{" "}
+                <button
+                  type="button"
+                  onClick={() => onReconnect()}
+                  className="underline underline-offset-2"
+                >
+                  Reconnect now
+                </button>
               </Banner>
             )}
             {connection === "reconnecting" && (
@@ -330,10 +339,12 @@ function NewRunDialog({
 
   const selectedEnv = environments.find((e) => e.environmentId === environmentId);
   const selectedTask = tasks.find((t) => t.taskId === taskId);
-  // mode support resolution order: selected task's declared modes, then the
-  // environment summary, then all four (tolerant when neither is projected)
-  const modeSource = selectedTask?.executionModes ?? selectedEnv?.executionModes ?? ["dry_run", "interactive", "batch", "replay"];
-  const supportedModes = modeSource.filter((m): m is CreateRunInput["executionMode"] =>
+  // mode support resolution: intersect the selected task's declared modes with
+  // the environment summary's modes when both are projected
+  const declared = selectedTask?.executionModes ?? selectedEnv?.executionModes ?? ["dry_run", "interactive", "batch", "replay"];
+  const envModes = selectedEnv?.executionModes;
+  const modeSource = envModes ? declared.filter((m) => envModes.includes(m)) : declared;
+  const supportedModes = (modeSource.length > 0 ? modeSource : declared).filter((m): m is CreateRunInput["executionMode"] =>
     ["dry_run", "interactive", "batch", "replay"].includes(m),
   );
 
@@ -375,10 +386,17 @@ function NewRunDialog({
     transport
       .getEnvironmentTasks(environmentId)
       .then((registered) => {
-        if (!cancelled) setTasks(registered);
+        if (!cancelled) {
+          setTasks(registered);
+          // registered tasks are required when the environment declares them
+          if (registered.length > 0) {
+            setTaskId((prev) => prev || registered[0].taskId);
+            setGoal((prev) => prev || registered[0].goal);
+          }
+        }
       })
       .catch(() => {
-        /* free-text goal remains available when the environment has no tasks */
+        /* free-form goal remains available when the environment has no tasks */
       });
     return () => {
       cancelled = true;
@@ -397,6 +415,7 @@ function NewRunDialog({
     const errors: Record<string, string> = {};
     if (!goal.trim()) errors.goal = "Goal is required";
     if (!environmentId) errors.environmentId = "Environment is required";
+    if (tasks.length > 0 && !taskId) errors.taskId = "A registered task is required for this environment";
     if (!modelProfile.trim()) errors.modelProfile = "Model profile is required";
     const calls = Number(toolCallCeiling);
     if (!Number.isFinite(calls) || calls <= 0) errors.toolCallCeiling = "Tool-call ceiling must be a positive number";
@@ -497,7 +516,7 @@ function NewRunDialog({
         </div>
         {tasks.length > 0 && (
           <div>
-            <label htmlFor="newrun-task" className="block text-xs font-medium text-slate-400">Registered task</label>
+            <label htmlFor="newrun-task" className="block text-xs font-medium text-slate-400">Registered task (required)</label>
             <select
               id="newrun-task"
               value={taskId}
@@ -506,14 +525,19 @@ function NewRunDialog({
                 const chosen = tasks.find((t) => t.taskId === e.target.value);
                 if (chosen) setGoal(chosen.goal);
               }}
+              aria-describedby={taskId ? undefined : "newrun-task-hint"}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
             >
-              <option value="">Free-form goal…</option>
               {tasks.map((task) => (
                 <option key={task.taskId} value={task.taskId}>{task.goal}</option>
               ))}
             </select>
-            <p className="mt-1 text-[11px] text-slate-500">Durable runs must match a registered task goal.</p>
+            {/* free-form goals are not accepted by the durable runtime yet */}
+            {fieldErrors.taskId && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.taskId}</p>}
+            <p id="newrun-task-hint" className="mt-1 text-[11px] text-slate-500">
+              This environment has registered tasks; the control plane currently requires one of them — free-form
+              goals are disabled until arbitrary task registration ships.
+            </p>
           </div>
         )}
         <div className="grid gap-3 sm:grid-cols-3">

@@ -49,6 +49,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     transportMode: transport.mode,
   });
   const [activeTab, setActiveTab] = useState<TabId>("runs");
+  const [streamNonce, setStreamNonce] = useState(0);
   const closeStreamRef = useRef<(() => void) | null>(null);
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
@@ -90,7 +91,8 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
   }, [load]);
 
   // stream lifecycle for the selected run: open from the acknowledged cursor,
-  // close when the selection or transport changes
+  // close when the selection or transport changes; reconnectNonce forces a
+  // manual stream reopen (stale banner) while preserving the cursor
   useEffect(() => {
     closeStreamRef.current?.();
     closeStreamRef.current = null;
@@ -107,7 +109,16 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     closeStreamRef.current = close;
     return close;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.selectedRunId, transport, state.loading]);
+  }, [state.selectedRunId, transport, state.loading, streamNonce]);
+
+  const manualReconnect = async () => {
+    try {
+      await transport.reconnect();
+    } catch {
+      /* reconnect surfaces its own state; the stream reopen below still runs */
+    }
+    setStreamNonce((n) => n + 1);
+  };
 
   const failAction = (error: unknown) => {
     const correlationId = (error as { correlationId?: string } | null)?.correlationId ?? null;
@@ -299,6 +310,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               onCancel={(run) => void cancelRun(run.runId)}
               onCreateRun={createRun}
               onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
+              onReconnect={() => void manualReconnect()}
             />
           )}
           {activeTab === "skills" && <SkillsView skills={state.skills} loading={state.loading} />}

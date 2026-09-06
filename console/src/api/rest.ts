@@ -109,6 +109,21 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
     } catch {
       throw new ApiError({ code: "DISCONNECTED", message: DISCONNECTED_MESSAGE }, 0);
     }
+    if (res.status === 401) {
+      // the HttpOnly cookie may have expired across a server restart: reset the
+      // cached session and re-authenticate once (safe GET bootstrap) before
+      // failing
+      sessionPromise = null;
+      await ensureSession();
+      try {
+        res = await fetch(`${baseUrl}${path}`, {
+          headers: { "content-type": "application/json" },
+          ...init,
+        });
+      } catch {
+        throw new ApiError({ code: "DISCONNECTED", message: DISCONNECTED_MESSAGE }, 0);
+      }
+    }
     if (!res.ok) {
       throw new ApiError(await safeJson(res), res.status);
     }
@@ -159,7 +174,6 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       let closed = false;
       let lastSequence = fromCursor;
       let consecutiveFailures = 0;
-      let receivedAny = false;
 
       const start = () => {
         if (closed) return;
@@ -178,7 +192,6 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
             const event = normalizeSseEvent(JSON.parse(message.data), "sse.data");
             if (event.sequence > lastSequence) {
               lastSequence = event.sequence;
-              receivedAny = true;
               consecutiveFailures = 0;
               onEvent(event);
             }
@@ -189,19 +202,38 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
         };
         es.onerror = () => {
           es?.close();
-          // a terminal run's stream closes server-side; a bounded number of
-          // silent reconnects prevents an endless retry loop
-          if (receivedAny || consecutiveFailures < 5) {
-            onState("stale");
+          // EOF handling: a terminal run's stream closes server-side. Check the
+          // run's status once; close normally when terminal, otherwise bounded
+          // retry with a fresh session (server restart invalidates the cookie)
+          void (async () => {
+            let terminal = false;
+            try {
+              const run = (await json(`/runs/${encodeURIComponent(runId)}`)) as { status?: unknown };
+              terminal =
+                run?.status === "succeeded" ||
+                run?.status === "failed" ||
+                run?.status === "cancelled" ||
+                run?.status === "timed_out";
+            } catch {
+              terminal = false; // unreachable -> bounded retry path below
+            }
+            if (terminal) {
+              onState("closed");
+              return;
+            }
+            if (consecutiveFailures >= 5) {
+              onState("stale");
+              return;
+            }
             consecutiveFailures += 1;
+            onState("reconnecting");
             retryTimer = setTimeout(() => {
+              sessionPromise = null; // server restart may have rotated the cookie
               ensureSession()
                 .then(start)
                 .catch(() => onState("disconnected"));
             }, 1500);
-          } else {
-            onState("closed");
-          }
+          })();
         };
       };
 

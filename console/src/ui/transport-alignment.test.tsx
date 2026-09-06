@@ -116,7 +116,7 @@ describe("run-options and registered tasks in the new-run dialog", () => {
     await screen.findAllByRole("button", { name: /run-sim-1001/ });
     await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
     const dialog = await screen.findByRole("dialog", { name: "Create run" });
-    const taskSelect = await within(dialog).findByLabelText("Registered task");
+    const taskSelect = await within(dialog).findByLabelText("Registered task (required)");
     await user.selectOptions(taskSelect, "task-finance-sim-007");
     await waitFor(() =>
       expect(within(dialog).getByLabelText("Goal")).toHaveValue("Reconcile the Q3 ledger batch and record the outcome."),
