@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import math
 from typing import Any, Protocol, Sequence
 
 from adaptive_agent.evaluation import (
@@ -113,10 +114,11 @@ class SQLiteRunEvidenceStore:
         self.store = store
 
     def verify(self, observation: RunObservation, frozen: FrozenProtocol, package: EnvironmentPackage) -> bool:
-        if observation.model_provenance.value != "real_model" or not observation.response_id or not observation.accounting_ref or not observation.evidence_ref:
+        if observation.model_provenance.value != "real_model" or not observation.response_id or not observation.accounting_ref or not observation.evidence_ref or not observation.outcome_ref or not observation.run_id:
             return False
         evidence = self.store.get_evidence(observation.evidence_ref)
-        if not evidence or not observation.run_id:
+        outcome_evidence = self.store.get_evidence(observation.outcome_ref)
+        if not evidence or not outcome_evidence:
             return False
         run = self.store.get_run(observation.run_id)
         if not run or run.get("task_id") != observation.task_id or run.get("environment_id") != observation.environment_id:
@@ -125,13 +127,35 @@ class SQLiteRunEvidenceStore:
             source_ref = json.loads(evidence["source_ref"])
             accounting = self.store.get_artifact(observation.accounting_ref)
             response = self.store.get_artifact(source_ref["sha256"])
+            outcome_source = json.loads(outcome_evidence["source_ref"])
+            outcome = self.store.get_artifact(outcome_source["sha256"])
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not all(isinstance(value, dict) for value in (response, accounting, outcome)):
             return False
         if sha256_json(response) != evidence.get("content_hash"):
             return False
-        if response.get("responseId") != observation.response_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response":
+        if response.get("responseId") != observation.response_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response" or outcome_evidence.get("run_id") != observation.run_id or outcome_evidence.get("event_type") != "trusted_outcome":
             return False
-        if not isinstance(accounting, dict) or accounting.get("responseId") != observation.response_id or accounting.get("runId") != observation.run_id or accounting.get("taskId") != observation.task_id or accounting.get("environmentId") != observation.environment_id or not accounting.get("versionRefs"):
+        usage = response.get("usage")
+        accounting_usage = accounting.get("usage")
+        if not isinstance(usage, dict) or not isinstance(accounting_usage, dict) or usage != accounting_usage:
+            return False
+        if accounting.get("responseId") != observation.response_id or accounting.get("runId") != observation.run_id or accounting.get("taskId") != observation.task_id or accounting.get("environmentId") != observation.environment_id:
+            return False
+        if outcome.get("responseId") != observation.response_id or outcome.get("runId") != observation.run_id or outcome.get("taskId") != observation.task_id or outcome.get("environmentId") != observation.environment_id:
+            return False
+        if not all(isinstance(usage.get(key), int) and usage[key] >= 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]:
+            return False
+        actual_cost = accounting.get("costMicrounits")
+        actual_latency = accounting.get("durationSeconds")
+        if not isinstance(actual_cost, (int, float)) or isinstance(actual_cost, bool) or not math.isfinite(actual_cost) or actual_cost < 0 or not isinstance(actual_latency, (int, float)) or isinstance(actual_latency, bool) or not math.isfinite(actual_latency) or actual_latency < 0:
+            return False
+        if actual_cost != observation.cost_microunits or actual_latency != observation.latency_seconds:
+            return False
+        if outcome.get("passed") != observation.passed or outcome.get("reliable") != observation.reliable or outcome.get("safetyViolations") != observation.safety_violations:
+            return False
+        if not isinstance(accounting.get("versionRefs"), dict) or accounting.get("versionRefs") != response.get("versionRefs") or not accounting.get("versionRefs"):
             return False
         expected = {
             "model": sha256_json({"profile": frozen.inputs["modelProfile"], "provider": frozen.inputs["provider"]}),
@@ -141,7 +165,9 @@ class SQLiteRunEvidenceStore:
             "schema": sha256_json(package.manifest.tool_schemas),
             "image": str(frozen.inputs["imageDigest"]),
         }
-        return dict(observation.config_hashes) == expected
+        if accounting["versionRefs"] != {"policy": package.manifest.policy_ref.sha256, "schema": sha256_json(package.manifest.tool_schemas), "planner": str(frozen.inputs["corePlannerHash"]), "budget": sha256_json(frozen.inputs["runBudget"]), "image": str(frozen.inputs["imageDigest"])}:
+            return False
+        return dict(observation.config_hashes) == expected and response.get("provider") == frozen.inputs["provider"] and response.get("modelProfile") == frozen.inputs["modelProfile"]
 
 
 def build_durable_adapters(store: Store) -> tuple[TrustedAttestationLedger, SQLiteAllocationStore, RunEvidenceStore]:

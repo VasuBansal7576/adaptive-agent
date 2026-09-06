@@ -302,6 +302,7 @@ class RunObservation:
     response_id: str | None = None
     accounting_ref: str | None = None
     evidence_ref: str | None = None
+    outcome_ref: str | None = None
     config_hashes: Mapping[str, str] = field(default_factory=dict)
     run_id: str | None = None
 
