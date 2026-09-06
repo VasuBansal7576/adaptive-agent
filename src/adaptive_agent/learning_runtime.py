@@ -183,9 +183,25 @@ class LearningRuntime:
         )
         for record_id, record in projected:
             persist(record_id, record)
+        persisted_projection = []
+        if not projected:
+            existing_reader = getattr(self.store, "list_learning_records", None)
+            existing = existing_reader(environment_id=environment_id, run_id=run_id) if callable(existing_reader) else ()
+            for record in existing:
+                if not isinstance(record, Mapping) or record.get("kind") != "live_evidence" or not isinstance(record.get("sourceId"), str) or not record["sourceId"].startswith("broker:"):
+                    continue
+                if record.get("environmentId") != environment_id or record.get("runId") != run_id or record.get("partition") != "development" or record.get("visibility") != "learner" or record.get("trustClass") != "broker" or record.get("trustedOutcome") is not True:
+                    continue
+                content = record.get("content")
+                if not isinstance(content, str) or record.get("contentHash") != content_hash(content) or not isinstance(record.get("sourceContentHash"), str):
+                    continue
+                derived = getattr(self.store, "get_evidence", lambda _id: None)(record["sourceId"])
+                if not isinstance(derived, Mapping) or derived.get("event_type") != "learning_evidence_projection" or derived.get("run_id") != run_id or derived.get("visibility") != "learner" or derived.get("redacted") != 1 or derived.get("trust_class") != "broker":
+                    continue
+                persisted_projection.append(record)
         joined_reader = getattr(self.store, "list_learning_evidence", None) or getattr(self.store, "list_learner_evidence", None)
         events = joined_reader(environment_id=environment_id, run_id=run_id) if callable(joined_reader) else self.store.list_evidence(run_id)
-        for event in events if not projected else ():
+        for event in events if not projected and not persisted_projection else ():
             if callable(joined_reader):
                 if event.get("partition") != "development" or event.get("environment_id") != environment_id or event.get("run_id") != run_id:
                     continue

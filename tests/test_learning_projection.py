@@ -65,3 +65,22 @@ def test_projection_excludes_evaluator_visibility_and_tampered_source(tmp_path: 
     tampered_event = {"run_id": RUN, "sequence": 9, "event_type": "tool_result", "content_hash": "0" * 64, "source_ref": tampered.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0}
     store.append_evidence("ev-tampered", tampered_event)
     assert DurableBrokerLearningProjection(store).project(environment_id=ENVIRONMENT, run_id=RUN, task_id="task-durable", outcome_passed=False) == []
+
+
+def test_persisted_projection_reused_after_raw_event_is_gone(tmp_path: Path):
+    import adaptive_agent.learning_runtime as runtime_module
+
+    store, manager, _ = _setup_store(tmp_path)
+    call_id = "call-restart"
+    store.prepare_tool_call({"call_id": call_id, "run_id": RUN, "step_id": "step-1", "environment_id": ENVIRONMENT, "tool": "read", "arguments_json": json.dumps({"invoice_id": "INV-DEV-000"}), "idempotency_key": "projection-restart"})
+    result = _broker_event(store, evidence_id="ev-restart", call_id=call_id)
+    store.save_tool_result(call_id, json.dumps(result, sort_keys=True, separators=(",", ":")), "none")
+    projected = DurableBrokerLearningProjection(store).project(environment_id=ENVIRONMENT, run_id=RUN, task_id="task-durable", outcome_passed=True)
+    record_id, record = projected[0]
+    store.save_learning_record(record_id, ENVIRONMENT, RUN, json.dumps(record, sort_keys=True, separators=(",", ":")))
+    with store._connect() as connection:
+        connection.execute("DELETE FROM evidence WHERE evidence_id = ?", ("ev-restart",))
+        connection.commit()
+    raw = runtime_module.LearningRuntime.build(store=store, manager=manager, model_client=object())._materialize_run_records(environment_id=ENVIRONMENT, run_id=RUN)
+    assert raw == []
+    assert any(row["record_id"] == record_id for row in store.list_learning_records(environment_id=ENVIRONMENT, run_id=RUN))
