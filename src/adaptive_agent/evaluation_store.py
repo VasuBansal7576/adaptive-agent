@@ -120,11 +120,7 @@ class SQLiteAllocationStore:
         )
 
     def get(self, allocation_id: str) -> dict[str, Any] | None:
-        with self.store.connect() as conn:
-            row = conn.execute("SELECT * FROM evaluator_allocations WHERE allocation_id = ?", (allocation_id,)).fetchone()
-        if row is None:
-            return None
-        return {**dict(row), "task_ids": json.loads(row["task_ids_json"])}
+        return self.store.get_allocation(allocation_id)
 
 
 class SQLiteRunEvidenceStore:
