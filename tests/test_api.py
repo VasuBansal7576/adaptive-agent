@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 from threading import Event, Thread
 import json
 import pytest
+from types import SimpleNamespace
 
 from adaptive_agent.api import CandidateProposalRequest, ControlPlane, EvaluationRequest, create_app, make_authenticated_model_runner
 from adaptive_agent.app import _FixtureProvider, create_runtime_app
@@ -99,6 +100,82 @@ def test_durable_launch_retry_does_not_reinvoke_model(tmp_path):
     assert retry.json() == {"runId": run["runId"], "status": "succeeded"}
     assert calls == 1
     assert api.get(f"/runs/{run['runId']}").json()["status"] == "succeeded"
+
+
+def test_benchmark_write_uses_authorized_batch_mode(monkeypatch, tmp_path):
+    """A test-double planner can mutate the reset fixture through the broker."""
+    import adaptive_agent.app as app_module
+    from adaptive_agent.prime_runtime import ChildPlannerBudget, SharedBudget
+
+    class PlannerClient:
+        def __init__(self):
+            self.turn = 0
+
+        def invoke(self, *, goal, environment, messages, **kwargs):
+            self.turn += 1
+            capability_id = next(capability for capability in environment["capabilities"] if capability.endswith(":finance.invoice.apply_payment"))
+            action = (
+                '{"action":"execute","code":"result = host_request({\\"type\\":\\"broker.call\\",\\"capabilityId\\":\\"%s\\",\\"arguments\\":{\\"invoice_id\\":\\"INV-DEV-000\\",\\"payment_id\\":\\"PAY-DEV-000\\",\\"expected_version\\":1}})"}'
+                % capability_id
+                if self.turn == 1 else '{"action":"finish","answer":"applied"}'
+            )
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"benchmark-{self.turn}", "text": action, "usage": {"outputTokens": 2}}
+
+    class FakePrime:
+        def __init__(self, config, broker):
+            self.config = config
+            self.broker = broker
+            self.child_planner = None
+            self._budget = SharedBudget(config.max_total_wall_seconds, config.max_total_artifact_bytes, config.max_artifact_count, config.child_runs, config.max_model_tokens)
+
+        @property
+        def planner_budget(self):
+            return ChildPlannerBudget(self._budget)
+
+        def record_model_observation(self, evidence, *, trusted_parent=False):
+            return evidence
+
+        def execute(self, code, *, timeout=None, cancel=None):
+            def host_request(payload):
+                return self.broker.call(payload["capabilityId"], payload.get("arguments", {}))
+
+            namespace = {"host_request": host_request}
+            exec(code, {"__builtins__": {}}, namespace)
+            return SimpleNamespace(status="ok", result=json.dumps(namespace.get("result")), stdout="", stderr="", error=None)
+
+        def close(self, remove_workspace=True):
+            return None
+
+    monkeypatch.setattr(app_module, "PrimeRuntimeAdapter", FakePrime)
+    seen = {}
+    app = create_runtime_app(
+        learning_model_client=PlannerClient(),
+        evaluator=lambda **kwargs: (seen.update(kwargs) or {"passed": True, "score": 1.0}),
+        data_dir=tmp_path,
+    )
+    runtime = app.state.durable_runtime
+    from adaptive_agent.benchmark import FrozenExecutionConfig
+    from adaptive_agent.evaluation import Arm, EvaluationProtocol, Partition
+
+    protocol = EvaluationProtocol()
+    protocol.freeze(runtime.packages)
+    task = runtime.packages["finance"].tasks_for_partition(Partition.DEVELOPMENT)[0]
+    observation = runtime.execute_evaluation_task(
+        task,
+        FrozenExecutionConfig(protocol.start_candidate_generation(), Arm.B0, 17),
+        runtime.controller.get_active_bundle(),
+    )
+    run_id = observation.run_id
+    assert run_id is not None
+    assert runtime.get_run(run_id)["status"] == "succeeded"
+    assert runtime.controller.store.get_run(run_id)["execution_mode"] == "batch"
+    assert seen["model_responses"]
+    assert seen["kernel_events"]
+    tool_events = [row for row in runtime.controller.store.list_evidence(run_id) if row["event_type"] == "tool_result"]
+    assert tool_events
+    payload = runtime.controller.store.get_artifact(json.loads(tool_events[-1]["source_ref"])["sha256"])
+    assert payload["status"] == "ok"
+    assert payload["effect"] == "confirmed"
 
 
 def test_durable_terminal_event_stream_closes_after_completed_run(tmp_path):

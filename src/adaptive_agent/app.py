@@ -309,7 +309,10 @@ class DurableRuntime:
         model_ref = self.controller.store.put_artifact({"provider": provider_name, "model": model_name})
         budget_ref = self.controller.store.put_artifact(budget_value)
         protocol_hash = str(getattr(protocol, "protocol_hash", "protocol-unset"))
-        request = RunRequest(taskRef=task_ref, modelProfileRef=model_ref, budgetRef=budget_ref, idempotencyKey=f"benchmark:{protocol_hash}:{task_id}:{arm_value}:{seed}:{durable_bundle.content_hash}", executionMode="replay")
+        # Benchmark fixtures are reset per cell and may include declared write
+        # actions.  Batch mode is the manifest-authorized path that issues the
+        # one-use approvals required by the broker for those writes.
+        request = RunRequest(taskRef=task_ref, modelProfileRef=model_ref, budgetRef=budget_ref, idempotencyKey=f"benchmark:{protocol_hash}:{task_id}:{arm_value}:{seed}:{durable_bundle.content_hash}", executionMode="batch")
         run = self.controller.create_run(request, durable_task, skill_bundle=durable_bundle)
         row = self.controller.store.get_run(run.run_id)
         if row:
