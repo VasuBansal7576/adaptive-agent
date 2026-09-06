@@ -1,18 +1,15 @@
-"""Adaptive Agent bounded execution and control-plane package."""
+"""Adaptive Agent bounded execution and durable control-plane package."""
 
 from .planner import LunaInvocation, LunaPlanner, PlannerError, PlannerLimits, PlannerResult, PrimeCliModelClient, make_luna_model_runner
 from .prime_runtime import (
-    AdapterError,
-    ArtifactRef,
-    Capability,
-    CapabilityBroker,
-    CapabilitySet,
-    ExecutionMode,
-    ExecutionResult,
-    ModelObservation,
-    PrimeRuntimeAdapter,
-    PrimeRuntimeConfig,
+    AdapterError, ArtifactRef as PrimeArtifactRef, Capability as PrimeCapability,
+    CapabilityBroker, CapabilitySet, ExecutionMode as PrimeExecutionMode,
+    ExecutionResult, ModelObservation, PrimeRuntimeAdapter, PrimeRuntimeConfig,
     SecurityViolation,
+)
+from .models import (
+    ArtifactRef, Budget, CandidateProposal, EnvironmentManifest, EvaluationReport,
+    EvidenceRecord, PromotionDecision, RunRequest, TaskInput, ToolRequest, ToolResult,
 )
 
 _API_EXPORTS = {"ControlPlane", "app", "create_app", "make_authenticated_model_runner"}
@@ -26,8 +23,10 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "AdapterError", "ArtifactRef", "Capability", "CapabilityBroker", "CapabilitySet",
-    "ControlPlane", "ExecutionMode", "ExecutionResult", "LunaPlanner", "PrimeCliModelClient", "ModelObservation",
+    "AdapterError", "ArtifactRef", "PrimeArtifactRef", "PrimeCapability", "CapabilityBroker", "CapabilitySet",
+    "ControlPlane", "PrimeExecutionMode", "ExecutionResult", "LunaPlanner", "PrimeCliModelClient", "ModelObservation",
     "PlannerError", "PlannerLimits", "PlannerResult", "PrimeRuntimeAdapter", "LunaInvocation", "make_luna_model_runner",
     "PrimeRuntimeConfig", "SecurityViolation", "app", "create_app", "make_authenticated_model_runner",
+    "Budget", "CandidateProposal", "EnvironmentManifest", "EvaluationReport", "EvidenceRecord", "PromotionDecision",
+    "RunRequest", "TaskInput", "ToolRequest", "ToolResult",
 ]
