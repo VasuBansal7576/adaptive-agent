@@ -215,6 +215,12 @@ The simulation mode always shows a simulation label and never presents stream co
 Tests and probes must use newly allocated temporary Store and data paths.
 Do not treat a fixture pass, a transport smoke, or a candidate proposal validation as a heldout performance result.
 
+## Acknowledgments
+
+Adaptive Agent uses Prime Agent by Prime Intellect AI under the MIT License.
+The installed Prime `0.9.2` runtime is separate from the initial static-source review pinned at [Prime Agent commit `9c54a35dac3a2ad17910074d66664859ea175666`](https://github.com/PrimeIntellect-ai/prime-agent/tree/9c54a35dac3a2ad17910074d66664859ea175666).
+Retain the applicable Prime MIT notices in distributions.
+
 ## Limitations
 
 - The current candidate has passed proposal validation only.
