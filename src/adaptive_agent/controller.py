@@ -95,12 +95,8 @@ class DriverContext:
             approvalToken=approval_token,
         )
         result = self._controller.dispatch_tool(self.env_id, req, capability, self._provider)
-        self._controller.append_event(
-            self.run_id,
-            "tool_result",
-            result.model_dump(mode="json", by_alias=True),
-            trust_class="broker",
-            visibility="learner",
+        self._controller.record_broker_tool_result(
+            self.run_id, result.model_dump(mode="json", by_alias=True)
         )
         return result
 
@@ -282,7 +278,7 @@ class Controller:
         return ev
 
     def record_broker_tool_result(self, run_id: str, result_payload: Mapping[str, Any]) -> EvidenceRecord:
-        """Persist an already brokered result and its learner-safe evidence."""
+        """Persist operator fidelity and a safe learner projection separately."""
         call_id = result_payload.get("callId")
         if not isinstance(call_id, str):
             raise ValueError("broker result callId is required")
@@ -291,7 +287,13 @@ class Controller:
             raise ValueError("broker result is not bound to the requested run")
         result_json = json.dumps(dict(result_payload), sort_keys=True, separators=(",", ":"))
         self.store.save_tool_result(call_id, result_json, str(result_payload.get("effect") or call.get("effect") or "unknown"))
-        return self.append_event(run_id, "tool_result", dict(result_payload), "broker", "learner")
+        operator_event = self.append_event(run_id, "tool_result", dict(result_payload), "broker", "operator")
+        run = self.store.get_run(run_id)
+        task = self.store.get_task(run.get("task_id")) if isinstance(run, Mapping) and isinstance(run.get("task_id"), str) else None
+        if isinstance(task, Mapping) and task.get("partition") == "development":
+            safe = {key: result_payload[key] for key in ("callId", "status", "effect", "toolVersion") if key in result_payload}
+            self.append_event(run_id, "learning_evidence_projection", safe, "broker", "learner")
+        return operator_event
 
     def events(self, run_id: str, after_sequence: int = 0) -> list[dict[str, Any]]:
         """Ordered SSE-ready event payloads: [{id, event, data}]."""
