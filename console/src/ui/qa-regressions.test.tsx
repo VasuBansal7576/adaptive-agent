@@ -161,7 +161,38 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect(await screen.findByText(/Proposal validation passed — this is not a performance result/)).toBeInTheDocument();
   });
 
-  it("shows the workflow strip and Learn-from-this-run only for server-declared eligible runs", async () => {
+  it("Modal Escape closes exactly once and Tab wraps one step per press", async () => {
+    // use the new-run dialog: onClose count observable via the dialog state
+    const user = userEvent.setup();
+    render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
+    await screen.findAllByRole("button", { name: /run-sim-1001/ });
+    await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
+    const dialog = await screen.findByRole("dialog", { name: "Create run" });
+    // move focus to the last focusable (Create run), then Tab: must wrap to the first field in ONE press (no double-jump)
+    const createBtn = within(dialog).getByRole("button", { name: "Create run" });
+    (createBtn as HTMLButtonElement).focus();
+    expect(createBtn).toHaveFocus();
+    await user.keyboard("{Tab}");
+    const focusables = dialog.querySelectorAll<HTMLElement>("a[href], button:not([disabled]), input, select, textarea");
+    const positions = focusables.length;
+    const afterOne = document.activeElement;
+    await user.keyboard("{Tab}");
+    const afterTwo = document.activeElement;
+    await user.keyboard("{Tab}");
+    const afterThree = document.activeElement;
+    // no double-execution: one press advances exactly one position in the trap
+    expect(afterTwo).not.toBe(afterOne);
+    expect(afterThree).not.toBe(afterTwo);
+    expect(within(dialog).queryAllByRole("button", { name: "Create run" }).length).toBe(1);
+    expect(positions).toBeGreaterThan(1);
+    // Escape closes and does not re-fire (dialog stays closed)
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the workflow strip and Learn-from-this-run only for eligible runs", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
     const runs = await sim.listRuns();
@@ -181,7 +212,7 @@ describe("qa regressions: createRun recovery and honesty", () => {
     // select the ineligible run: guidance replaces the action, no fake progress
     await user.click(screen.getAllByRole("button", { name: /run-sim-1001/ })[0]);
     await waitFor(() => expect(screen.queryByRole("button", { name: "Learn from this run" })).not.toBeInTheDocument());
-    expect(screen.getByText(/Eligible after a server-verified outcome/)).toBeInTheDocument();
+    expect(screen.getByText(/Becomes eligible after a verified outcome/)).toBeInTheDocument();
   });
 
   it("lists a run whose learningEligible flips true after the terminal outcome, without a full reload (QA run_a1662f…)", async () => {

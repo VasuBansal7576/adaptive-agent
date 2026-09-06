@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import type { ConsoleTransport, LearningCycleInput } from "../api/transport";
 import type { CandidateDiff, EvaluationJob, EvaluationReportProjection, RunRecord } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
@@ -40,15 +40,11 @@ export function CandidatesView({
       setCycleRunId(learningRequest.runId);
       setCycleOpen(true);
       onLearningRequestConsumed();
-      // the dialog was invoked from another tab: its focus-return target is
-      // the learning-cycle action here (the original invoker unmounted)
-      requestAnimationFrame(() => {
-        document.querySelector("[data-acc010-learning-cycle]")?.setAttribute("data-acc010-focus-return", "");
-      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [learningRequest]);
   const [notice, setNotice] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
+  const learningButtonRef = useRef<HTMLButtonElement>(null);
   const [evalJobs, setEvalJobs] = useState<EvaluationJob[] | null>(null);
   const [evalJobsError, setEvalJobsError] = useState<string | null>(null);
 
@@ -314,6 +310,7 @@ export function CandidatesView({
         runs={eligibleRuns}
         busy={cycleBusy}
         preselectedRunId={cycleRunId}
+        returnFocusTo={learningButtonRef}
         onSubmit={(input) => void runCycle(input)}
       />
 
@@ -383,7 +380,6 @@ function LearningCycleButton({ busy, onRun }: { busy: boolean; onRun: () => void
         type="button"
         onClick={onRun}
         disabled={busy}
-        data-acc010-learning-cycle=""
         className="rounded-md bg-sky-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-60"
         title="Select a completed development run; the runtime generates the proposal and evidence"
       >
@@ -399,6 +395,7 @@ function LearningCycleModal({
   runs,
   busy,
   preselectedRunId,
+  returnFocusTo,
   onSubmit,
 }: {
   open: boolean;
@@ -407,6 +404,7 @@ function LearningCycleModal({
   busy: boolean;
   /** run carried in from "Learn from this run" (or a previous dialog session) */
   preselectedRunId?: string;
+  returnFocusTo?: RefObject<HTMLButtonElement | null>;
   onSubmit: (input: LearningCycleInput) => void;
 }) {
   const [runId, setRunId] = useState(preselectedRunId ?? "");

@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode, type RefObject } from "react";
 
 export function Banner({
   tone,
@@ -53,11 +53,15 @@ export function Modal({
   title,
   onClose,
   children,
+  returnFocusTo,
 }: {
   open: boolean;
   title: string;
   onClose: () => void;
   children: ReactNode;
+  /** explicit focus-return target when the invoking control unmounts
+   *  (defaults to the element focused at open) */
+  returnFocusTo?: RefObject<HTMLElement | null>;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const restoreRef = useRef<HTMLElement | null>(null);
@@ -65,6 +69,8 @@ export function Modal({
   // identity must not tear down listeners or steal focus mid-render
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const returnFocusToRef = useRef(returnFocusTo);
+  returnFocusToRef.current = returnFocusTo;
 
   useEffect(() => {
     if (!open) return;
@@ -107,17 +113,11 @@ export function Modal({
       // focus-return target (set when the invoking control unmounts, e.g., a
       // tab switch carried the action elsewhere) takes precedence; otherwise
       // restore to the captured element when it is still connected.
-      // prefer the explicitly marked target (if still extant), then the
-      // carried action's learning-cycle control, then the captured element
-      const marked = document.querySelector<HTMLElement>("[data-acc010-focus-return]");
-      if (marked?.isConnected) {
-        marked.focus();
-        marked.removeAttribute("data-acc010-focus-return");
-        return;
-      }
-      const cycle = document.querySelector<HTMLElement>("[data-acc010-learning-cycle]");
-      if (cycle?.isConnected) {
-        cycle.focus();
+      // prefer the explicit return-focus target when provided and extant,
+      // then the element captured at open
+      const explicit = returnFocusToRef.current?.current;
+      if (explicit && explicit.isConnected) {
+        explicit.focus();
         return;
       }
       const restore = restoreRef.current;
