@@ -124,7 +124,7 @@ class _RegisteredPackage:
 class DurableRuntime:
     """Adapter used by the HTTP layer to make Controller the source of truth."""
 
-    def __init__(self, controller: Controller, registry: EnvironmentRegistry, packages: Mapping[str, Any], model_runner: Any | None = None, evaluator: Any | None = None, model_ref: Mapping[str, Any] | None = None, budget_ref: Mapping[str, Any] | None = None, control_plane: Any | None = None, package_bindings: Mapping[str, Any] | None = None, learning_model_client: Any | None = None, evaluation_executor: Any | None = None) -> None:
+    def __init__(self, controller: Controller, registry: EnvironmentRegistry, packages: Mapping[str, Any], model_runner: Any | None = None, evaluator: Any | None = None, model_ref: Mapping[str, Any] | None = None, budget_ref: Mapping[str, Any] | None = None, control_plane: Any | None = None, package_bindings: Mapping[str, Any] | None = None, learning_model_client: Any | None = None, evaluation_executor: Any | None = None, experiment_stage_runner: Any | None = None) -> None:
         self.controller, self.registry, self.packages = controller, registry, dict(packages)
         if package_bindings:
             self.packages.update(package_bindings)
@@ -133,6 +133,7 @@ class DurableRuntime:
         self.control_plane = control_plane
         self.learning_model_client = learning_model_client
         self.evaluation_executor = evaluation_executor
+        self.experiment_stage_runner = experiment_stage_runner
         # These pins are process-scoped and are captured before any learned
         # candidate can be generated.  They never derive from the active
         # skill bundle, which is the arm-specific input under evaluation.
@@ -156,6 +157,21 @@ class DurableRuntime:
             for task in registry.list_tasks_by_partition(name, "development")
         }
         self._reload_registered_environments()
+
+    def run_experiment_stage(self, *, cell_key: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Run one lifecycle cell through the runtime-owned implementation.
+
+        The production evaluator binds this callback when constructing the
+        complete experiment lifecycle.  A missing binding fails closed instead
+        of manufacturing a receipt from workload arithmetic.
+        """
+        callback = self.experiment_stage_runner
+        if not callable(callback):
+            raise LearningRuntimeError("runtime does not have a trusted experiment stage runner")
+        result = callback(cell_key=cell_key, context=dict(context))
+        if not isinstance(result, Mapping):
+            raise LearningRuntimeError("experiment stage runner returned a non-object")
+        return dict(result)
 
     def _reload_registered_environments(self) -> None:
         """Rebuild manifest/task projections from SQLite after a restart."""
@@ -300,6 +316,7 @@ class DurableRuntime:
             raise LearningRuntimeError("evaluation execution config is not frozen")
         arm = getattr(frozen_config, "arm", None)
         seed = getattr(frozen_config, "seed", None)
+        attempt = getattr(frozen_config, "attempt", 0)
         if arm is None or not isinstance(seed, int):
             raise LearningRuntimeError("evaluation execution config lacks arm or seed")
         arm_value = getattr(arm, "value", str(arm))
@@ -307,6 +324,8 @@ class DurableRuntime:
             raise LearningRuntimeError(f"evaluation arm is invalid: {arm_value!r}")
         if isinstance(seed, bool):
             raise LearningRuntimeError("evaluation execution seed must be an integer")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+            raise LearningRuntimeError("evaluation execution attempt must be a non-negative integer")
         if isinstance(bundle, SkillBundle):
             durable_bundle = bundle
         elif isinstance(bundle, Mapping):
@@ -339,7 +358,7 @@ class DurableRuntime:
         # Benchmark fixtures are reset per cell and may include declared write
         # actions.  Batch mode is the manifest-authorized path that issues the
         # one-use approvals required by the broker for those writes.
-        request = RunRequest(taskRef=task_ref, modelProfileRef=model_ref, budgetRef=budget_ref, idempotencyKey=f"benchmark:{protocol_hash}:{task_id}:{arm_value}:{seed}:{durable_bundle.content_hash}", executionMode="batch")
+        request = RunRequest(taskRef=task_ref, modelProfileRef=model_ref, budgetRef=budget_ref, idempotencyKey=f"benchmark:{protocol_hash}:{task_id}:{arm_value}:{seed}:{durable_bundle.content_hash}:attempt:{attempt}", executionMode="batch")
         run = self.controller.create_run(request, durable_task, skill_bundle=durable_bundle)
         row = self.controller.store.get_run(run.run_id)
         if row:
@@ -1013,6 +1032,20 @@ class DurableRuntime:
         package = package_override or self.packages.get(stored["environment_id"])
         if not task or not package:
             raise KeyError("development task not found")
+        # Reject an unusable paid-run budget before claiming or dispatching any
+        # model request.  Clamping zero to one would silently spend against an
+        # explicitly zero allocation.
+        run_record = self.controller.get_run(run_id)
+        try:
+            budget_data = self.controller.store.get_artifact(run_record.budget_ref) if run_record is not None else {}
+        except KeyError:
+            budget_data = {}
+        if isinstance(budget_data, Mapping):
+            max_tokens = int(budget_data.get("modelTokens", DEFAULT_MODEL_TOKENS))
+            wall_seconds = float(budget_data.get("wallTimeSeconds", 90))
+            max_cost = int(budget_data.get("costMicrounits", 100000))
+            if max_tokens <= 0 or max_cost <= 0 or wall_seconds <= 0:
+                raise RuntimeError("model, cost, and wall-time budgets must be positive before dispatch")
         claimed, current = self._claim_run(run_id)
         if current is None:
             raise KeyError("run not found")
@@ -1076,7 +1109,8 @@ class DurableRuntime:
             wall_seconds = float(budget_data.get("wallTimeSeconds", 90)) if isinstance(budget_data, Mapping) else 90.0
             child_runs = int(budget_data.get("childRuns", 0)) if isinstance(budget_data, Mapping) else 0
             pinned_image = image_digest if isinstance(image_digest, str) and image_digest not in {"", "image-unpinned"} else None
-            prime = PrimeRuntimeAdapter(PrimeRuntimeConfig(task_id=run_id, model="openai-codex/gpt-5.6-luna", provider="openai-codex", max_model_tokens=max(1, max_tokens), max_total_wall_seconds=max(0.1, wall_seconds), child_runs=max(0, child_runs), max_child_depth=1, docker_image=pinned_image, ao_session_id=os.environ.get("AO_SESSION_ID")), broker=CapabilityBroker(run_id, authorizer=authorize))
+            max_cost = int(budget_data.get("costMicrounits", 100000)) if isinstance(budget_data, Mapping) else 100000
+            prime = PrimeRuntimeAdapter(PrimeRuntimeConfig(task_id=run_id, model="openai-codex/gpt-5.6-luna", provider="openai-codex", max_model_tokens=max_tokens, max_model_cost_microunits=max_cost, max_total_wall_seconds=wall_seconds, child_runs=child_runs, max_child_depth=1, docker_image=pinned_image, ao_session_id=os.environ.get("AO_SESSION_ID")), broker=CapabilityBroker(run_id, authorizer=authorize))
             for tool in package.manifest.tool_schemas:
                 expires = (datetime.now(timezone.utc) + timedelta(seconds=90)).isoformat()
                 prime.broker.register(PrimeCapability(f"{run_id}:{tool.name}", tool.name, tool.version, tool.effect, "run", expires))
@@ -1132,7 +1166,7 @@ class DurableRuntime:
                 if wall_seconds <= 0:
                     self.result = PlannerResult("timed_out", None, 0, 0, 0, (), ())
                     return
-                planner = LunaPlanner(parent_client, prime, Sink(self._controller), limits=PlannerLimits(max_model_tokens=max(1, max_tokens), max_wall_seconds=max(0.1, wall_seconds)), emit=lambda event: self._controller.append_event(run_id, event.kind, {"summary": event.summary, "detail": event.detail}, "system", "operator"))
+                planner = LunaPlanner(parent_client, prime, Sink(self._controller), limits=PlannerLimits(max_model_tokens=max_tokens, max_wall_seconds=wall_seconds), emit=lambda event: self._controller.append_event(run_id, event.kind, {"summary": event.summary, "detail": event.detail}, "system", "operator"))
                 self.result = planner.run(goal=task.goal, environment=runtime._planner_environment(package, run_id), active_skills=runtime._active_skills(run_id), cancel=cancel)
         driver = Driver(self.controller)
         def evaluate() -> DurableOutcome:
@@ -1269,6 +1303,7 @@ def create_runtime_app(
     package_bindings: Mapping[str, Any] | None = None,
     learning_model_client: Any | None = None,
     evaluation_executor: Any | None = None,
+    experiment_stage_runner: Any | None = None,
     evaluation_protocol: Any | None = None,
     evaluation_arm_bundles: Mapping[Any, Any] | None = None,
 ):
@@ -1291,7 +1326,7 @@ def create_runtime_app(
     # every RunRecord budgetRef resolves to immutable bytes, just like custom
     # UI budgets.
     controller.store.put_artifact(budget_profile)
-    durable_runtime = DurableRuntime(controller, registry, packages, model_runner=model_runner, evaluator=evaluator, model_ref=model_ref, budget_ref=budget_ref, control_plane=plane, package_bindings=package_bindings, learning_model_client=learning_model_client, evaluation_executor=evaluation_executor)
+    durable_runtime = DurableRuntime(controller, registry, packages, model_runner=model_runner, evaluator=evaluator, model_ref=model_ref, budget_ref=budget_ref, control_plane=plane, package_bindings=package_bindings, learning_model_client=learning_model_client, evaluation_executor=evaluation_executor, experiment_stage_runner=experiment_stage_runner)
     app = create_app(plane, durable_runtime=durable_runtime)
     app.state.controller = controller
     if evaluation_protocol is not None:

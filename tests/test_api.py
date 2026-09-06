@@ -295,8 +295,8 @@ def test_durable_launch_retry_does_not_reinvoke_model(tmp_path):
     app = create_runtime_app(model_runner=runtime_runner, evaluator=lambda **_kwargs: {"passed": True}, data_dir=tmp_path)
     api = TestClient(app, base_url="http://127.0.0.1")
     assert api.get("/session/bootstrap").status_code == 200
-    task = api.get("/environments/finance/tasks").json()[0]
-    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "durable-retry"}).json()
+    task = app.state.durable_runtime.packages["finance"].tasks_for_partition("development")[0]
+    run = api.post("/runs", json={"goal": task.goal, "environmentId": "finance", "idempotencyKey": "durable-retry"}).json()
     assert api.post(f"/runs/{run['runId']}/launch").status_code == 202
     retry = api.post(f"/runs/{run['runId']}/launch")
     assert retry.status_code == 202
@@ -390,6 +390,39 @@ def test_benchmark_write_uses_authorized_batch_mode(monkeypatch, tmp_path):
     payload = runtime.controller.store.get_artifact(json.loads(tool_events[-1]["source_ref"])["sha256"])
     assert payload["status"] == "ok"
     assert payload["effect"] == "confirmed"
+
+
+@pytest.mark.parametrize("zero_field", ["modelTokens", "costMicrounits"])
+def test_zero_model_or_cost_budget_is_rejected_before_dispatch(tmp_path, zero_field):
+    calls = []
+
+    def runner(**_kwargs):
+        calls.append(True)
+        return Invocation()
+
+    app = create_runtime_app(model_runner=runner, evaluator=lambda **_: {"passed": True}, data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").status_code == 200
+    task = app.state.durable_runtime.packages["finance"].tasks_for_partition("development")[0]
+    run = api.post(
+        "/runs",
+        json={
+            "goal": task.goal,
+            "environmentId": "finance",
+            "idempotencyKey": "zero-budget",
+            "budget": {
+                "modelTokens": 0 if zero_field == "modelTokens" else 1,
+                "toolCalls": 1,
+                "childRuns": 0,
+                "wallTimeSeconds": 1,
+                "costMicrounits": 0 if zero_field == "costMicrounits" else 1,
+                "currency": "USD",
+            },
+        },
+    ).json()
+    with pytest.raises(RuntimeError, match="budgets must be positive"):
+        app.state.durable_runtime.launch(run["runId"])
+    assert calls == []
 
 
 def test_durable_terminal_event_stream_closes_after_completed_run(tmp_path):

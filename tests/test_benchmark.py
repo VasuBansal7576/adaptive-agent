@@ -138,6 +138,61 @@ class BenchmarkDriverTests(unittest.TestCase):
             self.assertTrue(second.failed)
             self.assertEqual(first_panel, {task_id for task_id, _, _ in calls})
 
+    def test_retry_uses_fresh_attempt_identity_and_preserves_failed_attempt(self):
+        packages = build_environment_packages()
+        protocol = EvaluationProtocol()
+        protocol.freeze(packages)
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            bundle = SkillBundle(skills=[])
+            attempts = []
+
+            class TrustedEvidence:
+                durable = True
+
+                def verify(self, observation, frozen, package):
+                    return True
+
+            def execute(task, frozen_config, selected_bundle):
+                attempts.append(frozen_config.attempt)
+                if len(attempts) == 1:
+                    raise RuntimeError("provider failed before receipt")
+                return RunObservation(
+                    task.task_id,
+                    task.environment_ref.id,
+                    Partition.DEVELOPMENT,
+                    frozen_config.seed,
+                    frozen_config.arm,
+                    True,
+                    True,
+                    0,
+                    1,
+                    1.0,
+                    model_provenance=ModelProvenance.REAL_MODEL,
+                    bundle_hash=selected_bundle.content_hash,
+                )
+
+            driver = ResumableEvaluationDriver(
+                store,
+                protocol,
+                packages,
+                execute,
+                bundle,
+                evidence_store=TrustedEvidence(),
+                owner_id="retry-owner",
+            )
+            first = driver.run_development_smoke("retry-identity")
+            self.assertFalse(first.complete)
+            second = driver.run_development_smoke("retry-identity")
+            self.assertTrue(second.complete)
+            self.assertEqual(attempts, [0, 1])
+            with store.connect() as conn:
+                rows = conn.execute(
+                    "SELECT status FROM benchmark_task_attempts WHERE benchmark_id = ? ORDER BY rowid",
+                    ("retry-identity",),
+                ).fetchall()
+            self.assertEqual([row["status"] for row in rows], ["failed", "complete"])
+
     def test_synthetic_executor_result_is_failed_not_success(self):
         packages = build_environment_packages()
         protocol = EvaluationProtocol()

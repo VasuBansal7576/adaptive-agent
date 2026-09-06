@@ -42,6 +42,13 @@ class FrozenExecutionConfig:
     # Kept optional for legacy callback callers.  The benchmark driver always
     # supplies and validates the selected arm's trusted content hash.
     bundle_hash: str = ""
+    # Each retry gets a distinct attempt identity.  Keeping this optional
+    # preserves callers that construct the legacy four-field config directly.
+    attempt: int = 0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.attempt, bool) or not isinstance(self.attempt, int) or self.attempt < 0:
+            raise EvaluationError("evaluation attempt must be a non-negative integer")
 
 
 TrustedTaskExecutor = Callable[[TaskInput, FrozenExecutionConfig, object], RunObservation]
@@ -158,7 +165,8 @@ class ResumableEvaluationDriver:
                         try:
                             selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
                             bundle_hash = self._bundle_hash(selected_bundle)
-                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash), selected_bundle)
+                            attempt = self._next_attempt(benchmark_id, task, arm, seed)
+                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash, attempt), selected_bundle)
                             self._validate_observation(observation, task, environment_id, partition, seed, arm, bundle_hash)
                             if not self.evidence_store.verify(observation, frozen, package):
                                 raise EvaluationError("runtime observation lacks trusted persisted evidence")
@@ -198,7 +206,8 @@ class ResumableEvaluationDriver:
             existing = self._load(benchmark_id, task.task_id, arm, seed)
             return BenchmarkSummary(benchmark_id, Partition.DEVELOPMENT, (existing,) if existing else (), 1)
         try:
-            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash), selected_bundle)
+            attempt = self._next_attempt(benchmark_id, task, arm, seed)
+            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash, attempt), selected_bundle)
             self._validate_observation(observation, task, environment_id, Partition.DEVELOPMENT, seed, arm, bundle_hash)
             if not self.evidence_store.verify(observation, frozen, package):
                 raise EvaluationError("runtime observation lacks trusted persisted evidence")
@@ -207,6 +216,15 @@ class ResumableEvaluationDriver:
         except Exception as exc:
             self._save(benchmark_id, task, arm, seed, "failed", str(exc), None)
             return BenchmarkSummary(benchmark_id, Partition.DEVELOPMENT, (BenchmarkTaskStatus(task.task_id, environment_id, Partition.DEVELOPMENT, arm, seed, "failed", error=str(exc)),), 1)
+
+    def _next_attempt(self, benchmark_id: str, task: TaskInput, arm: Arm, seed: int) -> int:
+        """Return the next immutable attempt number for one benchmark cell."""
+        with self.store.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM benchmark_task_attempts WHERE benchmark_id = ? AND task_id = ? AND environment_id = ? AND partition = ? AND arm = ? AND seed = ?",
+                (benchmark_id, task.task_id, task.environment_ref.id, task.partition.value, arm.value, seed),
+            ).fetchone()
+        return int(row["count"] if row is not None else 0)
 
     def _development_smoke_complete(self, benchmark_id: str) -> bool:
         with self.store.connect() as conn:

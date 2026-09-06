@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 MODEL_TOKENS = 20_000
