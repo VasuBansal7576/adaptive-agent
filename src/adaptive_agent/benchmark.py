@@ -129,6 +129,9 @@ class ResumableEvaluationDriver:
             first_environment = next(iter(tasks_by_env))
             tasks_by_env = {first_environment: tasks_by_env[first_environment][:1]}
         arms = (Arm.B0,) if partition is Partition.DEVELOPMENT else ((Arm.B0, Arm.L) if partition is not Partition.FINAL else (Arm.B0, Arm.L, Arm.A))
+        missing_arms = [arm.value for arm in arms if arm not in self.arm_bundles and arm.value not in self.arm_bundles]
+        if missing_arms:
+            raise EvaluationError(f"missing expected arm bundles before execution: {', '.join(missing_arms)}")
         seeds = (self.protocol.seeds[0],) if partition is Partition.DEVELOPMENT else self.protocol.seeds
         statuses: list[BenchmarkTaskStatus] = []
         for environment_id, tasks in tasks_by_env.items():
@@ -151,7 +154,7 @@ class ResumableEvaluationDriver:
                             selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
                             bundle_hash = selected_bundle.content_hash if hasattr(selected_bundle, "content_hash") else None
                             observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash), selected_bundle)
-                            self._validate_observation(observation, task, environment_id, partition, seed, arm)
+                            self._validate_observation(observation, task, environment_id, partition, seed, arm, bundle_hash)
                             if not self.evidence_store.verify(observation, frozen, package):
                                 raise EvaluationError("runtime observation lacks trusted persisted evidence")
                             self._save(benchmark_id, task, arm, seed, "complete", None, observation)
@@ -164,9 +167,9 @@ class ResumableEvaluationDriver:
 
     def _development_smoke_complete(self, benchmark_id: str) -> bool:
         with self.store.connect() as conn:
-            rows = conn.execute("SELECT task_id, environment_id, arm, seed FROM benchmark_task_runs WHERE benchmark_id = ? AND partition = 'development' AND status = 'complete' AND observation_json IS NOT NULL", (benchmark_id,)).fetchall()
+            rows = conn.execute("SELECT task_id, environment_id, arm, seed, benchmark_id FROM benchmark_task_runs WHERE benchmark_id IN (?, ?) AND partition = 'development' AND status = 'complete' AND observation_json IS NOT NULL", (benchmark_id, f"{benchmark_id}:smoke")).fetchall()
         for row in rows:
-            status = self._load(benchmark_id, row["task_id"], Arm(row["arm"]), int(row["seed"]))
+            status = self._load(row["benchmark_id"], row["task_id"], Arm(row["arm"]), int(row["seed"]))
             if status and status.observation and self.evidence_store.verify(status.observation, self.protocol.start_candidate_generation(), self.packages[row["environment_id"]]):
                 return True
         return False
@@ -251,13 +254,15 @@ class ResumableEvaluationDriver:
             conn.commit()
 
     @staticmethod
-    def _validate_observation(observation: RunObservation, task: TaskInput, environment_id: str, partition: Partition, seed: int, arm: Arm) -> None:
+    def _validate_observation(observation: RunObservation, task: TaskInput, environment_id: str, partition: Partition, seed: int, arm: Arm, bundle_hash: str | None) -> None:
         if not isinstance(observation, RunObservation):
             raise EvaluationError("trusted executor must return RunObservation")
         if (observation.task_id, observation.environment_id, observation.partition, observation.seed, observation.arm) != (task.task_id, environment_id, partition, seed, arm):
             raise EvaluationError("trusted observation identity does not match requested task")
         if observation.model_provenance is not ModelProvenance.REAL_MODEL:
             raise EvaluationError("synthetic observation is not valid runtime evidence")
+        if not bundle_hash or observation.bundle_hash != bundle_hash:
+            raise EvaluationError("observation bundle hash does not match the requested arm bundle")
 
 
 __all__ = ["BenchmarkSummary", "BenchmarkTaskStatus", "FrozenExecutionConfig", "ResumableEvaluationDriver", "TrustedTaskExecutor"]
