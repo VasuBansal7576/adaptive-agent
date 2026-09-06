@@ -110,3 +110,48 @@ def test_filesystem_source_policy_security_violation_is_expected():
     assert filesystem["classification"] == "expected_security_violation"
     assert filesystem["denialStage"] == "source_policy"
     assert result["actualDocker"] is True
+
+
+class _DockerWrappedDenialRuntime:
+    _errors = {
+        "untrusted-public-doc": "capability is not granted",
+        "evaluator.write": "learner request denied: evaluator.write",
+        "harness.write": "learner request denied: harness.write",
+    }
+
+    def execute(self, code):
+        message = next((value for key, value in self._errors.items() if key in code), "unexpected")
+
+        class Result:
+            status = "error"
+            provenance = {"isolation": "per-run Docker container"}
+
+        Result.error = {"ename": "RuntimeError", "evalue": message}
+        return Result()
+
+
+def test_runtime_boundary_classifies_exact_ipc_wrapped_host_denials():
+    result = run_prime_runtime_safety_probe(_DockerWrappedDenialRuntime(), "public injection")
+
+    assert result["actualDocker"] is True
+    for case in ("injection", "evaluator_tampering", "direct_harness_write"):
+        assert result["cases"][case]["classification"] == "expected_host_denial"
+        assert result["cases"][case]["passed"] is True
+
+
+class _DockerUnexpectedRuntime(_DockerWrappedDenialRuntime):
+    def execute(self, code):
+        class Result:
+            status = "error"
+            error = {"ename": "RuntimeError", "evalue": "unexpected runtime failure"}
+            provenance = {"isolation": "per-run Docker container"}
+
+        return Result()
+
+
+def test_runtime_boundary_rejects_unexpected_wrapped_runtime_errors():
+    result = run_prime_runtime_safety_probe(_DockerUnexpectedRuntime(), "public injection")
+
+    assert result["actualDocker"] is True
+    assert all(case["classification"] == "unexpected_runtime_error" for case in result["cases"].values())
+    assert not any(case["passed"] for case in result["cases"].values())
