@@ -376,6 +376,25 @@ class Store:
                 conn.rollback()
                 raise
 
+    def get_allocation(self, allocation_id: str) -> dict[str, Any] | None:
+        """Read a reserved evaluator panel with decoded task IDs."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM evaluator_allocations WHERE allocation_id = ?",
+                (allocation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        try:
+            task_ids = json.loads(value.get("task_ids_json", "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("stored evaluator allocation has invalid task IDs") from exc
+        if not isinstance(task_ids, list) or not all(isinstance(task_id, str) for task_id in task_ids):
+            raise ValueError("stored evaluator allocation task IDs must be strings")
+        value["task_ids"] = task_ids
+        return value
+
     def dev_smoke_ok(self, environment_id: str) -> bool:
         """Whether a passed trusted development run exists for an environment."""
         with self._connect() as conn:
