@@ -57,7 +57,7 @@ class Package:
         self.environment_id = environment_id
         self._tasks = {
             "development": [self._task("development", 0)],
-            "validation": [self._task("validation", 0)],
+            "validation": [self._task("validation", index) for index in range(62)],
             "final": [self._task("final", 0)],
         }
 
@@ -125,6 +125,10 @@ class Protocol:
                 "corePlannerHash": "core",
                 "imageDigest": "image",
                 "runBudget": {"modelTokens": 20},
+                "auxiliaryQueryAllocations": {
+                    name: {"transfer": f"{name}-validation-60", "adaptation": f"{name}-validation-61"}
+                    for name in ("known-a", "known-b", "known-c")
+                },
             },
         )
 
@@ -217,7 +221,7 @@ def test_adaptation_learns_from_support_before_query(monkeypatch):
 
     assert runtime.calls[-2:] == [
         ("known-a-development-0", "L", 17, "primary"),
-        ("known-a-final-0", "L", 23, "adapted"),
+        ("known-a-validation-61", "L", 23, "adapted"),
     ]
     assert admissions == [
         "adaptation:adapt:known-a:support",

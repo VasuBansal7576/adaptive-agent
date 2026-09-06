@@ -500,6 +500,18 @@ class DefaultExperimentStageRunner:
             raise ExperimentRuntimeError(f"task index {index} is outside {environment_id}/{partition}")
         return tasks[index]
 
+    def _auxiliary_query_task(self, environment_id: str, purpose: str) -> Any:
+        allocations = self.inputs.get("auxiliaryQueryAllocations")
+        if not isinstance(allocations, Mapping) or not isinstance(allocations.get(environment_id), Mapping):
+            raise ExperimentRuntimeError("frozen protocol lacks auxiliary query allocation")
+        task_id = allocations[environment_id].get(purpose)
+        if not isinstance(task_id, str) or not task_id:
+            raise ExperimentRuntimeError(f"frozen protocol lacks {purpose} query allocation")
+        for task in _tasks(_package(self.runtime, environment_id), "validation"):
+            if _task_id(task) == task_id:
+                return task
+        raise ExperimentRuntimeError("frozen auxiliary query task is unavailable")
+
     def _execute(self, task: Any, arm: str, seed: int, bundle: Any, attempt: int) -> Any:
         config = _ExecutionConfig(self.frozen_protocol, arm, seed, _bundle_hash(bundle), attempt)
         observation = self.runtime.execute_evaluation_task(task, config, bundle)
@@ -899,7 +911,7 @@ class DefaultExperimentStageRunner:
         # Transfer queries are operational lifecycle evidence, not promotion
         # evidence. Keep them outside the validation panel so this cell can
         # never consume the primary promotion task allocation.
-        query_task = self._task_for_cell(cell_key, "final", environment_id, 0)
+        query_task = self._auxiliary_query_task(environment_id, "transfer")
         observation, evaluation_receipt = self._execute_stage_subcall(
             query_task,
             "L",
@@ -938,7 +950,7 @@ class DefaultExperimentStageRunner:
         support = self._task_for_cell(cell_key, "development", environment_id, 0)
         # Adaptation support is development-only; its query must be disjoint
         # from both development support and the validation promotion panel.
-        query = self._task_for_cell(cell_key, "final", environment_id, 0)
+        query = self._auxiliary_query_task(environment_id, "adaptation")
         support_observation, support_receipt = self._execute_stage_subcall(
             support,
             "L",

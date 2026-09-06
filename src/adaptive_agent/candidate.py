@@ -603,11 +603,17 @@ class CandidateManager:
                 if vals.get("candidate_reliability", 0) < vals.get("baseline_reliability", 0):
                     return "rejected", f"observed reliability regression in environment {env}"
 
-        base_cost = view.uncertainty.get("baseline_cost", 0.0) or 1e-9
-        base_latency = view.uncertainty.get("baseline_latency", 0.0) or 1e-9
-        if view.mean_cost / base_cost > gate.max_cost_ratio:
+        base_cost = view.uncertainty.get("baseline_cost", 0.0)
+        base_latency = view.uncertainty.get("baseline_latency", 0.0)
+        if base_cost < 0 or base_latency < 0:
+            return "rejected", "baseline cost and latency must be non-negative"
+        if base_cost == 0 and view.mean_cost > 0:
+            return "rejected", "candidate cost is non-zero against a zero-cost baseline"
+        if base_latency == 0 and view.p95_latency > 0:
+            return "rejected", "candidate latency is non-zero against a zero-latency baseline"
+        if base_cost > 0 and view.mean_cost / base_cost > gate.max_cost_ratio:
             return "rejected", f"cost ratio exceeds {gate.max_cost_ratio}"
-        if view.p95_latency / base_latency > gate.max_latency_ratio:
+        if base_latency > 0 and view.p95_latency / base_latency > gate.max_latency_ratio:
             return "rejected", f"latency ratio exceeds {gate.max_latency_ratio}"
 
         return "promoted", "passed frozen gate"

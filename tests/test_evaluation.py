@@ -89,7 +89,7 @@ class EvaluationTests(unittest.TestCase):
         package = packages[environment_id]
         for partition in Partition:
             tasks = package.tasks_for_partition(partition)
-            self.assertEqual(len(tasks), 60 if partition is Partition.VALIDATION else 20)
+            self.assertEqual(len(tasks), 62 if partition is Partition.VALIDATION else 20)
             for task in tasks:
                 session = package.reset(task.task_id, 1)
                 spec_state = session.state

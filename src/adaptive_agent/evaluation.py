@@ -602,7 +602,7 @@ def _build_finance() -> EnvironmentPackage:
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
-        for index in range(60 if partition == Partition.VALIDATION else 20):
+        for index in range(62 if partition == Partition.VALIDATION else 20):
             family, goal, target, refs = builders(index, partition_tag)
             mode = index % 3
             invoice = f"INV-{partition_tag}-{index:03d}"
@@ -613,6 +613,8 @@ def _build_finance() -> EnvironmentPackage:
                 family = ("single_invoice_record", "single_dispute_record", "single_account_record")[index % 3]
             elif partition == Partition.VALIDATION:
                 family = ("invoice_payment_join", "dispute_customer_approval", "account_history_correlation")[index % 3]
+                if index >= 60:
+                    family = ("transfer_query", "adaptation_query")[index - 60]
             else:
                 family = ("conditional_settlement_decision", "conditional_dispute_escalation", "conditional_risk_decision")[index % 3]
             task = _task(environment_id, partition, family, index, goal, tuple(refs.values()))
@@ -710,7 +712,7 @@ def _build_support() -> EnvironmentPackage:
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
-        for index in range(60 if partition == Partition.VALIDATION else 20):
+        for index in range(62 if partition == Partition.VALIDATION else 20):
             ticket, customer = f"TKT-{partition_tag}-{index:03d}", f"CUS-{partition_tag}-{index:03d}"
             mode = index % 3
             if mode == 0:
@@ -723,6 +725,8 @@ def _build_support() -> EnvironmentPackage:
                 family = ("single_ticket_resolution", "single_ticket_tagging", "single_ticket_priority")[index % 3]
             elif partition == Partition.VALIDATION:
                 family = ("ticket_customer_join", "ticket_history_check", "ticket_impact_correlation")[index % 3]
+                if index >= 60:
+                    family = ("transfer_query", "adaptation_query")[index - 60]
                 if mode == 0:
                     target["ticket_tag"] = "specialist"
                 elif mode == 1:
@@ -792,7 +796,7 @@ def _build_it() -> EnvironmentPackage:
     specs: list[_TaskSpec] = []
     for partition in Partition:
         partition_tag = {Partition.DEVELOPMENT: "DEV", Partition.VALIDATION: "VAL", Partition.FINAL: "FIN"}[partition]
-        for index in range(60 if partition == Partition.VALIDATION else 20):
+        for index in range(62 if partition == Partition.VALIDATION else 20):
             asset, incident, user = f"AST-{partition_tag}-{index:03d}", f"INC-{partition_tag}-{index:03d}", f"USR-{partition_tag}-{index:03d}"
             mode = index % 3
             if mode == 0:
@@ -805,6 +809,8 @@ def _build_it() -> EnvironmentPackage:
                 family = ("single_incident_record", "single_access_record", "single_asset_record")[index % 3]
             elif partition == Partition.VALIDATION:
                 family = ("incident_asset_join", "user_asset_entitlement", "asset_owner_history")[index % 3]
+                if index >= 60:
+                    family = ("transfer_query", "adaptation_query")[index - 60]
                 if mode == 0:
                     target["asset_owner"] = user
                 elif mode == 1:
@@ -966,6 +972,7 @@ class EvaluationProtocol:
     bootstrap_draws: int = 10_000
     analysis_seed: int = 20260906
     validation_candidate_limit: int = 3
+    auxiliary_query_tasks_per_environment: int = 2
     run_budget: BudgetSpec = field(default_factory=BudgetSpec)
     concurrency_limit: int = 1
     known_environments: tuple[str, ...] = ("finance", "customer_support", "it")
@@ -975,7 +982,7 @@ class EvaluationProtocol:
     _frozen: "FrozenProtocol | None" = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if len(self.seeds) != 3 or self.tasks_per_environment < 20 or self.bootstrap_draws != 10_000 or self.validation_candidate_limit != 3:
+        if len(self.seeds) != 3 or self.tasks_per_environment < 20 or self.bootstrap_draws != 10_000 or self.validation_candidate_limit != 3 or self.auxiliary_query_tasks_per_environment != 2:
             raise EvaluationError("protocol counts must match the frozen Track 1 defaults")
         if self.concurrency_limit < 1 or not self.known_environments:
             raise EvaluationError("invalid protocol limits")
@@ -1005,7 +1012,16 @@ class EvaluationProtocol:
             raise EvaluationError(f"missing fixture packages: {sorted(missing)}")
         fixture_hashes = {name: packages[name].public_fixture_hash() for name in required}
         partition_hashes = {f"{name}:{partition.value}": packages[name].partition_hash(partition) for name in required for partition in Partition}
-        payload = self.to_dict(include_frozen=False) | {"fixtureHashes": fixture_hashes, "partitionHashes": partition_hashes}
+        auxiliary = {
+            name: {
+                "transfer": packages[name].tasks_for_partition(Partition.VALIDATION)[self.validation_candidate_limit * self.tasks_per_environment].task_id,
+                "adaptation": packages[name].tasks_for_partition(Partition.VALIDATION)[self.validation_candidate_limit * self.tasks_per_environment + 1].task_id,
+            }
+            for name in self.known_environments
+        }
+        if any(len(packages[name].tasks_for_partition(Partition.VALIDATION)) < self.validation_candidate_limit * self.tasks_per_environment + self.auxiliary_query_tasks_per_environment for name in self.known_environments):
+            raise EvaluationError("validation pool lacks the frozen auxiliary query allocation")
+        payload = self.to_dict(include_frozen=False) | {"fixtureHashes": fixture_hashes, "partitionHashes": partition_hashes, "auxiliaryQueryAllocations": auxiliary}
         frozen = FrozenProtocol(sha256_json(payload), fixture_hashes, partition_hashes, payload)
         object.__setattr__(self, "_frozen", frozen)
         return frozen
@@ -1202,6 +1218,26 @@ class EvaluationReport:
     billing_basis: str = "SDK nominal usage cost; subscription billing not measured"
 
     @property
+    def final_gate_passed(self) -> bool:
+        """Return the immutable held-out L-vs-B0 verdict, including zero baselines."""
+        if self.comparison != "final" or self.validity_status != "valid" or not self.safety_passed:
+            return False
+        baseline = self.arm_summaries.get(Arm.B0.value)
+        learned = self.arm_summaries.get(Arm.L.value)
+        if baseline is None or learned is None or not baseline.count or not learned.count:
+            return False
+        if learned.accuracy - baseline.accuracy < 0.05:
+            return False
+        if baseline.mean_cost == 0 and learned.mean_cost > 0:
+            return False
+        if baseline.p95_latency_seconds == 0 and learned.p95_latency_seconds > 0:
+            return False
+        return (
+            (baseline.mean_cost == 0 or learned.mean_cost / baseline.mean_cost <= 1.10)
+            and (baseline.p95_latency_seconds == 0 or learned.p95_latency_seconds / baseline.p95_latency_seconds <= 1.10)
+        )
+
+    @property
     def promotion_eligible(self) -> bool:
         return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed and self.metric_cells_complete and self.safety_cells_complete and self.model_provenance_complete and bool(self.safety_probe_outputs) and self.attestation_ledger is not None and self.attestation_ledger.durable and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in getattr(self, "_rows", ()))
 
@@ -1223,7 +1259,7 @@ class EvaluationReport:
         return self
 
     def to_dict(self) -> JsonObject:
-        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "safetyProbeOutputs": _jsonable(self.safety_probe_outputs), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit), "actualInputTokens": self.actual_input_tokens, "actualOutputTokens": self.actual_output_tokens, "nominalCostUsd": self.nominal_cost_usd, "wallDurationSeconds": self.wall_duration_seconds, "billingBasis": self.billing_basis}
+        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "finalGatePassed": self.final_gate_passed, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "safetyProbeOutputs": _jsonable(self.safety_probe_outputs), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit), "actualInputTokens": self.actual_input_tokens, "actualOutputTokens": self.actual_output_tokens, "nominalCostUsd": self.nominal_cost_usd, "wallDurationSeconds": self.wall_duration_seconds, "billingBasis": self.billing_basis}
 
 
 Executor = Callable[[Arm, EnvironmentPackage, TaskInput, int], RunObservation]
