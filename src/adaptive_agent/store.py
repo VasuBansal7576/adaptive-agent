@@ -100,6 +100,7 @@ class Store:
                     task_id TEXT NOT NULL,
                     environment_id TEXT NOT NULL,
                     bundle_id TEXT NOT NULL,
+                    bundle_hash TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL UNIQUE,
                     last_event_sequence INTEGER DEFAULT 0,
@@ -241,6 +242,10 @@ class Store:
             for name, declaration in (("benchmark_id", "TEXT"), ("arm", "TEXT"), ("seed", "INTEGER"), ("owner_id", "TEXT")):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE task_runs ADD COLUMN {name} {declaration}")
+            # Migration: bundle_hash column for runs created before the pin.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+            if "bundle_hash" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN bundle_hash TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     @contextmanager

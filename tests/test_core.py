@@ -314,7 +314,7 @@ class TestControllerSeam:
         return task
 
     def test_create_run_idempotent_and_events(self, store, registry, broker, provider):
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
+        from adaptive_agent.models import Budget, ModelProfile, RunRequest, SkillBundle
 
         ctl = self._ctl(store, registry, broker)
         task = self._task(registry, store)
@@ -324,12 +324,18 @@ class TestControllerSeam:
             budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
             idempotencyKey="idem-1",
         )
-        r1 = ctl.create_run(req, task)
+        bundle = SkillBundle()
+        r1 = ctl.create_run(req, task, skill_bundle=bundle)
         r2 = ctl.create_run(req, task)
         assert r1.run_id == r2.run_id
         assert ctl.get_run(r1.run_id).status.value == "queued"
         evs = ctl.events(r1.run_id)
         assert evs and evs[0]["event"] == "run_created" and evs[0]["id"] == 1
+        stored = store.get_run(r1.run_id)
+        assert stored is not None
+        assert stored["bundle_hash"] == bundle.content_hash
+        event_payload = store.get_artifact(json.loads(evs[0]["data"]["source_ref"])["sha256"])
+        assert event_payload["skillBundleHash"] == stored["bundle_hash"]
 
     def test_execute_run_dispatches_through_broker(self, store, registry, broker, provider):
         from adaptive_agent.models import Budget, ModelProfile, RunRequest

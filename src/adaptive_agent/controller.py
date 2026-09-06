@@ -462,6 +462,7 @@ class Controller:
                 "task_id": task.task_id,
                 "environment_id": manifest.environment_id,
                 "bundle_id": skill_bundle.bundle_id,
+                "bundle_hash": skill_bundle.content_hash,
                 "status": run.status.value,
                 "idempotency_key": request.idempotency_key,
                 "last_event_sequence": 0,
@@ -469,7 +470,16 @@ class Controller:
                 "run_json": run.model_dump_json(by_alias=True),
             },
         )
-        self.append_event(run.run_id, "run_created", {"run_id": run.run_id}, "system", "learner")
+        self.append_event(
+            run.run_id,
+            "run_created",
+            {
+                "run_id": run.run_id,
+                "skillBundleHash": skill_bundle.content_hash,
+            },
+            "system",
+            "learner",
+        )
         return run
 
     def get_run(self, run_id: str) -> RunRecord | None:
