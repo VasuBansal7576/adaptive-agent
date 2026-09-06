@@ -13,14 +13,13 @@ Read [MILESTONES.md](MILESTONES.md) for implementation evidence and delivery gat
 
 ## Current status
 
-The current local `main` is `7c65f5b`.
+The verified checkpoint covers the assembled control plane and console.
 The root-verified real path reached the production UI, the authenticated Luna subscription, the Docker runtime, a broker write, and the trusted evaluator on the clean Store and data directory `/private/tmp/adaptive-agent-main-20260906`.
 The run was `run_a1662f700a9a400b9e0f80b87a52f76e`.
 
 The run produced learning candidate `cand_a095170f9c6d4f58943deb7539270de0` from three broker references and 7,206 learning tokens.
 Candidate proposal validation passed.
 No heldout panel or performance result has been run from this checkpoint.
-Session 6 is fixing the full lifecycle 360/720 regression.
 
 The accepted Luna-through-ChatGPT subscription path does not expose an API-key or provider switch.
 The trusted parent accounts actual model usage and rejects after aggregate token exhaustion.
@@ -42,6 +41,37 @@ Install the console dependencies from `package.json`.
 
 ```sh
 bun install
+```
+
+The API can start without Docker, Prime Agent, or the authenticated subscription.
+Model-backed runs need all of them.
+
+The Prime runtime requires a working Docker daemon, an installed `prime-agent` CLI with its bundled `rlm/repl.py` runtime, an authenticated subscription directory, and an AO session identifier.
+The adapter accepts only provider `openai-codex` with model `openai-codex/gpt-5.6-luna`.
+Set `PRIME_AGENT_CODING_AGENT_DIR` to the AO-authorized coding-agent directory that contains the subscription authentication state.
+Set `AO_SESSION_ID` to the trusted AO session identifier.
+The identifier must contain only letters, digits, `_`, `.`, `:`, or `-`.
+Do not print or commit the subscription directory contents.
+
+Check the non-secret prerequisites before a model run.
+
+```sh
+docker info
+prime-agent --version
+prime-agent --help
+test -n "$PRIME_AGENT_CODING_AGENT_DIR"
+case "${AO_SESSION_ID:-}" in
+  ""|*[!A-Za-z0-9_.:-]*) exit 1 ;;
+esac
+```
+
+The API starts when these checks fail because it validates the Prime runtime when a model-backed run launches.
+The run fails when Docker, the Prime runtime bundle, the subscription directory, or `AO_SESSION_ID` is unavailable.
+
+An optional authenticated reachability check invokes the subscription model and must not use a retained benchmark or demo data directory.
+
+```sh
+prime-agent --print --no-tools --provider openai-codex --model openai-codex/gpt-5.6-luna
 ```
 
 ## Run locally
@@ -97,14 +127,38 @@ bunx tsc --noEmit
 bun run build
 ```
 
-With the API already running, exercise the live session, run, event-stream, and cancellation contract.
+The API smoke creates and launches a run.
+It uses the live model path when the API has the required runtime and subscription configuration.
+Run it only against a disposable API and data directory, and set `API_BASE` explicitly.
 
 ```sh
-bun run api:smoke
+SMOKE_DATA_DIR="$(mktemp -d -t adaptive-agent-smoke.XXXXXX)"
+uv run adaptive-agent --data-dir "$SMOKE_DATA_DIR" --port 8010
 ```
 
-Set `API_BASE` to target another API URL.
+In a second terminal, run the smoke against that disposable API.
+
+```sh
+API_BASE=http://127.0.0.1:8010 bun run api:smoke
+```
+
 The smoke command exits successfully with a skip message when the API is unreachable, so check its output.
+The smoke can consume subscription usage and can execute fixture writes.
+Do not point it at the default `:8000` API when that API uses retained benchmark or demo data.
+
+For a built-console smoke that performs only GET requests and does not launch a model run, build the console before starting a separate disposable API and set `BASE` explicitly.
+
+```sh
+APP_DATA_DIR="$(mktemp -d -t adaptive-agent-app-smoke.XXXXXX)"
+bun run build
+uv run adaptive-agent --data-dir "$APP_DATA_DIR" --port 8011 --console-dist console/dist
+```
+
+In a second terminal, run the GET-only smoke.
+
+```sh
+BASE=http://127.0.0.1:8011 node console/scripts/prod-app-smoke.mjs
+```
 
 ## Architecture
 
@@ -166,7 +220,6 @@ Do not treat a fixture pass, a transport smoke, or a candidate proposal validati
 - The current candidate has passed proposal validation only.
   It has not passed an independent heldout comparison.
 - No sealed four-environment B0/L/A panel or measured performance claim exists.
-- Session 6 is fixing the full lifecycle 360/720 regression before the complete workload can be accepted.
 - The strict per-call provider output-token cap is unmet because the accepted subscription path exposes no hard provider switch or API-key boundary.
   Aggregate trusted accounting and local post-response checks do not prove provider enforcement.
 - SDK-reported nominal cost does not prove economic billing.
