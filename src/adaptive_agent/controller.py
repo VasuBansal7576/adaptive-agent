@@ -500,10 +500,22 @@ class Controller:
             or skill_bundle.execution_config.image_digest
             or "image-unpinned"
         )
+        budget_payload: dict[str, Any] = {}
+        try:
+            stored_budget = self.store.get_artifact(request.budget_ref)
+            if isinstance(stored_budget, dict):
+                budget_payload = stored_budget
+        except (KeyError, ValueError):
+            budget_payload = {}
+        child_depth = budget_payload.get("max_child_depth", budget_payload.get("maxChildDepth"))
         self.append_event(
             run.run_id,
             "run_created",
-            {"run_id": run.run_id, "imageDigest": image_digest},
+            {
+                "run_id": run.run_id,
+                "imageDigest": image_digest,
+                "maxChildDepth": child_depth if isinstance(child_depth, int) else skill_bundle.execution_config.child_depth_limit,
+            },
             "system",
             "learner",
         )

@@ -354,6 +354,7 @@ class TestControllerSeam:
         created = store.get_evidence(evs[0]["data"]["evidence_id"])
         payload = store.get_artifact(ArtifactRef.model_validate_json(created["source_ref"]))
         assert payload["imageDigest"] == "image-unpinned"
+        assert payload["maxChildDepth"] == 1  # frozen Budget.max_child_depth propagated
 
     def test_execute_run_dispatches_through_broker(self, store, registry, broker, provider):
         from adaptive_agent.models import Budget, ModelProfile, RunRequest
