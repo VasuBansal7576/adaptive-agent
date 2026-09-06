@@ -470,6 +470,12 @@ export function createSimulationTransport(options?: {
     },
 
     async launchDiagnostic(input: { candidateId: string; baseBundleHash: string }) {
+      // idempotent like the backend: relaunching the same frozen candidate/base
+      // returns the SAME diagnostic with its cached results
+      const existing = diagnosticCatalog.find(
+        (d) => d.candidateId === input.candidateId && d.baseBundleHash === input.baseBundleHash,
+      );
+      if (existing) return { diagnosticId: existing.diagnosticId, state: existing.state };
       const diagnosticId = `diag-sim-${(learningActionCount += 1).toString().padStart(3, "0")}`;
       diagnosticCatalog = [
         {
@@ -480,7 +486,7 @@ export function createSimulationTransport(options?: {
           state: "queued",
           completedCells: 0,
           totalCells: 6,
-          startedAt: "2026-09-06T12:00:00Z",
+          startedAt: null,
           updatedAt: "2026-09-06T12:00:00Z",
           armSummaries: [],
           error: null,
@@ -492,9 +498,27 @@ export function createSimulationTransport(options?: {
     },
 
     async listDiagnostics() {
-      // deterministic progress: one cell completes per poll until 6/6
+      // deterministic progress: one cell completes per poll until 6/6.
+      // startedAt set when the run actually starts; meanScore stays null until
+      // an arm completes. A requested cancellation finishes on the next poll.
       diagnosticCatalog = diagnosticCatalog.map((d) => {
         if (d.state === "cancelled" || d.state === "completed" || d.state === "failed") return d;
+        if ((d.error ?? "").includes("cancellation requested")) {
+          return {
+            ...d,
+            state: "cancelled" as const,
+            error: "cancellation requested by operator",
+            updatedAt: "2026-09-06T12:02:00Z",
+          };
+        }
+        if (d.state === "queued") {
+          return {
+            ...d,
+            state: "running" as const,
+            startedAt: "2026-09-06T12:00:30Z",
+            updatedAt: "2026-09-06T12:00:30Z",
+          };
+        }
         const nextCells = Math.min(6, d.completedCells + 1);
         const completed = nextCells === 6;
         return {
@@ -507,16 +531,18 @@ export function createSimulationTransport(options?: {
                 { arm: "B0" as const, completed: 3, successes: 2, meanScore: 0.55, totalTokens: 4200, wallDurationSeconds: 240 },
                 { arm: "L" as const, completed: 3, successes: 3, meanScore: 0.9, totalTokens: 5100, wallDurationSeconds: 262 },
               ]
-            : d.armSummaries,
+            : d.armSummaries.map((a) => ({ ...a, meanScore: a.meanScore ?? null })),
         };
       });
       return structuredClone(diagnosticCatalog);
     },
 
     async cancelDiagnostic(diagnosticId: string) {
+      // backend semantics: state stays running; a nullable error carries the
+      // pending cancellation until the run actually stops
       diagnosticCatalog = diagnosticCatalog.map((d) =>
         d.diagnosticId === diagnosticId && (d.state === "queued" || d.state === "running")
-          ? { ...d, state: "cancelled" as const, error: "cancelled by operator", updatedAt: "2026-09-06T12:02:00Z" }
+          ? { ...d, error: "cancellation requested by operator", updatedAt: "2026-09-06T12:02:00Z" }
           : d,
       );
     },

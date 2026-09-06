@@ -223,7 +223,7 @@ describe("run-options and registered tasks in the new-run dialog", () => {
     const transport: ConsoleTransport = { ...sim, listCandidates: async () => realShape as never };
     render(<App transport={transport} />);
     await user.click(await screen.findByRole("tab", { name: "Candidates" }));
-    expect(await screen.findByText("cand_405ac49df3c845f8be97490490a41350")).toBeInTheDocument();
+    expect((await screen.findAllByText("cand_405ac49df3c845f8be97490490a41350")).length).toBeGreaterThanOrEqual(1);
     expect(await screen.findByText("Evaluating")).toBeInTheDocument();
     expect(await screen.findByText(/2647d69d89ff0368/)).toBeInTheDocument();
     expect(await screen.findByText(/broker:ev_2efcf195/)).toBeInTheDocument();

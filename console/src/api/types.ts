@@ -227,7 +227,8 @@ export type DiagnosticArmSummary = {
   arm: "B0" | "L";
   completed: number;
   successes: number;
-  meanScore: number;
+  /** null until at least one task completes for this arm; never coerced to 0 */
+  meanScore: number | null;
   totalTokens: number;
   wallDurationSeconds: number;
 };
@@ -241,7 +242,8 @@ export type DiagnosticRecord = {
   state: "queued" | "running" | "completed" | "failed" | "cancelled";
   completedCells: number;
   totalCells: number;
-  startedAt: string;
+  /** null while queued (not yet started); never coerced */
+  startedAt: string | null;
   updatedAt: string;
   armSummaries: DiagnosticArmSummary[];
   error: string | null;

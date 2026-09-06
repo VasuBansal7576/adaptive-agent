@@ -151,7 +151,7 @@ describe("qa regressions: createRun recovery and honesty", () => {
     };
     render(<App transport={transport} />);
     await user.click(await screen.findByRole("tab", { name: "Candidates" }));
-    await user.click((await screen.findAllByRole("button", { name: "Launch evaluation" }))[0]);
+    await user.click((await screen.findAllByRole("button", { name: "Full validation (360 runs)" }))[0]);
     expect(await screen.findByText(/Evaluation eval-sim-900 queued/)).toBeInTheDocument();
     expect(launched[0].candidateId).toBe("cand-sim-204");
   });
@@ -399,12 +399,23 @@ describe("qa regressions: createRun recovery and honesty", () => {
     // never conflated with promotion evidence
     expect(screen.getAllByText(/Development check, not promotion evidence/).length).toBeGreaterThanOrEqual(1);
 
-    // second diagnostic: cancel path
+    // second diagnostic: same frozen candidate/base relaunches IDEMPOTENTLY —
+    // the SAME diagnostic id and cached completed results return, no new job
     await user.click(await screen.findByRole("button", { name: "Quick comparison" }));
-    await waitFor(() => expect(screen.getAllByText(/2\/6 runs|1\/6 runs/)[0]).toBeInTheDocument(), { timeout: 12000 });
-    const cancelButtons = screen.getAllByRole("button", { name: "Cancel" });
-    await user.click(cancelButtons[cancelButtons.length - 1]);
-    await waitFor(() => expect(screen.getAllByText("Cancelled").length).toBeGreaterThanOrEqual(1), { timeout: 4000 });
+    await waitFor(() => expect(screen.getByText("6/6 runs")).toBeInTheDocument(), { timeout: 6000 });
+    expect(screen.getAllByText(/Development check, not promotion evidence/).length).toBeGreaterThanOrEqual(1);
+
+    // cancellation on a queued/running diagnostic: pending state then cancelled.
+    // A different frozen candidate/base creates a NEW diagnostic (relaunching
+    // the SAME one is idempotent, as asserted above).
+    const sim2 = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const diag2 = await sim2.launchDiagnostic({ candidateId: "cand-sim-205", baseBundleHash: "d".repeat(64) });
+    expect(diag2.state).toBe("queued");
+    await sim2.cancelDiagnostic(diag2.diagnosticId);
+    const rows = await sim2.listDiagnostics();
+    const cancelledRow = rows.find((r) => r.diagnosticId === diag2.diagnosticId);
+    expect(cancelledRow?.state).toBe("cancelled");
+    expect(cancelledRow?.error).toContain("cancellation requested by operator");
   });
 
   it("diagnostic parse: rejects malformed rows and wrong totalCells instead of silently rendering", async () => {
@@ -417,12 +428,12 @@ describe("qa regressions: createRun recovery and honesty", () => {
   it("full validation stays a secondary explicit long-running action", async () => {
     render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
     await userEvent.setup().click(await screen.findByRole("tab", { name: "Candidates" }));
-    const full = await screen.findByText("Full validation (360 runs)");
-    expect(full).toBeInTheDocument();
-    // presented as notice text, never as a quick check
-    expect(full.getAttribute("title")).toContain("takes hours");
-    // it is NOT a launch button for the diagnostics flow
-    expect(full.tagName).toBe("SPAN");
+    const fullButtons = await screen.findAllByRole("button", { name: "Full validation (360 runs)" });
+    expect(fullButtons.length).toBeGreaterThanOrEqual(1);
+    // real secondary action wired to the trusted evaluation launch, with the long-running notice
+    expect(fullButtons[0].getAttribute("title")).toContain("runs for hours"); // long-running notice visible
+    // the quick-comparison panel never presents full validation as a quick action
+    expect(screen.getByText(/Estimated a few minutes/)).toBeTruthy();
   });
 
   it("opens the learning-cycle dialog from the empty-candidates state (regression)", async () => {

@@ -48,40 +48,70 @@ export function CandidatesView({
   const [diagnostics, setDiagnostics] = useState<DiagnosticRecord[] | null>(null);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [launching, setLaunching] = useState(false);
+  const diagnosticsActiveRef = useRef<boolean | null>(null);
+  const cancelledRef = useRef(false);
   const [evalJobs, setEvalJobs] = useState<EvaluationJob[] | null>(null);
   const [evalJobsError, setEvalJobsError] = useState<string | null>(null);
 
-  // quick development comparison rows follow the candidate list
+  // quick development comparison rows: restored on mount, then a recurring
+  // poll INDEPENDENT of the candidate list. The loop continues while any row
+  // is active OR while the list has not been fetched once yet (retry after
+  // failure); it never updates after unmount.
+  useEffect(() => {
+    cancelledRef.current = false;
+    return () => {
+      cancelledRef.current = true;
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
-    transport
-      .listDiagnostics()
-      .then((rows) => {
-        if (!cancelled) {
-          setDiagnosticsError(null);
-          setDiagnostics(rows);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let fetchedOnce = false;
+    const tick = async () => {
+      if (cancelled) return;
+      try {
+        const rows = await transport.listDiagnostics();
+        if (cancelled) return;
+        fetchedOnce = true;
+        setDiagnosticsError(null);
+        setDiagnostics(rows);
+        const active = rows.some((d) => d.state === "queued" || d.state === "running");
+        diagnosticsActiveRef.current = active;
+        if (active) timer = setTimeout(() => void tick(), 2000);
+        else if (!fetchedOnce) timer = setTimeout(() => void tick(), 2000);
+      } catch (error) {
+        if (cancelled) return;
+        // retry after failure while we have not confirmed a quiet, empty list
+        if (!fetchedOnce || (diagnosticsActiveRef.current ?? false)) {
+          timer = setTimeout(() => void tick(), 4000);
         }
-      })
-      .catch((error) => {
-        if (!cancelled) setDiagnosticsError(error instanceof Error ? error.message : "diagnostics unavailable");
-      });
+        setDiagnosticsError(error instanceof Error ? error.message : "diagnostics unavailable");
+      }
+    };
+    void tick();
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
-  }, [transport, candidates]);
+  }, [transport]);
 
-  // live poll while any diagnostic is queued/running (progress x/6)
+  // live poll while any diagnostic is queued/running (progress x/6);
+  // re-arms on every state update and retries after failures
   useEffect(() => {
     const active = (diagnostics ?? []).some((d) => d.state === "queued" || d.state === "running");
     if (!active) return;
     const timer = setTimeout(() => {
+      if (cancelledRef.current) return;
       transport
         .listDiagnostics()
         .then((rows) => {
+          if (cancelledRef.current) return;
           setDiagnosticsError(null);
           setDiagnostics(rows);
         })
         .catch((error) => {
+          if (cancelledRef.current) return;
           setDiagnosticsError(error instanceof Error ? error.message : "diagnostics unavailable");
         });
     }, 2000);
@@ -160,6 +190,7 @@ export function CandidatesView({
       await transport.launchDiagnostic({ candidateId: latestValidated.candidateId, baseBundleHash: latestValidated.baseBundleHash });
       const rows = await transport.listDiagnostics();
       setDiagnostics(rows);
+      diagnosticsActiveRef.current = rows.some((d) => d.state === "queued" || d.state === "running");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Diagnostic launch failed";
       const correlationId = (error as { correlationId?: string } | null)?.correlationId ?? null;
@@ -265,20 +296,26 @@ export function CandidatesView({
         <article key={cand.candidateId} className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h3 className="break-all font-mono text-sm text-slate-100">{cand.candidateId}</h3>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <StatusBadge status={cand.state} />
               {cand.state === "validated" && (
                 <button
                   type="button"
                   onClick={() => void launchEvaluation(cand)}
                   className="rounded-md border border-sky-700 px-3 py-1.5 text-xs font-medium text-sky-300 hover:bg-sky-950/60"
-                  title="Queue the trusted evaluation for this candidate"
+                  title="Full validation: queues the trusted 360-run evaluation; runs for hours. Only the trusted evaluator gates promotion."
                 >
-                  Launch evaluation
+                  Full validation (360 runs)
                 </button>
               )}
             </div>
           </div>
+          {cand.state === "validated" && (
+            <p className="mt-1 w-full text-[11px] text-slate-500">
+              Full validation queues the trusted 360-run panel and takes hours; the quick comparison above is a
+              development check only.
+            </p>
+          )}
           {cand.state === "validated" && (
             <p className="mt-1 text-[11px] text-slate-500">
               Proposal validation passed — this is not a performance result.
@@ -689,6 +726,10 @@ function ActualReportPanel({ report, evaluationId }: { report: EvaluationReportP
   );
 }
 
+function pendingCancel(d: DiagnosticRecord): boolean {
+  return (d.error ?? "").includes("cancellation requested") && (d.state === "queued" || d.state === "running");
+}
+
 const DIAGNOSTIC_ESTIMATE =
   "Quick development comparison: 6 runs (3 public development tasks, baseline and learned). Estimated a few minutes.";
 
@@ -712,31 +753,35 @@ function DiagnosticsPanel({
   return (
     <section aria-labelledby="diagnostics-heading" className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
+        <div className="min-w-0">
           <h3 id="diagnostics-heading" className="text-sm font-semibold text-slate-100">
             Quick comparison
           </h3>
           <p className="mt-0.5 text-[11px] text-slate-500">
             Development check, not promotion evidence. {DIAGNOSTIC_ESTIMATE}
           </p>
+          <p className="text-[11px] text-slate-500">
+            {latestValidated
+              ? (
+                <>
+                  For candidate <span className="break-all font-mono">{latestValidated.candidateId}</span> against its
+                  recorded base.
+                </>
+              )
+              : (
+                <>No validated candidate yet. Stage a candidate, then run a quick comparison against its base.</>
+              )}
+          </p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onLaunch}
-            disabled={launching || !!activeDiagnostic || !latestValidated}
-            className="rounded-md bg-sky-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-60"
-            title="Runs 3 public development tasks on baseline and learned arms"
-          >
-            {launching || activeDiagnostic ? "Quick comparison in progress…" : "Quick comparison"}
-          </button>
-          <span
-            className="rounded-md border border-slate-600 px-3 py-1.5 text-xs font-medium text-slate-400"
-            title="Full validation runs the 360-run panel and takes hours; only the trusted evaluator gates promotion"
-          >
-            Full validation (360 runs)
-          </span>
-        </div>
+        <button
+          type="button"
+          onClick={onLaunch}
+          disabled={launching || !!activeDiagnostic || !latestValidated}
+          className="rounded-md bg-sky-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-60"
+          title="Runs 3 public development tasks on baseline and learned arms"
+        >
+          {launching || activeDiagnostic ? "Quick comparison in progress…" : "Quick comparison"}
+        </button>
       </div>
 
       {error && <Banner tone="warn" title={`Diagnostics unavailable: ${error}`} role="alert" />}
@@ -758,7 +803,7 @@ function DiagnosticsPanel({
                     {d.completedCells}/{d.totalCells} runs
                   </span>
                   <StatusBadge status={d.state} />
-                  {(d.state === "queued" || d.state === "running") && (
+                  {(d.state === "queued" || d.state === "running") && !pendingCancel(d) && (
                     <button
                       type="button"
                       onClick={() => onCancel(d.diagnosticId)}
@@ -769,9 +814,11 @@ function DiagnosticsPanel({
                   )}
                 </div>
               </div>
-              {d.error && <p className="mt-1 text-[11px] text-rose-300">{d.error}</p>}
+              {pendingCancel(d) && <p className="mt-1 text-[11px] text-amber-300">Cancellation pending…</p>}
+              {d.error && !pendingCancel(d) && <p className="mt-1 text-[11px] text-rose-300">{d.error}</p>}
               {d.armSummaries.length > 0 && (
-                <table className="mt-2 w-full text-[11px]">
+                <div className="overflow-x-auto">
+              <table className="mt-2 w-full text-[11px]">
                   <caption className="sr-only">Development comparison arm results</caption>
                   <thead>
                     <tr className="text-left text-slate-500">
@@ -789,13 +836,14 @@ function DiagnosticsPanel({
                         <th scope="row" className="py-1 pr-2 text-left font-mono">{a.arm}</th>
                         <td className="py-1 pr-2">{a.completed}</td>
                         <td className="py-1 pr-2">{a.successes}</td>
-                        <td className="py-1 pr-2">{a.meanScore.toFixed(2)}</td>
+                        <td className="py-1 pr-2">{a.meanScore === null ? "not measured" : a.meanScore.toFixed(2)}</td>
                         <td className="py-1 pr-2">{a.totalTokens}</td>
                         <td className="py-1">{a.wallDurationSeconds}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
+                </div>
               )}
             </li>
           ))}

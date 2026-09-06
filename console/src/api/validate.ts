@@ -413,16 +413,21 @@ export function parseDiagnostics(value: unknown): DiagnosticRecord[] {
     const completedCells = num(o.completedCells, `${field}.completedCells`);
     const totalCells = num(o.totalCells, `${field}.totalCells`);
     if (totalCells !== 6) throw new SchemaError(`${field}.totalCells`);
-    const startedAt = str(o.startedAt, `${field}.startedAt`);
+    // startedAt is null while queued; never coerced to a timestamp
+    const startedAt: string | null =
+      o.startedAt === null || o.startedAt === undefined ? null : str(o.startedAt, `${field}.startedAt`);
     const updatedAt = str(o.updatedAt, `${field}.updatedAt`);
     const arms = arr(o.armSummaries, `${field}.armSummaries`).map((raw, j) => {
       const a = obj(raw, `${field}.armSummaries[${j}]`);
       const armName = oneOf(a.arm, ["B0", "L"] as const, `${field}.armSummaries[${j}].arm`);
+      // meanScore is null until a task completes for this arm; never coerced to 0
+      const meanScore: number | null =
+        a.meanScore === null || a.meanScore === undefined ? null : num(a.meanScore, `${field}.armSummaries[${j}].meanScore`);
       return {
         arm: armName,
         completed: num(a.completed, `${field}.armSummaries[${j}].completed`),
         successes: num(a.successes, `${field}.armSummaries[${j}].successes`),
-        meanScore: num(a.meanScore, `${field}.armSummaries[${j}].meanScore`),
+        meanScore,
         totalTokens: num(a.totalTokens, `${field}.armSummaries[${j}].totalTokens`),
         wallDurationSeconds: num(a.wallDurationSeconds, `${field}.armSummaries[${j}].wallDurationSeconds`),
       };
