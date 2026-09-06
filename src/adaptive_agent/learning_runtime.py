@@ -199,59 +199,26 @@ class LearningRuntime:
                 if not isinstance(derived, Mapping) or derived.get("event_type") != "learning_evidence_projection" or derived.get("run_id") != run_id or derived.get("visibility") != "learner" or derived.get("redacted") != 1 or derived.get("trust_class") != "broker":
                     continue
                 persisted_projection.append(record)
-        joined_reader = getattr(self.store, "list_learning_evidence", None) or getattr(self.store, "list_learner_evidence", None)
-        events = joined_reader(environment_id=environment_id, run_id=run_id) if callable(joined_reader) else self.store.list_evidence(run_id)
+        joined_reader = getattr(self.store, "list_learning_evidence", None)
+        if not callable(joined_reader):
+            raise LearningRuntimeError("Store lacks unified learning evidence seam")
+        events = joined_reader(environment_id=environment_id, run_id=run_id, include_broker_projection=True)
         for event in events if not projected and not persisted_projection else ():
-            if callable(joined_reader):
-                if event.get("partition") != "development" or event.get("environment_id") != environment_id or event.get("run_id") != run_id:
-                    continue
-                if event.get("visibility") != "learner" or event.get("redacted") != 1:
-                    continue
-            else:
-                provenance = self.store.evidence_provenance(event["evidence_id"])
-                if not provenance or provenance.get("environment_id") != environment_id or provenance.get("partition") != "development":
-                    continue
-                if event.get("trust_class") not in {"broker", "system"} or event.get("visibility") not in {"learner", "operator"}:
-                    continue
-            # Some session-2 runtimes currently retain broker events as
-            # operator-only.  Project only the broker's safe envelope here;
-            # never copy its raw payload into learner context.
-            if event.get("event_type") != "tool_result":
+            if event.get("kind") != "broker_call":
                 continue
-            payload: Mapping[str, Any] = {}
-            source_event = getattr(self.store, "get_evidence", lambda _id: None)(event["evidence_id"])
-            if isinstance(source_event, Mapping) and isinstance(source_event.get("source_ref"), str):
-                ref = json.loads(source_event["source_ref"])
-                raw_payload = self.store.get_artifact(ref["sha256"])
-                if isinstance(raw_payload, Mapping):
-                    payload = raw_payload
-            safe: dict[str, Any] = {key: payload.get(key) for key in ("status", "effect", "toolVersion") if key in payload}
-            # A narrow Store join may already return these allowlisted fields;
-            # consume that projection without reopening raw operator evidence.
-            for key in ("tool", "input", "result", "error", "callId", "toolVersion", "status", "effect"):
-                if key in event:
-                    safe[key] = _sanitize_learning_value(event[key])
-            call_id = payload.get("callId")
-            call_reader = getattr(self.store, "get_tool_call", None)
-            call = call_reader(call_id) if callable(call_reader) and isinstance(call_id, str) else None
-            if isinstance(call, Mapping) and call.get("run_id") == run_id and call.get("environment_id") == environment_id:
-                safe["tool"] = call.get("tool")
-                try:
-                    safe["input"] = _sanitize_learning_value(json.loads(call.get("arguments_json", "{}")))
-                except (TypeError, json.JSONDecodeError):
-                    pass
-                try:
-                    result = json.loads(call.get("result_json")) if call.get("result_json") else {}
-                except (TypeError, json.JSONDecodeError):
-                    result = {}
-                if isinstance(result, Mapping):
-                    safe["result"] = _sanitize_learning_value({key: result.get(key) for key in ("status", "effect", "output") if key in result})
-                    error = result.get("error")
-                    if isinstance(error, Mapping):
-                        safe["error"] = {key: _sanitize_learning_value(error.get(key)) for key in ("code", "retry") if key in error}
-            content = f"Broker development observation: eventType={event['event_type']}; details={canonical_json(safe)}"
-            record = {"kind": "live_evidence", "sourceId": event["evidence_id"], "content": content, "contentHash": content_hash(content), "sourceContentHash": event["content_hash"], "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": event.get("trust_class", "broker"), "trustedOutcome": True, "outcomePassed": outcome_passed}
-            persist(f"learning-evidence-{event['evidence_id']}", record)
+            if event.get("partition") != "development" or event.get("environmentId") != environment_id or event.get("runId") != run_id:
+                continue
+            evidence_id = event.get("evidenceId")
+            if not isinstance(evidence_id, str):
+                continue
+            safe = {
+                key: _sanitize_learning_value(event[key])
+                for key in ("callId", "tool", "input", "result", "status", "errorCode", "retry", "version", "effect", "idempotencyKey", "argumentsSha256", "resultSha256", "evidenceContentHash")
+                if key in event and event[key] is not None
+            }
+            content = f"Broker development observation: {canonical_json(safe)}"
+            record = {"kind": "live_evidence", "sourceId": f"broker:{evidence_id}", "content": content, "contentHash": content_hash(content), "sourceContentHash": event.get("evidenceContentHash"), "sourceEvidenceId": evidence_id, "sourceCallId": event.get("callId"), "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": True, "outcomePassed": outcome_passed}
+            persist(f"learning-broker-{evidence_id}", record)
         outcome_content = f"A trusted evaluator outcome is recorded for this completed development run; passed={str(outcome_passed).lower()}."
         outcome_record = {"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": outcome_content, "contentHash": content_hash(outcome_content), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True, "outcomePassed": outcome_passed}
         persist(f"learning-outcome-{run_id}", outcome_record)
