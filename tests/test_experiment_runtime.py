@@ -359,3 +359,47 @@ def test_actual_durable_runtime_rejects_unfrozen_execution_before_model_dispatch
     with pytest.raises(LearningRuntimeError, match="not frozen"):
         runtime.execute_evaluation_task(task, config, Bundle("base"))
     assert runtime.learning_model_client.calls == 0
+
+
+@pytest.mark.parametrize("zero_field", ["modelTokens", "costMicrounits"])
+def test_actual_durable_runtime_rejects_zero_budget_before_model_dispatch(tmp_path, zero_field):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("adaptive_agent.constants")
+    from fastapi.testclient import TestClient
+    from adaptive_agent.app import create_runtime_app
+
+    calls = []
+
+    def deterministic_runner(**_kwargs):
+        calls.append(True)
+        return SimpleNamespace(
+            text="deterministic response",
+            provider="openai-codex",
+            model="openai-codex/gpt-5.6-luna",
+            response_id="deterministic-response",
+            usage={"inputTokens": 1, "outputTokens": 1},
+        )
+
+    app = create_runtime_app(model_runner=deterministic_runner, evaluator=lambda **_: {"passed": True}, data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").status_code == 200
+    task = app.state.durable_runtime.packages["finance"].tasks_for_partition("development")[0]
+    run = api.post(
+        "/runs",
+        json={
+            "goal": task.goal,
+            "environmentId": "finance",
+            "idempotencyKey": f"zero-budget-{zero_field}",
+            "budget": {
+                "modelTokens": 0 if zero_field == "modelTokens" else 1,
+                "toolCalls": 1,
+                "childRuns": 0,
+                "wallTimeSeconds": 1,
+                "costMicrounits": 0 if zero_field == "costMicrounits" else 1,
+                "currency": "USD",
+            },
+        },
+    ).json()
+    with pytest.raises(RuntimeError, match="budgets must be positive"):
+        app.state.durable_runtime.launch(run["runId"])
+    assert calls == []
