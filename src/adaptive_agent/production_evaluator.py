@@ -88,8 +88,8 @@ def _require_bound_real_receipt(source_dir: str, run_id: str) -> None:
     if run is None or run.get("status") != "succeeded":
         raise RuntimeError(f"bound source run is not a succeeded durable run: {run_id}")
     evidence = source_store.list_evidence(run_id)
-    model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("trust_class") in {"broker", "system"} and row.get("visibility") in {"operator", "evaluator_only"}]
-    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("trust_class") == "evaluator" and row.get("visibility") in {"operator", "evaluator_only"}]
+    model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("trust_class") in {"broker", "system"} and row.get("visibility") == "operator"]
+    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("trust_class") == "evaluator" and row.get("visibility") == "evaluator_only"]
     if not model or not trusted:
         raise RuntimeError(
             f"bound source run lacks canonical model/trusted outcome evidence: {run_id}"
@@ -295,7 +295,16 @@ def _lifecycle_stages(runtime: Any, protocol: Any, declared_retries: int) -> tup
     def invoke(cell_key: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
         return callback(cell_key=cell_key, context={**dict(context), "declaredRetries": declared_retries, "sealedEnvironment": protocol.sealed_environment})
 
-    return tuple(LifecycleStage(name, cells[name], invoke) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final"))
+    def recover(receipt: Mapping[str, Any], *, stage: str, cell_key: str) -> Sequence[Any]:
+        runner = getattr(runtime, "experiment_stage_runner", None)
+        recovery = getattr(runner, "recover_evaluation_observations", None)
+        if not callable(recovery):
+            recovery = getattr(runner, "recover_observations", None)
+        if not callable(recovery):
+            raise RuntimeError("runtime does not expose durable observation recovery")
+        return recovery(receipt, stage=stage, cell_key=cell_key)
+
+    return tuple(LifecycleStage(name, cells[name], invoke, retries=declared_retries, observation_recoverer=recover if name in {"validation", "final"} else None) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final"))
 
 
 def main(argv: list[str] | None = None) -> int:
