@@ -30,6 +30,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from adaptive_agent.models import canonical_usage
+
 
 class AdapterError(RuntimeError):
     """A runtime, protocol, or policy failure."""
@@ -887,7 +889,11 @@ class PrimeRuntimeAdapter:
             raise AdapterError("model evidence does not match requested subscription path")
         if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
             raise AdapterError("model evidence requires a response id and non-empty usage")
-        observation = ModelObservation(provider, model, response_id, dict(usage), time.time())
+        try:
+            normalized_usage = canonical_usage(usage)
+        except ValueError as exc:
+            raise AdapterError(str(exc)) from exc
+        observation = ModelObservation(provider, model, response_id, normalized_usage, time.time())
         self._model_observation = observation
         return observation
 

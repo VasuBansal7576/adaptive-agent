@@ -34,16 +34,31 @@ class SharedLedgerModelClient:
         remaining = kwargs.get("remaining_deadline")
         if isinstance(remaining, (int, float)) and not isinstance(remaining, bool) and remaining <= 0:
             raise SecurityViolation("parent model deadline expired")
-        if self.budget.remaining_model_tokens == 0 or self.budget.remaining_model_cost_microunits == 0:
+        if (self.budget.remaining_model_tokens == 0
+                or self.budget.remaining_model_cost_microunits == 0):
             raise SecurityViolation("shared model budget exhausted")
-        raw = self.client.invoke(**kwargs)
+        # Test/deployment clients may expose the minimal planner interface and
+        # omit optional deadline/cancellation fields.  Preserve those fields
+        # for capable clients while avoiding a signature mismatch at this
+        # trusted adapter boundary.
+        try:
+            parameters = inspect.signature(self.client.invoke).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        forwarded = kwargs if accepts_kwargs or not parameters else {
+            key: value for key, value in kwargs.items() if key in parameters
+        }
+        raw = self.client.invoke(**forwarded)
         if not isinstance(raw, Mapping):
             raise AdapterError("parent model response must be an object")
         provider = raw.get("provider")
         model = raw.get("model")
         response_id = raw.get("responseId", raw.get("response_id"))
         usage = raw.get("usage")
-        if provider != MODEL_PROVIDER or model not in (MODEL_NAME, "gpt-5.6-luna"):
+        if model == "gpt-5.6-luna":
+            model = MODEL_NAME
+        if provider != MODEL_PROVIDER or model != MODEL_NAME:
             raise AdapterError("parent model response is not the pinned Luna subscription")
         if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
             raise AdapterError("parent model response lacks response id or usage accounting")
@@ -55,7 +70,7 @@ class SharedLedgerModelClient:
         if self.observation_sink is not None:
             self.observation_sink({
                 "provider": provider,
-                "model": MODEL_NAME if model == "gpt-5.6-luna" else model,
+                "model": model,
                 "responseId": response_id,
                 "usage": dict(usage),
                 **({"costMicrounits": receipt.cost_microunits, "economicCostStatus": "measured"} if receipt.cost_microunits is not None else ({"economicCostStatus": "unknown"} if self.budget.max_model_cost_microunits is not None else {})),
@@ -140,7 +155,8 @@ class LunaChildPlanner:
         """Return a parent proxy that shares and charges this planner ledger."""
         if self.budget is None:
             raise AdapterError("shared planner budget is required for parent accounting")
-        return SharedLedgerModelClient(self.client, self.budget, observation_sink=observation_sink)
+        sink = self.observation_sink if observation_sink is None else observation_sink
+        return SharedLedgerModelClient(self.client, self.budget, observation_sink=sink)
 
     def record_parent_model_usage(self, usage: Mapping[str, Any]) -> int:
         """Record a completed parent receipt in the same trusted ledger.
