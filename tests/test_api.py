@@ -630,6 +630,31 @@ def test_durable_event_projection_exposes_safe_failure_summary_and_hides_evaluat
     assert "hidden evaluator answer" not in response.text
 
 
+def test_learning_runtime_does_not_use_legacy_learner_feed(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "learning-unified-seam"}).json()
+    store = app.state.durable_runtime.controller.store
+    calls = []
+
+    def unified_projection(*, environment_id, run_id):
+        calls.append((environment_id, run_id))
+        return [{"evidence_id": "safe-unified", "run_id": run_id, "visibility": "learner", "redacted": 1, "partition": "development"}]
+
+    def forbidden_legacy_feed(**_kwargs):
+        raise AssertionError("GET /learning/runtime used the legacy learner feed")
+
+    store.list_learning_evidence = unified_projection
+    store.list_learner_evidence = forbidden_legacy_feed
+    response = api.get("/learning/runtime", params={"environmentId": "finance", "runId": run["runId"]})
+
+    assert response.status_code == 200
+    assert response.json()["developmentEvidence"][0]["evidence_id"] == "safe-unified"
+    assert calls == [("finance", run["runId"])]
+
+
 def test_durable_restart_does_not_reopen_claimed_run(tmp_path):
     first_app = create_runtime_app(data_dir=tmp_path)
     first_api = TestClient(first_app, base_url="http://127.0.0.1")
