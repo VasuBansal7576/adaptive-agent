@@ -58,11 +58,16 @@ class SharedLedgerModelClient:
         model = raw.get("model")
         if model == "gpt-5.6-luna":
             model = MODEL_NAME
+        if provider != MODEL_PROVIDER or model != MODEL_NAME:
+            raise AdapterError("parent model response is not the pinned Luna subscription")
+        response_id = raw.get("responseId", raw.get("response_id"))
+        if not isinstance(response_id, str) or not response_id.strip():
+            raise AdapterError("parent model response lacks response id")
         if self.observation_sink is not None:
             self.observation_sink({
                 "provider": provider,
                 "model": model,
-                "responseId": raw.get("responseId", raw.get("response_id")),
+                "responseId": response_id,
                 "usage": dict(usage),
             })
         # Charge exactly once, immediately after the provider call. The
