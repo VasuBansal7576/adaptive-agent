@@ -21,6 +21,10 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class RunIdempotencyConflict(ValueError):
+    """An idempotency key was reused with a different request fingerprint."""
+
+
 class Store:
     """Local content-addressed store backed by SQLite and flat files."""
 
@@ -74,6 +78,7 @@ class Store:
                     bundle_id TEXT NOT NULL,
                     status TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL UNIQUE,
+                    request_fingerprint TEXT NOT NULL DEFAULT '',
                     last_event_sequence INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
                     completed_at TEXT,
@@ -158,6 +163,13 @@ class Store:
                     consumed_call_id TEXT,
                     expires_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS learning_records (
+                    record_id TEXT PRIMARY KEY,
+                    environment_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS outcomes (
                     outcome_id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL UNIQUE,
@@ -207,6 +219,49 @@ class Store:
 
     def has_artifact(self, sha: str) -> bool:
         return (self.artifact_dir / f"{sha}.json").exists()
+
+    def put_immutable_bytes(self, data: bytes) -> ArtifactRef:
+        """Content-addressed immutable blob store (arbitrary bytes)."""
+        import hashlib
+
+        sha = hashlib.sha256(data).hexdigest()
+        path = self.artifact_dir / f"{sha}.bin"
+        if not path.exists():
+            tmp = self.artifact_dir / f"{sha}.tmp"
+            tmp.write_bytes(data)
+            tmp.replace(path)
+        return ArtifactRef(id=f"blob_{sha[:16]}", version="1", sha256=sha)
+
+    def get_immutable_bytes(self, ref: ArtifactRef | str) -> bytes:
+        sha = ref.sha256 if isinstance(ref, ArtifactRef) else ref
+        path = self.artifact_dir / f"{sha}.bin"
+        if not path.exists():
+            raise KeyError(f"blob {sha} not found")
+        return path.read_bytes()
+
+    # ------------------------------------------------------------------ learning records (session7 seam)
+    def save_learning_record(self, record_id: str, environment_id: str, run_id: str, record_json: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO learning_records (record_id, environment_id, run_id, record_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (record_id, environment_id, run_id, record_json, _utcnow()),
+            )
+            conn.commit()
+
+    def list_learning_records(self, environment_id: str | None = None, run_id: str | None = None) -> list[dict[str, Any]]:
+        """Read-only learning-record query; filtered by env and/or run."""
+        query = "SELECT * FROM learning_records WHERE 1=1"
+        params: list[Any] = []
+        if environment_id is not None:
+            query += " AND environment_id = ?"
+            params.append(environment_id)
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY created_at"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------ generic helpers
     def _insert_json(self, table: str, id_col: str, obj_id: str, data: dict[str, Any]) -> None:
@@ -268,6 +323,58 @@ class Store:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM runs WHERE idempotency_key = ?", (key,)).fetchone()
             return dict(row) if row else None
+
+    def create_run_idempotent(
+        self,
+        idempotency_key: str,
+        request_fingerprint: str,
+        run_data: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        """Atomic request-fingerprint run creation.
+
+        Returns ("exists", row) when the key already belongs to an identical
+        request, ("created", row) on success, and raises
+        RunIdempotencyConflict when the key is bound to different content.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT * FROM runs WHERE idempotency_key = ?", (idempotency_key,)
+                ).fetchone()
+                if existing is not None:
+                    conn.commit()
+                    row = dict(existing)
+                    if row.get("request_fingerprint") != request_fingerprint:
+                        raise RunIdempotencyConflict(
+                            f"idempotency key {idempotency_key!r} already bound to a different request"
+                        )
+                    return "exists", row
+                run_data = dict(run_data)
+                run_id = run_data.pop("run_id", None)
+                if run_id is None:
+                    raise ValueError("run_data must include run_id")
+                run_data["idempotency_key"] = idempotency_key
+                run_data["request_fingerprint"] = request_fingerprint
+                columns = ["run_id"] + list(run_data.keys())
+                values = [run_id] + list(run_data.values())
+                conn.execute(
+                    f"INSERT INTO runs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                    values,
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+                return "created", dict(row)
+            except RunIdempotencyConflict:
+                raise
+            except Exception:
+                conn.rollback()
+                raise
+
+    def list_environments(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM environments ORDER BY registered_at").fetchall()
+            return [dict(r) for r in rows]
 
     def update_run_status(
         self,
