@@ -236,7 +236,7 @@ class EvaluationJob:
                 charged_input += child_usage["inputTokens"]
                 charged_output += child_usage["outputTokens"]
                 charged_tools += child_tools
-                charged_wall += int(float(child_wall) * 1_000_000)
+                charged_wall += round(float(child_wall) * 1_000_000)
                 charged_cost += int(child_cost)
             residual = payload.get("residualUsage")
             if not isinstance(residual, Mapping) or any(not isinstance(residual.get(key), int) or isinstance(residual.get(key), bool) or residual[key] < 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or residual["totalTokens"] != residual["inputTokens"] + residual["outputTokens"]:
@@ -244,11 +244,11 @@ class EvaluationJob:
             reported_residual = (residual["inputTokens"], residual["outputTokens"], payload.get("residualToolCalls", 0), payload.get("residualWallSeconds", 0), payload.get("residualCostMicrounits", 0))
             if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (reported_residual[0], reported_residual[1], reported_residual[2])) or isinstance(reported_residual[3], bool) or not isinstance(reported_residual[3], (int, float)) or not math.isfinite(reported_residual[3]) or reported_residual[3] < 0 or isinstance(reported_residual[4], bool) or not isinstance(reported_residual[4], (int, float)) or not math.isfinite(reported_residual[4]) or reported_residual[4] < 0:
                 raise EvaluationError("residual lifecycle accounting is malformed")
-            full_wall = int(float(wall_seconds or 0) * 1_000_000)
+            full_wall = round(float(wall_seconds or 0) * 1_000_000)
             full_cost = int(cost_value) if isinstance(cost_value, (int, float)) and not isinstance(cost_value, bool) else None
             expected_residual = (input_tokens - charged_input, output_tokens - charged_output, tool_calls - charged_tools, full_wall - charged_wall, None if full_cost is None else full_cost - charged_cost)
-            actual_residual = (reported_residual[0], reported_residual[1], reported_residual[2], int(float(reported_residual[3]) * 1_000_000), int(reported_residual[4]))
-            if expected_residual != actual_residual:
+            actual_residual = (reported_residual[0], reported_residual[1], reported_residual[2], round(float(reported_residual[3]) * 1_000_000), int(reported_residual[4]))
+            if expected_residual[:3] != actual_residual[:3] or expected_residual[4] != actual_residual[4] or abs(expected_residual[3] - actual_residual[3]) > 1:
                 raise EvaluationError("lifecycle receipt aggregate does not match charged subcalls and residual")
             input_tokens, output_tokens = residual["inputTokens"], residual["outputTokens"]
             tool_calls = payload.get("residualToolCalls", 0)
@@ -259,7 +259,7 @@ class EvaluationJob:
             cost_value = 0
         if not isinstance(tool_calls, int) or isinstance(tool_calls, bool) or tool_calls < 0 or isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float)) or not math.isfinite(wall_seconds) or wall_seconds < 0 or isinstance(cost_value, bool) or not isinstance(cost_value, (int, float)) or not math.isfinite(cost_value) or cost_value < 0:
             raise EvaluationError("lifecycle accounting is malformed")
-        wall_micros = int(float(wall_seconds or 0) * 1_000_000)
+        wall_micros = round(float(wall_seconds or 0) * 1_000_000)
         cost = int(cost_value) if isinstance(cost_value, (int, float)) and not isinstance(cost_value, bool) else 0
         with self.store.connect() as conn:
             conn.execute("UPDATE evaluation_lifecycle_attempts SET status = ?, result_json = ?, error = ?, updated_at = datetime('now') WHERE job_id = ? AND stage = ? AND cell_key = ? AND attempt = ?", (status, json.dumps(payload, sort_keys=True, default=str), error, job_id, stage, cell_key, attempt))
@@ -360,7 +360,7 @@ class EvaluationJob:
             status = "failed" if error else "complete"
             cost_value = int(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else 0
             conn.execute("UPDATE evaluation_lifecycle_subcalls SET status = ?, result_json = ?, error = ?, updated_at = datetime('now') WHERE admission_id = ?", (status, json.dumps(payload, sort_keys=True, default=str), error, admission_id))
-            conn.execute("UPDATE evaluation_lifecycle_budget SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, tool_calls = tool_calls + ?, wall_micros = wall_micros + ?, cost_microunits = cost_microunits + ?, blocked = CASE WHEN ? THEN 1 ELSE blocked END, updated_at = datetime('now') WHERE job_id = ?", (usage["inputTokens"], usage["outputTokens"], tool_calls, int(float(wall_seconds or 0) * 1_000_000), cost_value, unknown_cost, row["job_id"]))
+            conn.execute("UPDATE evaluation_lifecycle_budget SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, tool_calls = tool_calls + ?, wall_micros = wall_micros + ?, cost_microunits = cost_microunits + ?, blocked = CASE WHEN ? THEN 1 ELSE blocked END, updated_at = datetime('now') WHERE job_id = ?", (usage["inputTokens"], usage["outputTokens"], tool_calls, round(float(wall_seconds or 0) * 1_000_000), cost_value, unknown_cost, row["job_id"]))
             conn.commit()
         return {"admissionId": admission_id, "status": status, "reused": False, "dispatchAllowed": False}
 

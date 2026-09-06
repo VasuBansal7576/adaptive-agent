@@ -278,7 +278,7 @@ class DefaultExperimentStageRunner:
         task_ids = value.get("taskIds")
         if task_ids is not None and (not isinstance(task_ids, list) or len(task_ids) != len(run_ids) or any(not isinstance(task_id, str) or not task_id for task_id in task_ids)):
             raise ExperimentRuntimeError("lifecycle receipt task IDs are malformed")
-        from adaptive_agent.evaluation import Arm, BudgetSpec, ModelProvenance, Partition, Provenance, RunObservation
+        from adaptive_agent.evaluation import Arm, BudgetSpec, ModelProvenance, Partition, Provenance, RunObservation, sha256_json
 
         frozen_inputs = _protocol_inputs(self.protocol)
         budget_value = _mapping(frozen_inputs["runBudget"], "frozen run budget")
@@ -356,6 +356,7 @@ class DefaultExperimentStageRunner:
             versions = model_payload.get("versionRefs") or accounting.get("versionRefs")
             if not isinstance(versions, Mapping):
                 raise ExperimentRuntimeError(f"observation run {run_id!r} lacks frozen config hashes")
+            package = _package(self.runtime, environment_id)
             observations.append(RunObservation(
                 task_id, environment_id, Partition(partition), seed, Arm(arm),
                 bool(outcome_payload.get("passed", outcome_row_data.get("passed"))),
@@ -374,7 +375,14 @@ class DefaultExperimentStageRunner:
                 accounting_ref=accounting_ref,
                 evidence_ref=model_row.get("evidence_id"),
                 outcome_ref=outcome_row.get("evidence_id"),
-                config_hashes=dict(versions),
+                config_hashes={
+                    "model": sha256_json({"profile": frozen_inputs["modelProfile"], "provider": frozen_inputs["provider"]}),
+                    "planner": str(frozen_inputs["corePlannerHash"]),
+                    "budget": sha256_json(frozen_inputs["runBudget"]),
+                    "policy": sha256_json(package.manifest.policy_ref),
+                    "schema": sha256_json(package.manifest.tool_schemas),
+                    "image": str(frozen_inputs["imageDigest"]),
+                },
                 run_id=run_id,
                 bundle_hash=bundle_hash,
             ))
@@ -762,7 +770,15 @@ class DefaultExperimentStageRunner:
             if not cost_seen and isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 cost = float(value)
                 cost_seen = True
-        complete = (observed == 0 and wall_seen and (nominal_seen or cost_seen)) or (observed == len(wanted) and not wall_missing and not nominal_missing)
+        # Measured economic cost is an independently complete accounting
+        # signal. Missing nominal USD usage must not downgrade a receipt
+        # whose provider supplied measured cost, since nominal usage is not
+        # the billing contract.
+        complete = (observed == 0 and wall_seen and (nominal_seen or cost_seen)) or (
+            observed == len(wanted)
+            and not wall_missing
+            and (cost_seen or (nominal_seen and not nominal_missing))
+        )
         output: dict[str, Any] = {"wallSeconds": wall if wall_seen else 0.0, "accountingComplete": complete}
         if cost_seen and not billing_unknown and complete:
             output["costMicrounits"] = int(round(cost))
@@ -843,13 +859,28 @@ class DefaultExperimentStageRunner:
             cell_key,
             "support",
         )
-        support_learning = self._candidate_from_run(
-            getattr(support_observation, "run_id"),
-            cell_key,
-            bind_primary=False,
-            context=context,
-        )
-        adapted_candidate = _load_bundle(self.runtime, support_learning["candidateBundleHash"])
+        # Adaptation evaluates the already promoted candidate against a fresh
+        # support/query pair. Candidate generation is a separate lifecycle
+        # operation and must not be re-run from a task receipt that has no
+        # authenticated learner observation.
+        candidate_hash = _required_string(self._candidate_hash, "candidate bundle hash")
+        candidate_id = _required_string(self._candidate_id, "candidate id")
+        adapted_candidate = _load_bundle(self.runtime, candidate_hash)
+        support_learning = {
+            "stage": "learning",
+            "cellKey": cell_key,
+            "status": "complete",
+            "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0},
+            "toolCalls": 0,
+            "wallSeconds": 0.0,
+            "costMicrounits": 0,
+            "candidateId": candidate_id,
+            "candidateBundleHash": candidate_hash,
+            "sourceRunIds": [getattr(support_observation, "run_id")],
+            "nestedAdmissions": [],
+            "nestedCheckpoints": [],
+            "reusedCandidate": True,
+        }
         query_observation, query_receipt = self._execute_stage_subcall(
             query,
             "L",
@@ -879,10 +910,9 @@ class DefaultExperimentStageRunner:
             support_learning,
             charged_subcall_ids=[
                 support_receipt["nestedAdmissionId"],
-                *support_learning.get("nestedAdmissions", []),
                 query_receipt["nestedAdmissionId"],
             ],
-            charged_subcall_receipts=[support_receipt, support_learning, query_receipt],
+            charged_subcall_receipts=[support_receipt, query_receipt],
         )
 
     @staticmethod

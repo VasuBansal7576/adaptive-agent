@@ -339,7 +339,7 @@ def _run_probe(case_id: str) -> list[tuple[str, bool, str]]:
             # not marked promoted.
             ev4 = ctl.append_event(dev_run.run_id, "tool_result", {"v": 4}, "broker", "learner")
             pre_active = mgr2.get_active_bundle().content_hash
-            cand4 = SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s4", name="s", version="1", procedure="check twice")])
+            cand4 = SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s4", version="1", procedure="check twice")])
             p4_prop = fresh_proposal(base_bundle_hash=pre_active, supporting_evidence_ids=[ev4.evidence_id])
             p4x = mgr2.submit_candidate(p4_prop, cand4)
             mgr2.start_evaluation(p4x.candidate_id)
@@ -434,7 +434,7 @@ def _run_probe(case_id: str) -> list[tuple[str, bool, str]]:
                 provider.reset(child.run_id)
                 ctl.execute_run(child.run_id, ENV, provider, _Boom())
                 step = ctl.begin_step(ctx.run_id, "child")
-                ctl.finish_step(step, "failed", ToolError(code=ToolErrorCode.OUTCOME_UNKNOWN, message=f"child run {child.run_id} failed"))
+                ctl.finish_step(step, "failed", {"code": ToolErrorCode.OUTCOME_UNKNOWN.value, "message": f"child run {child.run_id} failed"})
                 raise RuntimeError("child run failed")
 
         ctl.execute_run(parent.run_id, ENV, provider, _ParentDriver())

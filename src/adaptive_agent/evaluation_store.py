@@ -172,17 +172,32 @@ class SQLiteRunEvidenceStore:
         if receipts is not None:
             if not isinstance(receipts, list) or not isinstance(aggregate_usage, dict):
                 return False
-            calculated = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+            canonical_keys = ("inputTokens", "outputTokens", "totalTokens")
+            cache_keys = ("cacheReadInputTokens", "cacheCreationInputTokens", "cachedInputTokens")
+            calculated = {key: 0 for key in canonical_keys}
+            calculated_cache = {key: 0 for key in cache_keys}
             for receipt in receipts:
                 if not isinstance(receipt, dict) or not isinstance(receipt.get("usage"), dict):
                     return False
                 usage = receipt["usage"]
-                if any(not isinstance(usage.get(key), int) or usage[key] < 0 for key in calculated):
+                if any(not isinstance(usage.get(key), int) or isinstance(usage[key], bool) or usage[key] < 0 for key in canonical_keys):
                     return False
-                for key in calculated:
+                for key in canonical_keys:
                     calculated[key] += usage[key]
-            if aggregate_usage != calculated:
+                for key in cache_keys:
+                    value = usage.get(key, 0)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        return False
+                    calculated_cache[key] += value
+            if any(key not in aggregate_usage or aggregate_usage.get(key) != value for key, value in calculated.items()):
                 return False
+            if any(key not in canonical_keys and key not in cache_keys for key in aggregate_usage):
+                return False
+            for key, value in calculated_cache.items():
+                aggregate_value = aggregate_usage.get(key)
+                if value or key in aggregate_usage:
+                    if not isinstance(aggregate_value, int) or isinstance(aggregate_value, bool) or aggregate_value != value:
+                        return False
         if sha256_json(response) != evidence.get("content_hash") or source_ref.get("sha256") != evidence.get("content_hash"):
             return False
         if sha256_json(accounting) != observation.accounting_ref or sha256_json(outcome) != outcome_source.get("sha256") or outcome_source.get("sha256") != outcome_evidence.get("content_hash"):
@@ -218,6 +233,21 @@ class SQLiteRunEvidenceStore:
             return False
         actual_cost = accounting.get("costMicrounits")
         actual_latency = accounting.get("durationSeconds")
+        if actual_cost is None:
+            nominal_cost = accounting.get("nominalCostUsd")
+            coverage = accounting.get("nominalCostCoverage")
+            complete_coverage = (
+                accounting.get("nominalCostStatus") == "complete"
+                and isinstance(coverage, dict)
+                and isinstance(coverage.get("knownReceipts"), int)
+                and not isinstance(coverage.get("knownReceipts"), bool)
+                and isinstance(coverage.get("totalReceipts"), int)
+                and not isinstance(coverage.get("totalReceipts"), bool)
+                and coverage["totalReceipts"] > 0
+                and coverage["knownReceipts"] == coverage["totalReceipts"]
+            )
+            if complete_coverage and isinstance(nominal_cost, (int, float)) and not isinstance(nominal_cost, bool) and math.isfinite(float(nominal_cost)) and nominal_cost >= 0:
+                actual_cost = int(round(float(nominal_cost) * 1_000_000))
         if not isinstance(actual_cost, (int, float)) or isinstance(actual_cost, bool) or not math.isfinite(actual_cost) or actual_cost < 0 or not isinstance(actual_latency, (int, float)) or isinstance(actual_latency, bool) or not math.isfinite(actual_latency) or actual_latency < 0:
             return False
         if actual_cost != observation.cost_microunits or actual_latency != observation.latency_seconds:

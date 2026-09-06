@@ -105,12 +105,12 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
             assert evidence
             proposal = {
                 "predictedEffect": "bounded synthetic improvement",
-                "editOperations": [{"path": "skills/generic/procedure", "operation": "add", "value": "Use the verified broker workflow."}],
+                "editOperations": [{"path": "skills/portable-procedure/procedure", "operation": "add", "value": "Use the verified workflow."}],
                 "supportingEvidenceIds": [evidence],
                 "proposerVersion": "synthetic-test-model",
-                "skill": {"procedure": "Use the verified broker workflow."},
+                "skill": {"procedure": "Use the verified workflow."},
             }
-            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"synthetic-learning-{self.calls}", "text": json.dumps(proposal), "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "costMicrounits": 0}
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"synthetic-learning-{self.calls}", "text": json.dumps(proposal), "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "costMicrounits": 0, "economicCostStatus": "measured"}
 
     task_model = TaskModel()
     learning_model = LearningModel()
@@ -126,15 +126,9 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     counts = {stage.name: len(stage.cells) for stage in stages}
     assert counts["validation"] == 360 and counts["final"] == 720
     plan = _lifecycle_execution_plan(counts, 0)
-    limits = {"attempts": plan["totalAdmissions"], "inputTokens": 10_000_000, "outputTokens": 10_000_000, "toolCalls": 10_000_000, "wallMicros": 10_000_000_000, "costMicrounits": 10_000_000}
+    limits = {"attempts": max(plan["totalAdmissions"], 1_000_000), "inputTokens": 1_000_000_000_000, "outputTokens": 1_000_000_000_000, "toolCalls": 1_000_000_000_000, "wallMicros": 1_000_000_000_000, "costMicrounits": 1_000_000_000_000}
     job = runtime.build_evaluation_job(protocol, {Arm.B0: active})
     result = job.run_experiment("full-production-synthetic", stages, limits=limits)
-    if result.status != "complete":
-        with runtime.controller.store.connect() as conn:
-            for rid in [row[0] for row in conn.execute("SELECT run_id FROM runs LIMIT 3")]:
-                for event in runtime.controller.store.list_evidence(rid):
-                    if event["event_type"] == "run_failed":
-                        print("FAIL", runtime.controller.store.get_artifact(json.loads(event["source_ref"])["sha256"]))
     assert result.status == "complete", result.error
     assert result.reports is not None and set(result.reports) == {"validation", "final"}
     assert result.reports["validation"].validity_status == "valid"

@@ -587,7 +587,13 @@ class DurableRuntime:
         version_refs = model_payload.get("versionRefs") if isinstance(model_payload, Mapping) else None
         if not isinstance(version_refs, Mapping):
             raise LearningRuntimeError("evaluation model receipt lacks frozen config hashes")
-        observation_kwargs = {"provenance": Provenance.DETERMINISTIC_SIMULATION, "model_provenance": ModelProvenance.REAL_MODEL, "model_profile": model_name, "core_planner_hash": core_hash, "budget": budget, "response_id": model_payload.get("responseId"), "accounting_ref": accounting_ref, "evidence_ref": model_row["evidence_id"], "outcome_ref": outcome_ref, "config_hashes": dict(version_refs), "run_id": run.run_id}
+        policy_ref = package.manifest.policy_ref
+        if callable(getattr(policy_ref, "model_dump", None)):
+            policy_ref = policy_ref.model_dump(mode="json", by_alias=True)
+        schemas = package.manifest.tool_schemas
+        if schemas and callable(getattr(schemas[0], "model_dump", None)):
+            schemas = tuple(schema.model_dump(mode="json", by_alias=True) for schema in schemas)
+        observation_kwargs = {"provenance": Provenance.DETERMINISTIC_SIMULATION, "model_provenance": ModelProvenance.REAL_MODEL, "model_profile": model_name, "core_planner_hash": core_hash, "budget": budget, "response_id": model_payload.get("responseId"), "accounting_ref": accounting_ref, "evidence_ref": model_row["evidence_id"], "outcome_ref": outcome_ref, "config_hashes": {"model": sha256_json({"profile": inputs.get("modelProfile", model_name), "provider": inputs.get("provider", provider_name)}), "planner": str(inputs.get("corePlannerHash", core_hash)), "budget": sha256_json(inputs.get("runBudget", budget_value)), "policy": sha256_json(policy_ref), "schema": sha256_json(schemas), "image": str(inputs.get("imageDigest", image_digest))}, "run_id": run.run_id}
         # Session-6's evaluator model includes bundle_hash; keep this worker
         # compatible with the pre-merge evaluator while exposing it whenever
         # the authoritative type is present.
