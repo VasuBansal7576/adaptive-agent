@@ -299,6 +299,10 @@ class RunObservation:
     model_profile: str = "openai-codex/gpt-5.6-luna"
     core_planner_hash: str = ""
     budget: BudgetSpec = field(default_factory=BudgetSpec)
+    response_id: str | None = None
+    accounting_ref: str | None = None
+    evidence_ref: str | None = None
+    config_hashes: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.cost_microunits < 0 or self.latency_seconds < 0 or self.safety_violations < 0:
@@ -337,17 +341,35 @@ class Outcome:
     evaluator_version: str
 
 
-_TRUSTED_ATTESTATIONS: dict[str, str] = {}
+class TrustedAttestationLedger(Protocol):
+    durable: bool
+
+    def put(self, token: str, digest: str) -> None: ...
+    def get(self, token: str) -> str | None: ...
+
+
+class _MemoryAttestationLedger:
+    durable = False
+
+    def __init__(self) -> None:
+        self._values: dict[str, str] = {}
+
+    def put(self, token: str, digest: str) -> None:
+        self._values[token] = digest
+
+    def get(self, token: str) -> str | None:
+        return self._values.get(token)
 
 
 class TrustedEvaluatorRegistry:
     """Registry and attestation ledger owned by the independent evaluator."""
 
-    def __init__(self) -> None:
+    def __init__(self, ledger: TrustedAttestationLedger | None = None) -> None:
         self._registrations: dict[str, str] = {}
-        self._safety_probes: dict[str, Callable[[], SafetyProbeResult | bool]] = {}
+        self._safety_probes: dict[str, Callable[[], SafetyProbeResult]] = {}
+        self.ledger = ledger or _MemoryAttestationLedger()
 
-    def register_safety_probe(self, case_id: str, probe: Callable[[], SafetyProbeResult | bool]) -> None:
+    def register_safety_probe(self, case_id: str, probe: Callable[[], SafetyProbeResult]) -> None:
         """Register an executable safety check owned by the evaluator."""
         if not case_id or not callable(probe):
             raise EvaluationError("invalid safety probe")
@@ -362,7 +384,9 @@ class TrustedEvaluatorRegistry:
             raise EvaluationError(f"unregistered safety probe: {case_id}")
         try:
             result = probe()
-            return result if isinstance(result, SafetyProbeResult) else SafetyProbeResult(bool(result))
+            if not isinstance(result, SafetyProbeResult) or not result.outputs or not result.provenance or not result.obligations:
+                return SafetyProbeResult(False, obligations=(f"probe {case_id} returned incomplete evidence",))
+            return result
         except Exception:
             return SafetyProbeResult(False, obligations=(f"probe {case_id} raised",))
 
@@ -380,11 +404,11 @@ class TrustedEvaluatorRegistry:
 
     def attest(self, payload: Mapping[str, JsonValue]) -> str:
         token = secrets.token_urlsafe(24)
-        _TRUSTED_ATTESTATIONS[token] = sha256_json(payload)
+        self.ledger.put(token, sha256_json(payload))
         return token
 
     def verify(self, token: str | None, payload: Mapping[str, JsonValue]) -> bool:
-        return bool(token) and _TRUSTED_ATTESTATIONS.get(token) == sha256_json(payload)
+        return bool(token) and self.ledger.get(token) == sha256_json(payload)
 
 
 class LiveProvider(Protocol):
@@ -1100,6 +1124,20 @@ def _paired_metric(pairs: Sequence[tuple[RunObservation, RunObservation]]) -> di
     return {"accuracy": sum(candidate.passed - baseline.passed for baseline, candidate in pairs) / len(pairs), "reliability": sum(candidate.reliable - baseline.reliable for baseline, candidate in pairs) / len(pairs), "cost": sum(candidate.cost_microunits - baseline.cost_microunits for baseline, candidate in pairs) / len(pairs), "latency": sum(candidate.latency_seconds - baseline.latency_seconds for baseline, candidate in pairs) / len(pairs)}
 
 
+def _trusted_observation(row: RunObservation, protocol: EvaluationProtocol, package: EnvironmentPackage) -> bool:
+    if row.model_provenance is not ModelProvenance.REAL_MODEL or not row.response_id or not row.accounting_ref or not row.evidence_ref:
+        return False
+    expected = {
+        "model": sha256_json({"profile": protocol.model_profile, "provider": protocol.provider}),
+        "planner": protocol.core_planner_hash,
+        "budget": sha256_json(protocol.run_budget),
+        "policy": sha256_json(package.manifest.policy_ref),
+        "schema": sha256_json(package.manifest.tool_schemas),
+        "image": sha256_json({"modelProfile": protocol.model_profile}),
+    }
+    return dict(row.config_hashes) == expected
+
+
 @dataclass(frozen=True)
 class ExposureRecord:
     environment_id: str
@@ -1137,10 +1175,12 @@ class EvaluationReport:
     attestation: str | None = None
     safety_case_results: Mapping[str, bool] = field(default_factory=dict)
     safety_probe_outputs: Mapping[str, JsonObject] = field(default_factory=dict)
+    attestation_ledger: TrustedAttestationLedger | None = field(default=None, repr=False, compare=False)
 
     @property
     def promotion_eligible(self) -> bool:
-        return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed and self.metric_cells_complete and self.safety_cells_complete and self.model_provenance_complete and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in getattr(self, "_rows", ()))
+        real_probe_evidence = set(self.safety_probe_outputs) == {"EVAL-004", "EVAL-005"} and all("controller_toolbroker" in set(result.get("provenance", [])) for result in self.safety_probe_outputs.values())
+        return self.comparison == "validation" and self.validity_status == "valid" and not self.missing_pairs and not self.partition_leak and not self.invalid_fixture_resets and not self.infrastructure_failures and self.safety_passed and self.metric_cells_complete and self.safety_cells_complete and self.model_provenance_complete and real_probe_evidence and self.attestation_ledger is not None and self.attestation_ledger.durable and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in getattr(self, "_rows", ()))
 
     def require_promotion_evidence(self, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage]) -> "EvaluationReport":
         protocol.assert_integrity(packages)
@@ -1148,7 +1188,7 @@ class EvaluationReport:
         if self.evaluator_refs != expected_refs:
             raise PromotionEvidenceRefused("report evaluator registration does not match the known environments")
         payload = {"comparison": self.comparison, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "evaluatorRefs": self.evaluator_refs, "environmentCells": self.environment_cells, "armSummaries": self.arm_summaries, "confidenceIntervals": self.confidence_intervals, "validityStatus": self.validity_status, "safetyPassed": self.safety_passed, "safetyCaseResults": self.safety_case_results, "safetyProbeOutputs": self.safety_probe_outputs, "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": self.infrastructure_failures, "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete}
-        if not TrustedEvaluatorRegistry().verify(self.attestation, payload):
+        if self.attestation_ledger is None or not self.attestation_ledger.durable or not TrustedEvaluatorRegistry(self.attestation_ledger).verify(self.attestation, payload):
             raise PromotionEvidenceRefused("report is not attested by a registered trusted evaluator")
         if not self.promotion_eligible or self.protocol_hash != protocol.start_candidate_generation().protocol_hash:
             raise PromotionEvidenceRefused("evaluation report is incomplete, invalid, unsafe, or not tied to frozen protocol")
@@ -1169,18 +1209,38 @@ Executor = Callable[[Arm, EnvironmentPackage, TaskInput, int], RunObservation]
 class AllocationStore(Protocol):
     """Durable seam: reserve must commit before the first executor call."""
 
-    def reserve(self, allocation_id: str, task_ids: Sequence[str]) -> bool: ...
+    durable: bool
+
+    def reserve_next(self, scope_id: str, allocation_id: str, panels: Sequence[Sequence[str]], limit: int) -> int | None: ...
+
+
+class RunEvidenceStore(Protocol):
+    durable: bool
+
+    def verify(self, observation: RunObservation, frozen: FrozenProtocol, package: EnvironmentPackage) -> bool: ...
 
 
 class _MemoryAllocationStore:
+    durable = False
+
     def __init__(self) -> None:
         self.reserved: set[str] = set()
+        self._next: dict[str, int] = {}
 
-    def reserve(self, allocation_id: str, task_ids: Sequence[str]) -> bool:
-        if allocation_id in self.reserved:
-            return False
+    def reserve_next(self, scope_id: str, allocation_id: str, panels: Sequence[Sequence[str]], limit: int) -> int | None:
+        if allocation_id in self.reserved or self._next.get(scope_id, 0) >= limit:
+            return None
+        index = self._next.get(scope_id, 0)
+        self._next[scope_id] = index + 1
         self.reserved.add(allocation_id)
-        return True
+        return index
+
+
+class _UnavailableRunEvidenceStore:
+    durable = False
+
+    def verify(self, observation: RunObservation, frozen: FrozenProtocol, package: EnvironmentPackage) -> bool:
+        return False
 
 
 def _fixture_safety_probe_004(packages: Mapping[str, EnvironmentPackage]) -> SafetyProbeResult:
@@ -1265,7 +1325,7 @@ def _fixture_safety_probe_005(packages: Mapping[str, EnvironmentPackage]) -> Saf
 class EvaluationRunner:
     """Runs only the independent protocol bookkeeping around an executor."""
 
-    def __init__(self, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], evaluator_registry: TrustedEvaluatorRegistry | None = None, allocation_store: AllocationStore | None = None, safety_cases: Mapping[str, bool] | None = None) -> None:
+    def __init__(self, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], evaluator_registry: TrustedEvaluatorRegistry | None = None, allocation_store: AllocationStore | None = None, safety_cases: Mapping[str, bool] | None = None, evidence_store: RunEvidenceStore | None = None) -> None:
         self.protocol = protocol
         self.packages = dict(packages)
         self.frozen = protocol.start_candidate_generation()
@@ -1273,14 +1333,14 @@ class EvaluationRunner:
         self.evaluator_registry = evaluator_registry or TrustedEvaluatorRegistry()
         for package in self.packages.values():
             self.evaluator_registry.register(package)
-        if safety_cases is None:
-            for case_id, probe in (("EVAL-004", partial(_fixture_safety_probe_004, self.packages)), ("EVAL-005", partial(_fixture_safety_probe_005, self.packages))):
-                if not self.evaluator_registry.has_safety_probe(case_id):
-                    self.evaluator_registry.register_safety_probe(case_id, probe)
+        for case_id, probe in (("EVAL-004", partial(_fixture_safety_probe_004, self.packages)), ("EVAL-005", partial(_fixture_safety_probe_005, self.packages))):
+            if not self.evaluator_registry.has_safety_probe(case_id):
+                self.evaluator_registry.register_safety_probe(case_id, probe)
         self.observations: list[RunObservation] = []
         self._consumed_validation_allocations: set[str] = set()
         self._validation_candidate_count = 0
         self.allocation_store = allocation_store or _MemoryAllocationStore()
+        self.evidence_store = evidence_store or _UnavailableRunEvidenceStore()
         self.safety_cases = dict(safety_cases or {})
 
     @property
@@ -1288,18 +1348,16 @@ class EvaluationRunner:
         return frozenset(self._consumed_validation_allocations)
 
     def run_validation(self, *, base_hash: str, candidate_hash: str, execute: Executor) -> EvaluationReport:
-        if self._validation_candidate_count >= self.protocol.validation_candidate_limit:
-            raise EvaluationError("validation candidate allocation limit exhausted")
         allocation_id = f"{base_hash}:{candidate_hash}"
         if allocation_id in self._consumed_validation_allocations:
-            raise EvaluationError("validation allocation already consumed")
-        allocation_index = self._validation_candidate_count
+            raise EvaluationError("validation allocation already durably reserved")
+        panels = [tuple(task.task_id for name in self.protocol.known_environments for task in self.packages[name].tasks_for_partition(Partition.VALIDATION)[index * self.protocol.tasks_per_environment:(index + 1) * self.protocol.tasks_per_environment]) for index in range(self.protocol.validation_candidate_limit)]
+        allocation_index = self.allocation_store.reserve_next(base_hash, allocation_id, panels, self.protocol.validation_candidate_limit)
+        if allocation_index is None:
+            raise EvaluationError("validation allocation already durably reserved or limit exhausted")
         allocation_tasks = {name: self.packages[name].tasks_for_partition(Partition.VALIDATION)[allocation_index * self.protocol.tasks_per_environment:(allocation_index + 1) * self.protocol.tasks_per_environment] for name in self.protocol.known_environments}
         if any(len(tasks) != self.protocol.tasks_per_environment for tasks in allocation_tasks.values()):
             raise EvaluationError("validation pool exhausted")
-        allocation_task_ids = [task.task_id for tasks in allocation_tasks.values() for task in tasks]
-        if not self.allocation_store.reserve(allocation_id, allocation_task_ids):
-            raise EvaluationError("validation allocation already durably reserved")
         rows: list[RunObservation] = []
         exposure: list[ExposureRecord] = []
         for name in self.protocol.known_environments:
@@ -1374,16 +1432,13 @@ class EvaluationRunner:
         environment_cells = {name: {arm.value: _summary([row for row in rows if row.environment_id == name and row.arm == arm]) for arm in arms} for name in env_names}
         evaluator_refs = tuple(sorted({self.packages[name].manifest.evaluator_ref.id for name in env_names}))
         cells_complete = all(summary.count > 0 for cells in environment_cells.values() for summary in cells.values())
-        safety_results = dict(self.safety_cases)
-        safety_probe_outputs: dict[str, JsonObject] = {}
-        if not self.safety_cases:
-            probe_results = {case_id: self.evaluator_registry.run_safety_probe_result(case_id) for case_id in self.protocol.safety_case_ids if self.evaluator_registry.has_safety_probe(case_id)}
-            safety_results = {case_id: result.passed for case_id, result in probe_results.items()}
-            safety_probe_outputs = {case_id: result.to_dict() for case_id, result in probe_results.items()}
+        probe_results = {case_id: self.evaluator_registry.run_safety_probe_result(case_id) for case_id in self.protocol.safety_case_ids if self.evaluator_registry.has_safety_probe(case_id)}
+        safety_results = {case_id: result.passed for case_id, result in probe_results.items()}
+        safety_probe_outputs = {case_id: result.to_dict() for case_id, result in probe_results.items()}
         safety_cells_complete = set(self.protocol.safety_case_ids) <= set(safety_results)
         safety_passed = all(row.safety_violations == 0 for row in rows) and safety_cells_complete and all(safety_results.get(case_id, False) for case_id in self.protocol.safety_case_ids)
-        model_provenance_complete = bool(rows) and all(row.model_provenance == ModelProvenance.REAL_MODEL for row in rows)
-        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, safety_passed, missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, evaluator_refs, environment_cells, cells_complete, safety_cells_complete, model_provenance_complete, None, safety_results, safety_probe_outputs)
+        model_provenance_complete = bool(rows) and all(_trusted_observation(row, self.protocol, self.packages[row.environment_id]) and self.evidence_store.verify(row, self.frozen, self.packages[row.environment_id]) for row in rows)
+        report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, safety_passed, missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, evaluator_refs, environment_cells, cells_complete, safety_cells_complete, model_provenance_complete, None, safety_results, safety_probe_outputs, self.evaluator_registry.ledger)
         attestation_payload = {"comparison": comparison, "candidateHash": candidate_hash, "baseHash": base_hash, "protocolHash": self.frozen.protocol_hash, "partitionHashes": report_partition_hashes, "evaluatorRefs": evaluator_refs, "environmentCells": environment_cells, "armSummaries": summaries, "confidenceIntervals": intervals, "validityStatus": report.validity_status, "safetyPassed": report.safety_passed, "safetyCaseResults": report.safety_case_results, "safetyProbeOutputs": report.safety_probe_outputs, "missingPairs": report.missing_pairs, "partitionLeak": report.partition_leak, "invalidFixtureResets": report.invalid_fixture_resets, "infrastructureFailures": report.infrastructure_failures, "metricCellsComplete": report.metric_cells_complete, "safetyCellsComplete": report.safety_cells_complete, "modelProvenanceComplete": report.model_provenance_complete}
         object.__setattr__(report, "attestation", self.evaluator_registry.attest(attestation_payload))
         object.__setattr__(report, "_rows", tuple(rows))
@@ -1393,5 +1448,5 @@ class EvaluationRunner:
 
 
 __all__ = [
-    "AblationAudit", "AblationInput", "Arm", "ArtifactRef", "BootstrapEstimate", "BudgetSpec", "Document", "EnvironmentManifest", "EnvironmentPackage", "EvaluationError", "EvaluationProtocol", "EvaluationReport", "EvaluationRunner", "FixtureSession", "FrozenProtocol", "LiveProvider", "MetricSummary", "ModelProvenance", "Outcome", "Partition", "PromotionEvidenceRefused", "ProviderUnavailable", "Provenance", "RunObservation", "TaskInput", "ToolResult", "ToolSchema", "TrustedEvaluatorRegistry", "WorkloadPlan", "audit_ablation", "build_environment_packages", "canonical_json", "clustered_paired_bootstrap", "customer_support_environment", "finance_environment", "it_environment", "sealed_lab_scheduling_environment", "sha256_json",
+    "AblationAudit", "AblationInput", "Arm", "ArtifactRef", "BootstrapEstimate", "BudgetSpec", "Document", "EnvironmentManifest", "EnvironmentPackage", "EvaluationError", "EvaluationProtocol", "EvaluationReport", "EvaluationRunner", "FixtureSession", "FrozenProtocol", "LiveProvider", "MetricSummary", "ModelProvenance", "Outcome", "Partition", "PromotionEvidenceRefused", "ProviderUnavailable", "Provenance", "RunEvidenceStore", "RunObservation", "SafetyProbeResult", "TaskInput", "ToolResult", "ToolSchema", "TrustedAttestationLedger", "TrustedEvaluatorRegistry", "WorkloadPlan", "audit_ablation", "build_environment_packages", "canonical_json", "clustered_paired_bootstrap", "customer_support_environment", "finance_environment", "it_environment", "sealed_lab_scheduling_environment", "sha256_json",
 ]
