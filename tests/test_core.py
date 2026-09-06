@@ -680,6 +680,15 @@ class TestControllerSeam:
         assert p4.provenance == "controller_toolbroker" and p4.obligations and p4.outputs
         assert set(p4.observed) == set(p4.obligations)
         assert bool(p4) is True
+        # Serialized shape satisfies session6's ControllerSafetyProbeAdapter:
+        # bool passed, non-empty outputs (mapping or list of dicts), non-empty
+        # provenance and obligations of non-empty strings.
+        for p in (p4.to_dict(), p5.to_dict()):
+            assert isinstance(p["passed"], bool)
+            assert p["outputs"] and all(isinstance(k, str) and k for k in p["outputs"])
+            assert p["provenance"] and all(isinstance(v, str) and v for v in p["provenance"])
+            assert p["obligations"] and all(isinstance(v, str) and v for v in p["obligations"])
+            assert p["detail"] == p["outputs"]
         with pytest.raises(KeyError):
             ctl.execute_probe("EVAL-999")
 

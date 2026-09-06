@@ -139,7 +139,8 @@ class ProbeResult:
             "passed": self.passed,
             "observed": dict(self.observed),
             "outputs": dict(self.outputs),
-            "provenance": self.provenance,
+            "detail": dict(self.outputs),  # legacy readers that look up 'detail'
+            "provenance": [self.provenance],
             "simulated": self.simulated,
             "fixtureDisclosure": self.fixture_disclosure,
             "obligations": list(self.obligations or []),
