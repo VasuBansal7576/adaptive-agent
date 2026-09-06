@@ -569,7 +569,7 @@ class DurableRuntime:
         # Benchmark fixtures are reset per cell and may include declared write
         # actions.  Batch mode is the manifest-authorized path that issues the
         # one-use approvals required by the broker for those writes.
-        request = RunRequest(taskRef=task_ref, modelProfileRef=model_ref, budgetRef=budget_ref, idempotencyKey=f"benchmark:{protocol_hash}:{task_id}:{arm_value}:{seed}:{durable_bundle.content_hash}:attempt:{attempt}", executionMode="batch")
+        request = RunRequest(taskRef=task_ref, modelProfileRef=model_ref, budgetRef=budget_ref, idempotencyKey=f"benchmark:{protocol_hash}:{task_id}:{arm_value}:{seed}:{durable_bundle.content_hash}:attempt:{attempt}", executionMode="batch", attempt=attempt)
         run = self.controller.create_run(request, durable_task, skill_bundle=durable_bundle)
         row = self.controller.store.get_run(run.run_id)
         if row:

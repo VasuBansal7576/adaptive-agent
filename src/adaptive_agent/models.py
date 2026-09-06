@@ -162,6 +162,16 @@ class RunRequest(BaseModel):
     parent_run_id: str | None = Field(None, alias="parentRunId")
     execution_mode: str = Field("interactive", alias="executionMode")
     active_skill_refs: list[ArtifactRef] = Field(default_factory=list, alias="activeSkillRefs")
+    # Evaluator-owned retries use a fresh immutable attempt identity.  Public
+    # runs retain the default zero for backwards compatibility.
+    attempt: int = Field(0, ge=0)
+
+    @field_validator("attempt")
+    @classmethod
+    def validate_attempt(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("attempt must be a non-negative integer")
+        return value
 
 
 class ModelProfile(BaseModel):
@@ -270,6 +280,7 @@ class RunRecord(BaseModel):
     seed: int | None = None
     bundle_hash: str | None = Field(None, alias="bundleHash")
     arm_bundles: dict[str, str] = Field(default_factory=dict, alias="armBundles")
+    attempt: int = Field(0, ge=0)
 
 
 class StepRecord(BaseModel):

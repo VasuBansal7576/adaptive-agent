@@ -527,7 +527,10 @@ class Controller:
         """Idempotent run creation: same idempotency key returns the stored run."""
         existing = self.store.get_run_by_idempotency_key(request.idempotency_key)
         if existing:
-            return RunRecord.model_validate_json(existing["run_json"])
+            existing_run = RunRecord.model_validate_json(existing["run_json"])
+            if existing_run.attempt != request.attempt:
+                raise ValueError("idempotency key is already bound to a different evaluation attempt")
+            return existing_run
 
         if skill_bundle is None:
             skill_bundle = self.candidates.get_active_bundle() or SkillBundle()
@@ -546,6 +549,7 @@ class Controller:
             executionMode=request.execution_mode,
             activeSkillRefs=request.active_skill_refs,
             parentRunId=request.parent_run_id,
+            attempt=request.attempt,
             status=RunStatus.queued,
         )
         self.store.save_run(
