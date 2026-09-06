@@ -5,15 +5,16 @@
  * and the selected-run workflow. No backend field is required: the label is
  * derived from the environmentId the server already projects.
  *
- * - Known built-in catalog ids (finance, customer_support, it, lab_scheduling,
- *   including their "-sim" development-fixture variants) are labeled as
- *   built-in simulated business fixtures.
- * - "appworld" is an external published simulated benchmark: results are
- *   never real customer data and no completed benchmark claims are made.
- * - Anything else: source not specified — never labeled as built-in fixture.
+ * Identification is by EXACT registered id only: the known built-in catalog
+ * ids (finance, customer_support, it, lab_scheduling) plus the explicit -sim
+ * variants used by the console's development fixtures. Arbitrary user
+ * packages like finance-external or appworld-custom are NOT labeled as
+ * built-in fixture or AppWorld — they fall back to "source not specified".
  */
 export const BUILTIN_CATALOG_IDS = ["finance", "customer_support", "it", "lab_scheduling"] as const;
 const APPWORLD_ID = "appworld";
+/** explicit development-fixture ids used by the console's simulation transport */
+const SIM_VARIANTS = ["finance-sim", "customer_support-sim", "it-sim", "lab_scheduling-sim"];
 
 export type SourceLabel = {
   /** compact tag for cards/badges */
@@ -22,34 +23,28 @@ export type SourceLabel = {
   provenance: string;
 };
 
-function matchesCatalog(id: string, known: string): boolean {
-  return id === known || id.startsWith(`${known}-`);
-}
-
 export function sourceLabelFor(environmentId: string | undefined | null): SourceLabel {
   const id = (environmentId ?? "").toLowerCase();
   if (!id) {
     return {
       tag: "source not specified",
-      provenance: "Environment source not specified; do not treat results as externally sourced.",
+      provenance: "Data source not specified.",
     };
   }
-  if (id === APPWORLD_ID || id.startsWith(`${APPWORLD_ID}-`)) {
+  if (id === APPWORLD_ID) {
     return {
       tag: "AppWorld",
-      provenance:
-        "Tasks come from AppWorld, an external published simulated benchmark. Results are never real customer data, and no completed benchmark claims are made.",
+      provenance: "Tasks use AppWorld, a published benchmark with simulated app data.",
     };
   }
-  if (BUILTIN_CATALOG_IDS.some((known) => matchesCatalog(id, known))) {
+  if (BUILTIN_CATALOG_IDS.includes(id as (typeof BUILTIN_CATALOG_IDS)[number]) || SIM_VARIANTS.includes(id)) {
     return {
       tag: "simulated business fixture",
-      provenance:
-        "Tasks come from the built-in simulated business fixture catalog; results are not from external datasets, and model execution does not change data provenance.",
+      provenance: "Tasks use the built-in simulated business fixture catalog.",
     };
   }
   return {
     tag: "source not specified",
-    provenance: "Environment source not specified; do not treat results as externally sourced.",
+    provenance: "Data source not specified.",
   };
 }
