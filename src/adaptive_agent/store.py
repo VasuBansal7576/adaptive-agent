@@ -732,6 +732,45 @@ class Store:
             })
         return out
 
+    # ------------------------------------------------------------------ run receipts (EvaluationJob seam)
+    def get_run_receipts(self, run_id: str) -> dict[str, Any]:
+        """Exact durable receipts for one run, for EvaluationJob consumption.
+
+        Single-path: model_response evidence payloads, accounting artifacts
+        (with cumulative aggregates), the trusted outcome row, and run/task/env
+        binding. Read-only; does not project hidden evaluator content.
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            raise KeyError(f"run {run_id!r} not found")
+        model_responses: list[dict[str, Any]] = []
+        accountings: list[dict[str, Any]] = []
+        for row in self.list_evidence(run_id):
+            try:
+                ref = json.loads(row["source_ref"])
+                payload = self.get_artifact(ref["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if row["event_type"] == "model_response" and isinstance(payload, dict):
+                model_responses.append(payload)
+            elif row["event_type"] == "accounting_recorded" and isinstance(payload, dict):
+                try:
+                    acct = self.get_artifact(payload["accountingRef"]["sha256"])
+                    if isinstance(acct, dict):
+                        accountings.append(acct)
+                except (KeyError, TypeError):
+                    continue
+        outcome = self.get_outcome_by_run_id(run_id)
+        return {
+            "runId": run_id,
+            "taskId": run["task_id"],
+            "environmentId": run["environment_id"],
+            "status": run["status"],
+            "modelResponses": model_responses,
+            "accounting": accountings,
+            "trustedOutcome": outcome,
+        }
+
     # ------------------------------------------------------------------ learning records (session7 seam)
     def save_learning_record(self, record_id: str, environment_id: str, run_id: str, record_json: str) -> None:
         with self._connect() as conn:

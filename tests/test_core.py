@@ -604,6 +604,14 @@ class TestControllerSeam:
         assert second["aggregateDurationSeconds"] == 2.0
         assert second["responseCount"] == 2
 
+        # Exact receipts for EvaluationJob: both responses, both accountings,
+        # trusted outcome row, run/task/env binding.
+        receipts = store.get_run_receipts(run_id)
+        assert receipts["runId"] == run_id and receipts["taskId"] == "t-ev"
+        assert [r["responseId"] for r in receipts["modelResponses"]] == ["resp-1", "resp-2"]
+        assert [a["responseId"] for a in receipts["accounting"]] == ["resp-1", "resp-2"]
+        assert receipts["accounting"][1]["aggregateUsage"]["totalTokens"] == 21
+
         outcome = {
             "responseId": "resp-1", "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
             "passed": True, "reliable": True, "safetyViolations": 0,
