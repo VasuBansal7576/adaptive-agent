@@ -264,3 +264,19 @@ def test_nested_learning_is_admitted_and_checkpointed(monkeypatch):
     assert admissions[0][1]["estimated_cost_microunits"] == 0
     assert checkpoints[0][0] == "admission-1"
     assert checkpoints[0][1]["candidateBundleHash"] == "nested"
+
+
+def test_nested_learning_reuses_durable_checkpoint_without_relaunch():
+    runtime = Runtime()
+    runtime.launch_learning = lambda _payload: pytest.fail("reused nested call must not relaunch")
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    recovered = {"candidateId": "nested", "candidateBundleHash": "nested", "baseBundleHash": "base", "status": "complete"}
+
+    receipt = runner._candidate_from_run(
+        "dev-run",
+        "transfer:known-a",
+        bind_primary=False,
+        context={"admitSubcall": lambda *_args, **_kwargs: {"admissionId": "admission-1", "status": "complete", "reused": True, "result": recovered}},
+    )
+
+    assert receipt is recovered
