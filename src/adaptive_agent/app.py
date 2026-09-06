@@ -581,10 +581,11 @@ class DurableRuntime:
             persisted["run_json"] = json.dumps(run_payload, sort_keys=True)
             self.controller.store.save_run(run.run_id, persisted)
 
-        # Learning and evaluation have separate model-boundary clients.  A
-        # callable evaluation runner must stay on the direct authenticated
-        # path even when a learning client is configured on the runtime.
+        # Prefer the explicit evaluation runner, then use the injected client
+        # for benchmark-only Prime executions that have no separate runner.
         model_client = self.model_runner if self.model_runner is not None and callable(getattr(self.model_runner, "invoke", None)) else None
+        if model_client is None and self.learning_model_client is not None and callable(getattr(self.learning_model_client, "invoke", None)):
+            model_client = self.learning_model_client
         # launch() owns claim, reset, Prime Docker, broker budget, retries, and
         # trusted outcome persistence for both API and benchmark executions.
         core_hash = str(inputs.get("corePlannerHash", self.core_planner_hash))
@@ -742,9 +743,6 @@ class DurableRuntime:
             arm_hashes[arm_name] = content_hash
         self._evaluation_arm_bundles = arm_hashes
         self._evaluation_base_bundle_hash = arm_hashes[Arm.B0.value]
-        from adaptive_agent.experiment_runtime import DefaultExperimentStageRunner
-
-        self.experiment_stage_runner = DefaultExperimentStageRunner(self, protocol)
         frozen = protocol.start_candidate_generation()
         evaluator_refs = sorted({
             self.packages[name].manifest.evaluator_ref.id

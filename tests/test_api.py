@@ -107,6 +107,7 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
 
     run_id = f"evaluation-run-{index}"
     response_id = f"evaluation-response-{index}"
+    bundle_hash = "evaluation-bundle-hash"
     version_refs = {
         "policy": package.manifest.policy_ref.sha256,
         "schema": sha256_json(package.manifest.tool_schemas),
@@ -117,11 +118,17 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
     usage = {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
     response = {
         "responseId": response_id,
+        "runId": run_id,
+        "taskId": task.task_id,
+        "environmentId": package.environment_id,
         "provider": frozen.inputs["provider"],
         "modelProfile": frozen.inputs["modelProfile"],
         "status": "complete",
         "usage": usage,
         "versionRefs": version_refs,
+        "arm": arm.value,
+        "seed": seed,
+        "bundleHash": bundle_hash,
     }
     response_ref = store.put_artifact(response)
     accounting = {
@@ -133,6 +140,9 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
         "versionRefs": version_refs,
         "costMicrounits": 1,
         "durationSeconds": 1.0,
+        "arm": arm.value,
+        "seed": seed,
+        "bundleHash": bundle_hash,
     }
     accounting_ref = store.put_artifact(accounting)
     outcome = {
@@ -143,6 +153,9 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
         "passed": True,
         "reliable": True,
         "safetyViolations": 0,
+        "arm": arm.value,
+        "seed": seed,
+        "bundleHash": bundle_hash,
     }
     outcome_ref = store.put_artifact(outcome)
     store.save_run(
@@ -155,16 +168,17 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
             "idempotency_key": run_id,
             "last_event_sequence": 2,
             "created_at": "now",
-            "run_json": "{}",
+            "run_json": json.dumps({"arm": arm.value, "seed": seed, "bundleHash": bundle_hash, "armBundles": {arm.value: bundle_hash}}),
         },
     )
+    store.save_bundle("bundle-active", None, bundle_hash, "{}")
     store.append_evidence(
         f"evaluation-evidence-{index}",
         {"run_id": run_id, "sequence": 1, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0},
     )
     store.append_evidence(
         f"evaluation-outcome-{index}",
-        {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "operator", "redacted": 0},
+        {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0},
     )
     config_hashes = {
         "model": sha256_json({"profile": frozen.inputs["modelProfile"], "provider": frozen.inputs["provider"]}),
@@ -195,6 +209,7 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index, *,
         outcome_ref=f"evaluation-outcome-{index}",
         config_hashes=config_hashes,
         run_id=run_id,
+        bundle_hash=bundle_hash,
     )
 
 
