@@ -110,7 +110,7 @@ def _receipt(case_id: str, passed: bool, outcome: Mapping[str, Any], provenance:
         "modelProvider": "deterministic-test-provider",
         "modelCalls": model_calls,
         "modelReceipts": [
-            {key: item[key] for key in ("provider", "model", "responseId", "usage", "costMicrounits", "economicCostStatus") if key in item}
+            {key: item[key] for key in ("provider", "model", "responseId", "usage", "costMicrounits", "nominalCostUsd", "economicCostStatus", "costBasis") if key in item}
             for item in model_receipts[:8]
         ],
         "provenance": dict(provenance),
