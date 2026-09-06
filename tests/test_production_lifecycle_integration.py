@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,19 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     """
     monkeypatch.setenv("ADAPTIVE_AGENT_IMAGE_DIGEST", "sha256:e1242afd3804f022cb3bcdc4ae3fe1e5dcb5b79d09e98bdaffd5db320a32f0bb")
     import adaptive_agent.app as app_module
+
+    class ControlledClock:
+        def __init__(self):
+            self.local = threading.local()
+
+        def monotonic(self):
+            value = getattr(self.local, "value", 0.0) + 1.0
+            self.local.value = value
+            return value
+
+    # Keep this integration test deterministic while preserving the real
+    # runtime's monotonic clock and its persisted duration accounting.
+    monkeypatch.setattr(app_module, "time", SimpleNamespace(monotonic=ControlledClock().monotonic))
     create_runtime_app = app_module.create_runtime_app
     from adaptive_agent.evaluation import Arm
     from adaptive_agent.production_evaluator import _lifecycle_execution_plan, _lifecycle_stages

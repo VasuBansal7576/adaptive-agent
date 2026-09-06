@@ -789,6 +789,7 @@ class DefaultExperimentStageRunner:
         nominal_missing = False
         cost = 0.0
         cost_seen = False
+        cost_missing = False
         billing_unknown = False
         rows = self.runtime.controller.store.list_evidence(run_id)
         wanted = set(refs)
@@ -799,13 +800,22 @@ class DefaultExperimentStageRunner:
             observed += 1
             source = row.get("source_ref")
             if not isinstance(source, str):
+                wall_missing = True
+                nominal_missing = True
+                cost_missing = True
                 continue
             try:
                 source_data = json.loads(source)
                 payload = self.runtime.controller.store.get_artifact(source_data["sha256"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                wall_missing = True
+                nominal_missing = True
+                cost_missing = True
                 continue
             if not isinstance(payload, Mapping):
+                wall_missing = True
+                nominal_missing = True
+                cost_missing = True
                 continue
             duration = payload.get("wallSeconds", payload.get("durationSeconds", payload.get("inferenceDurationSeconds")))
             if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
@@ -823,6 +833,8 @@ class DefaultExperimentStageRunner:
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 cost += float(value)
                 cost_seen = True
+            else:
+                cost_missing = True
             economic = payload.get("economicCost")
             billing_unknown = billing_unknown or isinstance(economic, Mapping) and economic.get("status") == "unknown"
             billing_unknown = billing_unknown or payload.get("economicCostStatus") == "unknown"
@@ -843,15 +855,20 @@ class DefaultExperimentStageRunner:
         # signal. Missing nominal USD usage must not downgrade a receipt
         # whose provider supplied measured cost, since nominal usage is not
         # the billing contract.
-        complete = (observed == 0 and wall_seen and (nominal_seen or cost_seen)) or (
+        measured_complete = cost_seen and not cost_missing and not billing_unknown
+        nominal_complete = nominal_seen and not nominal_missing
+        complete = (observed == 0 and not wanted and wall_seen and (nominal_seen or cost_seen)) or (
             observed == len(wanted)
             and not wall_missing
-            and (cost_seen or (nominal_seen and not nominal_missing))
+            and (
+                measured_complete
+                or nominal_complete
+            )
         )
         output: dict[str, Any] = {"wallSeconds": wall if wall_seen else 0.0, "accountingComplete": complete}
-        if cost_seen and not billing_unknown and complete:
+        if measured_complete and complete:
             output["costMicrounits"] = int(round(cost))
-        elif nominal_seen and not nominal_missing:
+        elif nominal_complete and complete:
             output["nominalCostUsd"] = nominal
         return output
 

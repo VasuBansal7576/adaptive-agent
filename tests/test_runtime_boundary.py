@@ -35,6 +35,8 @@ def test_runtime_retry_uses_fresh_run_identity_after_pre_receipt_failure(tmp_pat
                 model="openai-codex/gpt-5.6-luna",
                 response_id="retry-response",
                 usage={"inputTokens": 1, "outputTokens": 1},
+                costMicrounits=1,
+                economicCostStatus="measured",
             )
 
     app = app_module.create_runtime_app(
