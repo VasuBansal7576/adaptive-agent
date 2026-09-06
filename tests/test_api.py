@@ -1,6 +1,8 @@
 from fastapi.testclient import TestClient
 from threading import Event, Thread
+from datetime import datetime, timedelta, timezone
 import json
+import asyncio
 import pytest
 from types import SimpleNamespace
 
@@ -10,12 +12,12 @@ from adaptive_agent.evaluation import Arm, EvaluationProtocol, EvaluationRunner,
 from adaptive_agent.evaluation_store import build_durable_evaluation_runner
 from adaptive_agent.store import Store
 from adaptive_agent.environment import EnvironmentRegistry
-from adaptive_agent.broker import ToolBroker
+from adaptive_agent.broker import Capability, ToolBroker
 from adaptive_agent.controller import Controller
 from adaptive_agent.planner import make_luna_model_runner
 from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
 from adaptive_agent.evaluation import sha256_json
-from adaptive_agent.models import RunStatus
+from adaptive_agent.models import RunStatus, ToolErrorCode, ToolRequest
 
 
 def manifest():
@@ -667,6 +669,127 @@ def test_fixture_provider_preserves_rejected_and_successful_write_effects():
     assert successful.status == "ok"
     assert successful.output["ok"] is True
     assert successful.effect == "confirmed"
+
+
+def test_runtime_broker_rejects_fixture_enum_before_dispatch(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    package = runtime.packages["finance"]
+    task = package.tasks_for_partition(Partition.DEVELOPMENT)[1]
+    provider = _FixtureProvider(package, task, "fixture-invalid-enum", seed=1)
+    request = ToolRequest(
+        runId="fixture-invalid-enum",
+        stepId="step-invalid-enum",
+        tool="finance.dispute.resolve",
+        arguments={
+            "dispute_id": "DSP-DEV-001",
+            "resolution": "resolved-by-agent",
+            "expected_version": 1,
+        },
+        idempotencyKey="invalid-enum",
+    )
+    capability = Capability(
+        run_id=request.run_id,
+        environment_id="finance",
+        tool=request.tool,
+        effect="write",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+
+    result = runtime.controller.broker.request_tool_call("finance", request, capability, provider)
+
+    assert result.status == "error"
+    assert result.error is not None
+    assert result.error.code == ToolErrorCode.INVALID_INPUT
+    assert result.effect == "none"
+    assert provider.session.state["dispute_status"] == "open"
+
+
+def test_runtime_authorize_gives_reads_fresh_identities_after_write(tmp_path, monkeypatch):
+    import adaptive_agent.app as app_module
+
+    class ScriptedClient:
+        def __init__(self):
+            self.turn = 0
+
+        def invoke(self, *, goal, environment, messages):
+            self.turn += 1
+            if self.turn == 1:
+                code = (
+                    "first = await host_request({'type': 'broker.call', 'capabilityId': capability_ids[0], 'arguments': {'dispute_id': 'DSP-DEV-001'}})\n"
+                    "write = await host_request({'type': 'broker.call', 'capabilityId': capability_ids[1], 'arguments': {'dispute_id': 'DSP-DEV-001', 'resolution': 'customer-approved', 'expected_version': 1}})\n"
+                    "second = await host_request({'type': 'broker.call', 'capabilityId': capability_ids[0], 'arguments': {'dispute_id': 'DSP-DEV-001'}})\n"
+                    "result = {'first': first, 'write': write, 'second': second}\n"
+                    "return result"
+                )
+                action = {"action": "execute", "code": code}
+            else:
+                action = {"action": "finish", "answer": "done"}
+            return {
+                "provider": "openai-codex",
+                "model": "openai-codex/gpt-5.6-luna",
+                "responseId": f"authorize-{self.turn}",
+                "text": json.dumps(action),
+                "usage": {"outputTokens": 3, "cost": {"total": 0}},
+            }
+
+    class FakePrime:
+        def __init__(self, config, broker):
+            from adaptive_agent.prime_runtime import ChildPlannerBudget, SharedBudget
+
+            self.config = config
+            self.broker = broker
+            self.child_planner = None
+            self._child_budget_type = ChildPlannerBudget
+            self._budget = SharedBudget(config.max_total_wall_seconds, config.max_total_artifact_bytes, config.max_artifact_count, config.child_runs, config.max_model_tokens)
+
+        @property
+        def planner_budget(self):
+            return self._child_budget_type(self._budget)
+
+        def record_model_observation(self, evidence, *, trusted_parent=False):
+            return evidence
+
+        def execute(self, code, *, timeout=None, cancel=None):
+            capability_ids = [
+                f"{self.config.task_id}:finance.dispute.read",
+                f"{self.config.task_id}:finance.dispute.resolve",
+            ]
+
+            async def host_request(payload):
+                assert payload["type"] == "broker.call"
+                return self.broker.call(payload["capabilityId"], payload["arguments"])
+
+            namespace = {"host_request": host_request, "capability_ids": capability_ids}
+            async_source = "async def __cell__():\n" + "\n".join(f"    {line}" for line in code.splitlines())
+            namespace["__builtins__"] = {}
+            exec(async_source, namespace, namespace)
+            result = asyncio.run(namespace["__cell__"]())
+            return SimpleNamespace(status="ok", result=json.dumps(result), stdout="", stderr="", error=None)
+
+        def close(self, remove_workspace=True):
+            return None
+
+    monkeypatch.setattr(app_module, "PrimeRuntimeAdapter", FakePrime)
+    app = create_runtime_app(learning_model_client=ScriptedClient(), data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    task = runtime.packages["finance"].tasks_for_partition(Partition.DEVELOPMENT)[1]
+    from adaptive_agent.benchmark import FrozenExecutionConfig
+
+    protocol = EvaluationProtocol()
+    protocol.freeze(runtime.packages)
+    observation = runtime.execute_evaluation_task(
+        task,
+        FrozenExecutionConfig(protocol.start_candidate_generation(), Arm.B0, 17),
+        runtime.controller.get_active_bundle(),
+    )
+
+    assert observation.run_id is not None
+    tool_events = [row for row in runtime.controller.store.list_evidence(observation.run_id) if row["event_type"] == "tool_result"]
+    payloads = [runtime.controller.store.get_artifact(json.loads(row["source_ref"])["sha256"]) for row in tool_events]
+    assert [payload["effect"] for payload in payloads] == ["none", "confirmed", "none"]
+    assert payloads[0]["output"]["record"]["version"] == 1
+    assert payloads[2]["output"]["record"]["version"] == 2
 
 
 def test_runtime_binds_default_stage_runner_and_clean_pins(monkeypatch, tmp_path):

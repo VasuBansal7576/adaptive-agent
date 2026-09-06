@@ -46,6 +46,7 @@ class ProviderExecutionOutcome:
     output: dict[str, Any]
     status: Literal["ok", "error"] = "ok"
     effect: Literal["none", "confirmed", "unknown"] = "none"
+    error: ToolError | None = None
 
 
 class ToolProvider(ABC):
@@ -401,6 +402,7 @@ class ToolBroker:
                 broker_evidence_ref=ArtifactRef(id="pending", version="0", sha256="0" * 64),
                 status=outcome.status,
                 output=outcome.output,
+                error=outcome.error,
                 effect=outcome.effect,
             )
         except Exception as exc:

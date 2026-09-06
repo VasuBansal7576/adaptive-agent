@@ -26,14 +26,14 @@ from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
 from adaptive_agent.broker import Capability, ProviderExecutionOutcome, ToolBroker, ToolProvider
 from adaptive_agent.controller import Controller
 from adaptive_agent.environment import EnvironmentRegistry
-from adaptive_agent.evaluation import build_environment_packages, sha256_json, FixtureSession, Outcome as FixtureOutcome, TrustedEvaluatorRegistry
+from adaptive_agent.evaluation import EvaluationError, build_environment_packages, sha256_json, FixtureSession, Outcome as FixtureOutcome, TrustedEvaluatorRegistry
 from adaptive_agent.learning import LearningService, PlannerLearningAdapter
 from adaptive_agent.learning_store import DurableLearningSourceAdapter, CandidateManagerLearningAdapter, LearningStoreError
 from adaptive_agent.learning_runtime import LearningRuntime, LearningRuntimeError
 from adaptive_agent.planner import PrimeCliModelClient, LunaPlanner, PlannerResult, PlannerLimits
 from adaptive_agent.prime_child_planner import LunaChildPlanner
 from adaptive_agent.prime_runtime import Capability as PrimeCapability, CapabilityBroker, PrimeRuntimeAdapter, PrimeRuntimeConfig
-from adaptive_agent.models import ArtifactRef, EnvironmentManifest as DurableManifest, TaskInput as DurableTask, ToolSchema as DurableTool, RunStatus, ToolRequest, Outcome as DurableOutcome, canonical_usage
+from adaptive_agent.models import ArtifactRef, EnvironmentManifest as DurableManifest, TaskInput as DurableTask, ToolSchema as DurableTool, RunStatus, ToolRequest, ToolError, ToolErrorCode, Outcome as DurableOutcome, canonical_usage
 from adaptive_agent.store import Store
 from adaptive_agent.evaluation_store import build_durable_adapters
 
@@ -97,7 +97,18 @@ class _FixtureProvider(ToolProvider):
     def execute(self, run_id: str, tool: str, arguments: dict[str, Any]) -> ProviderExecutionOutcome:
         if run_id != self.session.task_id and run_id != self._run_id:
             raise RuntimeError("provider is bound to a different run")
-        result = self.package.invoke(self.session, tool, arguments)
+        try:
+            result = self.package.invoke(self.session, tool, arguments)
+        except EvaluationError as exc:
+            message = str(exc)
+            if not message.startswith(("unknown tool arguments:", "missing tool arguments:", "invalid value for tool argument")):
+                raise
+            return ProviderExecutionOutcome(
+                output={"ok": False, "code": ToolErrorCode.INVALID_INPUT.value},
+                status="error",
+                effect="none",
+                error=ToolError(code=ToolErrorCode.INVALID_INPUT, message=message, retry="never"),
+            )
         return ProviderExecutionOutcome(
             output=dict(result.output),
             status="ok" if result.status == "ok" else "error",
@@ -1514,9 +1525,19 @@ class DurableRuntime:
             # plane; custom UI budgets are always persisted as artifacts.
             budget_data = {}
         budget_remaining = {"tool_calls": int(budget_data.get("toolCalls", 32)) if isinstance(budget_data, Mapping) else 32}
+        read_invocation = 0
         def authorize(capability: PrimeCapability, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+            nonlocal read_invocation
             canonical = json.dumps(dict(arguments), sort_keys=True, separators=(",", ":"))
-            request = ToolRequest(runId=run_id, stepId=f"planner-{hashlib.sha256(canonical.encode()).hexdigest()[:16]}", tool=capability.tool, arguments=dict(arguments), idempotencyKey=f"prime:{capability.id}:{hashlib.sha256(canonical.encode()).hexdigest()}")
+            argument_hash = hashlib.sha256(canonical.encode()).hexdigest()
+            if capability.effect == "read":
+                read_invocation += 1
+                invocation_hash = hashlib.sha256(f"{argument_hash}:{read_invocation}".encode()).hexdigest()
+                idempotency_key = f"prime:{capability.id}:read:{read_invocation}:{argument_hash}"
+            else:
+                invocation_hash = argument_hash
+                idempotency_key = f"prime:{capability.id}:{argument_hash}"
+            request = ToolRequest(runId=run_id, stepId=f"planner-{invocation_hash[:16]}", tool=capability.tool, arguments=dict(arguments), idempotencyKey=idempotency_key)
             expires = datetime.fromisoformat(capability.expires_at.replace("Z", "+00:00"))
             durable_capability = Capability(run_id, package.environment_id, capability.tool, capability.effect, {}, expires)
             run = self.controller.get_run(run_id)
