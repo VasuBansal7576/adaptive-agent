@@ -88,6 +88,7 @@ async function main() {
   // no hashes are computed from id strings in the client
   const runOptions = await json("/run-options");
   const modelRef = runOptions?.modelProfiles?.[0]?.ref;
+  const budgetRef = runOptions?.budgetRef ?? runOptions?.budgetDefaults?.budgetRef;
   if (!modelRef?.sha256) throw new Error("/run-options did not provide an authoritative model ref");
   console.log(`run-options ok: profile ${modelRef.id} (budget ${runOptions.budgetDefaults?.modelTokens} tokens / ${runOptions.budgetDefaults?.toolCalls} calls / ${runOptions.budgetDefaults?.wallTimeSeconds}s)`);
   const body = {
@@ -96,7 +97,7 @@ async function main() {
       : { goal: "console smoke: verify create/launch/events/cancel", environmentId },
     modelProfileRef: modelRef,
     // server-advertised trusted budget ref (verbatim when present)
-    ...(runOptions.budgetDefaults?.budgetRef ? { budgetRef: runOptions.budgetDefaults.budgetRef } : {}),
+    ...(budgetRef ? { budgetRef } : {}),
     // validated budget object; the backend hashes and stores it
     budget: {
       modelTokens: runOptions.budgetDefaults?.modelTokens ?? 4000,
@@ -158,7 +159,7 @@ async function main() {
   const res = await fetch(`${base}/runs/${run.runId}/events?cursor=0`, {
     headers: cookie ? { cookie } : {},
   });
-  const reader = res.body.getReader();
+  let reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   // launch runs as a background task; allow bounded latency before events flow
