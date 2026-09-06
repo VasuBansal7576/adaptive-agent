@@ -55,6 +55,7 @@ def test_failed_stage_reconciles_all_responses_once_and_missing_receipt_stays_un
             raise RuntimeError("token budget exhausted after broker effect")
 
     client = MultiResponseClient()
+    runtime.controller.append_event(run["runId"], "tool_result", {"status": "ok", "effect": "confirmed"}, "broker", "operator")
 
     class FailedStage:
         def act(self, _ctx):
@@ -71,6 +72,8 @@ def test_failed_stage_reconciles_all_responses_once_and_missing_receipt_stays_un
     evidence = runtime.controller.store.list_evidence(run["runId"])
     assert [row for row in evidence if row["event_type"] == "trusted_outcome"]
     assert runtime.controller.store.get_outcome_by_run_id(run["runId"])["passed"] == 0
+    outcome_row = runtime.controller.store.get_outcome_by_run_id(run["runId"])
+    assert json.loads(outcome_row["metadata_json"])["status"] == "budget_exhausted"
 
     restarted = create_runtime_app(data_dir=tmp_path).state.durable_runtime
     restarted._record_model_response(run["runId"], restarted.packages["finance"], {
@@ -84,6 +87,7 @@ def test_failed_stage_reconciles_all_responses_once_and_missing_receipt_stays_un
     accounting = restarted.controller.store.get_artifact(payload["accountingRef"]["sha256"])
     assert [item["responseId"] for item in accounting["receipts"]] == ["r1", "r2"]
     assert accounting["aggregateUsage"]["totalTokens"] == 36
+    assert accounting["toolCalls"] == 1
 
     missing = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "missing-receipt"}).json()
     runtime._claim_run(missing["runId"])
