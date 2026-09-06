@@ -94,6 +94,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
   // close when the selection or transport changes; reconnectNonce forces a
   // manual stream reopen (stale banner) while preserving the cursor
   const lastRecordRefresh = useRef(0);
+  const acknowledgedRef = useRef(0);
   const refreshCandidates = useCallback(async () => {
     try {
       const candidates = await transport.listCandidates();
@@ -128,36 +129,47 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     const runId = state.selectedRunId;
     const cursor = state.cursors[runId] ?? 0;
     dispatch({ type: "connection", state: "connecting" });
+    // acknowledged cursor + burst-deduped refresh schedulers, local to this stream
+    acknowledgedRef.current = cursor;
+    const pendingRefresh = { timer: null as ReturnType<typeof setTimeout> | null };
+    const pendingTerminal = { timer: null as ReturnType<typeof setTimeout> | null };
+    const scheduleRecordRefresh = () => {
+      if (pendingRefresh.timer) return;
+      pendingRefresh.timer = setTimeout(() => {
+        pendingRefresh.timer = null;
+        void refreshRunRecords(true);
+      }, 300);
+    };
+    const scheduleTerminalRefresh = () => {
+      if (pendingTerminal.timer) return;
+      pendingTerminal.timer = setTimeout(() => {
+        pendingTerminal.timer = null;
+        void refreshRunRecords(true);
+      }, 1200);
+    };
     const close = transport.openRunStream(runId, cursor, {
       onEvent: (event) => {
-        // hidden evaluator_only rows create legitimate sequence gaps: recover
-        // authoritatively via a record refresh instead of a false stale warning
-        const prevCursor = state.cursors[runId] ?? 0;
-        const gapSkipped = event.sequence > prevCursor + 1;
+        // acknowledged cursor local to THIS stream: updated per event so gap
+        // detection never reads a stale closure and never forces per-event
+        // authoritative GETs
+        const gapSkipped = event.sequence > acknowledgedRef.current + 1;
+        acknowledgedRef.current = Math.max(acknowledgedRef.current, event.sequence);
         dispatch({ type: "event", event });
         // refresh the authoritative record when the event carries no validated
         // status (bare status/outcome rows) or when plane-shape status/approval
-        // events arrive — never parse display text
+        // events arrive — never parse display text. Bursts (gaps, bare rows)
+        // dedupe into one scheduled refresh.
         if (gapSkipped || event.needsRecordRefresh || (!event.runStatus && (event.kind === "status" || event.kind === "approval"))) {
-          void refreshRunRecords(true);
+          scheduleRecordRefresh();
         }
-        // a terminal lifecycle event settles the run: close the stream and
-        // schedule the authoritative record refresh (private outcome commits
-        // server-side around this transition)
+        // a terminal lifecycle event schedules ONE delayed authoritative
+        // refresh (the private outcome commits server-side around this
+        // transition). Normal terminal EOF closes the stream — no manual close
+        // here so later evidence always drains first; timers dedupe across
+        // replayed historical terminal events.
         const TERMINAL_STATES = ["succeeded", "failed", "cancelled", "timed_out"];
         if (event.runStatus && TERMINAL_STATES.includes(event.runStatus)) {
-          closeStreamRef.current?.();
-          closeStreamRef.current = null;
-          dispatch({ type: "connection", state: "closed" });
-          setTimeout(() => void refreshRunRecords(true), 1200);
-        }
-        // terminal finalization: the server commits the private trusted outcome
-        // (evaluator_only, never streamed) around this transition; a delayed
-        // refresh picks up the public projection (e.g. learningEligible)
-        // without exposing private evidence
-        const TERMINAL = ["succeeded", "failed", "cancelled", "timed_out"];
-        if (event.runStatus && TERMINAL.includes(event.runStatus)) {
-          setTimeout(() => void refreshRunRecords(true), 1200);
+          scheduleTerminalRefresh();
         }
       },
       onState: (connection) => {

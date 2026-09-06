@@ -63,19 +63,12 @@ export type ConsoleAction =
  */
 export function applyEvent(state: ConsoleState, event: RunEvent): ConsoleState {
   const cursor = state.cursors[event.runId] ?? 0;
-  if (event.sequence <= cursor) return state; // duplicate
-  if (event.sequence > cursor + 1) {
-    // sequence gaps are EXPECTED in the durable projection: evaluator_only
-    // rows are filtered server-side, so visible sequences legitimately skip.
-    // Advance the acknowledged cursor past the hidden rows (the server resume
-    // cursor is compared against its own full ledger) and surface nothing as
-    // stale — authoritative recovery comes from the record refresh path, not
-    // a permanent false warning.
-    return {
-      ...state,
-      cursors: { ...state.cursors, [event.runId]: event.sequence },
-    };
-  }
+  if (event.sequence <= cursor) return state; // duplicate suppression
+  // Sequence gaps are EXPECTED in the durable projection: evaluator_only rows
+  // are filtered server-side, so visible sequences legitimately skip. A gapped
+  // event is still a VISIBLE event — apply it normally (status + evidence) and
+  // advance the acknowledged cursor past the hidden rows. Nothing is dropped
+  // or fabricated; authoritative recovery uses the record refresh path.
   const events = state.events[event.runId] ?? [];
   const run = state.runs.find((r) => r.runId === event.runId);
   const TERMINAL = new Set(["succeeded", "failed", "cancelled", "timed_out"]);

@@ -16,6 +16,7 @@ class FakeEventSource {
   static frames: string[] = [];
   static dropOnConnections = 0; // drop after first frame on the first N connections
   static connectionCount = 0;
+  static eofAfterFrames = false; // emit onerror after all frames (server EOF)
   url: string;
   onmessage: ((ev: { data: string }) => void) | null = null;
   onerror: (() => void) | null = null;
@@ -37,10 +38,30 @@ class FakeEventSource {
         return;
       }
     }
+    if (FakeEventSource.eofAfterFrames) {
+      setTimeout(() => !this.closed && this.onerror?.(), 5);
+    }
   }
   close() {
     this.closed = true;
   }
+}
+
+function durableFrame(seq: number, type: string): string {
+  return JSON.stringify({
+    id: seq,
+    event: type,
+    data: {
+      run_id: "run_873a94b0ce424e7699709663b461eb13",
+      sequence: seq,
+      event_type: type,
+      content_hash: `${type}-hash`,
+      source_ref: `{"id":"art_${type}","version":"1","sha256":"${type}-hash"}`,
+      trust_class: "system",
+      visibility: "operator",
+      redacted: 0,
+    },
+  });
 }
 
 const CAPTURED_WIRE = [
@@ -135,6 +156,46 @@ describe("captured ACTUAL wire through normalizeSseEvent and the live UI", () =>
     await waitFor(() => expect(states).toContain("closed"), { timeout: 4000 });
     expect(states).not.toContain("stale");
     close();
+  });
+
+  it("private gap + later learning evidence + correct Closed settlement", { timeout: 12000 }, async () => {
+    const runRecord = {
+      runId: "run_873a94b0ce424e7699709663b461eb13",
+      // consistent authoritative terminal state matching the wire's run_failed
+      status: "failed",
+      lastEventSequence: 4,
+      taskRef: { id: "t", version: "1", sha256: "h" },
+      environmentRef: { id: "e", version: "1", sha256: "h" },
+      policyRef: { id: "p", version: "1", sha256: "h" },
+      modelProfileRef: { id: "m", version: "1", sha256: "h" },
+      skillBundleRef: { id: "b", version: "1", sha256: "h" },
+      budgetRef: { id: "bu", version: "1", sha256: "h" },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.includes("/session")) return new Response("{}", { status: 200 });
+        if (u.endsWith("/runs")) return new Response(JSON.stringify([runRecord]), { status: 200 });
+        if (u.includes("/runs/")) return new Response(JSON.stringify(runRecord), { status: 200 });
+        return new Response(JSON.stringify([]), { status: 200 });
+      }),
+    );
+    // server ledger: seq2 is evaluator_only (hidden); the visible stream is
+    // seq1, seq3 (learning evidence), seq4 (terminal)
+    FakeEventSource.frames = [
+      durableFrame(1, "run_created"),
+      durableFrame(3, "learning_evidence_projection"),
+      durableFrame(4, "run_failed"),
+    ];
+    FakeEventSource.eofAfterFrames = true; // the durable server closes on terminal
+    render(<App transport={transportRef.current} />);
+    // all three visible events applied across the private gap; none dropped
+    await waitFor(() => expect(screen.getByText("Closed")).toBeInTheDocument(), { timeout: 6000 });
+    const applied = (document.body.textContent || "").match(/#\d/g) ?? [];
+    expect(applied).toEqual(["#1", "#3", "#4"]);
+    // status derived from the validated terminal event type, not the gap
+    expect((await screen.findAllByText("Failed")).length).toBeGreaterThanOrEqual(1);
   });
 
   it("advances the browser cursor over the captured durable frames with zero rejections", () => {
