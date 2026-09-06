@@ -219,7 +219,8 @@ class EvaluationJob:
                 child_tools = child.get("toolCalls", 0)
                 child_wall = child.get("wallSeconds", 0)
                 child_cost = child.get("costMicrounits")
-                if child.get("economicCostStatus") == "unknown" or child_cost is None or not isinstance(child_tools, int) or isinstance(child_tools, bool) or child_tools < 0 or isinstance(child_wall, bool) or not isinstance(child_wall, (int, float)) or not math.isfinite(child_wall) or child_wall < 0 or isinstance(child_cost, bool) or not isinstance(child_cost, (int, float)) or not math.isfinite(child_cost) or child_cost < 0:
+                unknown_child_cost = child.get("economicCostStatus") == "unknown" and child.get("costBasis") != "nominal_budget_proxy"
+                if unknown_child_cost or child_cost is None or not isinstance(child_tools, int) or isinstance(child_tools, bool) or child_tools < 0 or isinstance(child_wall, bool) or not isinstance(child_wall, (int, float)) or not math.isfinite(child_wall) or child_wall < 0 or isinstance(child_cost, bool) or not isinstance(child_cost, (int, float)) or not math.isfinite(child_cost) or child_cost < 0:
                     raise EvaluationError("charged subcall receipt cost or accounting is unknown")
                 charged_input += child_usage["inputTokens"]
                 charged_output += child_usage["outputTokens"]
