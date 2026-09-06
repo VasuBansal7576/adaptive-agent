@@ -162,6 +162,99 @@ class ModelObservation:
                 "observedAt": self.observed_at}
 
 
+@dataclass(frozen=True)
+class ChildPlanRequest:
+    """Trusted-parent input to the child planner; it contains no credentials."""
+
+    prompt: str
+    kwargs: Mapping[str, Any]
+    parent_run_id: str
+    depth: int
+    remaining_seconds: float
+    capabilities: tuple[str, ...]
+    cancel_event: threading.Event
+    budget: "ChildPlannerBudget"
+
+
+@dataclass(frozen=True)
+class ChildPlan:
+    """Code selected by the trusted parent model for one isolated child."""
+
+    code: str
+    name: str = "child"
+    model: str = "openai-codex/gpt-5.6-luna"
+
+
+@dataclass
+class SharedBudget:
+    """One decreasing ledger shared by parent and all child adapters."""
+
+    max_wall_seconds: float
+    max_artifact_bytes: int
+    max_artifact_count: int
+    max_child_runs: int = 0
+    max_model_tokens: int | None = None
+    started_at: float = field(default_factory=time.monotonic)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    artifact_bytes: int = 0
+    artifact_count: int = 0
+    artifact_refs: dict[tuple[str, str, str], ArtifactRef] = field(default_factory=dict)
+    child_runs_used: int = 0
+    model_tokens_used: int = 0
+
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.max_wall_seconds - (time.monotonic() - self.started_at))
+
+    def reserve_child(self) -> None:
+        with self.lock:
+            if self.cancel_event.is_set() or self.remaining_seconds() <= 0 or self.child_runs_used >= self.max_child_runs:
+                raise SecurityViolation("shared child budget is exhausted or cancelled")
+            self.child_runs_used += 1
+
+    def release_child(self) -> None:
+        with self.lock:
+            self.child_runs_used = max(0, self.child_runs_used - 1)
+
+    def record_model_usage(self, tokens: int) -> None:
+        if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+            raise AdapterError("model token usage must be a non-negative integer")
+        with self.lock:
+            if self.max_model_tokens is not None and self.model_tokens_used + tokens > self.max_model_tokens:
+                raise SecurityViolation("shared model token budget exhausted")
+            self.model_tokens_used += tokens
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+
+@dataclass(frozen=True)
+class ChildPlannerBudget:
+    """Trusted planner seam for cancellation and parent-owned accounting."""
+
+    ledger: SharedBudget
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        return self.ledger.cancel_event
+
+    @property
+    def remaining_seconds(self) -> float:
+        return self.ledger.remaining_seconds()
+
+    @property
+    def remaining_model_tokens(self) -> int | None:
+        if self.ledger.max_model_tokens is None:
+            return None
+        return max(0, self.ledger.max_model_tokens - self.ledger.model_tokens_used)
+
+    def record_model_usage(self, tokens: int) -> None:
+        self.ledger.record_model_usage(tokens)
+
+
+ChildPlanner = Callable[[ChildPlanRequest], ChildPlan | Mapping[str, Any] | str]
+
+
 @dataclass
 class PrimeRuntimeConfig:
     task_id: str
@@ -178,9 +271,16 @@ class PrimeRuntimeConfig:
     max_cpu_seconds: int = 30
     max_processes: int = 8
     max_artifact_bytes: int = 8 * 1024 * 1024
+    max_total_artifact_bytes: int = 64 * 1024 * 1024
+    max_artifact_count: int = 128
+    max_total_wall_seconds: float = 300.0
+    max_model_tokens: int | None = None
+    max_child_depth: int = 1
     child_runs: int = 0
     require_docker: bool = True
     docker_image: str | None = None
+    # Supplied by the trusted parent/AO session, never by learner code.
+    ao_session_id: str | None = None
 
 
 # This is deliberately narrower than Python's full library surface.  A task
@@ -335,11 +435,7 @@ class _KernelProcess:
             "--cpus", "0.5", "--ulimit", "nofile=64:64", "--ulimit", "fsize=16777216:16777216",
             "--user", "65534:65534", "--env", "HOME=/tmp", "--env", "TMPDIR=/tmp",
         ]
-        ao_session = os.environ.get("AO_SESSION_ID")
-        if ao_session:
-            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", ao_session):
-                raise AdapterError("invalid AO_SESSION_ID for Docker cleanup label")
-            command.extend(["--label", f"ao.session={ao_session}"])
+        command.extend(["--label", self.adapter.cleanup_label])
         command.append(image)
         try:
             self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -605,17 +701,32 @@ class _KernelProcess:
 class PrimeRuntimeAdapter:
     """One persistent, task-scoped Prime Python kernel."""
 
-    def __init__(self, config: PrimeRuntimeConfig, broker: CapabilityBroker | None = None):
+    def __init__(self, config: PrimeRuntimeConfig, broker: CapabilityBroker | None = None,
+                 child_planner: ChildPlanner | None = None, *,
+                 _shared_budget: SharedBudget | None = None,
+                 _artifact_store_root: Path | None = None, _depth: int = 0):
         if config.provider != "openai-codex" or config.model != "openai-codex/gpt-5.6-luna":
             raise AdapterError("only the authenticated openai-codex/gpt-5.6-luna path is supported; Prime Inference is disabled")
         if not config.require_docker:
             raise AdapterError("host execution is forbidden; Docker isolation is mandatory")
         if shutil.which("docker") is None:
             raise AdapterError("Docker CLI is required for the Prime learner boundary")
+        ao_session_id = config.ao_session_id or os.environ.get("AO_SESSION_ID")
+        if not ao_session_id or not re.fullmatch(r"[A-Za-z0-9_.:-]+", ao_session_id):
+            raise AdapterError("trusted AO_SESSION_ID is required for Docker cleanup")
         self.config = config
+        self._ao_session_id = ao_session_id
         self.root = Path(config.root_dir) if config.root_dir else Path(tempfile.mkdtemp(prefix=f"adaptive-{config.task_id}-"))
         self.root.mkdir(parents=True, exist_ok=True)
         self.broker = broker or CapabilityBroker(config.task_id)
+        self.child_planner = child_planner
+        self._depth = _depth
+        if _depth > config.max_child_depth:
+            raise AdapterError("child depth exceeds configured maximum")
+        self._budget = _shared_budget or SharedBudget(
+            config.max_total_wall_seconds, config.max_total_artifact_bytes, config.max_artifact_count,
+            config.child_runs, config.max_model_tokens)
+        self._artifact_store_root = _artifact_store_root or (self.root / "artifacts")
         self.kernel: _KernelProcess | None = None
         self._lock = threading.RLock()
         self._children = 0
@@ -630,6 +741,11 @@ class PrimeRuntimeAdapter:
     def mode(self) -> ExecutionMode:
         return self._mode
 
+    @property
+    def cleanup_label(self) -> str:
+        """Trusted AO label propagated to every learner Docker container."""
+        return f"ao.session={self._ao_session_id}"
+
     def provenance(self) -> dict[str, Any]:
         return {
             "adapter": "adaptive-agent.prime-runtime",
@@ -640,6 +756,7 @@ class PrimeRuntimeAdapter:
             "kernel": "Prime Agent rlm.repl protocol v3",
             "runtimeSource": str(self._runtime_src),
             "isolation": "per-run Docker container; nonroot, read-only root, tmpfs /tmp, dropped capabilities, no-new-privileges, pids/memory/cpu limits",
+            "cleanupLabel": f"ao.session={self._ao_session_id}",
             "network": "none inside learner container; broker bridge uses the parent stdio protocol",
             "credentials": "not inherited by learner process",
             "limits": {"cellSeconds": self.config.max_cell_seconds, "memoryBytes": self.config.max_memory_bytes,
@@ -685,15 +802,16 @@ class PrimeRuntimeAdapter:
         assert self.kernel
         cell_id = uuid.uuid4().hex
         started = time.monotonic()
-        effective_timeout = timeout if timeout is not None else self.config.max_cell_seconds
-        if cancel and cancel.is_set():
+        requested_timeout = timeout if timeout is not None else self.config.max_cell_seconds
+        effective_timeout = min(requested_timeout, self._budget.remaining_seconds())
+        if effective_timeout <= 0 or self._budget.cancel_event.is_set() or (cancel and cancel.is_set()):
             self.cancel(cell_id)
             return ExecutionResult(self.config.task_id, cell_id, "aborted", None, "", "", None, 0, self.mode, self.provenance())
         stop_watcher = threading.Event()
         if cancel is not None:
             def watch_cancel() -> None:
                 while not stop_watcher.wait(0.02):
-                    if cancel.is_set():
+                    if cancel.is_set() or self._budget.cancel_event.is_set():
                         self.cancel(cell_id)
                         return
             threading.Thread(target=watch_cancel, daemon=True).start()
@@ -714,13 +832,11 @@ class PrimeRuntimeAdapter:
         finally:
             stop_watcher.set()
 
-    def execute_child(self, code: str, *, timeout: float | None = None) -> ExecutionResult:
-        """Run one bounded child in a fresh Docker kernel with no parent state."""
+    def _execute_child_reserved(self, code: str, *, timeout: float | None = None) -> ExecutionResult:
         with self._lock:
-            if self._children >= self.config.child_runs:
-                raise SecurityViolation("child run budget exhausted")
             self._children += 1
-        child_id = f"{self.config.task_id}-child-{self._children}"
+            child_number = self._children
+        child_id = f"{self.config.task_id}-child-{child_number}"
         child_root = self.root / "children" / child_id
         child = PrimeRuntimeAdapter(
             PrimeRuntimeConfig(
@@ -732,21 +848,91 @@ class PrimeRuntimeAdapter:
                 max_cell_seconds=min(timeout or self.config.max_cell_seconds, self.config.max_cell_seconds),
                 max_memory_bytes=self.config.max_memory_bytes, max_cpu_seconds=self.config.max_cpu_seconds,
                 max_processes=self.config.max_processes, max_artifact_bytes=self.config.max_artifact_bytes,
+                max_total_artifact_bytes=self.config.max_total_artifact_bytes,
+                max_artifact_count=self.config.max_artifact_count,
+                max_total_wall_seconds=self.config.max_total_wall_seconds,
+                max_model_tokens=self.config.max_model_tokens,
+                max_child_depth=self.config.max_child_depth,
                 child_runs=0, require_docker=True, docker_image=self.config.docker_image,
+                ao_session_id=self.config.ao_session_id,
             ),
             broker=CapabilityBroker(child_id),
+            _shared_budget=self._budget,
+            _artifact_store_root=self._artifact_store_root,
+            _depth=self._depth + 1,
         )
         try:
-            result = child.execute(code, timeout=timeout)
+            result = child.execute(code, timeout=timeout, cancel=self._budget.cancel_event)
             result.provenance["parentRunId"] = self.config.task_id
+            result.provenance["childDepth"] = self._depth + 1
+            result.provenance["capabilities"] = []
             return result
         finally:
             child.close(remove_workspace=True)
 
+    def execute_child(self, code: str, *, timeout: float | None = None) -> ExecutionResult:
+        """Run one bounded child in a fresh Docker kernel with attenuated context."""
+        if self._depth >= self.config.max_child_depth:
+            raise SecurityViolation("child depth budget exhausted")
+        self._budget.reserve_child()
+        return self._execute_child_reserved(code, timeout=timeout)
+
     def cancel(self, cell_id: str | None = None) -> None:
+        self._budget.cancel()
         with self._lock:
             if self.kernel:
                 self.kernel.cancel(cell_id)
+
+    @staticmethod
+    def _sanitize_child_kwargs(value: Any, depth: int = 0) -> Any:
+        if depth > 4:
+            raise SecurityViolation("child planner kwargs are too deeply nested")
+        if isinstance(value, Mapping):
+            clean = {}
+            for key, item in value.items():
+                if not isinstance(key, str) or len(key) > 128:
+                    raise SecurityViolation("child planner kwargs contain an invalid key")
+                if any(word in key.lower() for word in ("credential", "secret", "password", "token", "api_key")):
+                    raise SecurityViolation("credentials are not allowed in child planner kwargs")
+                clean[key] = PrimeRuntimeAdapter._sanitize_child_kwargs(item, depth + 1)
+            return clean
+        if isinstance(value, list):
+            if len(value) > 128:
+                raise SecurityViolation("child planner kwargs list is too large")
+            return [PrimeRuntimeAdapter._sanitize_child_kwargs(item, depth + 1) for item in value]
+        if value is None or isinstance(value, (bool, int, float, str)):
+            if isinstance(value, str) and len(value) > 8192:
+                raise SecurityViolation("child planner kwargs string is too large")
+            return value
+        raise SecurityViolation("child planner kwargs must be JSON values")
+
+    def _plan_child(self, payload: Mapping[str, Any]) -> tuple[ChildPlan, ChildPlanRequest]:
+        if self.child_planner is None:
+            raise SecurityViolation("trusted child planner is not configured")
+        prompt = payload.get("prompt")
+        kwargs = payload.get("kwargs", {})
+        if not isinstance(prompt, str) or not prompt or len(prompt) > 16384:
+            raise AdapterError("child prompt must be a bounded non-empty string")
+        clean_kwargs = self._sanitize_child_kwargs(kwargs)
+        planner_budget = ChildPlannerBudget(self._budget)
+        request = ChildPlanRequest(prompt, clean_kwargs, self.config.task_id, self._depth,
+                                   planner_budget.remaining_seconds, (),
+                                   planner_budget.cancel_event, planner_budget)
+        planned = self.child_planner(request)
+        if isinstance(planned, ChildPlan):
+            plan = planned
+        elif isinstance(planned, str):
+            plan = ChildPlan(planned)
+        elif isinstance(planned, Mapping):
+            plan = ChildPlan(str(planned.get("code", "")), str(planned.get("name", "child")),
+                             str(planned.get("model", self.config.model)))
+        else:
+            raise AdapterError("child planner returned an invalid plan")
+        if not isinstance(plan.code, str) or not plan.code.strip() or len(plan.code) > 65536:
+            raise AdapterError("child planner code is invalid or too large")
+        if plan.model != self.config.model:
+            raise AdapterError("child planner model does not match the pinned model")
+        return plan, request
 
     def handle_host_request(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         request_type = payload.get("type")
@@ -770,9 +956,31 @@ class PrimeRuntimeAdapter:
                 self._artifact_transfers.pop(transfer_id, None)
             return {"aborted": True}
         if request_type == "rlm.run":
-            if self._children >= self.config.child_runs:
-                raise SecurityViolation("child run budget exhausted")
-            raise SecurityViolation("child runner is not configured")
+            if self.child_planner is None:
+                raise SecurityViolation("child run budget exhausted: trusted child planner is not configured")
+            if self._depth >= self.config.max_child_depth:
+                raise SecurityViolation("child depth budget exhausted")
+            # Reserve before invoking the potentially paid parent model. A
+            # malformed planner response refunds this reservation below.
+            self._budget.reserve_child()
+            try:
+                plan, request = self._plan_child(payload)
+            except Exception:
+                self._budget.release_child()
+                raise
+            result = self._execute_child_reserved(plan.code, timeout=min(self.config.max_cell_seconds, request.remaining_seconds))
+            return {
+                "rlm_child_id": f"{self.config.task_id}-child-{self._children}",
+                "name": plan.name,
+                "session_dir": str(self.root / "children" / f"{self.config.task_id}-child-{self._children}"),
+                "model": plan.model,
+                "status": result.status,
+                "result": result.result,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "error": result.error,
+                "provenance": result.provenance,
+            }
         if request_type in {"harness.write", "policy.write", "evaluator.write", "promotion.write", "credentials.read", "hidden.read"}:
             raise SecurityViolation(f"learner request denied: {request_type}")
         raise SecurityViolation(f"unsupported host request: {request_type}")
@@ -837,12 +1045,30 @@ class PrimeRuntimeAdapter:
         if len(data) > self.config.max_artifact_bytes:
             raise AdapterError("artifact exceeds configured size limit")
         digest = hashlib.sha256(data).hexdigest()
-        dest = self.root / "artifacts" / f"{artifact_id}-{digest[:16]}"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_suffix(".tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, dest)
-        return ArtifactRef(artifact_id, version, digest, len(data), str(dest))
+        key = (artifact_id, version, digest)
+        with self._budget.lock:
+            existing = self._budget.artifact_refs.get(key)
+            if existing is not None:
+                return existing
+            if self._budget.artifact_count >= self._budget.max_artifact_count:
+                raise AdapterError("cumulative artifact count limit exceeded")
+            if self._budget.artifact_bytes + len(data) > self._budget.max_artifact_bytes:
+                raise AdapterError("cumulative artifact byte limit exceeded")
+            self._budget.artifact_count += 1
+            self._budget.artifact_bytes += len(data)
+            dest = self._artifact_store_root / f"{artifact_id}-{digest[:16]}"
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dest.with_name(dest.name + f".{uuid.uuid4().hex}.tmp")
+                tmp.write_bytes(data)
+                os.replace(tmp, dest)
+                ref = ArtifactRef(artifact_id, version, digest, len(data), str(dest))
+                self._budget.artifact_refs[key] = ref
+                return ref
+            except Exception:
+                self._budget.artifact_count -= 1
+                self._budget.artifact_bytes -= len(data)
+                raise
 
     def export_artifact(self, source: str | Path, *, artifact_id: str | None = None, version: str = "1") -> ArtifactRef:
         requested = Path(source)

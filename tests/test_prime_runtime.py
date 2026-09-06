@@ -66,6 +66,16 @@ class PrimeRuntimeTests(unittest.TestCase):
         self.assertEqual(denied.status, "error")
         self.assertIn("denied", denied.error["evalue"])
 
+    def test_docker_cleanup_label_is_trusted_and_required(self):
+        adapter = self.make(ao_session_id="trusted-session")
+        self.assertEqual(adapter.cleanup_label, "ao.session=trusted-session")
+        self.assertEqual(adapter.provenance()["cleanupLabel"], "ao.session=trusted-session")
+        import unittest.mock as mock
+        from adaptive_agent import prime_runtime
+        with mock.patch.dict(prime_runtime.os.environ, {"AO_SESSION_ID": ""}, clear=False):
+            with self.assertRaises(AdapterError):
+                PrimeRuntimeAdapter(PrimeRuntimeConfig(task_id="missing-label"))
+
     def test_docker_unavailable_fails_closed_without_host_execution(self):
         import unittest.mock as mock
         from adaptive_agent import prime_runtime
@@ -87,6 +97,98 @@ class PrimeRuntimeTests(unittest.TestCase):
         # A timed-out await/sync cell is interrupted before a subsequent cell.
         followup = adapter.execute("6 * 7")
         self.assertEqual(followup.result, "42")
+
+    def test_child_budget_and_planner_errors_are_checked_before_paid_callback(self):
+        zero = self.make(child_runs=0)
+        calls = []
+        zero.child_planner = lambda _request: calls.append(True) or {"code": "42"}
+        result = zero.execute("from rlm import host_request\nawait host_request('rlm.run', {'prompt':'no', 'kwargs':{}})")
+        self.assertEqual(result.status, "error")
+        self.assertEqual(calls, [])
+
+        retry = self.make(child_runs=1)
+        attempts = []
+        def planner(request):
+            attempts.append(request)
+            if len(attempts) == 1:
+                raise RuntimeError("planner failed")
+            return {"code": "6 * 7"}
+        retry.child_planner = planner
+        first = retry.execute("from rlm import host_request\nawait host_request('rlm.run', {'prompt':'first', 'kwargs':{}})")
+        second = retry.execute("from rlm import host_request\nawait host_request('rlm.run', {'prompt':'second', 'kwargs':{}})")
+        self.assertEqual(first.status, "error")
+        self.assertEqual(second.status, "ok")
+        self.assertEqual(len(attempts), 2)
+
+    def test_learner_requested_child_uses_trusted_planner_and_shared_budget(self):
+        adapter = self.make(child_runs=1, max_child_depth=1)
+        seen = {}
+        def planner(request):
+            seen.update({"prompt": request.prompt, "depth": request.depth,
+                         "capabilities": request.capabilities,
+                         "remaining": request.remaining_seconds,
+                         "cancel_same": request.cancel_event is request.budget.cancel_event,
+                         "tokens": request.budget.remaining_model_tokens})
+            return {"name": "useful-child", "code": "answer = 40 + 2\nanswer"}
+        adapter.child_planner = planner
+        result = adapter.execute(
+            "from rlm import host_request\n"
+            "await host_request('rlm.run', {'prompt':'compute the answer', 'kwargs':{}})"
+        )
+        self.assertEqual(result.status, "ok")
+        self.assertIn("'result': '42'", result.result)
+        self.assertEqual(seen["prompt"], "compute the answer")
+        self.assertEqual(seen["depth"], 0)
+        self.assertEqual(seen["capabilities"], ())
+        self.assertTrue(seen["cancel_same"])
+        second = adapter.execute(
+            "from rlm import host_request\n"
+            "await host_request('rlm.run', {'prompt':'again', 'kwargs':{}})"
+        )
+        self.assertEqual(second.status, "error")
+        self.assertIn("shared child budget", second.error["evalue"])
+        restricted = self.make(child_runs=1, max_child_depth=0)
+        with self.assertRaises(AdapterError):
+            restricted.execute_child("1 + 1")
+
+    def test_child_planner_cancel_and_depth_are_bounded(self):
+        adapter = self.make(child_runs=1, max_cell_seconds=3)
+        adapter.child_planner = lambda _request: {"code": "while True: pass"}
+        holder = {}
+        worker = threading.Thread(target=lambda: holder.setdefault(
+            "result", adapter.execute("from rlm import host_request\nawait host_request('rlm.run', {'prompt':'loop', 'kwargs':{}})")))
+        worker.start()
+        deadline = time.time() + 4
+        while adapter.kernel is None and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)
+        started_cancel = time.monotonic()
+        adapter.cancel()
+        worker.join(4)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(holder["result"].status, "aborted")
+        self.assertLess(time.monotonic() - started_cancel, 2.0)
+
+    def test_cumulative_artifact_budget_allows_duplicates_but_rejects_new_bytes(self):
+        adapter = self.make(max_artifact_bytes=16, max_total_artifact_bytes=5, max_artifact_count=2)
+        data = b"abcde"
+        encoded = base64.b64encode(data).decode()
+        digest = hashlib.sha256(data).hexdigest()
+        code = ("from rlm import host_request\nimport base64\n"
+                f"t=await host_request('artifact.begin', {{'artifactId':'same','version':'1','size':5}})\n"
+                f"await host_request('artifact.chunk', {{'transferId':t['transferId'],'offset':0,'data':{encoded!r}}})\n"
+                f"await host_request('artifact.finish', {{'transferId':t['transferId'],'sha256':{digest!r}}})")
+        self.assertEqual(adapter.execute(code).status, "ok")
+        self.assertEqual(adapter.execute(code).status, "ok")
+        second_data = base64.b64encode(b"fghij").decode()
+        second = adapter.execute(
+            "from rlm import host_request\n"
+            f"t=await host_request('artifact.begin', {{'artifactId':'new','version':'1','size':5}})\n"
+            f"await host_request('artifact.chunk', {{'transferId':t['transferId'],'offset':0,'data':{second_data!r}}})\n"
+            f"await host_request('artifact.finish', {{'transferId':t['transferId'],'sha256':{hashlib.sha256(b'fghij').hexdigest()!r}}})"
+        )
+        self.assertEqual(second.status, "error")
+        self.assertIn("cumulative artifact", second.error["evalue"])
 
     def test_bounded_child_has_fresh_state_and_budget(self):
         adapter = self.make(child_runs=1)
