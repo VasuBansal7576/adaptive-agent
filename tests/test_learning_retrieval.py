@@ -1,8 +1,9 @@
 import hashlib
 import json
 import unittest
+from threading import Event
 
-from adaptive_agent.learning import LearningError, LearningService, PlannerLearningAdapter
+from adaptive_agent.learning import LearningError, LearningService, PlannerLearningAdapter, PROPOSAL_CONTRACT
 from adaptive_agent.retrieval import AccessFilteredRetriever, InMemorySourceProvider, RetrievalError, SourceKind, SourceRecord, content_hash
 
 
@@ -39,8 +40,9 @@ class PlannerClient:
         self.payload = payload
         self.messages = None
 
-    def invoke(self, *, goal, environment, messages):
+    def invoke(self, *, goal, environment, messages, **kwargs):
         self.messages = messages
+        self.forwarded = kwargs
         return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": "planner-response", "text": json.dumps(self.payload), "usage": {"totalTokens": 20}}
 
 
@@ -130,6 +132,8 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(result.authoritative_candidate["state"], "validated")
         self.assertNotIn("evaluatorRef", self.seen["environment"])  # learner sees no trusted control reference
         self.assertNotIn("passed", self.seen["environment"]["sanitizedFeedback"])
+        self.assertEqual(self.seen["environment"]["proposalContract"], PROPOSAL_CONTRACT)
+        self.assertEqual(self.seen["environment"]["proposalLimits"]["maxPatchBytes"], 32_768)
         self.assertEqual(len(self.sink.payloads), 1)
         self.assertEqual(self.sink.patch_hash, result.candidate_payload["changedArtifactHashes"][0])
         self.assertEqual(hashlib.sha256(result.patch_bytes).hexdigest(), result.candidate_payload["changedArtifactHashes"][0])
@@ -212,6 +216,24 @@ class LearningTests(unittest.TestCase):
         self.assertTrue(evidence_sink.calls[0][1])
         self.assertEqual(client.messages[0]["role"], "system")
         self.assertIn("bounded learning patch", client.messages[0]["content"])
+
+    def test_planner_budget_deadline_and_cancel_are_forwarded(self):
+        client = PlannerClient(self.valid_payload())
+        service = LearningService(self.retriever, PlannerLearningAdapter(client, EvidenceSink()), self.sink, lambda: "a" * 64)
+        cancel = Event()
+        service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, remaining_deadline=12.5, cancel=cancel, token_cap=321)
+        self.assertEqual(client.forwarded, {"remaining_deadline": 12.5, "cancel": cancel, "token_cap": 321})
+
+    def test_model_usage_over_token_cap_is_rejected(self):
+        class OverCapInvocation(Invocation):
+            usage = {"totalTokens": 11}
+
+        def runner(*, goal, environment, emit):
+            return OverCapInvocation(self.valid_payload())
+
+        service = LearningService(self.retriever, runner, self.sink, lambda: "a" * 64)
+        with self.assertRaisesRegex(LearningError, "token cap"):
+            service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, token_cap=10)
 
 
 if __name__ == "__main__":
