@@ -176,6 +176,10 @@ class Store:
                     environment_id TEXT NOT NULL,
                     task_id TEXT NOT NULL,
                     partition TEXT NOT NULL,
+                    benchmark_id TEXT,
+                    arm TEXT,
+                    seed INTEGER,
+                    owner_id TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     state_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL
@@ -206,6 +210,10 @@ class Store:
                 );
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)").fetchall()}
+            for name, declaration in (("benchmark_id", "TEXT"), ("arm", "TEXT"), ("seed", "INTEGER"), ("owner_id", "TEXT")):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE task_runs ADD COLUMN {name} {declaration}")
             conn.commit()
 
     @contextmanager
@@ -300,10 +308,45 @@ class Store:
     def get_task_run(self, task_run_id: str) -> dict[str, Any] | None:
         return self._get_json("task_runs", "task_run_id", task_run_id)
 
-    def list_task_runs(self, environment_id: str | None = None, partition: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+    def claim_benchmark_task_run(
+        self, task_run_id: str, *, benchmark_id: str, environment_id: str,
+        task_id: str, partition: str, arm: str | None = None,
+        seed: int | None = None, owner_id: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Claim a benchmark task once and refuse foreign-owner takeover."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone()
+            if existing is not None:
+                row = dict(existing)
+                if (row["environment_id"], row["task_id"], row["partition"], row.get("benchmark_id"), row.get("arm"), row.get("seed")) != (environment_id, task_id, partition, benchmark_id, arm, seed):
+                    conn.rollback()
+                    raise ValueError("task run id is already bound to different benchmark inputs")
+                conn.commit()
+                return False, row
+            conn.execute(
+                "INSERT INTO task_runs(task_run_id, environment_id, task_id, partition, benchmark_id, arm, seed, owner_id, status, state_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', '{}', ?)",
+                (task_run_id, environment_id, task_id, partition, benchmark_id, arm, seed, owner_id, _utcnow()),
+            )
+            conn.commit()
+            return True, dict(conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone())
+
+    def release_task_run(self, task_run_id: str, owner_id: str, status: str, state_json: str | None = None) -> bool:
+        """Update a task run only when its current owner matches."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT owner_id FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone()
+            if row is None or row["owner_id"] != owner_id:
+                conn.rollback()
+                return False
+            conn.execute("UPDATE task_runs SET status = ?, state_json = COALESCE(?, state_json), updated_at = ? WHERE task_run_id = ?", (status, state_json, _utcnow(), task_run_id))
+            conn.commit()
+            return True
+
+    def list_task_runs(self, environment_id: str | None = None, partition: str | None = None, status: str | None = None, benchmark_id: str | None = None, arm: str | None = None, owner_id: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM task_runs WHERE 1=1"
         params: list[Any] = []
-        for column, value in (("environment_id", environment_id), ("partition", partition), ("status", status)):
+        for column, value in (("environment_id", environment_id), ("partition", partition), ("status", status), ("benchmark_id", benchmark_id), ("arm", arm), ("owner_id", owner_id)):
             if value is not None:
                 query += f" AND {column} = ?"
                 params.append(value)
