@@ -11,6 +11,7 @@ export function CandidatesView({
   loading,
   onActionError,
   onRefreshCandidates,
+  onRefreshRuns,
 }: {
   transport: ConsoleTransport;
   candidates: CandidateDiff[];
@@ -18,6 +19,8 @@ export function CandidatesView({
   loading: boolean;
   onActionError: (message: string, correlationId?: string | null) => void;
   onRefreshCandidates: () => void;
+  /** refresh authoritative run records (eligibility) without a reload */
+  onRefreshRuns: () => void;
 }) {
   const [rollbackTarget, setRollbackTarget] = useState<CandidateDiff | null>(null);
   const [reason, setReason] = useState("");
@@ -118,7 +121,7 @@ export function CandidatesView({
         </p>
       </div>
 
-      <LearningCycleButton busy={cycleBusy} onRun={() => setCycleOpen(true)} />
+      <LearningCycleButton busy={cycleBusy} onRun={() => { onRefreshRuns(); setCycleOpen(true); }} />
 
       {loading && <LoadingState label="Loading candidates…" />}
 
@@ -403,8 +406,9 @@ function LearningCycleModal({
           </label>
           {runs.length === 0 ? (
             <p role="status" className="mt-1 text-[13px] text-slate-400">
-              No completed development runs are eligible yet. Complete a run successfully first, then stage a
-              learning cycle.
+              No completed development runs are eligible yet. Eligibility is declared by the server after the
+              trusted outcome commits — open this dialog again or wait a moment and it will appear; private
+              evaluation evidence is never shown.
             </p>
           ) : (
             <select

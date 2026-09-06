@@ -103,9 +103,10 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     }
   }, [transport]);
 
-  const refreshRunRecords = useCallback(async () => {
-    // throttle background record refreshes
-    if (Date.now() - lastRecordRefresh.current < 2000) return;
+  const refreshRunRecords = useCallback(async (force = false) => {
+    // throttle background record refreshes; forced refreshes (tab open, user
+    // intent) always run
+    if (!force && Date.now() - lastRecordRefresh.current < 2000) return;
     lastRecordRefresh.current = Date.now();
     try {
       const runs = await transport.listRuns();
@@ -136,6 +137,14 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
         if (event.needsRecordRefresh || (!event.runStatus && (event.kind === "status" || event.kind === "approval"))) {
           void refreshRunRecords();
         }
+        // terminal finalization: the server commits the private trusted outcome
+        // (evaluator_only, never streamed) around this transition; a delayed
+        // refresh picks up the public projection (e.g. learningEligible)
+        // without exposing private evidence
+        const TERMINAL = ["succeeded", "failed", "cancelled", "timed_out"];
+        if (event.runStatus && TERMINAL.includes(event.runStatus)) {
+          setTimeout(() => void refreshRunRecords(true), 1200);
+        }
       },
       onState: (connection) => {
         if (connection !== "closed") dispatch({ type: "connection", state: connection });
@@ -145,6 +154,10 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     return close;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.selectedRunId, transport, state.loading, streamNonce]);
+
+  useEffect(() => {
+    if (activeTab === "candidates") void refreshRunRecords(true);
+  }, [activeTab, refreshRunRecords]);
 
   const manualReconnect = async () => {
     try {
@@ -357,6 +370,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               loading={state.loading}
               onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
               onRefreshCandidates={() => void refreshCandidates()}
+              onRefreshRuns={() => void refreshRunRecords(true)}
             />
           )}
         </div>

@@ -141,13 +141,25 @@ export function reducer(state: ConsoleState, action: ConsoleAction): ConsoleStat
     case "runUpdated":
       return { ...state, runs: state.runs.map((r) => (r.runId === action.run.runId ? action.run : r)) };
     case "runsRefreshed":
-      // authoritative record refresh (e.g., after plane-shape status events or
-      // stream close): merge server-side status into existing runs
+      // authoritative record refresh (e.g., after plane-shape status events,
+      // stream close, or eligibility flips): merge the server projection into
+      // existing runs — the server is authoritative for status, outcome, and
+      // learningEligible (set after the private trusted outcome commits)
       return {
         ...state,
         runs: state.runs.map((r) => {
           const fresh = action.runs.find((f) => f.runId === r.runId);
-          return fresh ? { ...r, status: fresh.status, lastEventSequence: Math.max(r.lastEventSequence, fresh.lastEventSequence), budgetUsed: fresh.budgetUsed ?? r.budgetUsed } : r;
+          return fresh
+            ? {
+                ...r,
+                status: fresh.status,
+                lastEventSequence: Math.max(r.lastEventSequence, fresh.lastEventSequence),
+                budgetUsed: fresh.budgetUsed ?? r.budgetUsed,
+                learningEligible: fresh.learningEligible,
+                outcomeRef: fresh.outcomeRef ?? r.outcomeRef,
+                executionMode: fresh.executionMode ?? r.executionMode,
+              }
+            : r;
         }),
       };
     case "runAdded":
