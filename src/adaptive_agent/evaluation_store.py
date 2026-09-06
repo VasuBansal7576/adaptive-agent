@@ -58,12 +58,12 @@ class SQLiteTrustedAttestationLedger:
 
     def __init__(self, store: Store) -> None:
         self.store = store
-        with store._connect() as conn:
+        with store.connect() as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS evaluator_attestations (token TEXT PRIMARY KEY, digest TEXT NOT NULL, created_at TEXT NOT NULL)")
             conn.commit()
 
     def put(self, token: str, digest: str) -> None:
-        with self.store._connect() as conn:
+        with self.store.connect() as conn:
             try:
                 conn.execute("INSERT INTO evaluator_attestations(token, digest, created_at) VALUES (?, ?, datetime('now'))", (token, digest))
                 conn.commit()
@@ -73,7 +73,7 @@ class SQLiteTrustedAttestationLedger:
                     raise ValueError("attestation token already has a different digest")
 
     def get(self, token: str) -> str | None:
-        with self.store._connect() as conn:
+        with self.store.connect() as conn:
             row = conn.execute("SELECT digest FROM evaluator_attestations WHERE token = ?", (token,)).fetchone()
         return str(row["digest"]) if row else None
 
@@ -83,14 +83,14 @@ class SQLiteAllocationStore:
 
     def __init__(self, store: Store) -> None:
         self.store = store
-        with store._connect() as conn:
+        with store.connect() as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS evaluator_allocations (scope_id TEXT NOT NULL, allocation_id TEXT PRIMARY KEY, panel_index INTEGER NOT NULL, panel_hash TEXT NOT NULL, task_ids_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(scope_id, panel_index))")
             conn.commit()
 
     def reserve_next(self, scope_id: str, allocation_id: str, panels: Sequence[Sequence[str]], limit: int) -> int | None:
         if not panels or len(panels) < limit:
             raise ValueError("allocation panels must cover the configured limit")
-        with self.store._connect() as conn:
+        with self.store.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute("SELECT panel_index FROM evaluator_allocations WHERE allocation_id = ?", (allocation_id,)).fetchone()
             if existing:
