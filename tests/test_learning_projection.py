@@ -82,5 +82,7 @@ def test_persisted_projection_reused_after_raw_event_is_gone(tmp_path: Path):
         connection.execute("DELETE FROM evidence WHERE evidence_id = ?", ("ev-restart",))
         connection.commit()
     raw = runtime_module.LearningRuntime.build(store=store, manager=manager, model_client=object())._materialize_run_records(environment_id=ENVIRONMENT, run_id=RUN)
-    assert raw == []
-    assert any(row["record_id"] == record_id for row in store.list_learning_records(environment_id=ENVIRONMENT, run_id=RUN))
+    assert len(raw) == 1
+    assert raw[0]["sourceId"] == record["sourceId"]
+    persisted = store.list_learning_records(environment_id=ENVIRONMENT, run_id=RUN)
+    assert [row["record_id"] for row in persisted].count(record_id) == 1
