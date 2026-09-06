@@ -418,11 +418,58 @@ class DurableRuntime:
         if self._learning_runtime is None:
             model_client = self.learning_model_client if self.learning_model_client is not None else (self.model_runner if hasattr(self.model_runner, "invoke") else None)
             self._learning_runtime = LearningRuntime.build(store=self.controller.store, manager=self.controller.candidates, model_client=model_client)
+        before = {
+            row.get("evidence_id")
+            for row in self.controller.store.list_evidence(payload.run_id)
+            if row.get("event_type") == "learning_model_observation"
+        }
         proposal = self._learning_runtime.propose_completed_run(payload.run_id, goal=task["goal"] if isinstance(task, Mapping) else None, feedback={"status": run.status.value})
+        learning_rows = [
+            row for row in self.controller.store.list_evidence(payload.run_id)
+            if row.get("event_type") == "learning_model_observation" and row.get("evidence_id") not in before
+        ]
+        learning_accounting = {"wallSeconds": 0.0, "accountingComplete": bool(learning_rows)}
+        nominal_total = 0.0
+        nominal_seen = False
+        cost_total = 0
+        cost_complete = bool(learning_rows)
+        for row in learning_rows:
+            try:
+                source = json.loads(row["source_ref"])
+                observation = self.controller.store.get_artifact(source["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                learning_accounting["accountingComplete"] = False
+                continue
+            if not isinstance(observation, Mapping):
+                learning_accounting["accountingComplete"] = False
+                continue
+            duration = observation.get("durationSeconds")
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
+                learning_accounting["wallSeconds"] += float(duration)
+            else:
+                learning_accounting["accountingComplete"] = False
+            nominal = observation.get("nominalCostUsd")
+            if isinstance(nominal, (int, float)) and not isinstance(nominal, bool) and nominal >= 0:
+                nominal_total += float(nominal)
+                nominal_seen = True
+            else:
+                learning_accounting["accountingComplete"] = False
+            cost = observation.get("costMicrounits")
+            status = observation.get("economicCostStatus")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0 and status != "unknown":
+                cost_total += int(cost)
+            else:
+                cost_complete = False
+        if nominal_seen:
+            learning_accounting["nominalCostUsd"] = nominal_total
+        if cost_complete:
+            learning_accounting["costMicrounits"] = cost_total
+        else:
+            learning_accounting["economicCostStatus"] = "unknown"
         candidate = dict(proposal.authoritative_candidate)
         if "candidate_id" in candidate:
             candidate["candidateId"] = candidate.pop("candidate_id")
-        return {"actionId": f"learn_{__import__('uuid').uuid4().hex}", "runId": payload.run_id, "predictedEffect": proposal.candidate_payload["predictedEffect"], "evidenceIds": proposal.candidate_payload["supportingEvidenceIds"], "proposalRef": self.controller.store.put_artifact(proposal.bundle_patch).model_dump(mode="json", by_alias=True), "candidate": candidate, "status": "staged", "createdAt": __import__("adaptive_agent.api", fromlist=["_now"])._now()}
+        return {"actionId": f"learn_{__import__('uuid').uuid4().hex}", "runId": payload.run_id, "predictedEffect": proposal.candidate_payload["predictedEffect"], "evidenceIds": proposal.candidate_payload["supportingEvidenceIds"], "proposalRef": self.controller.store.put_artifact(proposal.bundle_patch).model_dump(mode="json", by_alias=True), "candidate": candidate, "status": "staged", "createdAt": __import__("adaptive_agent.api", fromlist=["_now"])._now(), **learning_accounting}
 
     def learning_runtime(self, *, environment_id: str, run_id: str) -> dict[str, Any]:
         """Return the narrow learner context for one durable development run.

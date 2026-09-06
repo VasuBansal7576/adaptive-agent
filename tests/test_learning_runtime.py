@@ -19,6 +19,7 @@ if core_src:
 
 try:
     from adaptive_agent.candidate import CandidateManager
+    from adaptive_agent.learning import PlannerLearningAdapter
     from adaptive_agent.learning_runtime import LearningRuntime, StoreModelObservationSink
     from adaptive_agent.models import CandidateProposal, SkillBundle, SkillVersion
 except ImportError as exc:
@@ -65,7 +66,7 @@ def test_learning_model_observation_sink_never_writes_parent_model_response(tmp_
     sink = StoreModelObservationSink(store, RUN)
 
     sink.record_model_observation(
-        {"provider": "test", "model": "learning-model", "responseId": "learning-resp", "usage": {"totalTokens": 2}},
+        {"provider": "test", "model": "learning-model", "responseId": "learning-resp", "usage": {"totalTokens": 2, "cost": {"total": 0.000012}}, "durationSeconds": 0.25},
         trusted_parent=True,
     )
 
@@ -74,7 +75,67 @@ def test_learning_model_observation_sink_never_writes_parent_model_response(tmp_
     assert len(observations) == 1
     assert observations[0]["event_type"] == "learning_model_observation"
     assert observations[0]["visibility"] == "operator"
+    import json
+    payload = store.get_artifact(json.loads(observations[0]["source_ref"])["sha256"])
+    assert payload["durationSeconds"] == 0.25
+    assert payload["nominalCostUsd"] == 0.000012
+    assert payload["economicCostStatus"] == "unknown"
+    assert "costMicrounits" not in payload
     assert not any(row.get("event_type") == "model_response" and row.get("evidence_id") == "learning-model-learning-resp" for row in rows)
+
+
+def test_learning_observation_sink_retains_measured_cost_separately(tmp_path: Path):
+    store, _, _ = _setup_store(tmp_path)
+    sink = StoreModelObservationSink(store, RUN)
+
+    sink.record_model_observation(
+        {"provider": "test", "model": "learning-model", "responseId": "measured-resp", "usage": {"totalTokens": 3}, "durationSeconds": 0.5, "costMicrounits": 17, "economicCostStatus": "measured"},
+        trusted_parent=True,
+    )
+
+    import json
+    row = next(row for row in store.list_evidence(RUN) if row.get("evidence_id") == "learning-model-measured-resp")
+    payload = store.get_artifact(json.loads(row["source_ref"])["sha256"])
+    assert payload["costMicrounits"] == 17
+    assert payload["economicCostStatus"] == "measured"
+    assert "nominalCostUsd" not in payload
+
+
+def test_planner_adapter_forwards_usage_cost_and_measured_duration_without_provider_call():
+    captured = []
+
+    class Client:
+        def invoke(self, **_kwargs):
+            return {"provider": "test", "model": "learning-model", "responseId": "adapter-resp", "text": "not parsed here", "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5, "cost": {"total": 0.000021}}}
+
+    class Sink:
+        def record_model_observation(self, evidence, *, trusted_parent=False):
+            captured.append((dict(evidence), trusted_parent))
+
+    invocation = PlannerLearningAdapter(Client(), Sink())(goal="learn", environment={}, emit=lambda *_args: None)
+    assert invocation.response_id == "adapter-resp"
+    assert captured[0][1] is True
+    evidence = captured[0][0]
+    assert evidence["nominalCostUsd"] == 0.000021
+    assert evidence["economicCostStatus"] == "unknown"
+    assert evidence["durationSeconds"] >= 0
+
+
+def test_planner_adapter_persists_malformed_optional_cost_as_unknown():
+    captured = []
+
+    class Client:
+        def invoke(self, **_kwargs):
+            return {"provider": "test", "model": "learning-model", "responseId": "malformed-cost", "text": "malformed proposal", "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2, "cost": {"total": "not-a-number"}}}
+
+    class Sink:
+        def record_model_observation(self, evidence, *, trusted_parent=False):
+            captured.append(dict(evidence))
+
+    PlannerLearningAdapter(Client(), Sink())(goal="learn", environment={}, emit=lambda *_args: None)
+    assert captured[0]["economicCostStatus"] == "unknown"
+    assert "nominalCostUsd" not in captured[0]
+    assert captured[0]["durationSeconds"] >= 0
 
 
 def test_restart_projection_uses_row_bindings_when_json_omits_them(tmp_path: Path):

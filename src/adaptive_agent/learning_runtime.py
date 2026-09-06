@@ -9,6 +9,7 @@ candidate, or treats model text as an outcome.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -65,7 +66,32 @@ class StoreModelObservationSink:
             raise LearningRuntimeError("model observations require trusted parent provenance")
         if not isinstance(evidence.get("responseId"), str) or not isinstance(evidence.get("usage"), Mapping):
             raise LearningRuntimeError("model observation provenance is incomplete")
-        payload = {"provider": evidence.get("provider"), "model": evidence.get("model"), "responseId": evidence["responseId"], "usage": dict(evidence["usage"])}
+        usage = dict(evidence["usage"])
+        duration = evidence.get("durationSeconds")
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(float(duration)) or duration < 0:
+            raise LearningRuntimeError("model observation duration is malformed")
+        cost = evidence.get("costMicrounits")
+        if cost is not None and (isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(float(cost)) or cost < 0):
+            raise LearningRuntimeError("model observation economic cost is malformed")
+        nominal = evidence.get("nominalCostUsd")
+        if nominal is None and isinstance(usage.get("cost"), Mapping):
+            nominal = usage["cost"].get("total")
+        if nominal is not None and (isinstance(nominal, bool) or not isinstance(nominal, (int, float)) or not math.isfinite(float(nominal)) or nominal < 0):
+            raise LearningRuntimeError("model observation nominal cost is malformed")
+        status = evidence.get("economicCostStatus", "unknown")
+        if not isinstance(status, str) or not status:
+            raise LearningRuntimeError("model observation economic status is malformed")
+        payload = {
+            "provider": evidence.get("provider"),
+            "model": evidence.get("model"),
+            "responseId": evidence["responseId"],
+            "usage": usage,
+            "durationSeconds": float(duration),
+            "economicCostStatus": status,
+            "status": str(evidence.get("status", "complete")),
+            **({"costMicrounits": int(round(float(cost)))} if cost is not None else {}),
+            **({"nominalCostUsd": float(nominal)} if nominal is not None else {}),
+        }
         ref = self.store.put_artifact(payload)
         sequence = self.store.next_event_sequence(self.run_id)
         self.store.append_evidence(
