@@ -43,5 +43,6 @@ def test_eval005_receipts_show_recovery_and_retained_over_cap_usage(tmp_path: Pa
     assert cost["outcome"]["budget"]["modelCostMicrounitsUsed"] == 4
     assert cost["modelCalls"] == 2
     assert [item["responseId"] for item in cost["modelReceipts"]] == ["eval005-simulated-1", "eval005-simulated-2"]
+    assert [item["costMicrounits"] for item in cost["modelReceipts"]] == [2, 2]
     assert [item["nominalCostUsd"] for item in cost["modelReceipts"]] == [0.000002, 0.000002]
     assert [item["economicCostStatus"] for item in cost["modelReceipts"]] == ["unknown", "unknown"]

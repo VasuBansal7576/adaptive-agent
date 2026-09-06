@@ -21,6 +21,9 @@ def _cost_observation(receipt: Any) -> dict[str, Any]:
         }
     if receipt.cost_microunits is not None:
         fields: dict[str, Any] = {
+            # This value is retained for shared budget accounting, but the
+            # basis/status make clear it is not a billed economic charge.
+            "costMicrounits": receipt.cost_microunits,
             "economicCostStatus": "unknown",
             "costBasis": "nominal_budget_proxy",
         }

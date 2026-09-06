@@ -87,7 +87,7 @@ class CostGuardTests(unittest.TestCase):
         self.assertEqual([item["economicCostStatus"] for item in observations], ["unknown", "unknown"])
         self.assertEqual([item["costBasis"] for item in observations], ["nominal_budget_proxy", "nominal_budget_proxy"])
         self.assertEqual([item["nominalCostUsd"] for item in observations], [0.008184, 0.008184])
-        self.assertTrue(all("costMicrounits" not in item for item in observations))
+        self.assertEqual([item["costMicrounits"] for item in observations], [8184, 8184])
 
     def test_explicit_measured_economic_cost_stays_distinguishable(self):
         usage = {"inputTokens": 1, "outputTokens": 1, "economicCost": {"status": "measured", "microunits": 17}}
@@ -170,7 +170,7 @@ class CostGuardTests(unittest.TestCase):
         self.assertEqual([item["economicCostStatus"] for item in observations], ["unknown", "unknown"])
         self.assertEqual([item["costBasis"] for item in observations], ["nominal_budget_proxy", "nominal_budget_proxy"])
         self.assertEqual([item["nominalCostUsd"] for item in observations], [0.000007, 0.000004])
-        self.assertTrue(all("costMicrounits" not in item for item in observations))
+        self.assertEqual([item["costMicrounits"] for item in observations], [7, 4])
         self.assertEqual(len(observations), 2)
         with self.assertRaises(SecurityViolation):
             parent.invoke(goal="blocked", environment={}, messages=[], remaining_deadline=5)
