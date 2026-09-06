@@ -137,6 +137,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     current = _read_state(state_path)
     if current and (current.get("baseBundleHash") != base_hash or current.get("manifestHash") != protocols[0].protocol_hash):
         raise RuntimeError("experiment state is not bound to the frozen base or manifest")
+    if current and current.get("trainingStatus") == "failed":
+        raise RuntimeError("training previously failed; refusing a budget-expanding retry")
+    if current and current.get("learningStatus") == "failed":
+        raise RuntimeError("learning previously failed; refusing a redispatch")
     if current and current.get("learningStatus") == "in_flight":
         raise RuntimeError("learning was interrupted without an authenticated recoverable receipt")
     source_ids = current.get("trainingRunIds") if current else None
@@ -146,7 +150,21 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         _atomic_json(state_path, state)
         bundles = {Arm.B0: base_hash, Arm.L: base_hash, Arm.A: base_hash}
         train_runner = create_appworld_benchmark_runner(runtime, package, protocols[0], bundles, data_dir / "train")
-        train_runner.run("train", bundles, arms=(Arm.B0,))
+        try:
+            train_runner.run("train", bundles, arms=(Arm.B0,))
+        except Exception as exc:
+            with sqlite3.connect(train_runner.db) as conn:
+                run_ids = [row[0] for row in conn.execute("SELECT run_id FROM appworld_cells WHERE benchmark_id=?", ("train",))]
+            terminal_failure = any(
+                isinstance((run := runtime.controller.store.get_run(run_id)), Mapping)
+                and run.get("status") in {"failed", "timed_out", "outcome_unknown"}
+                for run_id in run_ids
+            )
+            if terminal_failure:
+                failed_state = _read_state(state_path) or {}
+                failed_state.update({"trainingStatus": "failed", "trainingError": str(exc)})
+                _atomic_json(state_path, failed_state)
+            raise
         with sqlite3.connect(train_runner.db) as conn:
             rows = conn.execute("SELECT result_json FROM appworld_cells WHERE benchmark_id=? AND status='complete' ORDER BY task_id", ("train",)).fetchall()
         source_ids = [json.loads(row[0])["observation"]["run_id"] for row in rows]
