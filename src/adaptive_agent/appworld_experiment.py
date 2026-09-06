@@ -90,13 +90,54 @@ def _candidate_binding(runtime: Any, learned_hash: str, base_hash: str, source_i
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("learned candidate receipt is malformed") from exc
     evidence_ids = proposal.get("supportingEvidenceIds", proposal.get("supporting_evidence_ids", ()))
-    if not isinstance(evidence_ids, list):
+    if not isinstance(evidence_ids, list) or not evidence_ids:
         raise RuntimeError("learned candidate evidence binding is malformed")
     allowed = set(source_ids)
     for evidence_id in evidence_ids:
         provenance = store.evidence_provenance(evidence_id)
         if not isinstance(provenance, Mapping) or provenance.get("run_id") not in allowed:
             raise RuntimeError("learned candidate evidence is outside the frozen training source set")
+    if not any(row.get("event_type") == "learning_model_observation" for run_id in source_ids for row in store.list_evidence(run_id)):
+        raise RuntimeError("learned candidate lacks an authenticated learner receipt")
+
+
+def _derive_ablation(runtime: Any, learned_hash: str) -> str:
+    """Persist the production-style L-derived, memory-disabled A bundle."""
+    from adaptive_agent.models import SkillBundle, sha256_json
+
+    store = runtime.controller.store
+    learned_row = store.get_bundle_by_hash(learned_hash)
+    if not isinstance(learned_row, Mapping):
+        raise RuntimeError("learned bundle is missing")
+    raw = learned_row.get("bundle_json")
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("learned bundle payload is malformed")
+    learned = SkillBundle.model_validate(payload)
+    if learned.content_hash != learned_hash or sha256_json(learned.model_dump(mode="json", by_alias=True, exclude={"content_hash"})) != learned_hash:
+        raise RuntimeError("learned bundle hash does not validate")
+    ablation_payload = learned.model_dump(mode="json", by_alias=True)
+    ablation_payload["bundle_id"] = f"{learned.bundle_id}:memory-disabled"
+    ablation_payload["parent"] = learned.content_hash
+    ablation_payload["skills"] = []
+    config = dict(ablation_payload.get("executionConfig", {}))
+    config["skill_refs"] = []
+    config["instruction_variant"] = "default"
+    ablation_payload["executionConfig"] = config
+    ablation_payload["contentHash"] = ""
+    ablation = SkillBundle.model_validate(ablation_payload)
+    existing = store.get_bundle(ablation.bundle_id)
+    if existing is None:
+        store.save_bundle(ablation.bundle_id, ablation.parent, ablation.content_hash, ablation.model_dump_json(by_alias=True), False)
+    elif existing.get("content_hash") != ablation.content_hash:
+        raise RuntimeError("memory-disabled bundle binding conflicts with durable state")
+    return ablation.content_hash
+
+
+def _training_ids(runner: Any) -> list[str]:
+    with sqlite3.connect(runner.db) as conn:
+        rows = conn.execute("SELECT result_json FROM appworld_cells WHERE benchmark_id=? AND status='complete' ORDER BY task_id", ("train",)).fetchall()
+    return [json.loads(row[0])["observation"]["run_id"] for row in rows]
 
 
 def _read_state(path: Path) -> dict[str, Any] | None:
@@ -108,7 +149,11 @@ def _read_state(path: Path) -> dict[str, Any] | None:
     return value
 
 
-def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
+def run_experiment(args: argparse.Namespace, *, progress: Any | None = None) -> dict[str, Any]:
+    def emit(stage: str, status: str, **details: Any) -> None:
+        if callable(progress):
+            progress({"stage": stage, "status": status, **details})
+
     data_dir = Path(args.data_dir)
     manifest_path, state_path = data_dir / MANIFEST_NAME, data_dir / STATE_NAME
     if args.initialize and (manifest_path.exists() or (data_dir.exists() and any(data_dir.iterdir()))):
@@ -145,12 +190,14 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("learning was interrupted without an authenticated recoverable receipt")
     source_ids = current.get("trainingRunIds") if current else None
     learned_hash = current.get("learnedBundleHash") if current else None
+    ablation_hash = current.get("ablationBundleHash") if current else None
     if not source_ids:
         state = {"manifestHash": protocols[0].protocol_hash, "baseBundleHash": base_hash, "trainingRunIds": [], "trainingStatus": "running", "learningStatus": "pending", "devStatus": "pending", "finalStatus": "pending"}
         _atomic_json(state_path, state)
         bundles = {Arm.B0: base_hash, Arm.L: base_hash, Arm.A: base_hash}
         train_runner = create_appworld_benchmark_runner(runtime, package, protocols[0], bundles, data_dir / "train")
         try:
+            emit("train", "running", expected=8, arms=[Arm.B0.value])
             train_runner.run("train", bundles, arms=(Arm.B0,))
         except Exception as exc:
             with sqlite3.connect(train_runner.db) as conn:
@@ -172,6 +219,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("training panel did not produce exactly eight durable runs")
         state.update({"trainingRunIds": source_ids, "trainingStatus": "complete", "learningStatus": "in_flight"})
         _atomic_json(state_path, state)
+        emit("train", "complete", count=8, arms=[Arm.B0.value])
+        emit("learning", "running")
         learning = LearningRuntime.build(store=runtime.controller.store, manager=runtime.controller.candidates, model_client=client, token_budget=args.model_tokens, wall_seconds=WALL_SECONDS)
         proposal = learning.propose_completed_runs(source_ids, primary_run_id=source_ids[0], goal="Learn reusable AppWorld procedures", feedback={"status": "completed"})
         candidate = proposal.authoritative_candidate
@@ -179,31 +228,56 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         if not isinstance(learned_hash, str) or not learned_hash:
             raise RuntimeError("learning proposal did not produce a durable candidate bundle")
         _candidate_binding(runtime, learned_hash, base_hash, source_ids)
-        state.update({"learnedBundleHash": learned_hash, "learningStatus": "complete", "devStatus": "pending"})
+        ablation_hash = _derive_ablation(runtime, learned_hash)
+        state.update({"learnedBundleHash": learned_hash, "ablationBundleHash": ablation_hash, "learningStatus": "complete", "devStatus": "pending"})
         _atomic_json(state_path, state)
+        emit("learning", "complete", sourceCount=8)
     if not isinstance(source_ids, list) or len(source_ids) != 8 or not isinstance(learned_hash, str):
         raise RuntimeError("experiment state lacks a complete authenticated learning result")
+    # Re-open the train panel on every invocation.  The runner verifies every
+    # persisted receipt and only dispatches missing cells, so editable state
+    # cannot replace the strict eight-run source declaration.
+    train_runner = create_appworld_benchmark_runner(runtime, package, protocols[0], {Arm.B0: base_hash, Arm.L: base_hash, Arm.A: base_hash}, data_dir / "train")
+    train_runner.run("train", {Arm.B0: base_hash, Arm.L: base_hash, Arm.A: base_hash}, arms=(Arm.B0,))
+    recovered_source_ids = _training_ids(train_runner)
+    if recovered_source_ids != source_ids:
+        raise RuntimeError("durable train receipts do not match the frozen eight-run source declaration")
     _candidate_binding(runtime, learned_hash, base_hash, source_ids)
-    bundles = {Arm.B0: base_hash, Arm.L: learned_hash, Arm.A: base_hash}
+    if not isinstance(ablation_hash, str) or not ablation_hash:
+        raise RuntimeError("experiment state lacks an authenticated ablation bundle")
+    if not current or current.get("ablationBundleHash") != ablation_hash:
+        ablation_hash = _derive_ablation(runtime, learned_hash)
+        saved_state = _read_state(state_path) or {}
+        saved_state["ablationBundleHash"] = ablation_hash
+        _atomic_json(state_path, saved_state)
+    bundles = {Arm.B0: base_hash, Arm.L: learned_hash, Arm.A: ablation_hash}
+    if current and current.get("learningStatus") == "complete":
+        emit("learning", "complete", sourceCount=8)
     reports: list[dict[str, Any]] = []
+    emit("dev", "running", expected=60, arms=[arm.value for arm in (Arm.B0, Arm.L, Arm.A)])
+    dev_runner = create_appworld_benchmark_runner(runtime, package, protocols[1], bundles, data_dir / "dev")
+    dev_report = dev_runner.run("dev", bundles).to_dict()
+    if dev_report.get("selectedArms") != [arm.value for arm in (Arm.B0, Arm.L, Arm.A)] or not dev_report.get("provenanceComplete"):
+        raise RuntimeError("dev panel is not a complete B0/L/A receipt set")
+    reports.append(dev_report)
     dev_state = _read_state(state_path) or {}
-    if dev_state.get("devStatus") != "complete":
-        dev_runner = create_appworld_benchmark_runner(runtime, package, protocols[1], bundles, data_dir / "dev")
-        dev_report = dev_runner.run("dev", bundles).to_dict()
-        reports.append(dev_report)
-        dev_state.update({"devStatus": "complete", "devReport": dev_report})
-        _atomic_json(state_path, dev_state)
+    dev_state.update({"devStatus": "complete", "devReport": dev_report})
+    _atomic_json(state_path, dev_state)
+    emit("dev", "complete", count=60, arms=[arm.value for arm in (Arm.B0, Arm.L, Arm.A)])
     final_package = AppWorldPackage(replace(package.config, allow_test=True))
     if final_package.catalog.dataset_hash() != package.catalog.dataset_hash() or final_package.public_fixture_hash() != package.public_fixture_hash():
         raise RuntimeError("final-enabled AppWorld package does not match the frozen public manifest")
     runtime.packages["appworld"] = final_package
+    emit("test_normal", "running", expected=60, arms=[arm.value for arm in (Arm.B0, Arm.L, Arm.A)])
+    final_runner = create_appworld_benchmark_runner(runtime, final_package, protocols[2], bundles, data_dir / "test_normal")
+    final_report = final_runner.run("test_normal", bundles).to_dict()
+    if final_report.get("selectedArms") != [arm.value for arm in (Arm.B0, Arm.L, Arm.A)] or not final_report.get("provenanceComplete"):
+        raise RuntimeError("test_normal panel is not a complete B0/L/A receipt set")
+    reports.append(final_report)
     final_state = _read_state(state_path) or {}
-    if final_state.get("finalStatus") != "complete":
-        final_runner = create_appworld_benchmark_runner(runtime, final_package, protocols[2], bundles, data_dir / "test_normal")
-        final_report = final_runner.run("test_normal", bundles).to_dict()
-        reports.append(final_report)
-        final_state.update({"finalStatus": "complete", "finalReport": final_report})
-        _atomic_json(state_path, final_state)
+    final_state.update({"finalStatus": "complete", "finalReport": final_report})
+    _atomic_json(state_path, final_state)
+    emit("test_normal", "complete", count=60, arms=[arm.value for arm in (Arm.B0, Arm.L, Arm.A)])
     if len(reports) < 2:
         saved = _read_state(state_path) or {}
         reports = [saved[key] for key in ("devReport", "finalReport") if isinstance(saved.get(key), dict)]
@@ -233,7 +307,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    print(json.dumps(run_experiment(build_parser().parse_args(argv)), indent=2, sort_keys=True))
+    result = run_experiment(build_parser().parse_args(argv), progress=lambda event: print(json.dumps({"stageProgress": event}, sort_keys=True), flush=True))
+    print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 
