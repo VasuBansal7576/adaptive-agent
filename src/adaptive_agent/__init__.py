@@ -2,12 +2,14 @@
 
 from .prime_runtime import (
     AdapterError, ArtifactRef, Capability, CapabilityBroker, CapabilitySet,
-    ExecutionMode, ExecutionResult, ModelObservation, PrimeRuntimeAdapter, PrimeRuntimeConfig,
+    ChildPlan, ChildPlanRequest, ExecutionMode, ExecutionResult, ModelObservation,
+    PrimeRuntimeAdapter, PrimeRuntimeConfig, SharedBudget,
     SecurityViolation,
 )
 
 __all__ = [
     "AdapterError", "ArtifactRef", "Capability", "CapabilityBroker",
-    "CapabilitySet", "ExecutionMode", "ExecutionResult", "ModelObservation",
-    "PrimeRuntimeAdapter", "PrimeRuntimeConfig", "SecurityViolation",
+    "CapabilitySet", "ChildPlan", "ChildPlanRequest", "ExecutionMode",
+    "ExecutionResult", "ModelObservation", "PrimeRuntimeAdapter", "PrimeRuntimeConfig",
+    "SecurityViolation", "SharedBudget",
 ]
