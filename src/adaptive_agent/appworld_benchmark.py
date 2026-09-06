@@ -118,7 +118,7 @@ class DurableAppWorldAdapter:
             raise ValueError("durable AppWorld run identity is malformed") from exc
         ref = run_payload.get("finalAccountingRef")
         accounting = self.runtime.controller.store.get_artifact(ref) if isinstance(ref, str) else None
-        usage = accounting.get("usage") if isinstance(accounting, Mapping) else None
+        usage = accounting.get("aggregateUsage") if isinstance(accounting, Mapping) else None
         if not isinstance(usage, Mapping):
             raise ValueError("verified AppWorld final accounting has no measured usage")
         values = {key: usage.get(key) for key in ("inputTokens", "outputTokens", "totalTokens")}
@@ -314,7 +314,7 @@ class AppWorldBenchmarkRunner:
         rows = [c.observation for c in cells]; summaries = {}
         for arm in (Arm.B0, Arm.L, Arm.A):
             selected = [c for c in cells if c.observation.arm == arm]; usages = [c.usage for c in selected if c.usage is not None]
-            summaries[arm.value] = {"accuracy": sum(r.observation.passed for r in selected) / len(selected) if selected else 0.0, "reliability": sum(r.observation.reliable for r in selected) / len(selected) if selected else 0.0, "inputTokens": sum(int(u.get("inputTokens", 0)) for u in usages) if len(usages) == len(selected) else None, "outputTokens": sum(int(u.get("outputTokens", 0)) for u in usages) if len(usages) == len(selected) else None, "costMicrounits": sum(r.observation.cost_microunits for r in selected), "latencySeconds": sum(r.observation.latency_seconds for r in selected), "count": len(selected)}
+            summaries[arm.value] = {"accuracy": sum(r.observation.passed for r in selected) / len(selected) if selected else 0.0, "reliability": sum(r.observation.reliable for r in selected) / len(selected) if selected else 0.0, "inputTokens": sum(int(u.get("inputTokens", 0)) for u in usages) if len(usages) == len(selected) else None, "outputTokens": sum(int(u.get("outputTokens", 0)) for u in usages) if len(usages) == len(selected) else None, "totalTokens": sum(int(u.get("totalTokens", 0)) for u in usages) if len(usages) == len(selected) else None, "costMicrounits": sum(r.observation.cost_microunits for r in selected), "latencySeconds": sum(r.observation.latency_seconds for r in selected), "count": len(selected)}
         base, candidate = [r for r in rows if r.arm == Arm.B0], [r for r in rows if r.arm == Arm.L]; keys = {(r.task_id, r.seed) for r in base} & {(r.task_id, r.seed) for r in candidate}; expected = len(self.protocol.sampled_task_ids) * len(self.protocol.seeds) * 3
         intervals = clustered_paired_bootstrap(base, candidate) if len(rows) == expected else ()
         audit = getattr(self.runtime, "ablation_audit", lambda: None)()

@@ -124,6 +124,9 @@ def test_production_durable_runtime_adapter_reopens_without_dispatch(tmp_path, m
     runner = AppWorldBenchmarkRunner(tmp_path / "appworld", package, protocol, adapter)
     first = runner.run("production", bundles)
     assert first.provenance_complete and first.ablation_audit["passed"]
+    assert first.arm_summaries["B0"]["inputTokens"] == 4
+    assert first.arm_summaries["B0"]["outputTokens"] == 6
+    assert first.arm_summaries["B0"]["totalTokens"] == 10
     assert model.calls == 6 and worker_operations.count("reset") == 3 and worker_operations.count("call") == 3 and worker_operations.count("evaluate") == 3
     with runtime.controller.store.connect() as conn:
         assert any("aggregateEvaluation" in row[0] for row in conn.execute("SELECT metadata_json FROM outcomes"))
@@ -135,12 +138,30 @@ def test_production_durable_runtime_adapter_reopens_without_dispatch(tmp_path, m
     fresh_adapter = DurableAppWorldAdapter(fresh_runtime, protocol, {key.value: value for key, value in bundles.items()})
     second = AppWorldBenchmarkRunner(tmp_path / "appworld", package, protocol, fresh_adapter).run("production", bundles)
     assert second.provenance_complete and model.calls == 6 and worker_operations.count("call") == 3
+    assert second.arm_summaries["B0"]["inputTokens"] == 4
+    assert second.arm_summaries["B0"]["outputTokens"] == 6
+    assert second.arm_summaries["B0"]["totalTokens"] == 10
+
+    # The strict verifier also rejects an aggregate that no longer matches
+    # the immutable per-response receipts.
+    with sqlite3.connect(tmp_path / "appworld" / "appworld-benchmark.sqlite3") as conn:
+        cached = json.loads(conn.execute("SELECT result_json FROM appworld_cells LIMIT 1").fetchone()[0])
+    accounting_ref = cached["observation"]["accounting_ref"]
+    accounting_path = fresh_runtime.controller.store.artifact_dir / f"{accounting_ref}.json"
+    original_accounting = accounting_path.read_text()
+    accounting = json.loads(original_accounting)
+    accounting["aggregateUsage"]["inputTokens"] += 1
+    accounting["aggregateUsage"]["totalTokens"] += 1
+    accounting_path.write_text(json.dumps(accounting, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(ValueError, match="persisted AppWorld receipt failed verification"):
+        AppWorldBenchmarkRunner(tmp_path / "appworld", package, protocol, fresh_adapter).run("production", bundles)
+    accounting_path.write_text(original_accounting)
 
     # A cached usage edit is rejected against the fresh verified accounting,
     # before the shared runtime can dispatch another model request.
     with sqlite3.connect(tmp_path / "appworld" / "appworld-benchmark.sqlite3") as conn:
         row = conn.execute("SELECT result_json FROM appworld_cells LIMIT 1").fetchone()
-        tampered = json.loads(row[0]); tampered["usage"]["inputTokens"] = 7; tampered["usage"]["totalTokens"] = 10
+        tampered = json.loads(row[0]); tampered["usage"]["inputTokens"] = 7; tampered["usage"]["totalTokens"] = 13
         conn.execute("UPDATE appworld_cells SET result_json=?", (json.dumps(tampered),)); conn.commit()
     with pytest.raises(ValueError, match="persisted AppWorld receipt failed verification"):
         AppWorldBenchmarkRunner(tmp_path / "appworld", package, protocol, fresh_adapter).run("production", bundles)
