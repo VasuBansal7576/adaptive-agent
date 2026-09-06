@@ -324,6 +324,9 @@ function NewRunDialog({
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const goalRef = useRef<HTMLTextAreaElement>(null);
+  // run-options defaults must never clobber operator edits that land while the
+  // options request is in flight
+  const budgetTouched = useRef(false);
 
   const selectedEnv = environments.find((e) => e.environmentId === environmentId);
   const selectedTask = tasks.find((t) => t.taskId === taskId);
@@ -343,22 +346,23 @@ function NewRunDialog({
       .getRunOptions()
       .then((options) => {
         if (cancelled) return;
-        if (options.modelProfiles.length > 0) {
+        if (options.modelProfiles.length > 0 && modelProfile === MODEL_PROFILES[0].label) {
           setModelProfiles(options.modelProfiles.map((p) => ({ ref: p.ref, label: p.label })));
           setModelProfile(options.modelProfiles[0].label);
         }
-        setToolCallCeiling(String(options.budgetDefaults.toolCalls));
-        setWallSecondsCeiling(String(options.budgetDefaults.wallTimeSeconds));
-        setModelTokenCeiling(String(options.budgetDefaults.modelTokens));
+        if (!budgetTouched.current) {
+          setToolCallCeiling(String(options.budgetDefaults.toolCalls));
+          setWallSecondsCeiling(String(options.budgetDefaults.wallTimeSeconds));
+          setModelTokenCeiling(String(options.budgetDefaults.modelTokens));
+        }
       })
       .catch(() => {
         /* fallback constants remain; never block the dialog on this */
       });
-    // focus the goal field: it is the only decision the operator must make
-    const t = setTimeout(() => goalRef.current?.focus(), 30);
+    // the Modal's initial-focus handler places focus on the first field (the
+    // goal textarea); no aggressive polling that could steal focus mid-typing
     return () => {
       cancelled = true;
-      clearTimeout(t);
     };
   }, [open, environments, transport]);
 
@@ -515,19 +519,19 @@ function NewRunDialog({
         <div className="grid gap-3 sm:grid-cols-3">
           <div>
             <label htmlFor="newrun-calls" className="block text-xs font-medium text-slate-400">Tool-call limit</label>
-            <input id="newrun-calls" type="number" min="1" value={toolCallCeiling} onChange={(e) => setToolCallCeiling(e.target.value)}
+            <input id="newrun-calls" type="number" min="1" value={toolCallCeiling} onChange={(e) => { budgetTouched.current = true; setToolCallCeiling(e.target.value); }}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
             {fieldErrors.toolCallCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.toolCallCeiling}</p>}
           </div>
           <div>
             <label htmlFor="newrun-wall" className="block text-xs font-medium text-slate-400">Time limit (s)</label>
-            <input id="newrun-wall" type="number" min="1" value={wallSecondsCeiling} onChange={(e) => setWallSecondsCeiling(e.target.value)}
+            <input id="newrun-wall" type="number" min="1" value={wallSecondsCeiling} onChange={(e) => { budgetTouched.current = true; setWallSecondsCeiling(e.target.value); }}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
             {fieldErrors.wallSecondsCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.wallSecondsCeiling}</p>}
           </div>
           <div>
             <label htmlFor="newrun-tokens" className="block text-xs font-medium text-slate-400">Token budget</label>
-            <input id="newrun-tokens" type="number" min="1" value={modelTokenCeiling} onChange={(e) => setModelTokenCeiling(e.target.value)}
+            <input id="newrun-tokens" type="number" min="1" value={modelTokenCeiling} onChange={(e) => { budgetTouched.current = true; setModelTokenCeiling(e.target.value); }}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
             {fieldErrors.modelTokenCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.modelTokenCeiling}</p>}
           </div>

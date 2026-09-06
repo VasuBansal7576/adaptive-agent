@@ -57,6 +57,32 @@ describe("durable SSE event normalization", () => {
     expect(event.kind).toBe("step");
   });
 
+  it("maps the exact durable snake_case wire row observed against the live plane", () => {
+    const event = normalizeSseEvent(
+      {
+        id: 1,
+        event: "run_created",
+        data: {
+          evidence_id: "ev_34a1",
+          run_id: "run_9811",
+          sequence: 1,
+          event_type: "run_created",
+          content_hash: "9baec1f5358fbce8fa7d8a27fc4be5cb89d28857c67daf0b7ed83cdf8fe610b5",
+          source_ref: '{"id":"art_9baec1f5358fbce8","version":"1","sha256":"9baec1f5358fbce8"}',
+          trust_class: "system",
+          visibility: "learner",
+          redacted: 1,
+        },
+      },
+      "sse",
+    );
+    expect(event.runId).toBe("run_9811");
+    expect(event.sequence).toBe(1);
+    expect(event.kind).toBe("status");
+    expect(event.summary).toContain("run_created");
+    expect(event.detail).toContain("art_9baec1f5358fbce8");
+  });
+
   it("raises SchemaError on garbage instead of passing it through", () => {
     expect(() => normalizeSseEvent({ id: 1 }, "sse")).toThrow(SchemaError);
   });

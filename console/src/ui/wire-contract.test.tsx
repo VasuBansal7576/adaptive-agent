@@ -62,12 +62,18 @@ describe("live wire contract", () => {
         if (u.endsWith("/runs") && init?.method === "POST") {
           created = true;
           const body = JSON.parse(String(init.body));
-          expect(body.modelProfileRef).toBeTypeOf("object");
-          expect(body.modelProfileRef.id).toBe("model-profile");
-          expect(body.modelProfileRef.sha256).toMatch(/^[0-9a-f]{64}$/); // authoritative ref: hashed, never bare
-          expect(body.budgetRef).toBeTypeOf("object");
-          expect(body.budgetRef.id).toMatch(/^budget-/);
-          expect(body.budgetRef.sha256).toMatch(/^[0-9a-f]{64}$/);
+          // modelProfileRef comes from the /run-options projection verbatim;
+          // budget is the operator's validated object; no browser-computed hashes
+          expect(body.modelProfileRef).toEqual({ id: "model-profile", version: "1", sha256: "server-provided" });
+          expect(body.budgetRef).toBeUndefined();
+          expect(body.budget).toEqual({
+            modelTokens: 7777,
+            toolCalls: 32,
+            childRuns: 0,
+            wallTimeSeconds: 90,
+            costMicrounits: 100000,
+            currency: "USD",
+          });
           expect(typeof body.idempotencyKey).toBe("string");
           return new Response(JSON.stringify(RUN), { status: 201 });
         }
@@ -82,14 +88,33 @@ describe("live wire contract", () => {
     await transport.createRun({
       environmentId: "env",
       goal: "wire contract",
-      modelProfile: "model-profile",
+      modelProfile: "Luna",
+      modelProfileRef: { id: "model-profile", version: "1", sha256: "server-provided" },
       idempotencyKey: newIdempotencyKey(),
-      budget: { toolCallCeiling: 100, wallSecondsCeiling: 900, modelTokenCeiling: 20000 },
+      budget: { toolCallCeiling: 32, wallSecondsCeiling: 90, modelTokenCeiling: 7777 },
       executionMode: "interactive",
     });
+    // launch must have fired after create returned
     expect(calls.some((c) => /\/runs\/run_live_1\/launch$/.test(c.url))).toBe(true);
   });
 
+  it("refuses to invent a model ref when /run-options did not provide one", async () => {
+    const transport = createRestTransport();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
+    );
+    await expect(
+      transport.createRun({
+        environmentId: "env",
+        goal: "no ref",
+        modelProfile: "Luna",
+        idempotencyKey: newIdempotencyKey(),
+        budget: { toolCallCeiling: 32, wallSecondsCeiling: 90, modelTokenCeiling: 4000 },
+        executionMode: "interactive",
+      }),
+    ).rejects.toThrow(/modelProfileRef must come from the \/run-options projection/);
+  });
   it("UI create-run flow yields a launched (non-queued) run via transport createRun", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });

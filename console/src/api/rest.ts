@@ -6,17 +6,7 @@ import type {
   EnvironmentRegistration,
   LearningCycleInput,
 } from "./transport";
-import { validatePackageFields, formToStringPayload, formToRegistration, sha256Hex, type CanonicalRef } from "./transport";
-
-/**
- * Authoritative trusted-plane reference for the seeded entries. The control
- * plane resolves (id, version, sha256) against its trusted-ref sets, so the
- * console cannot invent profile or budget ids; it sends the seeded
- * "model-profile"/"budget-default" refs with the canonical-JSON hash.
- */
-export async function trustedRef(id: "model-profile" | "budget-default"): Promise<CanonicalRef> {
-  return { id, version: "1", sha256: await sha256Hex(JSON.stringify(id)) };
-}
+import { validatePackageFields, formToStringPayload, formToRegistration } from "./transport";
 import {
   SchemaError,
   parseCandidates,
@@ -243,19 +233,18 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       }).then(() => undefined),
 
     async createRun(input: CreateRunInput) {
-      // Refs are authoritative: prefer the server-provided model ref from
-      // /run-options; fall back to the seeded trusted ref. A ref without
-      // sha256 would poison every subsequent list refresh (SchemaError).
-      const modelProfileRef = input.modelProfileRef ?? (await trustedRef("model-profile"));
-      const budgetRef = await trustedRef("budget-default");
+      // Refs are authoritative and NEVER computed in the browser: the model
+      // ref comes from the server's /run-options projection. The budget is
+      // sent as the validated object from the operator's controls; the
+      // backend hashes and stores it as the run's budget artifact.
+      if (!input.modelProfileRef || !input.modelProfileRef.sha256) {
+        throw new SchemaError("run modelProfileRef must come from the /run-options projection");
+      }
       const taskRef: Record<string, unknown> = { goal: input.goal, environmentId: input.environmentId };
       if (input.taskId) taskRef.id = input.taskId;
       const body = {
         taskRef,
-        modelProfileRef,
-        budgetRef,
-        // durable runtime stores the budget object as the run's budget artifact;
-        // the plane path uses the trusted budgetRef above
+        modelProfileRef: input.modelProfileRef,
         budget: {
           modelTokens: input.budget.modelTokenCeiling,
           toolCalls: input.budget.toolCallCeiling,

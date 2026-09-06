@@ -109,6 +109,7 @@ export function parseRunEvent(value: unknown, field: string): RunEvent {
 
 /** Durable evidence event types -> console event kinds. */
 const EVENT_TYPE_TO_KIND: Record<string, RunEvent["kind"]> = {
+  run_created: "status",
   run_started: "status",
   run_completed: "status",
   run_succeeded: "status",
@@ -141,20 +142,32 @@ export function normalizeSseEvent(value: unknown, field: string): RunEvent {
   if (typeof o.kind === "string" && typeof o.summary === "string" && typeof o.runId === "string") {
     return parseRunEvent(o, field);
   }
-  // durable evidence envelope
+  // durable evidence envelope (snake_case on the wire)
   const envelopeId = typeof o.id === "number" ? o.id : undefined;
   const data = obj(o.data ?? o, `${field}.data`);
-  const runId = str(data.runId, `${field}.data.runId`);
+  const runId = str(data.runId ?? data.run_id, `${field}.data.runId`);
   const sequence = typeof data.sequence === "number"
     ? num(data.sequence, `${field}.data.sequence`)
     : envelopeId !== undefined
       ? num(envelopeId, `${field}.id`)
       : (() => { throw new SchemaError(`${field}.sequence`); })();
-  const eventType = str(data.eventType ?? o.event, `${field}.eventType`);
+  const eventType = str(data.eventType ?? data.event_type ?? o.event, `${field}.eventType`);
   const kind = EVENT_TYPE_TO_KIND[eventType] ?? "step";
-  const source = typeof data.sourceRef === "object" && data.sourceRef !== null ? data.sourceRef as Record<string, unknown> : null;
-  const sourceId = source && typeof source.id === "string" ? source.id : null;
-  const contentHash = typeof data.contentHash === "string" ? data.contentHash : null;
+  // source_ref may be an embedded JSON string on the durable wire
+  let sourceId: string | null = null;
+  const sourceRaw = data.sourceRef ?? data.source_ref;
+  if (typeof sourceRaw === "string") {
+    try {
+      const parsed = JSON.parse(sourceRaw) as Record<string, unknown>;
+      if (typeof parsed.id === "string") sourceId = parsed.id;
+    } catch {
+      sourceId = null;
+    }
+  } else if (typeof sourceRaw === "object" && sourceRaw !== null && typeof (sourceRaw as Record<string, unknown>).id === "string") {
+    sourceId = (sourceRaw as Record<string, unknown>).id as string;
+  }
+  const contentHashRaw = data.contentHash ?? data.content_hash;
+  const contentHash = typeof contentHashRaw === "string" ? contentHashRaw : null;
   const detail = sourceId
     ? `evidence artifact ${sourceId}`
     : contentHash

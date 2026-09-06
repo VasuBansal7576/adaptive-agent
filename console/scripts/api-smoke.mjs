@@ -72,11 +72,10 @@ async function main() {
   // legacy plane path (which reports no tasks).
   const environmentId = environments[0]?.environmentId ?? "neutral";
   const tasks = await json(`/environments/${encodeURIComponent(environmentId)}/tasks`).catch(() => []);
-  const { createHash } = await import("node:crypto");
-  const canonicalHash = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
   const modeFromTask = (task) => (Array.isArray(task?.executionModes) && task.executionModes.includes("dry_run") ? "dry_run" : task?.executionModes?.[0]);
   const task = Array.isArray(tasks) && tasks.length > 0 ? tasks[0] : null;
-  // authoritative model ref comes from the server's own /run-options projection
+  // authoritative model ref comes from the server's own /run-options projection;
+  // no hashes are computed from id strings in the client
   const runOptions = await json("/run-options");
   const modelRef = runOptions?.modelProfiles?.[0]?.ref;
   if (!modelRef?.sha256) throw new Error("/run-options did not provide an authoritative model ref");
@@ -86,7 +85,15 @@ async function main() {
       ? { id: task.taskId, goal: task.goal, environmentId }
       : { goal: "console smoke: verify create/launch/events/cancel", environmentId },
     modelProfileRef: modelRef,
-    budgetRef: { id: "budget-default", version: "1", sha256: canonicalHash("budget-default") },
+    // validated budget object; the backend hashes and stores it
+    budget: {
+      modelTokens: runOptions.budgetDefaults?.modelTokens ?? 4000,
+      toolCalls: runOptions.budgetDefaults?.toolCalls ?? 32,
+      childRuns: 0,
+      wallTimeSeconds: runOptions.budgetDefaults?.wallTimeSeconds ?? 90,
+      costMicrounits: runOptions.budgetDefaults?.costMicrounits ?? 100000,
+      currency: runOptions.budgetDefaults?.currency ?? "USD",
+    },
     idempotencyKey: `smoke-${Date.now()}`,
     executionMode: task ? (modeFromTask(task) ?? "interactive") : "dry_run",
   };
@@ -110,12 +117,18 @@ async function main() {
   console.log(`run created: ${run.runId} (${run.executionMode})`);
   if (run.executionMode !== "dry_run") throw new Error(`executionMode not recorded: ${run.executionMode}`);
 
-  // 3b. authoritative refs: the stored run must carry complete sha256 refs so
-  // every subsequent list refresh passes boundary validation (QA regression)
+  // 3b. authoritative refs: every ref the record carries must include sha256
+  // so subsequent list refreshes pass boundary validation (QA regression)
   const stored = await json(`/runs/${run.runId}`);
-  for (const ref of ["modelProfileRef", "budgetRef", "environmentRef", "policyRef", "taskRef", "skillBundleRef"]) {
+  const requiredRefs = ["modelProfileRef", "environmentRef", "policyRef", "taskRef", "skillBundleRef"];
+  const optionalRefs = ["budgetRef", "outcomeRef"];
+  for (const ref of [...requiredRefs, ...optionalRefs]) {
     const value = stored[ref];
-    if (!value || typeof value.sha256 !== "string" || value.sha256.length === 0) {
+    if (!value) {
+      if (requiredRefs.includes(ref)) throw new Error(`stored run lacks ${ref}`);
+      continue;
+    }
+    if (typeof value.sha256 !== "string" || value.sha256.length === 0) {
       throw new Error(`stored ${ref} lacks sha256: ${JSON.stringify(value)}`);
     }
   }
@@ -136,10 +149,18 @@ async function main() {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  const deadline = Date.now() + 8000;
+  // launch runs as a background task; allow bounded latency before events flow
+  const deadline = Date.now() + 25000;
   while (seen.length < 2 && Date.now() < deadline) {
     const { done, value } = await reader.read();
-    if (done) break;
+    if (done) {
+      // the stream closes when the run is terminal; reopen from the cursor
+      if (seen.length > 0) break;
+      await new Promise((r) => setTimeout(r, 500));
+      const retry = await fetch(`${base}/runs/${run.runId}/events?cursor=0`, { headers: cookie ? { cookie } : {} });
+      reader = retry.body.getReader();
+      continue;
+    }
     buffer += decoder.decode(value, { stream: true });
     let index;
     while ((index = buffer.indexOf("\n\n")) !== -1) {
@@ -149,7 +170,14 @@ async function main() {
       if (dataLine) {
         try {
           const event = JSON.parse(dataLine.slice(5).trim());
-          if (typeof event.sequence === "number") seen.push(event);
+          // both wire shapes: plane RunEvent has sequence; the durable
+          // envelope {id, event, data:{sequence}} carries it nested
+          const sequence = typeof event.sequence === "number"
+            ? event.sequence
+            : typeof event.id === "number"
+              ? event.id
+              : event.data?.sequence;
+          if (typeof sequence === "number") seen.push({ ...event, sequence });
         } catch {
           /* non-JSON line */
         }

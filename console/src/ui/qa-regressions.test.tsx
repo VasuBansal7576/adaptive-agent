@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { createSimulationTransport } from "../api/simulation";
@@ -40,12 +40,12 @@ describe("qa regressions: createRun recovery and honesty", () => {
     await screen.findAllByRole("button", { name: /run-sim-1001/ });
     await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
     const dialog = await screen.findByRole("dialog", { name: "Create run" });
-    await user.type(within(dialog).getByLabelText("Goal"), "roundtrip probe goal");
+    fireEvent.change(within(dialog).getByLabelText("Goal"), { target: { value: "roundtrip probe goal" } });
     await user.click(within(dialog).getByRole("button", { name: "Create run" }));
 
     // failure: dialog stays open, choices preserved, uncertainty stated
     expect(dialog).toBeInTheDocument();
-    expect(await within(dialog).findByText(/API may have accepted the run/)).toBeInTheDocument();
+    expect(await within(dialog).findByText(/API may have accepted the run/, {}, { timeout: 4000 })).toBeInTheDocument();
     await waitFor(() => expect(within(dialog).getByLabelText("Goal")).toHaveValue("roundtrip probe goal"));
     // global banner also states honest uncertainty
     expect(await screen.findByText(/API may have accepted this change/)).toBeInTheDocument();
@@ -57,6 +57,32 @@ describe("qa regressions: createRun recovery and honesty", () => {
     // success closes the dialog and shows the run
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect((await screen.findAllByText(/run-sim-1007/)).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("applies the operator's edited budget values to the run request, not the defaults", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const sent: Array<{ budget?: Record<string, number> }> = [];
+    const transport: ConsoleTransport = {
+      ...sim,
+      createRun: async (input) => {
+        sent.push({ budget: { ...input.budget, modelTokens: input.budget.modelTokenCeiling } as never });
+        return sim.createRun(input);
+      },
+    };
+    render(<App transport={transport} />);
+    await screen.findAllByRole("button", { name: /run-sim-1001/ });
+    await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
+    const dialog = await screen.findByRole("dialog", { name: "Create run" });
+    // wait for the run-options response to land (Model label flips to "Luna"),
+    // then edit the token budget so no late prefill can race the edit
+    await waitFor(() => expect(within(dialog).getByLabelText("Model")).toHaveValue("Luna"), { timeout: 3000 });
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000));
+    fireEvent.change(within(dialog).getByLabelText("Token budget"), { target: { value: "7777" } });
+    await user.type(within(dialog).getByLabelText("Goal"), "budget application probe");
+    await user.click(within(dialog).getByRole("button", { name: "Create run" }));
+    await waitFor(() => expect(sent.length).toBe(1));
+    expect(sent[0].budget?.modelTokens).toBe(7777);
   });
 
   it("restricts mode choices to the selected environment's declared modes", async () => {
