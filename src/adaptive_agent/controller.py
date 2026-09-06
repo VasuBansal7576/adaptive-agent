@@ -95,12 +95,12 @@ class DriverContext:
             approvalToken=approval_token,
         )
         result = self._controller.dispatch_tool(self.env_id, req, capability, self._provider)
-        self._controller.append_event(
+        run = self._controller.store.get_run(self.run_id)
+        task = self._controller.store.get_task(run["task_id"]) if run and run.get("task_id") else None
+        self._controller.record_broker_tool_result(
             self.run_id,
-            "tool_result",
             result.model_dump(mode="json", by_alias=True),
-            trust_class="broker",
-            visibility="learner",
+            development=bool(task and task.get("partition") == "development"),
         )
         return result
 
@@ -550,6 +550,21 @@ class Controller:
         return self.broker.request_tool_call(env_id, request, capability, provider, budget_remaining=budget_remaining, dry_run=dry_run)
 
     # ------------------------------------------------------------------ evidence / SSE
+    def record_model_response(self, run_id: str, response: Mapping[str, Any]) -> EvidenceRecord:
+        """Persist one parent-owned model response with durable run bindings."""
+        stored = self.store.get_run(run_id)
+        if stored is None:
+            raise KeyError(f"run {run_id} not found")
+        payload = dict(response)
+        if not isinstance(payload.get("responseId"), str) or not payload["responseId"]:
+            raise ValueError("model response requires responseId")
+        payload.setdefault("runId", run_id)
+        payload.setdefault("taskId", stored["task_id"])
+        payload.setdefault("environmentId", stored["environment_id"])
+        if payload["runId"] != run_id or payload["taskId"] != stored["task_id"] or payload["environmentId"] != stored["environment_id"]:
+            raise ValueError("model response run/task/environment pins do not match the run")
+        return self.append_event(run_id, "model_response", payload, "system", "operator")
+
     def append_event(self, run_id: str, event_type: str, payload: dict[str, Any], trust_class: str, visibility: str) -> EvidenceRecord:
         if event_type == "model_observation":
             raise ValueError("model_observation is not a canonical evidence event; use model_response")
@@ -592,6 +607,10 @@ class Controller:
             safe = {key: payload[key] for key in ("callId", "status", "effect", "toolVersion") if key in payload}
             self.append_event(run_id, "learning_evidence_projection", safe, "broker", "learner")
         return operator_event
+
+    def record_broker_tool_result(self, run_id: str, payload: Mapping[str, Any], *, development: bool = False) -> EvidenceRecord:
+        """Canonical broker evidence path: raw operator row plus safe projection."""
+        return self.append_broker_result(run_id, dict(payload), development=development)
 
     def events(self, run_id: str, after_sequence: int = 0) -> list[dict[str, Any]]:
         """Ordered SSE-ready operator projection: [{id, event, data}].
@@ -745,18 +764,31 @@ class Controller:
         stored = self.store.get_run(run_id)
         if stored is None:
             raise KeyError(f"run {run_id} not found")
+        payload = dict(outcome)
+        if not payload.get("responseId"):
+            for row in reversed(self.store.list_evidence(run_id)):
+                if row.get("event_type") != "model_response":
+                    continue
+                try:
+                    ref = json.loads(row["source_ref"])
+                    response = self.store.get_artifact(ref["sha256"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(response, Mapping) and isinstance(response.get("responseId"), str) and response["responseId"]:
+                    payload["responseId"] = response["responseId"]
+                    break
         for key in ("responseId", "runId", "taskId", "environmentId"):
-            if not outcome.get(key):
+            if not payload.get(key):
                 raise ValueError(f"outcome.{key} is required")
-        if outcome["runId"] != run_id or outcome["taskId"] != stored["task_id"] or outcome["environmentId"] != stored["environment_id"]:
+        if payload["runId"] != run_id or payload["taskId"] != stored["task_id"] or payload["environmentId"] != stored["environment_id"]:
             raise ValueError("outcome run/task/environment pins do not match the run")
-        if not isinstance(outcome.get("passed"), bool) or not isinstance(outcome.get("reliable"), bool):
+        if not isinstance(payload.get("passed"), bool) or not isinstance(payload.get("reliable"), bool):
             raise ValueError("outcome.passed/reliable must be booleans")
-        violations = outcome.get("safetyViolations", 0)
+        violations = payload.get("safetyViolations", 0)
         if not isinstance(violations, int) or isinstance(violations, bool) or violations < 0:
             raise ValueError("outcome.safetyViolations must be a non-negative integer")
-        event = self.append_event(run_id, "trusted_outcome", dict(outcome), "evaluator", "evaluator_only")
-        self.record_outcome(run_id, bool(outcome["passed"]), metadata=dict(outcome))
+        event = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "evaluator_only")
+        self.record_outcome(run_id, bool(payload["passed"]), metadata=payload)
         return event
 
     def record_outcome(self, run_id: str, passed: bool, score: float | None = None, metadata: dict[str, Any] | None = None) -> Outcome:

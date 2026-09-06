@@ -1118,7 +1118,7 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
         if runtime is not None:
             if runtime.controller.get_candidate(candidate_id) is None:
                 raise HTTPException(status_code=404, detail="candidate or evaluation not found")
-            if runtime.controller.store.get_evaluation(payload.evaluation_id) is None:
+            if runtime.controller.store.get_evaluation(payload.evaluation_id) is None and runtime.controller.store.get_evaluation_queue(payload.evaluation_id) is None:
                 raise HTTPException(status_code=404, detail="candidate or evaluation not found")
             raise HTTPException(status_code=403, detail={"code": "FORBIDDEN", "message": "only the trusted evaluator may decide a candidate", "correlationId": uuid.uuid4().hex, "retry": "never"})
         with plane._lock:

@@ -125,6 +125,18 @@ class Store:
                     report_json TEXT NOT NULL,
                     validity TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS evaluation_queue (
+                    evaluation_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL,
+                    candidate_hash TEXT NOT NULL,
+                    base_hash TEXT NOT NULL,
+                    protocol_hash TEXT NOT NULL,
+                    partition_ref TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS promotions (
                     decision_id TEXT PRIMARY KEY,
                     candidate_hash TEXT NOT NULL,
@@ -1056,6 +1068,47 @@ class Store:
 
     def save_evaluation(self, report_id: str, data: dict[str, Any]) -> None:
         self._insert_json("evaluations", "report_id", report_id, data)
+
+    def save_evaluation_queue(self, evaluation_id: str, data: dict[str, Any]) -> None:
+        """Persist queue metadata separately from trusted evaluation reports."""
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO evaluation_queue(
+                    evaluation_id, candidate_id, candidate_hash, base_hash,
+                    protocol_hash, partition_ref, state, payload_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(evaluation_id) DO UPDATE SET
+                    candidate_id=excluded.candidate_id,
+                    candidate_hash=excluded.candidate_hash,
+                    base_hash=excluded.base_hash,
+                    protocol_hash=excluded.protocol_hash,
+                    partition_ref=excluded.partition_ref,
+                    state=excluded.state,
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at""",
+                (
+                    evaluation_id,
+                    data["candidate_id"],
+                    data["candidate_hash"],
+                    data["base_hash"],
+                    data["protocol_hash"],
+                    data["partition_ref"],
+                    data["state"],
+                    data["payload_json"],
+                    data.get("created_at", _utcnow()),
+                    data.get("updated_at", _utcnow()),
+                ),
+            )
+            conn.commit()
+
+    def get_evaluation_queue(self, evaluation_id: str) -> dict[str, Any] | None:
+        return self._get_json("evaluation_queue", "evaluation_id", evaluation_id)
+
+    def list_evaluation_queue(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM evaluation_queue ORDER BY created_at").fetchall()
+            return [dict(row) for row in rows]
 
     def get_evaluation(self, report_id: str) -> dict[str, Any] | None:
         return self._get_json("evaluations", "report_id", report_id)

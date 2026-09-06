@@ -158,7 +158,7 @@ class DurableRuntime:
 
     def _reload_registered_environments(self) -> None:
         """Rebuild manifest/task projections from SQLite after a restart."""
-        with self.controller.store._connect() as conn:
+        with self.controller.store.connect() as conn:
             rows = conn.execute("SELECT id FROM environments ORDER BY id").fetchall()
         for row in rows:
             env_id = str(row["id"])
@@ -203,7 +203,7 @@ class DurableRuntime:
 
     def list_candidates(self) -> list[dict[str, Any]]:
         out = []
-        with self.controller.store._connect() as conn:
+        with self.controller.store.connect() as conn:
             rows = conn.execute("SELECT candidate_json FROM candidates ORDER BY created_at").fetchall()
         for row in rows:
             try:
@@ -230,9 +230,28 @@ class DurableRuntime:
             raise ValueError("evaluation base does not match candidate")
         self.controller.start_evaluation(payload.candidate_id)
         evaluation_id = f"eval_{__import__('uuid').uuid4().hex}"
-        data = {"candidate_hash": candidate.get("candidate_bundle_hash") or payload.candidate_id, "base_hash": payload.base_bundle_hash, "protocol_hash": payload.protocol_hash, "partition_ref": json.dumps(payload.partition_ref, sort_keys=True), "report_json": json.dumps({"evaluationId": evaluation_id, "candidateId": payload.candidate_id, "baseBundleHash": payload.base_bundle_hash, "protocolHash": payload.protocol_hash, "partitionRef": payload.partition_ref, "state": "queued", "trusted": False}, sort_keys=True), "validity": "queued"}
-        self.controller.store.save_evaluation(evaluation_id, data)
-        return json.loads(data["report_json"])
+        response = {
+            "evaluationId": evaluation_id,
+            "candidateId": payload.candidate_id,
+            "baseBundleHash": payload.base_bundle_hash,
+            "protocolHash": payload.protocol_hash,
+            "partitionRef": payload.partition_ref,
+            "state": "queued",
+            "trusted": False,
+        }
+        self.controller.store.save_evaluation_queue(
+            evaluation_id,
+            {
+                "candidate_id": payload.candidate_id,
+                "candidate_hash": candidate.get("candidate_bundle_hash") or payload.candidate_id,
+                "base_hash": payload.base_bundle_hash,
+                "protocol_hash": payload.protocol_hash,
+                "partition_ref": json.dumps(payload.partition_ref, sort_keys=True),
+                "state": "queued",
+                "payload_json": json.dumps(response, sort_keys=True),
+            },
+        )
+        return response
 
     def execute_evaluation_task(self, task: Any, frozen_config: Any, bundle: Any) -> Any:
         """Execute one frozen benchmark cell through the shared run path."""
@@ -362,7 +381,7 @@ class DurableRuntime:
         evaluation_id = task.get("evaluationId")
         if not isinstance(evaluation_id, str):
             return
-        stored = self.controller.store.get_evaluation(evaluation_id)
+        stored = self.controller.store.get_evaluation_queue(evaluation_id)
         if not stored:
             return
         try:
@@ -376,17 +395,28 @@ class DurableRuntime:
             report.setdefault("state", "completed")
             validity = str(report.get("validity", report.get("state", "completed")))
         except Exception as exc:
-            report = {**json.loads(stored["report_json"]), "state": "blocked", "trusted": False, "error": str(exc)}
+            report = {**json.loads(stored["payload_json"]), "state": "blocked", "trusted": False, "error": str(exc)}
             validity = "blocked"
-        updated = dict(stored)
-        updated.pop("report_id", None)
+        if validity == "blocked":
+            self.controller.store.save_evaluation_queue(
+                evaluation_id,
+                {**stored, "state": "blocked", "payload_json": json.dumps(report, sort_keys=True), "updated_at": datetime.now(timezone.utc).isoformat()},
+            )
+            return
         self.controller.store.save_evaluation(
             evaluation_id,
             {
-                **updated,
+                "candidate_hash": stored["candidate_hash"],
+                "base_hash": stored["base_hash"],
+                "protocol_hash": stored["protocol_hash"],
+                "partition_ref": stored["partition_ref"],
                 "report_json": json.dumps(report, sort_keys=True),
                 "validity": validity,
             },
+        )
+        self.controller.store.save_evaluation_queue(
+            evaluation_id,
+            {**stored, "state": "completed", "payload_json": json.dumps(report, sort_keys=True), "updated_at": datetime.now(timezone.utc).isoformat()},
         )
 
     def build_evaluation_driver(self, protocol: Any, arm_bundles: Mapping[Any, Any] | None = None) -> Any:
@@ -637,7 +667,7 @@ class DurableRuntime:
         return self._public_run(run, task) if task else run.model_dump(mode="json", by_alias=True)
 
     def list_runs(self) -> list[dict[str, Any]]:
-        with self.controller.store._connect() as conn:
+        with self.controller.store.connect() as conn:
             rows = conn.execute("SELECT run_id FROM runs ORDER BY created_at").fetchall()
         return [run for row in rows if (run := self.get_run(row[0])) is not None]
 
@@ -768,6 +798,9 @@ class DurableRuntime:
         }
         accounting_ref = self.controller.store.put_artifact(accounting)
         payload["accountingRef"] = accounting_ref.model_dump(mode="json", by_alias=True)
+        recorder = getattr(self.controller, "record_model_response", None)
+        if callable(recorder):
+            return recorder(run_id, payload)
         return self.controller.append_event(run_id, "model_response", payload, "system", "operator")
 
     def _claim_run(self, run_id: str) -> tuple[bool, Any | None]:
@@ -834,25 +867,11 @@ class DurableRuntime:
         trusted = getattr(self.controller, "record_trusted_outcome", None)
         if callable(trusted):
             stored = self.controller.store.get_run(run_id)
-            response_id: str | None = None
-            for row in reversed(self.controller.store.list_evidence(run_id)):
-                if row.get("event_type") != "model_response":
-                    continue
-                try:
-                    source = json.loads(row["source_ref"])
-                    payload = self.controller.store.get_artifact(source["sha256"])
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                    continue
-                candidate = payload.get("responseId") if isinstance(payload, Mapping) else None
-                if isinstance(candidate, str) and candidate:
-                    response_id = candidate
-                    break
-            if stored is not None and response_id is not None:
+            if stored is not None:
                 metadata = outcome.metadata if isinstance(outcome.metadata, Mapping) else {}
                 return trusted(
                     run_id,
                     {
-                        "responseId": response_id,
                         "runId": run_id,
                         "taskId": stored["task_id"],
                         "environmentId": stored["environment_id"],
@@ -887,15 +906,15 @@ class DurableRuntime:
 
     def _record_broker_result(self, run_id: str, payload: dict[str, Any], *, development: bool) -> Any:
         """Persist broker fidelity using the available controller authority."""
-        append = getattr(self.controller, "append_broker_result", None)
-        if callable(append):
-            return append(run_id, payload, development=development)
         record = getattr(self.controller, "record_broker_tool_result", None)
         if callable(record):
             parameters = inspect.signature(record).parameters
             if "development" in parameters:
                 return record(run_id, payload, development=development)
             return record(run_id, payload)
+        append = getattr(self.controller, "append_broker_result", None)
+        if callable(append):
+            return append(run_id, payload, development=development)
         # The canonical core has no broker-result convenience method.  Keep
         # the operator event durable without inventing a second projection
         # authority in the application adapter.
