@@ -175,13 +175,19 @@ def _message_text(message: Mapping[str, Any]) -> str:
     )
 
 
-def _parse_message_end_event(event: Mapping[str, Any], *, max_output_chars: int) -> Mapping[str, Any] | None:
+@dataclass(frozen=True)
+class _MessageEndParse:
+    final: Mapping[str, Any] | None = None
+    terminal_error: str | None = None
+
+
+def _parse_message_end_event(event: Mapping[str, Any], *, max_output_chars: int) -> _MessageEndParse:
     """Parse one assistant terminal event without treating provider errors as text."""
     if event.get("type") != "message_end":
-        return None
+        return _MessageEndParse()
     message = event.get("message")
     if not isinstance(message, Mapping) or message.get("role") != "assistant":
-        return None
+        return _MessageEndParse()
 
     stop_reason = message.get("stopReason", message.get("stop_reason"))
     if stop_reason is None:
@@ -194,22 +200,22 @@ def _parse_message_end_event(event: Mapping[str, Any], *, max_output_chars: int)
             "responseId": message.get("responseId", message.get("response_id")),
         }
         detail = _bounded_text(_redact(details), min(max_output_chars, 4_096))
-        raise PlannerError(f"Prime CLI assistant terminated with stopReason={stop_reason}: {detail}")
+        return _MessageEndParse(terminal_error=f"Prime CLI assistant terminated with stopReason={stop_reason}: {detail}")
 
     text = _message_text(message)
     if not text:
-        return None
+        return _MessageEndParse()
     provider, model = _canonical_model(message.get("provider"), message.get("model"))
     response_id = message.get("responseId", message.get("response_id"))
     if not isinstance(response_id, str) or not response_id.strip():
-        return None
-    return {
+        return _MessageEndParse()
+    return _MessageEndParse(final={
         "provider": provider,
         "model": model,
         "responseId": _bounded_text(response_id, 512),
         "text": _bounded_text(text, max_output_chars),
         "usage": dict(_bounded_usage(message.get("usage"))),
-    }
+    })
 
 
 class PrimeCliModelClient:
@@ -304,6 +310,7 @@ class PrimeCliModelClient:
             raise PlannerError(f"unable to launch Prime CLI: {exc}") from exc
 
         final: dict[str, Any] | None = None
+        pending_terminal_error: str | None = None
         stderr_tail = bytearray()
         streams: dict[int, tuple[Any, bytearray]] = {}
         selector = selectors.DefaultSelector()
@@ -317,15 +324,18 @@ class PrimeCliModelClient:
             selector.register(process.stderr, selectors.EVENT_READ, "stderr")
 
         def consume_stdout_line(line: bytes) -> None:
-            nonlocal final
+            nonlocal final, pending_terminal_error
             try:
                 event = json.loads(line.decode("utf-8", errors="replace"))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return
             if isinstance(event, Mapping):
                 parsed = _parse_message_end_event(event, max_output_chars=self.max_output_chars)
-                if parsed is not None:
-                    final = parsed
+                if parsed.terminal_error is not None:
+                    pending_terminal_error = parsed.terminal_error
+                elif parsed.final is not None:
+                    final = dict(parsed.final)
+                    pending_terminal_error = None
 
         def stop_process() -> None:
             if process.poll() is None:
@@ -401,6 +411,8 @@ class PrimeCliModelClient:
                 2_000,
             )
             raise PlannerError(f"Prime CLI exited with status {process.returncode}: {detail}")
+        if pending_terminal_error is not None:
+            raise PlannerError(pending_terminal_error)
         if final is None:
             detail = _bounded_text(_redact(bytes(stderr_tail).decode("utf-8", errors="replace").strip()), 2_000)
             suffix = f"; stderr: {detail}" if detail else ""
@@ -410,6 +422,7 @@ class PrimeCliModelClient:
     @staticmethod
     def _parse_events(stdout: str) -> Mapping[str, Any]:
         final: Mapping[str, Any] | None = None
+        pending_terminal_error: str | None = None
         for line in stdout.splitlines():
             try:
                 event = json.loads(line)
@@ -417,8 +430,13 @@ class PrimeCliModelClient:
                 continue
             if isinstance(event, Mapping):
                 parsed = _parse_message_end_event(event, max_output_chars=65_536)
-                if parsed is not None:
-                    final = parsed
+                if parsed.terminal_error is not None:
+                    pending_terminal_error = parsed.terminal_error
+                elif parsed.final is not None:
+                    final = parsed.final
+                    pending_terminal_error = None
+        if pending_terminal_error is not None:
+            raise PlannerError(pending_terminal_error)
         if final is None:
             raise PlannerError("Prime CLI JSON stream did not contain a final assistant message")
         return final
@@ -574,8 +592,9 @@ class LunaPlanner:
             "Use public docs, tool schemas, policy, and active skills as contracts. "
             "Return exactly one JSON object: {\\\"action\\\":\\\"execute\\\",\\\"code\\\":\\\"...\\\"} "
             "for Python to run in the task-scoped Prime kernel, or {\\\"action\\\":\\\"finish\\\",\\\"answer\\\":\\\"...\\\"}. "
-            "Use `from rlm import host_request` and await host_request(\"capabilities.discover\") first to retrieve the exact current-run capability ids. "
-            "Then call tools with await host_request(\"broker.call\", {\"capabilityId\": <the exact discovered id for the tool>, \"arguments\": {...}}); do not construct, copy, alias, or suffix-match ids, and do not import the rlm module itself. "
+            "Use the exact current-run capability ids already listed in environment.capabilities when calling tools. "
+            "Use capabilities.discover only for grant inspection or recovery; if needed, use `from rlm import host_request` and await host_request(\"capabilities.discover\") to retrieve the current grants, then call tools with await host_request(\"broker.call\", {\"capabilityId\": <the exact id from environment.capabilities or discovery>, \"arguments\": {...}}). "
+            "Never invent, construct, copy, reuse stale or foreign-run ids, or use aliases or suffix matching, and do not import the rlm module itself. "
             "Never import credentials, access the host, or invent outcomes. "
             "A tool result or error is feedback for the next turn. The first-class `environment` request field is the authoritative task contract, including task context, public docs, capabilities, tool schemas, schema, and budget."
         )

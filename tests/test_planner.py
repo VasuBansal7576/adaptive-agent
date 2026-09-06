@@ -206,6 +206,57 @@ def test_prime_cli_client_reports_bounded_redacted_stderr_when_final_event_is_mi
     assert "password=[REDACTED]" in message
 
 
+def _scripted_prime(tmp_path, name, events, stderr=""):
+    executable = tmp_path / name
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        + "\n".join(f"print(json.dumps({json.dumps(event)}))" for event in events)
+        + (f"\nsys.stderr.write({stderr!r})\n" if stderr else "\n")
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    return executable
+
+
+def _assistant_event(response_id, *, stop_reason=None, text=None, error_message=None):
+    message = {"role": "assistant", "responseId": response_id}
+    if text is not None:
+        message.update({
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "usage": {"totalTokens": 1},
+        })
+    if stop_reason is not None:
+        message["stopReason"] = stop_reason
+    if error_message is not None:
+        message["errorMessage"] = error_message
+    if text is not None:
+        message["content"] = [{"type": "text", "text": text}]
+    return {"type": "message_end", "message": message}
+
+
+def test_prime_cli_client_allows_retryable_error_before_later_valid_success(tmp_path):
+    executable = _scripted_prime(tmp_path, "prime-agent-retry", [
+        _assistant_event("error", stop_reason="error", error_message="temporary provider failure"),
+        _assistant_event("success", text='{"action":"finish","answer":"ok"}'),
+    ])
+    result = PrimeCliModelClient(executable=str(executable), coding_agent_dir=tmp_path).invoke(
+        goal="goal", environment={}, messages=[], remaining_deadline=5
+    )
+    assert result["responseId"] == "success"
+
+
+def test_prime_cli_client_rejects_valid_success_followed_by_final_error(tmp_path):
+    executable = _scripted_prime(tmp_path, "prime-agent-late-error", [
+        _assistant_event("success", text='{"action":"finish","answer":"stale"}'),
+        _assistant_event("error", stop_reason="error", error_message="final provider failure"),
+    ])
+    with pytest.raises(PlannerError, match="stopReason=error"):
+        PrimeCliModelClient(executable=str(executable), coding_agent_dir=tmp_path).invoke(
+            goal="goal", environment={}, messages=[], remaining_deadline=5
+        )
+
+
 def test_prime_cli_serialization_keeps_full_environment_once_with_unicode(tmp_path):
     captured = tmp_path / "request.bin"
     executable = tmp_path / "prime-agent-capture"
@@ -258,8 +309,10 @@ def test_system_prompt_documents_exact_discovery_contract_for_tool_calls():
     prompt = LunaPlanner(None, None, None)._system_prompt({}, ())
     assert 'host_request("capabilities.discover")' in prompt
     assert "exact current-run capability ids" in prompt
-    assert "exact discovered id for the tool" in prompt
-    assert "do not construct, copy, alias, or suffix-match ids" in prompt
+    assert "exact id from environment.capabilities or discovery" in prompt
+    assert "only for grant inspection or recovery" in prompt
+    assert "Never invent, construct, copy, reuse stale or foreign-run ids" in prompt
+    assert "aliases or suffix matching" in prompt
 
 
 def test_system_prompt_deduplicates_overlapping_skills_by_full_value():
