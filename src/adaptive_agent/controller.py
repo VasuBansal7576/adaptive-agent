@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import json
 import re
 import time
 from collections.abc import Mapping
@@ -64,25 +65,7 @@ ApprovalProvider = Callable[[ToolRequest], str | None]
 
 # Credential-shaped values are masked before learner-visible evidence is
 # recorded (sanitized feedback boundary; planner fix bec53f2).
-_SECRET_PATTERNS = (
-    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
-    re.compile(r"AKIA[0-9A-Z]{16}"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|bearer)\s*[:=]\s*\S+"),
-)
-
-
-def _sanitize_for_learner(value: Any) -> Any:
-    if isinstance(value, str):
-        out = value
-        for pat in _SECRET_PATTERNS:
-            out = pat.sub("[REDACTED]", out)
-        return out
-    if isinstance(value, Mapping):
-        return {k: _sanitize_for_learner(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_for_learner(v) for v in value]
-    return value
+from adaptive_agent.store import sanitize_for_learner as _sanitize_for_learner
 
 
 class DriverContext:
@@ -297,6 +280,18 @@ class Controller:
             },
         )
         return ev
+
+    def record_broker_tool_result(self, run_id: str, result_payload: Mapping[str, Any]) -> EvidenceRecord:
+        """Persist an already brokered result and its learner-safe evidence."""
+        call_id = result_payload.get("callId")
+        if not isinstance(call_id, str):
+            raise ValueError("broker result callId is required")
+        call = self.store.get_tool_call(call_id)
+        if not isinstance(call, Mapping) or call.get("run_id") != run_id:
+            raise ValueError("broker result is not bound to the requested run")
+        result_json = json.dumps(dict(result_payload), sort_keys=True, separators=(",", ":"))
+        self.store.save_tool_result(call_id, result_json, str(result_payload.get("effect") or call.get("effect") or "unknown"))
+        return self.append_event(run_id, "tool_result", dict(result_payload), "broker", "learner")
 
     def events(self, run_id: str, after_sequence: int = 0) -> list[dict[str, Any]]:
         """Ordered SSE-ready event payloads: [{id, event, data}]."""

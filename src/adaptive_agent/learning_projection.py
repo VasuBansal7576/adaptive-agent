@@ -59,18 +59,6 @@ class DurableBrokerLearningProjection:
                 result[schema["name"]] = schema
         return result
 
-    def _tool_call(self, call_id: str) -> Mapping[str, Any] | None:
-        getter = getattr(self.store, "get_tool_call", None)
-        if callable(getter):
-            row = getter(call_id)
-            return row if isinstance(row, Mapping) else None
-        connect = getattr(self.store, "_connect", None)
-        if not callable(connect):
-            return None
-        with connect() as connection:
-            row = connection.execute("SELECT * FROM tool_calls WHERE call_id = ?", (call_id,)).fetchone()
-            return dict(row) if row else None
-
     def _persist_derived_evidence(self, *, evidence_id: str, run_id: str, content: str) -> None:
         getter = getattr(self.store, "get_evidence", None)
         if callable(getter) and getter(evidence_id) is not None:
@@ -95,59 +83,75 @@ class DurableBrokerLearningProjection:
             raise LearningProjectionError("broker history is not bound to the requested run")
         if not isinstance(task, Mapping) or task.get("environment_id") != environment_id or task.get("partition") != "development":
             raise LearningProjectionError("broker history requires a DEVELOPMENT task")
+        list_run_tool_calls = getattr(self.store, "list_run_tool_calls", None)
+        if not callable(list_run_tool_calls):
+            raise LearningProjectionError("Store lacks canonical tool-call projection seam")
+        try:
+            joined_rows = list_run_tool_calls(run_id)
+        except (KeyError, PermissionError) as exc:
+            raise LearningProjectionError("broker history is not readable for this run") from exc
         schemas = self._tool_schemas(environment_id)
+        source_events = {
+            event.get("evidence_id"): event
+            for event in self.store.list_evidence(run_id)
+            if isinstance(event, Mapping)
+        }
         records: list[tuple[str, Mapping[str, Any]]] = []
-        for event in self.store.list_evidence(run_id):
+        for row in joined_rows:
+            if not isinstance(row, Mapping):
+                continue
+            evidence_id = row.get("evidenceId")
+            call_id = row.get("callId")
+            event = source_events.get(evidence_id)
+            if not isinstance(evidence_id, str) or not isinstance(call_id, str) or not isinstance(event, Mapping):
+                continue
             if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker" or event.get("visibility") not in {"learner", "operator"}:
                 continue
             source_ref = event.get("source_ref")
             if not isinstance(source_ref, str):
                 continue
-            ref = json.loads(source_ref)
+            try:
+                ref = json.loads(source_ref)
+            except (TypeError, json.JSONDecodeError):
+                continue
             try:
                 payload = self.store.get_artifact(ref["sha256"])
-            except (KeyError, ValueError):
+            except (KeyError, TypeError, ValueError):
                 continue
             if not isinstance(ref.get("sha256"), str) or hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest() != ref["sha256"] or event.get("content_hash") != ref["sha256"]:
                 continue
-            if not isinstance(payload, Mapping) or not isinstance(payload.get("callId"), str):
+            if not isinstance(payload, Mapping) or payload.get("callId") != call_id:
                 continue
-            call = self._tool_call(payload["callId"])
-            if not isinstance(call, Mapping) or call.get("run_id") != run_id or call.get("environment_id") != environment_id:
+            if row.get("runId") != run_id or row.get("taskId") != task_id or row.get("environmentId") != environment_id or row.get("partition") != "development":
                 continue
-            tool = call.get("tool")
+            tool = row.get("tool")
             schema = schemas.get(tool) if isinstance(tool, str) else None
             if schema is None:
                 continue
-            try:
-                arguments = json.loads(call.get("arguments_json", "{}"))
-                result = json.loads(call.get("result_json", "{}"))
-            except (TypeError, json.JSONDecodeError):
-                continue
+            arguments = row.get("input")
+            result_output = row.get("result")
             properties = schema.get("inputSchema", {}).get("properties", {}) if isinstance(schema.get("inputSchema"), Mapping) else {}
             safe_input = _safe({key: arguments[key] for key in properties if isinstance(arguments, Mapping) and key in arguments})
-            safe_result = _safe({key: result.get(key) for key in ("status", "effect", "toolVersion", "output") if isinstance(result, Mapping) and key in result})
-            safe_error = {}
-            if isinstance(result, Mapping) and isinstance(result.get("error"), Mapping):
-                safe_error = _safe({key: result["error"].get(key) for key in ("code", "retry") if key in result["error"]})
+            safe_result = _safe({key: value for key, value in (("status", row.get("status")), ("effect", row.get("effect")), ("toolVersion", row.get("version")), ("output", result_output)) if value is not None})
+            safe_error = _safe({key: value for key, value in (("code", row.get("errorCode")), ("retry", row.get("retry"))) if value is not None})
             details = {
-                "callId": payload["callId"], "tool": tool, "input": safe_input,
+                "callId": call_id, "tool": tool, "input": safe_input,
                 "result": safe_result, "error": safe_error,
-                "sourceEvidenceId": event["evidence_id"], "sourceContentHash": event.get("content_hash"),
-                "sourceArtifactHash": ref.get("sha256"), "callArgumentsHash": hashlib.sha256(str(call.get("arguments_json", "")).encode()).hexdigest(),
-                "callResultHash": hashlib.sha256(str(call.get("result_json", "")).encode()).hexdigest(),
+                "sourceEvidenceId": evidence_id, "sourceContentHash": event.get("content_hash"),
+                "sourceArtifactHash": ref.get("sha256"), "callArgumentsHash": row.get("argumentsSha256"),
+                "callResultHash": row.get("resultSha256"),
                 "runId": run_id, "taskId": task_id, "environmentId": environment_id, "partition": "development",
             }
             content = f"Broker development observation: {canonical_json(details)}"
             record = {
-                "kind": "live_evidence", "sourceId": f"broker:{event['evidence_id']}", "content": content,
+                "kind": "live_evidence", "sourceId": f"broker:{evidence_id}", "content": content,
                 "contentHash": content_hash(content), "sourceContentHash": event.get("content_hash"),
-                "sourceEvidenceId": event["evidence_id"], "sourceCallId": payload["callId"],
+                "sourceEvidenceId": evidence_id, "sourceCallId": call_id,
                 "environmentId": environment_id, "runId": run_id, "taskId": task_id,
                 "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": True, "outcomePassed": outcome_passed,
             }
             self._persist_derived_evidence(evidence_id=record["sourceId"], run_id=run_id, content=content)
-            records.append((f"learning-broker-{event['evidence_id']}", record))
+            records.append((f"learning-broker-{evidence_id}", record))
         return records
 
 

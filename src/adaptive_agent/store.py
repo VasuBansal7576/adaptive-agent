@@ -8,6 +8,7 @@ candidates, frozen evaluation protocols, promotions, and the active-bundle linea
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -19,6 +20,28 @@ from adaptive_agent.models import ArtifactRef, sha256_json
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# Credential-shaped values are masked before learner-visible projection.
+_SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|bearer)\s*[:=]\s*\S+"),
+)
+
+
+def sanitize_for_learner(value: Any) -> Any:
+    if isinstance(value, str):
+        out = value
+        for pat in _SECRET_PATTERNS:
+            out = pat.sub("[REDACTED]", out)
+        return out
+    if isinstance(value, dict):
+        return {k: sanitize_for_learner(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_for_learner(v) for v in value]
+    return value
 
 
 class RunIdempotencyConflict(ValueError):
@@ -449,6 +472,88 @@ class Store:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ broker call/evidence join (session7 seam)
+    def list_run_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
+        """Read-only sanitized projection of one DEVELOPMENT run's broker calls
+        joined to their evidence rows.
+
+        Fails closed on non-development partitions and unknown runs. Each row:
+        call_id, evidence_id, tool, input, result, errorCode, retry, version,
+        arguments_sha256, result_sha256, run/task/environment bindings.
+        Approval tokens are never included.
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            raise KeyError(f"run {run_id!r} not found")
+        task = self.get_task(run["task_id"])
+        if not task or task.get("partition") != "development":
+            raise PermissionError("tool-call projection is development-partition only")
+
+        calls = [
+            r for r in self.list_tool_calls(run_id)
+        ]
+        evidence_by_call: dict[str, dict[str, Any]] = {}
+        for ev in self.list_evidence(run_id):
+            if ev["event_type"] != "tool_result":
+                continue
+            try:
+                ref = json.loads(ev["source_ref"])
+                payload = self.get_artifact(ref["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("callId"), str):
+                evidence_by_call[payload["callId"]] = ev
+
+        out: list[dict[str, Any]] = []
+        for call in calls:
+            try:
+                args = json.loads(call["arguments_json"])
+            except (TypeError, json.JSONDecodeError):
+                args = {}
+            result: dict[str, Any] = {}
+            error_code = retry = None
+            if call.get("result_json"):
+                try:
+                    result = json.loads(call["result_json"])
+                except (TypeError, json.JSONDecodeError):
+                    result = {}
+            if isinstance(result, dict):
+                err = result.get("error")
+                if isinstance(err, dict):
+                    error_code = err.get("code")
+                    retry = err.get("retry")
+                status = result.get("status")
+                output = result.get("output")
+                version = result.get("toolVersion")
+                effect = result.get("effect")
+                result_sha = sha256_json(result)
+            else:
+                status = output = version = effect = result_sha = None
+            ev = evidence_by_call.get(call["call_id"], {})
+            out.append({
+                "callId": call["call_id"],
+                "evidenceId": ev.get("evidence_id"),
+                "tool": call["tool"],
+                "input": sanitize_for_learner(args),
+                "result": sanitize_for_learner(output) if output is not None else None,
+                "status": status,
+                "errorCode": error_code,
+                "retry": retry,
+                "version": version,
+                "effect": effect or call.get("effect"),
+                "idempotencyKey": call["idempotency_key"],
+                "argumentsSha256": sha256_json(args),
+                "resultSha256": result_sha,
+                "evidenceContentHash": ev.get("content_hash"),
+                "runId": run_id,
+                "taskId": run["task_id"],
+                "environmentId": run["environment_id"],
+                "partition": "development",
+                "visibility": "learner",
+                "redacted": True,
+            })
+        return out
 
     # ------------------------------------------------------------------ learning records (session7 seam)
     def save_learning_record(self, record_id: str, environment_id: str, run_id: str, record_json: str) -> None:
@@ -909,6 +1014,14 @@ class Store:
 
     def get_tool_call(self, call_id: str) -> dict[str, Any] | None:
         return self._get_json("tool_calls", "call_id", call_id)
+
+    def list_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tool_calls WHERE run_id = ? ORDER BY rowid",
+                (run_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def get_tool_call_by_idempotency(self, run_id: str, idempotency_key: str) -> dict[str, Any] | None:
         with self._connect() as conn:
