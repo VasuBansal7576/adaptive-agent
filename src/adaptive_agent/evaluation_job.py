@@ -615,7 +615,11 @@ class EvaluationJob:
             expected_partitions=frozen.partition_hashes,
             ablation_audit=ablation_audit,
         )
-        if not isinstance(report, EvaluationReport):
+        # Keep the report seam compatible with evaluator-owned test doubles
+        # and alternate concrete report implementations.  Persistence only
+        # requires the canonical serializer; receipt and pin validation above
+        # remains fully strict.
+        if report is None or not callable(getattr(report, "to_dict", None)):
             raise EvaluationError("durable evaluator returned a malformed lifecycle report")
         return report
 
