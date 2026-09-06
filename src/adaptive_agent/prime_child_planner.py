@@ -1,0 +1,146 @@
+"""Trusted Luna child-planner adapter for Prime runtime host requests."""
+from __future__ import annotations
+
+import inspect
+import json
+from typing import Any, Mapping, Protocol, Sequence
+
+from .prime_runtime import AdapterError, ChildPlan, ChildPlanRequest, ChildPlannerBudget, SecurityViolation
+
+MODEL_PROVIDER = "openai-codex"
+MODEL_NAME = "openai-codex/gpt-5.6-luna"
+
+
+class ChildModelClient(Protocol):
+    def invoke(self, **kwargs: Any) -> Mapping[str, Any]: ...
+
+
+def _usage_tokens(usage: Mapping[str, Any]) -> int:
+    for key in ("totalTokens", "total_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    input_tokens = usage.get("input", usage.get("input_tokens"))
+    output_tokens = usage.get("output", usage.get("output_tokens"))
+    if isinstance(input_tokens, int) and isinstance(output_tokens, int) and input_tokens >= 0 and output_tokens >= 0:
+        return input_tokens + output_tokens
+    raise AdapterError("child model usage must include total token accounting")
+
+
+def _text(raw: Mapping[str, Any]) -> str:
+    value = raw.get("text")
+    if isinstance(value, str):
+        return value.strip()
+    content = raw.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+        return "".join(str(part.get("text", "")) for part in content if isinstance(part, Mapping)).strip()
+    return ""
+
+
+def _parse_plan(text: str, max_code_chars: int) -> ChildPlan:
+    if not text or len(text) > max_code_chars * 2:
+        raise AdapterError("child model returned empty or oversized code")
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        lines = candidate.splitlines()
+        if len(lines) >= 3 and lines[-1].strip().startswith("```"):
+            candidate = "\n".join(lines[1:-1]).strip()
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise AdapterError(f"child model did not return the required JSON plan: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise AdapterError("child model plan must be an object")
+    code = payload.get("code")
+    if not isinstance(code, str) or not code.strip() or len(code) > max_code_chars:
+        raise AdapterError("child model plan has invalid code")
+    name = payload.get("name", "luna-child")
+    if not isinstance(name, str) or not name or len(name) > 128:
+        name = "luna-child"
+    return ChildPlan(code=code, name=name, model=MODEL_NAME)
+
+
+class LunaChildPlanner:
+    """Adapt session2's trusted ``PrimeCliModelClient`` to ``ChildPlanner``.
+
+    The client is parent-owned and must already use the authenticated Luna
+    subscription.  No learner-provided credential or token field is forwarded.
+    """
+
+    def __init__(self, client: ChildModelClient, *, budget: ChildPlannerBudget | None = None, max_code_chars: int = 32_768):
+        if max_code_chars < 1:
+            raise ValueError("max_code_chars must be positive")
+        self.client = client
+        self.budget = budget
+        self.max_code_chars = max_code_chars
+
+    def record_parent_model_usage(self, usage: Mapping[str, Any]) -> int:
+        """Record a completed parent receipt in the same trusted ledger.
+
+        The caller must use the runtime's ``planner_budget``. This is the
+        integration seam for LunaPlanner; it avoids a separate child ledger.
+        """
+        if self.budget is None:
+            raise AdapterError("shared planner budget is required for parent accounting")
+        tokens = _usage_tokens(usage)
+        self.budget.record_model_usage(tokens)
+        return tokens
+
+    def __call__(self, request: ChildPlanRequest) -> ChildPlan:
+        if self.budget is not None and request.budget.ledger is not self.budget.ledger:
+            raise SecurityViolation("child planner is bound to a different shared ledger")
+        if request.cancel_event.is_set() or request.budget.cancel_event.is_set():
+            raise SecurityViolation("child model planning cancelled")
+        remaining = min(request.remaining_seconds, request.budget.remaining_seconds)
+        if remaining <= 0:
+            raise SecurityViolation("child model planning deadline expired")
+        if request.budget.remaining_model_tokens == 0:
+            raise SecurityViolation("shared model token budget exhausted")
+        prompt = (
+            "Generate one useful isolated child computation for this request. "
+            "Return exactly JSON with string fields code and name. The code must "
+            "be safe bounded Python and return a result as its final expression. "
+            "Do not use credentials, host paths, network, tools, or another child.\n"
+            f"Child request: {request.prompt}"
+        )
+        environment = {
+            "role": "isolated-child-planner",
+            "parentRunId": request.parent_run_id,
+            "depth": request.depth,
+            "capabilities": [],
+        }
+        kwargs: dict[str, Any] = {
+            "goal": prompt,
+            "environment": environment,
+            "messages": [{"role": "user", "content": prompt}],
+            "remaining_deadline": remaining,
+            "cancel": request.cancel_event,
+        }
+        parameters = inspect.signature(self.client.invoke).parameters
+        accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        if accepts_kwargs or "token_cap" in parameters:
+            # This is accounting metadata only. The Luna subscription path has
+            # no supported hard output-token request field.
+            kwargs["token_cap"] = None
+        forwarded = kwargs if accepts_kwargs else {key: value for key, value in kwargs.items() if key in parameters}
+        raw = self.client.invoke(**forwarded)
+        if not isinstance(raw, Mapping):
+            raise AdapterError("child model response must be an object")
+        provider = raw.get("provider")
+        model = raw.get("model")
+        response_id = raw.get("responseId", raw.get("response_id"))
+        usage = raw.get("usage")
+        text = _text(raw)
+        if provider != MODEL_PROVIDER or model not in (MODEL_NAME, "gpt-5.6-luna"):
+            raise AdapterError("child model response is not the pinned Luna subscription")
+        if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage or not text:
+            raise AdapterError("child model response lacks response id, text, or usage")
+        # Record completed provider usage before enforcing the shared cap. An
+        # over-cap receipt remains visible in the ledger and blocks later calls.
+        request.budget.record_model_usage(_usage_tokens(usage))
+        return _parse_plan(text, self.max_code_chars)
+
+
+__all__ = ["ChildModelClient", "LunaChildPlanner", "MODEL_NAME", "MODEL_PROVIDER"]
