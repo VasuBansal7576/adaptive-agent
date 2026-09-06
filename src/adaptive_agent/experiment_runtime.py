@@ -172,6 +172,7 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
     economic_unknown = False
     nominal = 0.0
     nominal_seen = False
+    nominal_missing = False
     run_ids: list[str] = []
     evidence_refs: list[str] = []
     outcome_refs: list[str] = []
@@ -196,6 +197,8 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
         if current_nominal is not None:
             nominal += current_nominal
             nominal_seen = True
+        else:
+            nominal_missing = True
     receipt: dict[str, Any] = {
         "stage": stage,
         "cellKey": cell_key,
@@ -212,7 +215,7 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
     }
     if cost_seen and not economic_unknown:
         receipt["costMicrounits"] = cost
-    elif nominal_seen:
+    elif nominal_seen and not nominal_missing:
         receipt["costMicrounits"] = int(round(nominal * 1_000_000))
         receipt["costBasis"] = "nominal_budget_proxy"
         receipt["billingStatus"] = "unknown"
@@ -344,7 +347,11 @@ class DefaultExperimentStageRunner:
     ) -> tuple[Any, Mapping[str, Any]]:
         admission = self._admit_subcall(context, f"{stage}:{cell_key}:{subcall_key}")
         if admission is not None and admission.get("reused") is True:
+            if admission.get("dispatchAllowed") is not False:
+                raise ExperimentRuntimeError("reused nested evaluation admission lacks dispatch prohibition")
             raise ExperimentRuntimeError("nested evaluation checkpoint requires durable observation recovery")
+        if admission is not None and admission.get("dispatchAllowed") is not True:
+            raise ExperimentRuntimeError("nested evaluation admission did not authorize dispatch")
         try:
             observation = self._execute(task, arm, seed, bundle, attempt)
             receipt = _observation_receipt(
@@ -417,6 +424,8 @@ class DefaultExperimentStageRunner:
         baseline_refs = prior_learning_refs if prior_learning_refs is not None else self._learning_observation_ids(run_id)
         admission = self._admit_subcall(context, f"learning:{cell_key}:{run_id}")
         if admission is not None and admission.get("reused") is True:
+            if admission.get("dispatchAllowed") is not False:
+                raise ExperimentRuntimeError("reused nested learning admission lacks dispatch prohibition")
             if admission.get("status") != "complete" or not isinstance(admission.get("result"), Mapping):
                 raise ExperimentRuntimeError("nested subcall checkpoint requires durable result recovery")
             recovered = _mapping(admission["result"], "recovered nested learning receipt")
@@ -427,6 +436,8 @@ class DefaultExperimentStageRunner:
             else:
                 self._rotation_candidates[cell_key] = (candidate_id, candidate_hash)
             return recovered
+        if admission is not None and admission.get("dispatchAllowed") is not True:
+            raise ExperimentRuntimeError("nested learning admission did not authorize dispatch")
         try:
             result = self.runtime.launch_learning(SimpleNamespace(run_id=run_id))
             receipt = dict(self._learning_receipt(cell_key, run_id, result, bind_primary=bind_primary, prior_learning_refs=baseline_refs))
@@ -500,7 +511,14 @@ class DefaultExperimentStageRunner:
             "nestedAdmissions": [],
             "nestedCheckpoints": list(learning_refs),
         }
-        if learning_accounting.get("costMicrounits") is not None:
+        if not learning_accounting.get("accountingComplete", False):
+            if learning_accounting.get("costMicrounits") is not None:
+                receipt["costMicrounits"] = learning_accounting["costMicrounits"]
+            elif learning_accounting.get("nominalCostUsd") is not None:
+                receipt["costMicrounits"] = int(round(float(learning_accounting["nominalCostUsd"]) * 1_000_000))
+                receipt["costBasis"] = "nominal_budget_proxy"
+            receipt["economicCostStatus"] = "unknown"
+        elif learning_accounting.get("costMicrounits") is not None:
             receipt["costMicrounits"] = learning_accounting["costMicrounits"]
         elif learning_accounting.get("nominalCostUsd") is not None:
             receipt["costMicrounits"] = int(round(float(learning_accounting["nominalCostUsd"]) * 1_000_000))
@@ -569,16 +587,20 @@ class DefaultExperimentStageRunner:
     def _learning_accounting(self, run_id: str, refs: list[str], result: Any) -> dict[str, Any]:
         wall = 0.0
         wall_seen = False
+        wall_missing = False
         nominal = 0.0
         nominal_seen = False
+        nominal_missing = False
         cost = 0.0
         cost_seen = False
         billing_unknown = False
         rows = self.runtime.controller.store.list_evidence(run_id)
         wanted = set(refs)
+        observed = 0
         for row in rows:
             if row.get("evidence_id") not in wanted or row.get("event_type") != "learning_model_observation":
                 continue
+            observed += 1
             source = row.get("source_ref")
             if not isinstance(source, str):
                 continue
@@ -593,17 +615,21 @@ class DefaultExperimentStageRunner:
             if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
                 wall += float(duration)
                 wall_seen = True
+            else:
+                wall_missing = True
             value = payload.get("nominalCostUsd")
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 nominal += float(value)
                 nominal_seen = True
+            else:
+                nominal_missing = True
             value = payload.get("costMicrounits")
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 cost += float(value)
                 cost_seen = True
             economic = payload.get("economicCost")
             billing_unknown = billing_unknown or isinstance(economic, Mapping) and economic.get("status") == "unknown"
-        if isinstance(result, Mapping):
+        if isinstance(result, Mapping) and observed == 0:
             duration = result.get("wallSeconds")
             if not wall_seen and isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
                 wall = float(duration)
@@ -616,10 +642,11 @@ class DefaultExperimentStageRunner:
             if not cost_seen and isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 cost = float(value)
                 cost_seen = True
-        output: dict[str, Any] = {"wallSeconds": wall if wall_seen else 0.0}
-        if cost_seen and not billing_unknown:
+        complete = (observed == 0 and wall_seen and (nominal_seen or cost_seen)) or (observed == len(wanted) and not wall_missing and not nominal_missing)
+        output: dict[str, Any] = {"wallSeconds": wall if wall_seen else 0.0, "accountingComplete": complete}
+        if cost_seen and not billing_unknown and complete:
             output["costMicrounits"] = int(round(cost))
-        elif nominal_seen:
+        elif nominal_seen and not nominal_missing:
             output["nominalCostUsd"] = nominal
         return output
 
@@ -648,7 +675,7 @@ class DefaultExperimentStageRunner:
             raise ExperimentRuntimeError("transfer training set does not prove leave-one-environment-out exclusion")
         candidate, candidate_receipt = self._candidate_for_excluded_environment(context, environment_id)
         validation_task = self._task_for_cell(cell_key, "validation", environment_id, 0)
-        observation, _ = self._execute_stage_subcall(
+        observation, evaluation_receipt = self._execute_stage_subcall(
             validation_task,
             "L",
             int(self.protocol.seeds[0]),
@@ -659,7 +686,7 @@ class DefaultExperimentStageRunner:
             cell_key,
             "evaluation",
         )
-        return _observation_receipt(
+        receipt = _observation_receipt(
             self.runtime,
             "transfer",
             cell_key,
@@ -667,7 +694,15 @@ class DefaultExperimentStageRunner:
             self.pins,
             extra={"environmentId": environment_id, "partition": "validation", "resetBefore": True, "exposed": False, "heldoutAccess": False, "disjointDevelopmentEnvironments": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": list(candidate_receipt["sourceRunIds"]), "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"], "learningReceipt": dict(candidate_receipt)},
         )
-        return self._merge_receipts(receipt, candidate_receipt)
+        return self._merge_receipts(
+            receipt,
+            candidate_receipt,
+            charged_subcall_ids=[
+                evaluation_receipt["nestedAdmissionId"],
+                *candidate_receipt.get("nestedAdmissions", []),
+            ],
+            charged_subcall_receipts=[evaluation_receipt, candidate_receipt],
+        )
 
     def _adaptation(self, cell_key: str, context: Mapping[str, Any], attempt: int) -> Mapping[str, Any]:
         match = _ADAPT.fullmatch(cell_key)
@@ -677,7 +712,7 @@ class DefaultExperimentStageRunner:
         candidate = self._candidate(context)
         support = self._task_for_cell(cell_key, "development", environment_id, 0)
         query = self._task_for_cell(cell_key, "validation", environment_id, 0)
-        support_observation, _ = self._execute_stage_subcall(
+        support_observation, support_receipt = self._execute_stage_subcall(
             support,
             "L",
             int(self.protocol.seeds[0]),
@@ -695,7 +730,7 @@ class DefaultExperimentStageRunner:
             context=context,
         )
         adapted_candidate = _load_bundle(self.runtime, support_learning["candidateBundleHash"])
-        query_observation, _ = self._execute_stage_subcall(
+        query_observation, query_receipt = self._execute_stage_subcall(
             query,
             "L",
             int(self.protocol.seeds[1]),
@@ -719,14 +754,34 @@ class DefaultExperimentStageRunner:
         receipt["adaptedCandidateId"] = support_learning["candidateId"]
         receipt["adaptedCandidateBundleHash"] = support_learning["candidateBundleHash"]
         receipt["learningReceipt"] = dict(support_learning)
-        return self._merge_receipts(receipt, support_learning)
+        return self._merge_receipts(
+            receipt,
+            support_learning,
+            charged_subcall_ids=[
+                support_receipt["nestedAdmissionId"],
+                *support_learning.get("nestedAdmissions", []),
+                query_receipt["nestedAdmissionId"],
+            ],
+            charged_subcall_receipts=[support_receipt, support_learning, query_receipt],
+        )
 
     @staticmethod
-    def _merge_receipts(receipt: Mapping[str, Any], nested: Mapping[str, Any]) -> dict[str, Any]:
+    def _merge_receipts(
+        receipt: Mapping[str, Any],
+        nested: Mapping[str, Any],
+        *,
+        charged_subcall_ids: list[str] | None = None,
+        charged_subcall_receipts: list[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """Include authenticated nested-learning accounting exactly once."""
         merged = dict(receipt)
         outer_usage = _mapping(merged.get("usage"), "outer receipt usage")
         nested_usage = _mapping(nested.get("usage"), "nested receipt usage")
+        if charged_subcall_ids:
+            ids = [value for value in charged_subcall_ids if isinstance(value, str) and value]
+            if len(ids) != len(charged_subcall_ids) or len(ids) != len(set(ids)):
+                raise ExperimentRuntimeError("nested subcall admission IDs are malformed")
+            merged["chargedSubcallIds"] = ids
         merged["usage"] = {
             key: int(outer_usage[key]) + int(nested_usage[key])
             for key in ("inputTokens", "outputTokens", "totalTokens")
@@ -744,6 +799,35 @@ class DefaultExperimentStageRunner:
         if receipt.get("billingStatus") == "unknown" or nested.get("billingStatus") == "unknown":
             merged["billingStatus"] = "unknown"
             merged["costBasis"] = "nominal_budget_proxy"
+        if charged_subcall_ids:
+            children = charged_subcall_receipts or []
+            if len(children) != len(charged_subcall_ids):
+                raise ExperimentRuntimeError("nested subcall receipt count does not match admission IDs")
+            child_usage = {
+                key: sum(int(_mapping(child.get("usage"), "nested receipt usage")[key]) for child in children)
+                for key in ("inputTokens", "outputTokens", "totalTokens")
+            }
+            full_usage = _mapping(merged["usage"], "merged receipt usage")
+            merged["residualUsage"] = {
+                key: int(full_usage[key]) - child_usage[key]
+                for key in ("inputTokens", "outputTokens", "totalTokens")
+            }
+            if any(value < 0 for value in merged["residualUsage"].values()):
+                raise ExperimentRuntimeError("nested receipts exceed outer aggregate usage")
+            child_tools = sum(int(child.get("toolCalls", 0)) for child in children)
+            child_wall = sum(float(child.get("wallSeconds", 0)) for child in children)
+            merged["residualToolCalls"] = int(merged.get("toolCalls", 0)) - child_tools
+            merged["residualWallSeconds"] = float(merged.get("wallSeconds", 0)) - child_wall
+            if merged["residualToolCalls"] < 0 or merged["residualWallSeconds"] < 0:
+                raise ExperimentRuntimeError("nested receipts exceed outer aggregate runtime")
+            full_cost = merged.get("costMicrounits")
+            child_costs = [child.get("costMicrounits") for child in children]
+            if isinstance(full_cost, (int, float)) and not isinstance(full_cost, bool) and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in child_costs):
+                merged["residualCostMicrounits"] = int(full_cost) - sum(int(value) for value in child_costs)
+                if merged["residualCostMicrounits"] < 0:
+                    raise ExperimentRuntimeError("nested receipts exceed outer aggregate cost")
+            else:
+                merged["residualCostMicrounits"] = 0
         merged["nestedRunIds"] = list(nested.get("runIds", []))
         merged["nestedEvidenceRefs"] = list(nested.get("modelObservationRefs", []))
         return merged

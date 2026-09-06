@@ -200,7 +200,7 @@ def test_adaptation_learns_from_support_before_query(monkeypatch):
 
     def admit(key, **_estimates):
         admissions.append(key)
-        return {"admissionId": key, "status": "reserved", "reused": False}
+        return {"admissionId": key, "status": "reserved", "reused": False, "dispatchAllowed": True}
 
     def record(admission_id, *, result=None, error=None):
         checkpoints.append((admission_id, result, error))
@@ -211,7 +211,7 @@ def test_adaptation_learns_from_support_before_query(monkeypatch):
         "recordSubcall": record,
     }
 
-    runner._adaptation("adapt:known-a", context, 0)
+    result = runner._adaptation("adapt:known-a", context, 0)
 
     assert runtime.calls[-2:] == [
         ("known-a-development-0", "L", 17, "primary"),
@@ -223,6 +223,8 @@ def test_adaptation_learns_from_support_before_query(monkeypatch):
         "adaptation:adapt:known-a:query",
     ]
     assert all(error is None for _, _, error in checkpoints)
+    assert len(result["chargedSubcallIds"]) == 3
+    assert result["residualUsage"] == {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
 
 
 def test_partial_known_cost_remains_unknown():
@@ -233,6 +235,12 @@ def test_partial_known_cost_remains_unknown():
         "durationSeconds": 0.25,
         "economicCost": {"status": "unknown", "microunits": 7},
     }
+    runtime.controller.store.artifacts["acct-nominal"] = {
+        "usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5},
+        "toolCalls": 1,
+        "durationSeconds": 0.25,
+        "nominalCostUsd": 0.000007,
+    }
     runner = DefaultExperimentStageRunner(runtime, Protocol())
     first = SimpleNamespace(run_id="one", evidence_ref="model-1", outcome_ref="outcome-1", accounting_ref="acct-1")
     second = SimpleNamespace(run_id="two", evidence_ref="model-1", outcome_ref="outcome-1", accounting_ref="acct-unknown")
@@ -241,6 +249,11 @@ def test_partial_known_cost_remains_unknown():
 
     assert receipt["economicCostStatus"] == "unknown"
     assert "costMicrounits" not in receipt
+
+    partial = SimpleNamespace(run_id="one", evidence_ref="model-1", outcome_ref="outcome-1", accounting_ref="acct-nominal")
+    partial_receipt = experiment_runtime._observation_receipt(runtime, "transfer", "leave-out:known-a", [partial, second], runner.pins)
+    assert partial_receipt["economicCostStatus"] == "unknown"
+    assert "costMicrounits" not in partial_receipt
 
 
 def test_learning_receipt_preserves_nominal_proxy_and_wall_time(monkeypatch):
@@ -293,7 +306,7 @@ def test_nested_learning_is_admitted_and_checkpointed(monkeypatch):
 
     def admit(key, **estimates):
         admissions.append((key, estimates))
-        return {"admissionId": "admission-1", "status": "reserved", "reused": False}
+        return {"admissionId": "admission-1", "status": "reserved", "reused": False, "dispatchAllowed": True}
 
     def record(admission_id, *, result=None, error=None):
         checkpoints.append((admission_id, result, error))
@@ -321,7 +334,7 @@ def test_nested_learning_reuses_durable_checkpoint_without_relaunch():
         "dev-run",
         "transfer:known-a",
         bind_primary=False,
-        context={"admitSubcall": lambda *_args, **_kwargs: {"admissionId": "admission-1", "status": "complete", "reused": True, "result": recovered}},
+        context={"admitSubcall": lambda *_args, **_kwargs: {"admissionId": "admission-1", "status": "complete", "reused": True, "dispatchAllowed": False, "result": recovered}},
     )
 
     assert receipt is recovered
@@ -359,3 +372,106 @@ def test_actual_durable_runtime_rejects_unfrozen_execution_before_model_dispatch
     with pytest.raises(LearningRuntimeError, match="not frozen"):
         runtime.execute_evaluation_task(task, config, Bundle("base"))
     assert runtime.learning_model_client.calls == 0
+
+
+@pytest.mark.parametrize("zero_field", ["modelTokens", "costMicrounits"])
+def test_actual_durable_runtime_rejects_zero_budget_before_model_dispatch(tmp_path, zero_field):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("adaptive_agent.constants")
+    from fastapi.testclient import TestClient
+    from adaptive_agent.app import create_runtime_app
+
+    calls = []
+
+    def deterministic_runner(**_kwargs):
+        calls.append(True)
+        return SimpleNamespace(
+            text="deterministic response",
+            provider="openai-codex",
+            model="openai-codex/gpt-5.6-luna",
+            response_id="deterministic-response",
+            usage={"inputTokens": 1, "outputTokens": 1},
+        )
+
+    app = create_runtime_app(model_runner=deterministic_runner, evaluator=lambda **_: {"passed": True}, data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").status_code == 200
+    task = app.state.durable_runtime.packages["finance"].tasks_for_partition("development")[0]
+    run = api.post(
+        "/runs",
+        json={
+            "goal": task.goal,
+            "environmentId": "finance",
+            "idempotencyKey": f"zero-budget-{zero_field}",
+            "budget": {
+                "modelTokens": 0 if zero_field == "modelTokens" else 1,
+                "toolCalls": 1,
+                "childRuns": 0,
+                "wallTimeSeconds": 1,
+                "costMicrounits": 0 if zero_field == "costMicrounits" else 1,
+                "currency": "USD",
+            },
+        },
+    ).json()
+    with pytest.raises(RuntimeError, match="budgets must be positive"):
+        app.state.durable_runtime.launch(run["runId"])
+    assert calls == []
+
+
+def test_transfer_charged_subcalls_are_accounted_once_by_real_evaluation_job(tmp_path, monkeypatch):
+    pytest.importorskip("adaptive_agent.evaluation_job")
+    from adaptive_agent.evaluation import EvaluationProtocol, build_environment_packages
+    from adaptive_agent.evaluation_job import EvaluationJob, LifecycleStage
+    from adaptive_agent.store import Store as EvaluationStore
+
+    runtime = Runtime()
+    runtime.launch_learning = lambda _payload: {
+        "candidate": {"candidateId": "rotation", "candidateBundleHash": "rotation", "baseBundleHash": "base"},
+        "wallSeconds": 0.01,
+        "nominalCostUsd": 0.000004,
+    }
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    monkeypatch.setattr(experiment_runtime, "_load_bundle", lambda _runtime, content_hash: Bundle(content_hash))
+    monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, ["learning-ref"]))
+
+    def generic(cell, context):
+        return {
+            "status": "complete",
+            "stage": context["stage"],
+            "cellKey": cell,
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+            "toolCalls": 1,
+            "wallSeconds": 0.01,
+            "costMicrounits": 1,
+        }
+
+    def transfer(cell, context):
+        return runner._transfer(cell, context, int(context["attempt"]))
+
+    stages = (
+        LifecycleStage("bootstrap", ("bootstrap-0",), generic),
+        LifecycleStage("training", ("known-b-development-0",), lambda cell, context: {**generic(cell, context), "environmentId": "known-b", "runIds": ["dev-run"], "taskIds": [cell]}),
+        LifecycleStage("learning", ("learning-0",), generic),
+        LifecycleStage("transfer", ("leave-out:known-a",), transfer),
+        LifecycleStage("adaptation", ("adaptation-0",), generic),
+        LifecycleStage("safety", ("safety-0",), generic),
+        LifecycleStage("validation", ("validation-0",), generic),
+        LifecycleStage("final", ("final-0",), generic),
+    )
+    protocol = EvaluationProtocol()
+    packages = build_environment_packages()
+    protocol.freeze(packages)
+    job = EvaluationJob(EvaluationStore(tmp_path), object(), protocol, packages, {}, lambda *_args: None)
+
+    result = job.run_experiment(
+        "charged-transfer",
+        stages,
+        limits={"attempts": 12, "inputTokens": 100, "outputTokens": 100, "toolCalls": 100, "wallMicros": 100_000_000, "costMicrounits": 100},
+    )
+
+    assert result.status == "complete", result.error
+    accounting = job.lifecycle_accounting("charged-transfer")
+    assert accounting["subcalls"] == 2
+    assert accounting["costMicrounits"] == 18
+    assert accounting["inputTokens"] == 11
+    assert accounting["outputTokens"] == 10
