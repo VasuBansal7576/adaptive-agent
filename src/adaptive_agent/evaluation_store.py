@@ -218,6 +218,10 @@ class SQLiteRunEvidenceStore:
             return False
         actual_cost = accounting.get("costMicrounits")
         actual_latency = accounting.get("durationSeconds")
+        if actual_cost is None:
+            nominal_cost = accounting.get("nominalCostUsd")
+            if isinstance(nominal_cost, (int, float)) and not isinstance(nominal_cost, bool) and math.isfinite(nominal_cost) and nominal_cost >= 0:
+                actual_cost = int(round(float(nominal_cost) * 1_000_000))
         if not isinstance(actual_cost, (int, float)) or isinstance(actual_cost, bool) or not math.isfinite(actual_cost) or actual_cost < 0 or not isinstance(actual_latency, (int, float)) or isinstance(actual_latency, bool) or not math.isfinite(actual_latency) or actual_latency < 0:
             return False
         if actual_cost != observation.cost_microunits or actual_latency != observation.latency_seconds:
