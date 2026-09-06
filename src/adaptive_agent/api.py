@@ -551,9 +551,21 @@ class ControlPlane:
             return event
 
     def _emit_evidence(self, run_id: str, evidence_type: str, summary: str, payload: Mapping[str, Any]) -> JsonObject:
-        """Emit structured evidence while retaining the SSE summary/detail shape."""
+        """Emit structured evidence using one canonical event class.
+
+        ``model_observation`` was an older adapter term and is deliberately
+        rejected at this boundary so persisted and in-memory evidence cannot
+        diverge from the durable verifier's ``model_response`` chain.
+        """
+        if evidence_type == "model_observation":
+            raise ValueError("model_observation is not a canonical evidence event; use model_response")
+        if evidence_type not in {"model_response", "trusted_outcome"}:
+            raise ValueError(f"unsupported evidence event type: {evidence_type}")
         event = self._emit(run_id, "evidence", summary, json.dumps(dict(payload), sort_keys=True))
         event["evidenceType"] = evidence_type
+        event["eventType"] = evidence_type
+        event["event_type"] = evidence_type
+        event["visibility"] = "evaluator_only" if evidence_type == "trusted_outcome" else "operator"
         event["evidence"] = dict(payload)
         return event
 
