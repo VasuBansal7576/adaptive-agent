@@ -279,6 +279,7 @@ class SharedBudget:
     child_runs_used: int = 0
     model_tokens_used: int = 0
     model_cost_microunits_used: int = 0
+    cost_accounting_blocked: bool = False
 
     def remaining_seconds(self) -> float:
         return max(0.0, self.max_wall_seconds - (time.monotonic() - self.started_at))
@@ -294,14 +295,15 @@ class SharedBudget:
             raise AdapterError("model token usage must be a non-negative integer")
         if cost_microunits is not None and (not isinstance(cost_microunits, int) or isinstance(cost_microunits, bool) or cost_microunits < 0):
             raise AdapterError("model nominal cost must be a non-negative integer")
-        if self.max_model_cost_microunits is not None and cost_microunits is None:
-            raise AdapterError("model nominal cost is required by the configured cost guard")
         if currency is not None and currency.upper() != self.model_cost_currency.upper():
             raise AdapterError("model usage currency does not match configured currency")
         with self.lock:
             # A completed provider receipt is recorded in full before either
             # ledger rejects further dispatch. Never lose over-cap usage.
             self.model_tokens_used += tokens
+            if self.max_model_cost_microunits is not None and cost_microunits is None:
+                self.cost_accounting_blocked = True
+                raise SecurityViolation("shared model nominal cost is unavailable")
             if cost_microunits is not None:
                 self.model_cost_microunits_used += cost_microunits
             token_exhausted = self.max_model_tokens is not None and self.model_tokens_used > self.max_model_tokens
@@ -337,6 +339,8 @@ class ChildPlannerBudget:
     def remaining_model_cost_microunits(self) -> int | None:
         if self.ledger.max_model_cost_microunits is None:
             return None
+        if self.ledger.cost_accounting_blocked:
+            return 0
         return max(0, self.ledger.max_model_cost_microunits - self.ledger.model_cost_microunits_used)
 
     @property

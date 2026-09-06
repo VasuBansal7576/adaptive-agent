@@ -75,13 +75,35 @@ class CostGuardTests(unittest.TestCase):
         with self.assertRaises(AdapterError):
             parse_model_usage({"inputTokens": 9, "outputTokens": 1, "cost": {"total": 0.00001, "currency": "EUR"}}, require_cost=True)
 
-    def test_unknown_cost_is_rejected_when_cost_guard_is_configured(self):
+    def test_unknown_cost_preserves_receipt_tokens_and_blocks_future_dispatch(self):
         ledger = SharedBudget(30, 1000, 4, 1, 100, max_model_cost_microunits=10)
         observations = []
-        with self.assertRaises(AdapterError):
-            LunaChildPlanner(FakeClient(usage={"inputTokens": 1, "outputTokens": 1}), observation_sink=observations.append)(request(ledger))
-        self.assertEqual(observations, [])
-        self.assertEqual((ledger.model_tokens_used, ledger.model_cost_microunits_used), (0, 0))
+        client = FakeClient(usage={"inputTokens": 1, "outputTokens": 1})
+        planner = LunaChildPlanner(client, budget=ChildPlannerBudget(ledger), observation_sink=observations.append)
+        with self.assertRaises(SecurityViolation):
+            planner(request(ledger))
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(observations[0]["economicCostStatus"], "unknown")
+        self.assertNotIn("costMicrounits", observations[0])
+        self.assertEqual((ledger.model_tokens_used, ledger.model_cost_microunits_used), (2, 0))
+        self.assertTrue(ledger.cost_accounting_blocked)
+        with self.assertRaises(SecurityViolation):
+            planner(request(ledger))
+        self.assertEqual(client.calls, 1)
+
+    def test_unknown_cost_parent_has_same_one_call_block(self):
+        ledger = SharedBudget(30, 1000, 4, 1, 100, max_model_cost_microunits=10)
+        client = FakeClient(usage={"input_tokens": 4, "output_tokens": 1})
+        observations = []
+        proxy = LunaChildPlanner(client, budget=ChildPlannerBudget(ledger)).parent_model_client(observations.append)
+        with self.assertRaises(SecurityViolation):
+            proxy.invoke(goal="parent", environment={}, messages=[], remaining_deadline=5)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(ledger.model_tokens_used, 5)
+        self.assertEqual(observations[0]["economicCostStatus"], "unknown")
+        with self.assertRaises(SecurityViolation):
+            proxy.invoke(goal="blocked", environment={}, messages=[], remaining_deadline=5)
+        self.assertEqual(client.calls, 1)
 
     def test_zero_cost_budget_blocks_parent_and_child_preflight(self):
         ledger = SharedBudget(30, 1000, 4, 1, 100, max_model_cost_microunits=0)
