@@ -29,6 +29,15 @@ from adaptive_agent.evaluation import (
     Partition,
     RunObservation,
 )
+
+
+def _effective_cost_microunits(explicit_cost: object, nominal_cost_usd: object) -> int | None:
+    """Normalize measured cost, falling back to a clearly labeled nominal proxy."""
+    if isinstance(explicit_cost, (int, float)) and not isinstance(explicit_cost, bool) and math.isfinite(float(explicit_cost)) and explicit_cost >= 0:
+        return int(round(float(explicit_cost)))
+    if isinstance(nominal_cost_usd, (int, float)) and not isinstance(nominal_cost_usd, bool) and math.isfinite(float(nominal_cost_usd)) and nominal_cost_usd >= 0:
+        return int(round(float(nominal_cost_usd) * 1_000_000))
+    return None
 from adaptive_agent.evaluation_store import SQLiteRunEvidenceStore, build_durable_evaluation_runner
 from adaptive_agent.store import Store
 
@@ -713,6 +722,7 @@ class EvaluationJob:
                 actual_input_tokens=accounting["inputTokens"],
                 actual_output_tokens=accounting["outputTokens"],
                 nominal_cost_usd=accounting["nominalCostUsd"],
+                effective_cost_microunits=accounting["effectiveCostMicrounits"],
                 wall_duration_seconds=accounting["wallDurationSeconds"],
                 billing_basis=accounting["billingBasis"],
             )
@@ -735,6 +745,9 @@ class EvaluationJob:
         nominal_seen = False
         economic_cost_microunits = 0.0
         economic_cost_seen = False
+        effective_cost_microunits = 0
+        effective_cost_seen = False
+        nominal_proxy_seen = False
         inference_duration_seconds = 0.0
         inference_duration_seen = False
         economic_statuses: set[str] = set()
@@ -749,6 +762,7 @@ class EvaluationJob:
                     usage = candidate_usage
             input_tokens += int(usage.get("inputTokens", 0) or 0)
             output_tokens += int(usage.get("outputTokens", 0) or 0)
+            explicit_cost: object = None
             if isinstance(accounting, dict):
                 economic = accounting.get("economicCost")
                 if isinstance(economic, dict):
@@ -759,6 +773,9 @@ class EvaluationJob:
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
                         economic_cost_microunits += float(value)
                         economic_cost_seen = True
+                        explicit_cost = value
+                if explicit_cost is None:
+                    explicit_cost = accounting.get("costMicrounits")
                 duration = accounting.get("inferenceDurationSeconds")
                 if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
                     inference_duration_seconds += float(duration)
@@ -771,16 +788,27 @@ class EvaluationJob:
                 response = self.store.get_artifact(source["sha256"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 response = None
+            nominal_value: object = None
             if isinstance(response, dict):
                 value = response.get("nominalCostUsd")
                 usage_cost = response.get("usage", {}).get("cost", {}) if isinstance(response.get("usage"), dict) else {}
                 if value is None and isinstance(usage_cost, dict):
                     value = usage_cost.get("total")
+                nominal_value = value
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     nominal_cost += float(value)
                     nominal_seen = True
-        if nominal_seen:
-            billing_basis = "SDK nominal usage cost; subscription billing is separate and unmeasured"
+            effective = _effective_cost_microunits(explicit_cost, nominal_value)
+            if effective is not None:
+                effective_cost_microunits += effective
+                effective_cost_seen = True
+                nominal_proxy_seen = explicit_cost is None
+        if nominal_proxy_seen:
+            billing_basis = "effective cost uses SDK nominal usage cost as a proxy; economic cost is unknown; subscription billing is separate and unmeasured"
+        elif effective_cost_seen:
+            billing_basis = "effective cost uses explicit SDK economic cost; subscription billing is separate and unmeasured"
+        elif nominal_seen:
+            billing_basis = "SDK nominal usage cost proxy; economic cost is unknown; subscription billing is separate and unmeasured"
         elif economic_statuses:
             billing_basis = f"SDK economic cost status: {', '.join(sorted(economic_statuses))}; nominal USD cost unavailable"
         else:
@@ -790,6 +818,7 @@ class EvaluationJob:
             "outputTokens": output_tokens,
             "totalTokens": input_tokens + output_tokens,
             "nominalCostUsd": nominal_cost if nominal_seen else None,
+            "effectiveCostMicrounits": effective_cost_microunits if effective_cost_seen else None,
             "economicCostMicrounits": economic_cost_microunits if economic_cost_seen else None,
             "economicCostStatuses": sorted(economic_statuses),
             "inferenceDurationSeconds": inference_duration_seconds if inference_duration_seen else None,
