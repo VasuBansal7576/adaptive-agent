@@ -744,6 +744,22 @@ class DurableRuntime:
                 prime.close(remove_workspace=True)
             return
         runtime = self
+        from adaptive_agent.prime_child_planner import LunaChildPlanner
+
+        # Parent and child model calls share the adapter's trusted ledger. The
+        # child planner is attached only after the authenticated client exists,
+        # and its receipts are routed through the same parent-owned evidence
+        # path as the main planner.
+        child_planner = LunaChildPlanner(client, budget=prime.planner_budget)
+        prime.child_planner = child_planner
+
+        def record_child_model_observation(evidence: Mapping[str, Any]) -> Any:
+            result = prime.record_model_observation(evidence, trusted_parent=True)
+            runtime._record_model_response(run_id, package, {**dict(evidence), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest})
+            return result
+
+        child_planner.observation_sink = record_child_model_observation
+
         class Sink:
             def __init__(self, controller: Controller) -> None:
                 self._controller = controller
@@ -751,6 +767,7 @@ class DurableRuntime:
             def record_model_observation(self, evidence: Mapping[str, Any], *, trusted_parent: bool = False) -> Any:
                 result = prime.record_model_observation(evidence, trusted_parent=trusted_parent)
                 runtime._record_model_response(run_id, package, {**dict(evidence), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest})
+                child_planner.record_parent_model_usage(evidence["usage"])
                 return result
         class Driver:
             def __init__(self, controller: Controller) -> None:
