@@ -59,6 +59,10 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             row = RunObservation(task.task_id, "finance", Partition.VALIDATION, 17, Arm.L, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, response_id=response_id, accounting_ref=accounting_ref.sha256, evidence_ref="evidence-1", outcome_ref="outcome-1", config_hashes=expected, run_id=run_id)
             verifier = SQLiteRunEvidenceStore(store)
             self.assertTrue(verifier.verify(row, frozen, package))
+            with store.connect() as conn:
+                conn.execute("UPDATE evidence SET visibility = 'evaluator_only' WHERE evidence_id = ?", ("outcome-1",))
+                conn.commit()
+            self.assertTrue(verifier.verify(row, frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, response_id="wrong"), frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, run_id="wrong"), frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, accounting_ref="missing"), frozen, package))

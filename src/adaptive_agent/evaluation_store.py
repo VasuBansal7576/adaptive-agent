@@ -185,7 +185,11 @@ class SQLiteRunEvidenceStore:
             return False
         if response.get("responseId") != observation.response_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response" or outcome_evidence.get("run_id") != observation.run_id or outcome_evidence.get("event_type") != "trusted_outcome":
             return False
-        if evidence.get("visibility") != "operator" or outcome_evidence.get("visibility") != "operator":
+        # Model responses are operator-visible, while trusted evaluator
+        # outcomes may be evaluator-only so hidden answers never leak through
+        # the operator/event projection.  Both visibility classes are valid
+        # for the durable attestation as long as the row is evaluator-owned.
+        if evidence.get("visibility") != "operator" or outcome_evidence.get("visibility") not in {"operator", "evaluator_only"}:
             return False
         if evidence.get("eventType") not in (None, "model_response") or outcome_evidence.get("eventType") not in (None, "trusted_outcome"):
             return False
