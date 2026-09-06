@@ -165,7 +165,17 @@ async function main() {
   // launch runs as a background task; allow bounded latency before events flow
   const deadline = Date.now() + 25000;
   while (seen.length < 2 && Date.now() < deadline) {
-    const { done, value } = await reader.read();
+    const remaining = Math.max(1, deadline - Date.now());
+    let timeoutId;
+    const read = await Promise.race([
+      reader.read(),
+      new Promise((resolve) => {
+        timeoutId = setTimeout(() => resolve(null), remaining);
+      }),
+    ]);
+    clearTimeout(timeoutId);
+    if (read === null) break;
+    const { done, value } = read;
     if (done) {
       // the stream closes when the run is terminal; reopen from the cursor
       if (seen.length > 0) break;
@@ -205,8 +215,23 @@ async function main() {
     if (seen[k].sequence <= seen[k - 1].sequence) throw new Error("non-monotonic sequence numbers");
   }
   const lastSeq = Math.max(...seen.map((e) => e.sequence));
-  const dupRes = await fetch(`${base}/runs/${run.runId}/events?cursor=${lastSeq}`, { headers: cookie ? { cookie } : {} });
-  const dupText = await dupRes.text().catch(() => "");
+  // A live stream may remain open while the runtime is still finishing. Keep
+  // the duplicate check bounded so the smoke command never hangs on an idle
+  // post-cursor connection.
+  const duplicateController = new AbortController();
+  const duplicateTimeout = setTimeout(() => duplicateController.abort(), 2000);
+  let dupText = "";
+  try {
+    const dupRes = await fetch(`${base}/runs/${run.runId}/events?cursor=${lastSeq}`, {
+      headers: cookie ? { cookie } : {},
+      signal: duplicateController.signal,
+    });
+    dupText = await dupRes.text();
+  } catch {
+    // timeout or a terminal stream close is acceptable for this probe
+  } finally {
+    clearTimeout(duplicateTimeout);
+  }
   const dupCount = (dupText.match(/^data:/gm) || []).length;
   if (dupCount > 0) {
     // a terminal run legitimately closes with no new frames; any frame after
