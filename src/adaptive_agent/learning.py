@@ -292,20 +292,24 @@ _MAX_PATCH_BYTES = 32_768
 _MAX_CHANGED_LINES = 200
 
 # The provider reports token usage, while the request boundary only exposes a
-# serialized string.  Four UTF-8 bytes per token is deliberately conservative
-# for the JSON-heavy learner request.  Keep output headroom in the same
-# accounting unit so a successful proposal cannot exhaust the parent cap.
-_PROMPT_BYTES_PER_TOKEN = 4
+# serialized string.  This is a byte ceiling, not a tokenization guarantee:
+# one UTF-8 byte is allowed per available token, with explicit space reserved
+# for output and provider/request framing.  Measured provider usage remains
+# authoritative after dispatch.
 _PROMPT_OUTPUT_HEADROOM_TOKENS = 1_024
-_MIN_PACKING_TOKEN_CAP = 512
+_PROMPT_PROVIDER_HEADROOM_BYTES = 1_024
+_PROMPT_FRAMING_HEADROOM_BYTES = 1_024
 _MIN_USEFUL_EXCERPT_BYTES = 32
 
 
 def _prompt_budget_bytes(token_cap: int | None) -> int | None:
-    if token_cap is None or token_cap < _MIN_PACKING_TOKEN_CAP:
+    if token_cap is None:
         return None
-    headroom = min(_PROMPT_OUTPUT_HEADROOM_TOKENS, max(128, token_cap // 10))
-    return max(0, token_cap - headroom) * _PROMPT_BYTES_PER_TOKEN
+    reserved = _PROMPT_OUTPUT_HEADROOM_TOKENS + _PROMPT_PROVIDER_HEADROOM_BYTES + _PROMPT_FRAMING_HEADROOM_BYTES
+    budget = token_cap - reserved
+    if budget <= 0:
+        raise LearningError("learning proposal token cap is below the minimum serialized prompt budget")
+    return budget
 
 
 def _serialized_planner_request_bytes(goal: str, environment: Mapping[str, Any], *, token_cap: int | None = None) -> int:
@@ -360,6 +364,18 @@ def _pack_learning_context(
             mandatory.append(item)
     if not mandatory:
         mandatory = [evidence[0]]
+    unique_mandatory: list[Any] = []
+    mandatory_ids: dict[str, tuple[str, str]] = {}
+    for item in mandatory:
+        key = (item.environment_id or "", item.run_id or "")
+        previous_key = mandatory_ids.get(item.source_id)
+        if previous_key is not None:
+            if previous_key != key:
+                raise LearningError("selected learning source runs do not have unique evidence IDs")
+            continue
+        mandatory_ids[item.source_id] = key
+        unique_mandatory.append(item)
+    mandatory = unique_mandatory
     if budget is not None and mandatory:
         # Reserve room for every selected source before filling optional
         # context.  A greedy full-size first item would otherwise crowd out a
@@ -367,10 +383,14 @@ def _pack_learning_context(
         excerpt_reserve = max(_MIN_USEFUL_EXCERPT_BYTES, budget // (2 * len(mandatory)))
         mandatory = [item.with_excerpt(item.excerpt[:excerpt_reserve]) for item in mandatory]
     candidates = [(item, True) for item in mandatory]
-    candidates.extend((item, False) for item in evidence if item not in mandatory)
-    candidates.extend((item, False) for item in result.docs)
-    candidates.extend((item, False) for item in result.task_state)
-    candidates.extend((item, False) for item in result.skills)
+    candidate_source_ids = {item.source_id for item in mandatory}
+    for item in (*evidence, *result.docs, *result.task_state, *result.skills):
+        # A mandatory item may be an excerpted copy of the source record, so
+        # dataclass equality cannot be used for deduplication here.
+        if item.source_id in candidate_source_ids:
+            continue
+        candidate_source_ids.add(item.source_id)
+        candidates.append((item, False))
 
     selected: dict[str, list[Any]] = {"publicDocs": [], "developmentEvidence": [], "taskState": [], "activeSkills": []}
     key_for_kind = {
