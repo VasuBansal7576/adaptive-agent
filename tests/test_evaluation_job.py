@@ -61,11 +61,20 @@ class EvaluationJobTests(unittest.TestCase):
                     candidate_hash="candidate-hash",
                     base_hash="base-hash",
                     protocol_hash="protocol-hash",
-                    partition_hashes={
-                        f"customer_support:{phase}": f"customer-support-{phase}-partition",
-                        f"finance:{phase}": f"finance-{phase}-partition",
-                        f"it:{phase}": f"it-{phase}-partition",
-                    },
+                    partition_hashes=(
+                        {
+                            "customer_support:validation": "customer-support-validation-partition",
+                            "finance:validation": "finance-validation-partition",
+                            "it:validation": "it-validation-partition",
+                        }
+                        if phase == "validation"
+                        else {
+                            "customer_support:final": "customer-support-final-partition",
+                            "finance:final": "finance-final-partition",
+                            "it:final": "it-final-partition",
+                            "lab_scheduling:final": "lab-scheduling-final-partition",
+                        }
+                    ),
                     arm_summaries={},
                     confidence_intervals=(),
                     safety_passed=True,

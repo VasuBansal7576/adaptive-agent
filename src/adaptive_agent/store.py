@@ -146,6 +146,8 @@ class Store:
                     evaluator_refs_json TEXT NOT NULL DEFAULT '[]',
                     fixture_hashes_json TEXT NOT NULL DEFAULT '{}',
                     partition_hashes_json TEXT NOT NULL DEFAULT '{}',
+                    protocol_inputs_json TEXT NOT NULL DEFAULT '{}',
+                    phase_evaluator_refs_json TEXT NOT NULL DEFAULT '{}',
                     frozen_at TEXT NOT NULL,
                     active INTEGER DEFAULT 1
                 );
@@ -258,6 +260,8 @@ class Store:
                 ("evaluator_refs_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("fixture_hashes_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("partition_hashes_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("protocol_inputs_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("phase_evaluator_refs_json", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 if name not in frozen_cols:
                     conn.execute(f"ALTER TABLE frozen_protocols ADD COLUMN {name} {declaration}")
@@ -1207,11 +1211,13 @@ class Store:
         evaluator_refs: list[str] | None = None,
         fixture_hashes: dict[str, str] | None = None,
         partition_hashes: dict[str, str] | None = None,
+        protocol_inputs: dict[str, Any] | None = None,
+        phase_evaluator_refs: dict[str, list[str]] | None = None,
     ) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO frozen_protocols (protocol_hash, gate_json, evaluator_id, evaluator_refs_json, fixture_hashes_json, partition_hashes_json, frozen_at, active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-                (protocol_hash, gate_json, evaluator_id, json.dumps(evaluator_refs or []), json.dumps(fixture_hashes or {}), json.dumps(partition_hashes or {}), _utcnow()),
+                "INSERT INTO frozen_protocols (protocol_hash, gate_json, evaluator_id, evaluator_refs_json, fixture_hashes_json, partition_hashes_json, protocol_inputs_json, phase_evaluator_refs_json, frozen_at, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                (protocol_hash, gate_json, evaluator_id, json.dumps(evaluator_refs or []), json.dumps(fixture_hashes or {}), json.dumps(partition_hashes or {}), json.dumps(protocol_inputs or {}, sort_keys=True), json.dumps(phase_evaluator_refs or {}, sort_keys=True), _utcnow()),
             )
             conn.commit()
 

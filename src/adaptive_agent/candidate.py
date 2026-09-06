@@ -266,6 +266,8 @@ class CandidateManager:
         evaluator_refs: list[str] | None = None,
         fixture_hashes: dict[str, str] | None = None,
         partition_hashes: dict[str, str] | None = None,
+        protocol_inputs: dict[str, Any] | None = None,
+        phase_evaluator_refs: dict[str, list[str]] | None = None,
     ) -> str:
         """Register a frozen promotion gate bound to a trusted evaluator identity.
 
@@ -289,6 +291,8 @@ class CandidateManager:
             evaluator_refs=evaluator_refs,
             fixture_hashes=fixture_hashes,
             partition_hashes=partition_hashes,
+            protocol_inputs=protocol_inputs,
+            phase_evaluator_refs=phase_evaluator_refs,
         )
         return gate.protocol_hash
 

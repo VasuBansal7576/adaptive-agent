@@ -753,6 +753,14 @@ class DurableRuntime:
             self.packages[name].manifest.evaluator_ref.id
             for name in protocol.known_environments
         })
+        phase_environments = {
+            "validation": tuple(protocol.known_environments),
+            "final": (*protocol.known_environments, protocol.sealed_environment),
+        }
+        phase_evaluator_refs = {
+            phase: sorted(self.packages[name].manifest.evaluator_ref.id for name in environments)
+            for phase, environments in phase_environments.items()
+        }
         thresholds = dict(protocol.thresholds)
         if self.controller.store.get_frozen_protocol(frozen.protocol_hash) is None:
             self.controller.candidates.freeze_protocol(
@@ -766,6 +774,8 @@ class DurableRuntime:
                 evaluator_refs=evaluator_refs,
                 fixture_hashes=dict(frozen.fixture_hashes),
                 partition_hashes=dict(frozen.partition_hashes),
+                protocol_inputs=dict(frozen.inputs),
+                phase_evaluator_refs=phase_evaluator_refs,
             )
         # CandidateManager consumes the evaluator's serialized report contract.
         # Bind its verifier to the same durable attestation ledger used by the
@@ -792,8 +802,13 @@ class DurableRuntime:
             frozen = self.controller.store.get_frozen_protocol(protocol_hash)
             if frozen is None:
                 return False
+            inputs = json.loads(frozen["protocol_inputs_json"] or "{}")
+            known_value = inputs.get("knownEnvironments")
+            if not isinstance(known_value, list) or not known_value or any(not isinstance(name, str) or not name for name in known_value):
+                return False
+            known = tuple(known_value)
+            validation_key = f"{known[0]}:validation"
             partition_hashes = json.loads(frozen["partition_hashes_json"] or "{}")
-            validation_key = next(key for key in partition_hashes if key.endswith(":validation"))
         except (AttributeError, IndexError, KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
             return False
         row = {
@@ -828,10 +843,15 @@ class DurableRuntime:
                 return False
             phase = str(partition_ref["id"])
             frozen_partitions = json.loads(frozen["partition_hashes_json"] or "{}")
-            expected_partitions = {
-                key: value for key, value in frozen_partitions.items()
-                if isinstance(key, str) and key.endswith(f":{phase}")
-            }
+            inputs = json.loads(frozen["protocol_inputs_json"] or "{}")
+            known_value = inputs.get("knownEnvironments")
+            sealed = inputs.get("sealedEnvironment")
+            if not isinstance(known_value, list) or not known_value or any(not isinstance(name, str) or not name for name in known_value) or not isinstance(sealed, str) or not sealed:
+                return False
+            known = tuple(known_value)
+            environments = known if phase == "validation" else (*known, sealed)
+            expected_keys = tuple(f"{name}:{phase}" for name in environments)
+            expected_partitions = {key: frozen_partitions[key] for key in expected_keys}
             if not expected_partitions:
                 return False
             if report.get("partitionHashes") != expected_partitions:
@@ -839,7 +859,11 @@ class DurableRuntime:
             first_partition = next(iter(expected_partitions))
             if partition_ref.get("sha256") != expected_partitions[first_partition]:
                 return False
-            expected_refs = tuple(sorted(json.loads(frozen["evaluator_refs_json"] or "[]")))
+            phase_refs = json.loads(frozen["phase_evaluator_refs_json"] or "{}")
+            phase_ref_values = phase_refs.get(phase)
+            if not isinstance(phase_ref_values, list) or any(not isinstance(value, str) or not value for value in phase_ref_values):
+                return False
+            expected_refs = tuple(sorted(phase_ref_values))
             refs = report.get("evaluatorRefs")
             if not isinstance(refs, (list, tuple)) or tuple(sorted(str(value) for value in refs)) != expected_refs:
                 return False
@@ -870,7 +894,6 @@ class DurableRuntime:
                 return False
             ledger = self.controller.evaluator_adapters[0]
             registry = TrustedEvaluatorRegistry(ledger)
-            environments = tuple(key.rsplit(":", 1)[0] for key in expected_partitions)
             for name in environments:
                 package = self.packages.get(name)
                 if package is None:
