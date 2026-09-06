@@ -272,7 +272,7 @@ class Controller:
         operator_event = self.append_event(run_id, "tool_result", payload, "broker", "operator")
         if development:
             safe = {key: payload[key] for key in ("callId", "status", "effect", "toolVersion") if key in payload}
-            self.append_event(run_id, "tool_result", safe, "broker", "learner")
+            self.append_event(run_id, "learning_evidence_projection", safe, "broker", "learner")
         return operator_event
 
     def events(self, run_id: str, after_sequence: int = 0) -> list[dict[str, Any]]:
