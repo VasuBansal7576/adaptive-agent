@@ -28,10 +28,21 @@ The bounded Prime runtime adapter also recorded persistent kernel results `42` a
 Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes.
 The console worker reported a live FastAPI session, registration, create/launch, SSE cursor, and cancellation smoke as passing.
 That smoke used a synthetic neutral environment and does not establish a real model-to-tool-to-evaluator product run.
+It remains historical transport evidence only until its Store and data target are proven isolated from root QAdata.
 
 Tests and fixture runs are not interchangeable with those real-run checks.
 The backend and benchmark tests use synthetic providers, drivers, and deterministic fixtures, while console tests use simulation fixtures and captured wire frames.
 The implementation branches have not produced a sealed four-environment evaluation, a measured performance result, or a complete behavioral acceptance result.
+
+QA data-integrity hold: the original real evidence for `run_2fc` is contaminated by appended synthetic `model_response` rows at sequences 20 and 21, named `learning-model-fake-resp-1` and `learning-model-r20`.
+All history must be preserved, but those rows must not be erased, relabeled, or counted as real evidence.
+No transport smoke may target the root QAdata or port 8000 because the real authenticated path invokes the paid model.
+Every test and probe must use an isolated temporary Store and data directory.
+
+The repository contains no literal occurrence of the run or row identifiers, so the source and ownership of those specific append operations are not established here.
+The related evaluator-owned probe path observed on session 2 is `Controller.execute_probe`, authored in the session-2 probe commits `59adfb5` and `f423fac`.
+That path creates `tempfile.TemporaryDirectory(prefix="aa-probe-")` and a `Store` under its temporary directory, but this code-level property does not prove that `run_2fc` was isolated.
+Session 6 must create clean independent evaluation data, regenerate and validate real development evidence and its candidate, and retain exact path-level isolation proof before any sealed panel runs.
 
 The documentation phase and its local `main` integration are complete.
 Implementation, local verification, and M2-M4 coordination are active across the worker branches.

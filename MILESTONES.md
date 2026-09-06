@@ -56,11 +56,34 @@ The following records are the exact evidence available from the inspected worker
 | Session-5 console reports, up to 49/49 tests with TypeScript and build clean | Synthetic UI and captured-wire evidence | Console state, accessibility assertions, transport normalization, and recovery regressions | Browser-width acceptance, live inference, or sealed evaluation |
 | Devin 3000.6.14 session 4 and OpenCode session 5 each ran `pwd` successfully with no file changes | Real build-agent smoke | Those agent sessions could execute a basic command | Any product behavior |
 
+## QA data-integrity hold
+
+The original real evidence for `run_2fc` is on hold because synthetic `model_response` rows were appended at sequences 20 and 21.
+The affected rows are `learning-model-fake-resp-1` and `learning-model-r20`.
+Preserve the complete history, but do not erase, relabel, or count those rows as real evidence.
+
+The repository search found no literal occurrence of `run_2fc`, `learning-model-fake-resp-1`, or `learning-model-r20`.
+The source and ownership of those specific append operations therefore remain unverified and must not be inferred from the related probe code.
+The known related evaluator-owned probe path is session 2's `Controller.execute_probe`, authored in commits `59adfb5` and `f423fac`.
+Its static isolation proof is `tempfile.TemporaryDirectory(prefix="aa-probe-")` followed by `Store(Path(tmp) / "store")` for each probe execution.
+That proof establishes the intended probe boundary only, not the provenance or isolation of `run_2fc`.
+
+Do not run transport smoke against root QAdata or port 8000 during this hold.
+The real authenticated path invokes the paid model.
+All tests and probes must use a newly allocated temporary Store and data directory, with the resolved paths recorded in the verification output.
+Existing test code that uses temporary directories is not, by itself, proof that a shared QA run was untouched.
+
+Session 6 owns the next admissible evaluation step.
+It must create clean independent evaluation data, regenerate and validate real DEVELOPMENT evidence, and regenerate and validate the candidate from that clean source.
+Only after those checks and exact path-level isolation proof pass may any sealed panel be started.
+Until then, no contaminated run, appended synthetic row, historical root-data smoke, or unproven candidate may be used for a sealed result.
+The historical evidence entries above remain preserved as reports, but any entry without exact Store and data-target proof is excluded from clean QA evidence.
+
 The current gate status is deliberately conservative.
 M0 and M1 are complete as documentation and local integration milestones.
 M2 has substantial implementation and narrow real-run evidence, but remains unmet until the actual neutral goal-to-model-to-tool-to-trusted-evaluator path and required boundary checks are retained together.
 M3 has core learning, storage, broker, candidate, and benchmark components, but the complete three-pack lifecycle and all required acceptance scenarios are not verified as one integrated product.
-M4 is unmet because there is no sealed four-environment B0/L/A evaluation, measured cross-domain result, or final resource-budget evidence.
+M4 is unmet because there is no clean sealed four-environment B0/L/A evaluation, measured cross-domain result, or final resource-budget evidence.
 M5 and M6 have not started, and there are no public repository, social-demo, deployment, or submission claims.
 
 One user-accepted subscription limitation is still an UNMET criterion.
