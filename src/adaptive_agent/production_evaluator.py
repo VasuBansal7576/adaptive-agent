@@ -88,8 +88,8 @@ def _require_bound_real_receipt(source_dir: str, run_id: str) -> None:
     if run is None or run.get("status") != "succeeded":
         raise RuntimeError(f"bound source run is not a succeeded durable run: {run_id}")
     evidence = source_store.list_evidence(run_id)
-    model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("trust_class") in {"broker", "system"} and row.get("visibility") in {"operator", "evaluator_only"}]
-    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("trust_class") == "evaluator" and row.get("visibility") in {"operator", "evaluator_only"}]
+    model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("trust_class") in {"broker", "system"} and row.get("visibility") == "operator"]
+    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("trust_class") == "evaluator" and row.get("visibility") == "operator"]
     if not model or not trusted:
         raise RuntimeError(
             f"bound source run lacks canonical model/trusted outcome evidence: {run_id}"

@@ -36,6 +36,11 @@ def test_bound_private_outcome_requires_trusted_canonical_identity():
         outcome = {**identity, "responseId": "response-1", "passed": True, "reliable": True, "safetyViolations": 0}
         response_ref = store.put_artifact(response)
         outcome_ref = store.put_artifact(outcome)
-        store.append_evidence("model", {"run_id": run_id, "sequence": 1, "event_type": "model_response", "trust_class": "broker", "visibility": "evaluator_only", "redacted": 0, "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True)})
-        store.append_evidence("outcome", {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0, "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True)})
+        store.append_evidence("model", {"run_id": run_id, "sequence": 1, "event_type": "model_response", "trust_class": "broker", "visibility": "operator", "redacted": 0, "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True)})
+        store.append_evidence("outcome", {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "trust_class": "evaluator", "visibility": "operator", "redacted": 0, "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True)})
         _require_bound_real_receipt(directory, run_id)
+        with store.connect() as conn:
+            conn.execute("UPDATE evidence SET visibility = 'evaluator_only' WHERE evidence_id = 'outcome'")
+            conn.commit()
+        with pytest.raises(RuntimeError, match="canonical model/trusted outcome"):
+            _require_bound_real_receipt(directory, run_id)
