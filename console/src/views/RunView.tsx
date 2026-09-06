@@ -383,7 +383,7 @@ function NewRunDialog({
   const [tasks, setTasks] = useState<TaskOption[]>([]);
   const [modelProfile, setModelProfile] = useState(MODEL_PROFILES[0].label);
   const [modelProfiles, setModelProfiles] = useState<Array<{ ref: { id: string; version: string; sha256: string }; label: string }>>(MODEL_PROFILES);
-  const [advertisedBudgetRef, setAdvertisedBudgetRef] = useState<RunOptions["budgetDefaults"]["budgetRef"]>(undefined);
+  const [advertisedBudgetRef, setAdvertisedBudgetRef] = useState<RunOptions["budgetRef"]>(undefined);
   const [executionMode, setExecutionMode] = useState<CreateRunInput["executionMode"]>("interactive");
   const [toolCallCeiling, setToolCallCeiling] = useState(String(BUDGET_FALLBACK.toolCalls));
   const [wallSecondsCeiling, setWallSecondsCeiling] = useState(String(BUDGET_FALLBACK.wallTimeSeconds));
@@ -428,7 +428,7 @@ function NewRunDialog({
           setWallSecondsCeiling(String(options.budgetDefaults.wallTimeSeconds));
           setModelTokenCeiling(String(options.budgetDefaults.modelTokens));
         }
-        setAdvertisedBudgetRef(options.budgetDefaults.budgetRef);
+        setAdvertisedBudgetRef(options.budgetRef);
       })
       .catch(() => {
         /* fallback constants remain; never block the dialog on this */

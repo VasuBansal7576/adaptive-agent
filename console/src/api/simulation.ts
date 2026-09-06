@@ -293,8 +293,8 @@ export function createSimulationTransport(options?: {
           wallTimeSeconds: 90,
           costMicrounits: 100000,
           currency: "USD",
-          budgetRef: { id: "budget-default", version: "1", sha256: await sha256Hex(JSON.stringify("budget-default")) },
         },
+        budgetRef: { id: "budget-default", version: "1", sha256: await sha256Hex(JSON.stringify("budget-default")) },
       };
     },
 
