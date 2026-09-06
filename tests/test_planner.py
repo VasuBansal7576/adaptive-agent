@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 import stat
 import time
 from threading import Event
@@ -133,6 +134,54 @@ def test_prime_cli_client_parses_json_lines_and_normalizes_bare_model(tmp_path, 
     assert result["model"] == "openai-codex/gpt-5.6-luna"
     assert result["responseId"] == "resp-cli"
     assert result["usage"]["totalTokens"] == 10
+
+
+def test_prime_cli_serialization_keeps_full_environment_once_with_unicode(tmp_path):
+    captured = tmp_path / "request.bin"
+    executable = tmp_path / "prime-agent-capture"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        f"pathlib.Path({str(captured)!r}).write_bytes(sys.argv[-1].encode('utf-8'))\n"
+        "print(json.dumps({'type':'message_end','message':{'role':'assistant','provider':'openai-codex','model':'gpt-5.6-luna','responseId':'captured','content':[{'type':'text','text':'{\\\"action\\\":\\\"finish\\\",\\\"answer\\\":\\\"ok\\\"}'}],'usage':{'totalTokens':3}}}))\n"
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    environment = {
+        "taskContext": {"instruction": "完成任务 🌍", "marker": "ENVIRONMENT-唯一-雪"},
+        "docs": [{"content": "DOCS-RAW-唯一"}],
+        "publicDocs": [{"content": "DOCS-唯一"}],
+        "capabilities": ["CAPABILITY-唯一"],
+        "toolSchemas": [{"name": "TOOL-唯一"}],
+        "schema": {"name": "SCHEMA-唯一"},
+        "budgetRef": {"id": "BUDGET-唯一"},
+        "activeSkills": [{"id": "SKILL-唯一", "procedure": "Use the tool."}],
+    }
+    messages = [{"role": "system", "content": LunaPlanner(None, None, None)._system_prompt(environment, environment["activeSkills"])}]
+    messages.append({"role": "user", "content": "USER-唯一"})
+    goal = "GOAL-唯一"
+    PrimeCliModelClient(executable=str(executable), coding_agent_dir=tmp_path).invoke(
+        goal=goal, environment=environment, messages=messages, remaining_deadline=5
+    )
+    raw = captured.read_bytes()
+    expected = json.dumps({"goal": goal, "environment": environment, "messages": messages}, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    assert raw == expected
+    decoded = json.loads(raw)
+    assert decoded["environment"] == environment
+    assert decoded["messages"] == messages
+    for marker in ("ENVIRONMENT-唯一-雪", "DOCS-RAW-唯一", "DOCS-唯一", "CAPABILITY-唯一", "TOOL-唯一", "SCHEMA-唯一", "BUDGET-唯一", "SKILL-唯一"):
+        assert raw.count(marker.encode("utf-8")) == 1
+
+
+def test_system_prompt_uses_first_class_environment_and_preserves_distinct_skills():
+    environment = {"activeSkills": [{"id": "environment-skill"}], "taskContext": {"marker": "environment-only"}}
+    explicit = ({"id": "caller-skill", "procedure": "caller-only"},)
+    prompt = LunaPlanner(None, None, None)._system_prompt(environment, explicit)
+    assert "environment-only" not in prompt
+    assert "caller-skill" in prompt
+    assert "environment-skill" not in prompt
+
+    standalone = LunaPlanner(None, None, None)._system_prompt({}, explicit)
+    assert "caller-skill" in standalone
 
 
 def test_prime_cli_client_discards_unbounded_intermediate_jsonl_events(tmp_path):
