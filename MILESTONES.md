@@ -29,10 +29,10 @@ Dirty worktrees contain additional uncommitted implementation changes, which are
 
 | AO session | Observed ref and state | Implemented component status |
 | --- | --- | --- |
-| adaptive-agent-2 | `4832487`, dirty | Final2 backend integration overlay for the control API, durable runtime, evaluation launch, evaluator observation, and API regressions remains uncommitted |
+| adaptive-agent-2 | `f3785f0`, dirty | Current probe and full backend integration lineage for the control API, durable runtime, evaluation launch, evaluator observation, and API regressions; overlay remains uncommitted |
 | adaptive-agent-3 | `6aabe2e`, clean apart from generated cache files | Prime runtime boundary and the two-case EVAL-005 runtime probe |
 | adaptive-agent-4 | `83d2e01`, clean | Durable Controller, Store, Broker, evidence, and isolated EVAL-004/005 probes |
-| adaptive-agent-5 | `ae482da`, clean | React/Tailwind/Vite operator console, live REST/SSE transport, evaluation status, evidence provenance, recovery, and honest uncertainty states |
+| adaptive-agent-5 | `ae482da` after `29afe35`, clean | React/Tailwind/Vite operator console, live REST/SSE transport, evaluation status, evidence provenance, recovery, and honest uncertainty states |
 | adaptive-agent-6 | `c69a366`, dirty | Resumable benchmark and evaluator-boundary work; current dirty changes are not part of the local-main assembly plan |
 | adaptive-agent-7 | `09aa9b9`, clean | Evidence-linked bounded learning, retrieval, durable learning runtime, and integrated runtime budget-boundary regression |
 
@@ -47,12 +47,12 @@ The following records are the fresh root-verified evidence for this checkpoint, 
 
 | Evidence | Classification | What it establishes | What it does not establish |
 | --- | --- | --- | --- |
-| Session-2 final2 backend integration: committed ref `4832487` plus the dirty overlay in `api.py`, `app.py`, `evaluation_job.py`, `evaluation_store.py`, and `tests/test_api.py`; 171 backend tests passed | Current integration evidence | The current control-plane and evaluator-launch integration is test-covered at the reported checkpoint | A committed merge, real provider product run, heldout evaluation, or final performance result |
-| Actual Docker-backed EVAL-003 from the final2 runtime: seven safety cases passed on isolated temporary Store and data paths | Current boundary evidence | The seven safety cases crossed the actual Docker runtime boundary while using an isolated fixture and no paid model call | General model safety, product acceptance, or sealed evaluator performance |
+| Session-2 current probe and integration lineage at `f3785f0` with a reviewed dirty overlay; 171 backend tests passed | Current integration evidence | The current control-plane and evaluator-launch integration is test-covered at the reported checkpoint | A committed merge, real provider product run, heldout evaluation, or final performance result |
+| Actual Docker-backed EVAL-003 from the current session-2 lineage: 7 obligations passed on isolated temporary Store and data paths | Current boundary evidence | The seven obligations crossed the actual Docker runtime boundary while using an isolated fixture and no paid model call | General model safety, product acceptance, or sealed evaluator performance |
 | EVAL-003 safety hardening at `3261afc` atop `f423fac`; focused safety, core, and lifecycle tests 39 passed | Current safety evidence | Attacker-controlled public-document output, forged approval attempts, no-provider-write behavior, Docker-provenance requirements, fail-closed controller execution, and self-contained payload/content-hash receipts | A full pass without an injected Docker-backed Prime adapter, heldout evaluation, or paid-provider result |
 | Actual Docker-backed EVAL-005 at session-3 ref `6aabe2e`: `child_failure_recovery_and_cap` and `shared_model_cost_token_cap` passed | Current runtime-boundary evidence | Two parent-child, failure, and shared-cost runtime cases crossed the Docker boundary with bounded deterministic probe inputs | Paid-provider behavior, complete EVAL-005 acceptance, or final resource-budget evidence |
-| Four isolated Controller probe executions at session-4 ref `83d2e01` covering EVAL-004 and EVAL-005 passed on fresh temporary Stores and data directories | Current control-boundary evidence | Controller, Broker, candidate, evidence, replay, failure, and reconnect obligations exercised with isolated persistence | A sealed evaluation, cross-environment performance, or proof that historical root QAdata was isolated |
-| Session-5 console ref `ae482da`: 61/61 tests, TypeScript clean, and build clean; latest report had no live smoke | Current console evidence | Console parsing, evaluation status, learning eligibility, responsive master-detail behavior, and honest uncertainty states | Browser-width acceptance, live inference, or sealed evaluation |
+| Isolated Controller probes in the session-2 current lineage: 7 EVAL-004 obligations and 8 EVAL-005 obligations passed on fresh temporary Stores and data directories | Current control-boundary evidence | Controller, Broker, candidate, evidence, replay, failure, and reconnect obligations exercised with isolated persistence | A sealed evaluation, cross-environment performance, or proof that historical root QAdata was isolated |
+| Session-5 console lineage `29afe35` through clean tip `ae482da`: 61/61 tests, TypeScript clean, and build clean; latest report had no live smoke | Current console evidence | Console parsing, evaluation status, learning eligibility, responsive master-detail behavior, and honest uncertainty states | Browser-width acceptance, live inference, or sealed evaluation |
 | Isolated development smoke at `/tmp/adaptive-run-2fc3c680.fiZAAA`: durable run `run_7f5b3196fff541129d4e9c8345d0ba75`, `finance-development-00`, seed 17, sequence 16; scoped verifier `0561041`; full pytest 147 passed with two dependency warnings | Current isolated development-smoke evidence | Trusted `evaluator_only` outcome with operator-visible `model_response`, resume completion, one candidate, one transfer run, pinned Docker execution, aggregate usage, and confirmed broker invoice/payment reads plus `apply_payment` | Heldout or final evaluation, performance, public reproducibility, or closure of M2-M4 |
 | Prime 0.9.2 session 3, ChatGPT subscription, `openai-codex/gpt-5.6-luna`, actual Python `2+2` result `4` | Real runtime smoke | Subscription authentication and a narrow Python execution path | Product bridge, evaluator, safety, or performance acceptance |
 | `prime-agent --print --no-tools --provider openai-codex --model openai-codex/gpt-5.6-luna` returned `MODEL_SPIKE_OK` in 10.24s | Real provider smoke | Model reachability through the authenticated path | A goal/tool/evaluator run or provider hard output cap |
@@ -77,11 +77,11 @@ The focused safety, core, and lifecycle verification was 39 passed, with no serv
 
 ## Local-main assembly plan
 
-The local-main assembly is intentionally limited to the final2 backend overlay and the session-5 console.
+The local-main assembly is intentionally limited to the complete session-2 integration at `f3785f0` plus its reviewed overlay, followed by the session-5 console lineage `29afe35` through `ae482da`.
 It has not been performed by this documentation worker.
 
-1. Materialize and review the session-2 final2 overlay on top of committed ref `4832487`, including only its current tracked backend and API-test changes.
-2. Add the session-5 console ref `ae482da` after the backend wire contract is present.
+1. Materialize and review the complete session-2 integration at `f3785f0` plus its current tracked overlay before assembly.
+2. Add the session-5 console lineage from `29afe35` through `ae482da` after the backend wire contract is present.
 3. Run the backend and console checks with newly allocated temporary Store and data paths, preserving the reported 171 backend tests and 61/61 console result as prior evidence rather than replaying paid or shared-data smoke.
 4. Reassess M2-M4 from retained receipts and exact paths before considering any further assembly.
 
