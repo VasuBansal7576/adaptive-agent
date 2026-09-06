@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ConsoleTransport, CreateRunInput } from "../api/transport";
 import { newIdempotencyKey } from "../api/transport";
 import { describeToolError } from "../api/errors";
+import { sourceLabelFor } from "../api/sourceLabels";
 import type { ApprovalRequest, EnvironmentPackageSummary, RunEvent, RunOptions, RunRecord, TaskOption } from "../api/types";
 import type { ConnectionState } from "../state/consoleStore";
 import { StatusBadge } from "../components/StatusBadge";
@@ -625,9 +626,8 @@ function NewRunDialog({
             {/* free-form goals are not accepted by the durable runtime yet */}
             {fieldErrors.taskId && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.taskId}</p>}
             <p id="newrun-task-hint" className="mt-1 text-[11px] text-slate-500">
-              Select a registered task — this environment accepts registered task goals only. Tasks are drawn from
-              the built-in simulated business fixture catalog; results are not from external datasets, and model
-              execution does not change data provenance.
+              Select a registered task — this environment accepts registered task goals only.{" "}
+              {sourceLabelFor(environmentId).provenance}
             </p>
           </div>
         )}
@@ -786,8 +786,7 @@ function WorkflowStrip({
       caption: (
         <>
           Run {RUN_STATUS_PHRASE[selected.status] ?? `in progress (${selected.status})`}
-          {selected.outcomeRef ? " with a recorded outcome." : "."} Tasks come from the built-in simulated
-          business fixture catalog; model execution does not change data provenance.
+          {selected.outcomeRef ? " with a recorded outcome." : "."} {sourceLabelFor(selected.environmentId).provenance}
         </>
       ),
     },

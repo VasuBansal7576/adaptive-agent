@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { createSimulationTransport } from "../api/simulation";
 import type { ConsoleTransport } from "../api/transport";
+import type { RunRecord } from "../api/types";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 
 beforeEach(() => {
@@ -298,20 +299,68 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect(calls).toBeGreaterThanOrEqual(2); // the refresh happened without a reload
   });
 
+  it("distinguishes sources by EXACT registered id: built-in fixture vs AppWorld vs unspecified", async () => {
+    const { sourceLabelFor } = await import("../api/sourceLabels");
+    // exact known built-ins keep fixture wording
+    expect(sourceLabelFor("finance").tag).toBe("simulated business fixture");
+    expect(sourceLabelFor("customer_support").tag).toBe("simulated business fixture");
+    expect(sourceLabelFor("it").tag).toBe("simulated business fixture");
+    expect(sourceLabelFor("lab_scheduling").tag).toBe("simulated business fixture");
+    // the explicit -sim dev-fixture ids used by the console simulation
+    expect(sourceLabelFor("finance-sim").tag).toBe("simulated business fixture");
+    // AppWorld exact id only, plain published-benchmark wording
+    const appworld = sourceLabelFor("appworld");
+    expect(appworld.tag).toBe("AppWorld");
+    expect(appworld.provenance).toBe("Tasks use AppWorld, a published benchmark with simulated app data.");
+    // arbitrary user packages are NOT mislabeled
+    expect(sourceLabelFor("finance-external").tag).toBe("source not specified");
+    expect(sourceLabelFor("appworld-custom").tag).toBe("source not specified");
+    // unknown registered ids: source not specified, never built-in fixture
+    const unknown = sourceLabelFor("mystery_env");
+    expect(unknown.tag).toBe("source not specified");
+    expect(unknown.provenance).toBe("Data source not specified.");
+    // case is NOT folded: user-defined casing stays unregistered
+    expect(sourceLabelFor("Finance").tag).toBe("source not specified");
+    expect(sourceLabelFor("APPWORLD").tag).toBe("source not specified");
+
+  });
+
+  it("renders the AppWorld source label in registry and workflow without claiming results", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const envs = await sim.listEnvironments();
+    envs.push({ environmentId: "appworld", version: "1.0", validationState: "valid", evaluatorReady: true, toolCount: 3, policyScope: "appworld/*", executionModes: ["interactive"] });
+    const appworldRun: RunRecord = { ...(await sim.listRuns())[3], runId: "run_aw_1", environmentId: "appworld", environmentRef: { id: "appworld", version: "1", sha256: "aw" }, learningEligible: true };
+    const transport: ConsoleTransport = {
+      ...sim,
+      listEnvironments: async () => envs,
+      listRuns: async () => [appworldRun],
+    };
+    render(<App transport={transport} />);
+    // registry card tags AppWorld distinctly
+    await user.click(await screen.findByRole("tab", { name: "Environment registry" }));
+    expect(await screen.findByText("AppWorld")).toBeInTheDocument();
+    // selected-run workflow carries the AppWorld provenance, no result claims
+    await user.click(await screen.findByRole("tab", { name: "Runs" }));
+    await user.click((await screen.findAllByRole("button", { name: /run_aw_1/ }))[0]);
+    expect(await screen.findByText(/Tasks use AppWorld, a published benchmark with simulated app data/)).toBeInTheDocument();
+  });
+
   it("labels the built-in task catalog truthfully as simulated business fixtures", async () => {
     const user = userEvent.setup();
     const transport: ConsoleTransport = { ...createSimulationTransport({ disconnectAfterEvents: 0 }) };
     render(<App transport={transport} />);
     await screen.findAllByRole("button", { name: /run-sim-1001/ });
     // workflow strip states the provenance boundary explicitly
-    expect(screen.getByText(/Tasks come from the built-in simulated business fixture catalog; model execution does not change data provenance/)).toBeInTheDocument();
+    expect(screen.getByText(/Tasks use the built-in simulated business fixture catalog/)).toBeInTheDocument();
     // new-run dialog carries the same boundary near task selection
     await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
     const dialog = await screen.findByRole("dialog", { name: "Create run" });
     expect(
-      await within(dialog).findByText(/built-in simulated business fixture catalog; results are not from external datasets/),
+      await within(dialog).findByText(/Tasks use the built-in simulated business fixture catalog/),
     ).toBeInTheDocument();
-    // no claim of external/published benchmark sourcing anywhere in the app text
+    // no external/published benchmark sourcing claimed in this built-in flow
+    expect((document.body.textContent || "").toLowerCase()).not.toContain("published benchmark");
     expect((document.body.textContent || "").toLowerCase()).not.toContain("appworld");
   });
 
