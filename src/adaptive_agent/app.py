@@ -447,10 +447,10 @@ class DurableRuntime:
         if task.get("environment_id") != environment_id or task.get("partition") != "development":
             raise ValueError("learning runtime requires a development task")
         public_docs = store.get_public_docs(environment_id)
-        # Keep this API on the narrow Store projection.  The broader learning
-        # feed also contains broker-call joins for the internal learner and
-        # must not become an HTTP path for operator or evaluator evidence.
-        development_evidence = store.list_learner_evidence(environment_id=environment_id, run_id=run_id)
+        # Keep this API on the unified, sanitized Store projection.  It owns
+        # the learner visibility and development-partition filters, including
+        # exclusion of operator and evaluator-only evidence.
+        development_evidence = store.list_learning_evidence(environment_id=environment_id, run_id=run_id)
         return {
             "environmentId": environment_id,
             "runId": run_id,
