@@ -118,6 +118,54 @@ def test_missing_authoritative_method_fails_closed(tmp_path: Path):
         public_tool_schemas(AppWorldConfig(root, python=sys.executable))
 
 
+def test_public_docs_merge_required_parameters_and_response_schema(tmp_path: Path):
+    root = _public_root(tmp_path)
+    (root / "data" / "api_docs" / "function_calling" / "phone.json").write_text(json.dumps([
+        {"type": "function", "function": {"name": "phone__set_alarm", "description": "Schedule an alarm.", "parameters": {"type": "object", "properties": {"hour": {"type": "integer"}}}}},
+    ]))
+    (root / "data" / "api_docs" / "standard" / "phone.json").write_text(json.dumps([
+        {"api_name": "set_alarm", "method": "POST", "description": "Schedule an alarm.", "parameters": [{"name": "hour", "type": "integer", "required": True}], "response_schemas": {"200": {"alarmId": "alarm-1"}}},
+    ]))
+    schemas = public_tool_schemas(AppWorldConfig(root, python=sys.executable))
+    alarm = next(schema for schema in schemas if schema.name == "phone__set_alarm")
+    assert alarm.input_schema["required"] == ["hour"]
+    assert alarm.output_schema["examples"] == [{"alarmId": "alarm-1"}]
+    assert "response" not in alarm.output_schema.get("properties", {})
+    assert alarm.effect == "write"
+
+
+def test_search_ranks_multiword_descriptions_and_discovers_supervisor_with_pagination(tmp_path: Path):
+    root = _public_root(tmp_path)
+    (root / "data" / "api_docs" / "function_calling" / "supervisor.json").write_text(json.dumps([
+        {"type": "function", "function": {"name": "supervisor__get_profile", "description": "Retrieve the account profile for the current user.", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "supervisor__login", "description": "Log in to an account.", "parameters": {"type": "object", "properties": {}}}},
+    ]))
+    (root / "data" / "api_docs" / "function_calling" / "phone.json").write_text(json.dumps([
+        {"type": "function", "function": {"name": "phone__set_alarm", "description": "Schedule an alarm.", "parameters": {"type": "object", "properties": {"hour": {"type": "integer"}}}}},
+    ]))
+    (root / "data" / "api_docs" / "standard" / "supervisor.json").write_text(json.dumps([
+        {"api_name": "get_profile", "method": "GET", "parameters": []},
+        {"api_name": "login", "method": "POST", "parameters": []},
+    ]))
+    (root / "data" / "api_docs" / "standard" / "phone.json").write_text(json.dumps([
+        {"api_name": "set_alarm", "method": "POST", "parameters": [{"name": "hour", "type": "integer", "required": True}]},
+    ]))
+    worker = tmp_path / "worker.py"
+    worker.write_text("import json,sys\nfor line in sys.stdin:\n f=json.loads(line); op=f['operation']; r={'taskId':'train-1'} if op=='reset' else ({'closed':True} if op=='close' else {})\n print(json.dumps({'id':f['id'],'ok':True,'result':r}),flush=True)\n if op=='close': break\n")
+    config = AppWorldConfig(root, python=sys.executable)
+    task = AppWorldCatalog(config).task("train-1", "train")
+    with AppWorldProvider(config, task, "run-1", worker_command=[sys.executable, "-u", str(worker)]) as provider:
+        with pytest.raises(AppWorldError, match="invalid arguments"):
+            provider.execute("run-1", "appworld__call_write", {"apiName": "phone__set_alarm", "arguments": {}})
+        match = provider.execute("run-1", "appworld__search_api_docs", {"query": "account profile"}).output
+        assert match["results"][0]["apiName"] == "supervisor__get_profile"
+        assert match["results"][0]["description"].startswith("Retrieve the account profile")
+        page = provider.execute("run-1", "appworld__search_api_docs", {"limit": 1}).output
+        assert page["total"] == 3
+        assert page["truncated"] is True
+        assert page["nextOffset"] == 1
+
+
 def test_register_appworld_defaults_to_train_and_dev(tmp_path: Path):
     root = _public_root(tmp_path)
     store = Store(tmp_path / "store")

@@ -14,6 +14,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import select
 import subprocess
 import sys
@@ -383,33 +384,119 @@ class AppWorldCatalog:
         )
 
 
-def _schema_from_function_doc(doc: Mapping[str, Any], version: str) -> ToolSchema:
+def _standard_entries(path: Path) -> dict[str, Mapping[str, Any]]:
+    """Load standard docs in either the published list or fixture map form."""
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AppWorldUnavailable(f"invalid AppWorld standard API docs: {path}") from exc
+    entries: dict[str, Mapping[str, Any]] = {}
+    if isinstance(raw, Mapping):
+        for key, value in raw.items():
+            if isinstance(value, Mapping):
+                entries[str(key)] = value
+    elif isinstance(raw, list):
+        for value in raw:
+            if not isinstance(value, Mapping):
+                continue
+            key = value.get("api_name", value.get("apiName"))
+            if isinstance(key, str) and key:
+                entries[key] = value
+    return entries
+
+
+def _schema_like(value: Any) -> bool:
+    return isinstance(value, Mapping) and (isinstance(value.get("type"), str) or "properties" in value or "items" in value)
+
+
+def _response_schema(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a JSON schema while retaining published response examples."""
+    raw = entry.get("response_schemas", entry.get("responseSchemas"))
+    if not isinstance(raw, Mapping):
+        return {"type": "object", "additionalProperties": True}
+    if _schema_like(raw):
+        return dict(raw)
+    for key in ("success", "200", "2xx"):
+        candidate = raw.get(key)
+        if _schema_like(candidate):
+            return dict(candidate)
+    # AppWorld's standard format historically called concrete response examples
+    # "response_schemas". Keep those public examples available to callers while
+    # exposing a conservative object schema for validation.
+    return {
+        "type": "object",
+        "additionalProperties": True,
+        "examples": list(raw.values()),
+    }
+
+
+def _schema_from_function_doc(doc: Mapping[str, Any], version: str, standard: Mapping[str, Any] | None = None) -> ToolSchema:
     function = doc.get("function") if isinstance(doc.get("function"), Mapping) else {}
     name = str(function.get("name", ""))
     parameters = function.get("parameters")
     if not isinstance(parameters, dict):
         parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+    else:
+        parameters = json.loads(json.dumps(parameters))
+    properties = parameters.setdefault("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
+        parameters["properties"] = properties
+    required = list(parameters.get("required", [])) if isinstance(parameters.get("required", []), list) else []
+    if standard is not None:
+        standard_parameters = standard.get("parameters", [])
+        if isinstance(standard_parameters, list):
+            for parameter in standard_parameters:
+                if not isinstance(parameter, Mapping) or not isinstance(parameter.get("name"), str):
+                    continue
+                parameter_name = parameter["name"]
+                property_schema = properties.get(parameter_name)
+                if not isinstance(property_schema, dict):
+                    property_schema = {}
+                    properties[parameter_name] = property_schema
+                for key in ("type", "format", "enum", "items", "minimum", "maximum", "pattern"):
+                    if key not in property_schema and key in parameter:
+                        property_schema[key] = parameter[key]
+                for key in ("description", "default"):
+                    if key not in property_schema and key in parameter and parameter[key] is not None:
+                        property_schema[key] = parameter[key]
+                constraints = parameter.get("constraints")
+                if isinstance(constraints, list) and constraints and "constraints" not in property_schema:
+                    property_schema["constraints"] = constraints
+                if parameter.get("required") is True and parameter_name not in required:
+                    required.append(parameter_name)
+        parameters["required"] = required
+        parameters.setdefault("additionalProperties", False)
     _, _, api = name.partition("__")
     method: str | None = None
-    standard_path = Path(str(doc.get("_standard_path", "")))
-    if standard_path.is_file():
-        try:
-            standard = json.loads(standard_path.read_text())
-            entry = standard.get(api, {}) if isinstance(standard, dict) else {}
-            if isinstance(entry, Mapping) and isinstance(entry.get("method"), str):
+    if isinstance(standard, Mapping) and isinstance(standard.get("method"), str):
+        method = standard["method"].upper()
+    else:
+        standard_path = Path(str(doc.get("_standard_path", "")))
+        if standard_path.is_file():
+            entries = _standard_entries(standard_path)
+            entry = entries.get(api, {})
+            if isinstance(entry.get("method"), str):
                 method = entry["method"].upper()
-        except (OSError, json.JSONDecodeError):
-            method = None
     if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}:
         raise AppWorldUnavailable(f"missing authoritative HTTP method for AppWorld API: {name or '<unnamed>'}")
     effect = "read" if method in {"GET", "HEAD"} else "write"
-    return ToolSchema(name=name, version=version, inputSchema=parameters, outputSchema={"type": "object"}, effect=effect)
+    return ToolSchema(name=name, version=version, inputSchema=parameters, outputSchema=_response_schema(standard or {}), effect=effect)
 
 
-def public_tool_schemas(config: AppWorldConfig) -> tuple[ToolSchema, ...]:
+@dataclass(frozen=True)
+class _ApiDocRecord:
+    schema: ToolSchema
+    description: str
+    app: str
+    method: str
+
+
+def _api_doc_records(config: AppWorldConfig) -> tuple[_ApiDocRecord, ...]:
     docs_root = config.data_root / "api_docs" / "function_calling"
     standard_root = config.data_root / "api_docs" / "standard"
-    schemas: list[ToolSchema] = []
+    records: list[_ApiDocRecord] = []
+    seen: set[str] = set()
     for path in sorted(docs_root.glob("*.json")):
         try:
             entries = json.loads(path.read_text())
@@ -417,19 +504,30 @@ def public_tool_schemas(config: AppWorldConfig) -> tuple[ToolSchema, ...]:
             raise AppWorldUnavailable(f"invalid AppWorld API docs: {path}") from exc
         if not isinstance(entries, list):
             continue
+        standard_entries = _standard_entries(standard_root / path.name)
         for entry in entries:
-            if not isinstance(entry, dict):
+            if not isinstance(entry, Mapping):
                 continue
-            enriched = dict(entry)
-            name = entry.get("function", {}).get("name", "") if isinstance(entry.get("function"), dict) else ""
+            function = entry.get("function") if isinstance(entry.get("function"), Mapping) else {}
+            name = function.get("name", "")
             api = str(name).split("__", 1)[-1]
+            standard = standard_entries.get(api)
+            enriched = dict(entry)
             enriched["_standard_path"] = str(standard_root / path.name)
-            schema = _schema_from_function_doc(enriched, config.package_version)
-            if schema.name and schema.name not in {item.name for item in schemas}:
-                schemas.append(schema)
-    if not schemas:
+            schema = _schema_from_function_doc(enriched, config.package_version, standard)
+            if not schema.name or schema.name in seen:
+                continue
+            seen.add(schema.name)
+            description = str(function.get("description", "") or (standard or {}).get("description", "") or "").strip()
+            method = str((standard or {}).get("method", "")).upper()
+            records.append(_ApiDocRecord(schema, description, schema.name.split("__", 1)[0], method))
+    if not records:
         raise AppWorldUnavailable("AppWorld API documentation contains no callable schemas")
-    return tuple(schemas)
+    return tuple(records)
+
+
+def public_tool_schemas(config: AppWorldConfig) -> tuple[ToolSchema, ...]:
+    return tuple(record.schema for record in _api_doc_records(config))
 
 
 def broker_tool_schemas(version: str) -> tuple[ToolSchema, ...]:
@@ -437,7 +535,7 @@ def broker_tool_schemas(version: str) -> tuple[ToolSchema, ...]:
     api_name = {"type": "string", "minLength": 1}
     arguments = {"type": "object", "additionalProperties": True}
     return (
-        ToolSchema(name=_BROKER_DOC_SEARCH, version=version, inputSchema={"type": "object", "properties": {"query": {"type": "string"}}, "additionalProperties": False}, outputSchema={"type": "object"}, effect="read"),
+        ToolSchema(name=_BROKER_DOC_SEARCH, version=version, inputSchema={"type": "object", "properties": {"query": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, "additionalProperties": False}, outputSchema={"type": "object"}, effect="read"),
         ToolSchema(name=_BROKER_DOC_GET, version=version, inputSchema={"type": "object", "required": ["apiName"], "properties": {"apiName": api_name}, "additionalProperties": False}, outputSchema={"type": "object"}, effect="read"),
         ToolSchema(name=_BROKER_READ, version=version, inputSchema={"type": "object", "required": ["apiName", "arguments"], "properties": {"apiName": api_name, "arguments": arguments}, "additionalProperties": False}, outputSchema={"type": "object"}, effect="read"),
         ToolSchema(name=_BROKER_WRITE, version=version, inputSchema={"type": "object", "required": ["apiName", "arguments"], "properties": {"apiName": api_name, "arguments": arguments}, "additionalProperties": False}, outputSchema={"type": "object"}, effect="write"),
@@ -518,7 +616,8 @@ class AppWorldProvider(ToolProvider):
         self.task = task
         self.run_id = run_id
         self.seed = seed
-        self._api_schemas = {schema.name: schema for schema in public_tool_schemas(config)}
+        self._api_records = {record.schema.name: record for record in _api_doc_records(config)}
+        self._api_schemas = {name: record.schema for name, record in self._api_records.items()}
         self._schemas = {schema.name: schema for schema in broker_tool_schemas(config.package_version)}
         worker_script = Path(__file__).with_name("appworld_worker.py")
         launcher = "import runpy,sys; script=sys.argv[1]; root=sys.argv[2]; sys.argv=[script, '--root', root]; runpy.run_path(script, run_name='__main__')"
@@ -563,15 +662,54 @@ class AppWorldProvider(ToolProvider):
         if schema is None:
             raise AppWorldError(f"unknown AppWorld API: {tool}")
         if tool == _BROKER_DOC_SEARCH:
-            query = str(arguments.get("query", "")).lower()
-            hits = [{"apiName": name, "description": "AppWorld API"} for name in sorted(self._api_schemas) if not query or query in name.lower()]
-            return ProviderExecutionOutcome(output={"results": hits[:20]}, effect="none")
+            query = str(arguments.get("query", ""))
+            offset = arguments.get("offset", 0)
+            limit = arguments.get("limit", 20)
+            if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+                raise AppWorldError("search offset must be a non-negative integer")
+            if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+                raise AppWorldError("search limit must be an integer between 1 and 100")
+            query_tokens = re.findall(r"[a-z0-9]+", query.casefold())
+            ranked: list[tuple[int, str, _ApiDocRecord]] = []
+            for name, record in self._api_records.items():
+                name_tokens = re.findall(r"[a-z0-9]+", name.casefold())
+                description_tokens = re.findall(r"[a-z0-9]+", record.description.casefold())
+                if not query_tokens:
+                    score = 0
+                else:
+                    name_set = set(name_tokens)
+                    description_set = set(description_tokens)
+                    matched = [token for token in query_tokens if token in name_set or token in description_set]
+                    if not matched:
+                        continue
+                    score = sum(5 if token in name_set else 3 for token in matched)
+                    if len(matched) == len(query_tokens):
+                        score += 10
+                    phrase = " ".join(query_tokens)
+                    if phrase in " ".join(name_tokens + description_tokens):
+                        score += 2
+                ranked.append((score, name, record))
+            ranked.sort(key=lambda item: (-item[0], item[1]))
+            total = len(ranked)
+            page = ranked[offset : offset + limit]
+            hits = [
+                {
+                    "apiName": name,
+                    "app": record.app,
+                    "description": record.description,
+                    "method": record.method,
+                    "effect": record.schema.effect,
+                }
+                for _, name, record in page
+            ]
+            next_offset = offset + limit if offset + limit < total else None
+            return ProviderExecutionOutcome(output={"results": hits, "total": total, "offset": offset, "limit": limit, "truncated": next_offset is not None, "nextOffset": next_offset}, effect="none")
         if tool == _BROKER_DOC_GET:
             api_name = arguments.get("apiName")
-            api_schema = self._api_schemas.get(api_name) if isinstance(api_name, str) else None
-            if api_schema is None:
+            record = self._api_records.get(api_name) if isinstance(api_name, str) else None
+            if record is None:
                 raise AppWorldError("unknown AppWorld API documentation name")
-            return ProviderExecutionOutcome(output={"apiName": api_name, "schema": api_schema.model_dump(mode="json", by_alias=True)}, effect="none")
+            return ProviderExecutionOutcome(output={"apiName": api_name, "app": record.app, "description": record.description, "method": record.method, "schema": record.schema.model_dump(mode="json", by_alias=True)}, effect="none")
         api_name = arguments.get("apiName")
         api_arguments = arguments.get("arguments")
         if not isinstance(api_name, str) or not isinstance(api_arguments, dict):
