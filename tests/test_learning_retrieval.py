@@ -132,7 +132,8 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(result.authoritative_candidate["state"], "validated")
         self.assertNotIn("evaluatorRef", self.seen["environment"])  # learner sees no trusted control reference
         self.assertNotIn("passed", self.seen["environment"]["sanitizedFeedback"])
-        self.assertEqual(self.seen["environment"]["proposalContract"], PROPOSAL_CONTRACT)
+        self.assertEqual(self.seen["environment"]["proposalContract"]["type"], PROPOSAL_CONTRACT["type"])
+        self.assertEqual(self.seen["environment"]["proposalContract"]["properties"]["supportingEvidenceIds"]["items"], {"enum": ["ev-dev"]})
         self.assertEqual(self.seen["environment"]["proposalLimits"]["maxPatchBytes"], 32_768)
         self.assertEqual(len(self.sink.payloads), 1)
         self.assertEqual(self.sink.patch_hash, result.candidate_payload["changedArtifactHashes"][0])
@@ -222,7 +223,9 @@ class LearningTests(unittest.TestCase):
         service = LearningService(self.retriever, PlannerLearningAdapter(client, EvidenceSink()), self.sink, lambda: "a" * 64)
         cancel = Event()
         service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, remaining_deadline=12.5, cancel=cancel, token_cap=321)
-        self.assertEqual(client.forwarded, {"remaining_deadline": 12.5, "cancel": cancel, "token_cap": 321})
+        self.assertAlmostEqual(client.forwarded["remaining_deadline"], 12.5, delta=0.1)
+        self.assertIs(client.forwarded["cancel"], cancel)
+        self.assertEqual(client.forwarded["token_cap"], 321)
 
     def test_model_usage_over_token_cap_is_rejected(self):
         class OverCapInvocation(Invocation):
@@ -234,6 +237,32 @@ class LearningTests(unittest.TestCase):
         service = LearningService(self.retriever, runner, self.sink, lambda: "a" * 64)
         with self.assertRaisesRegex(LearningError, "token cap"):
             service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, token_cap=10)
+
+    def test_contract_enumerates_only_retrieved_development_evidence(self):
+        service = self.service(self.valid_payload())
+        service.propose(run_id="run-a", environment_id="env", goal="learn", environment={})
+        contract = self.seen["environment"]["proposalContract"]
+        self.assertEqual(contract["properties"]["supportingEvidenceIds"]["items"], {"enum": ["ev-dev"]})
+
+    def test_malformed_proposal_repair_reuses_deadline_and_remaining_token_ledger(self):
+        calls = []
+        payload = self.valid_payload()
+
+        class RepairRunner:
+            def __call__(self, *, goal, environment, emit, remaining_deadline=None, cancel=None, token_cap=None):
+                calls.append((environment["sanitizedFeedback"], remaining_deadline, token_cap))
+                if len(calls) == 1:
+                    return Invocation({"unexpected": True})
+                return Invocation(payload)
+
+        service = LearningService(self.retriever, RepairRunner(), self.sink, lambda: "a" * 64)
+        result = service.propose(run_id="run-a", environment_id="env", goal="learn", environment={}, remaining_deadline=12.5, token_cap=50, max_repair_attempts=1)
+        self.assertEqual(result.authoritative_candidate["state"], "validated")
+        self.assertAlmostEqual(calls[0][1], 12.5, delta=0.1)
+        self.assertLess(calls[1][1], calls[0][1])
+        self.assertEqual(calls[0][2], 50)
+        self.assertEqual(calls[1][2], 30)
+        self.assertEqual(calls[1][0]["failureClass"], "malformed_proposal")
 
 
 if __name__ == "__main__":

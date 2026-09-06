@@ -12,11 +12,13 @@ import hashlib
 import inspect
 import json
 import re
+import time
+from copy import deepcopy
 from dataclasses import dataclass
 from threading import Event
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from .retrieval import AccessFilteredRetriever, Citation, RetrievalError, RetrievalResult, canonical_json
+from .retrieval import AccessFilteredRetriever, Citation, RetrievalError, RetrievalResult, SourceRecord, canonical_json
 
 
 class LearningError(ValueError):
@@ -93,8 +95,15 @@ PROPOSAL_CONTRACT: dict[str, Any] = {
 }
 
 
-def proposal_contract_json() -> str:
-    return json.dumps(PROPOSAL_CONTRACT, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+def proposal_contract(allowed_supporting_evidence_ids: Sequence[str] | None = None) -> dict[str, Any]:
+    contract = deepcopy(PROPOSAL_CONTRACT)
+    if allowed_supporting_evidence_ids is not None:
+        contract["properties"]["supportingEvidenceIds"]["items"] = {"enum": list(allowed_supporting_evidence_ids)}
+    return contract
+
+
+def proposal_contract_json(allowed_supporting_evidence_ids: Sequence[str] | None = None) -> str:
+    return json.dumps(proposal_contract(allowed_supporting_evidence_ids), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _sha256(value: Any) -> str:
@@ -317,6 +326,44 @@ def _validate_skill(value: Any) -> dict[str, Any]:
     return result
 
 
+def _validate_proposal_payload(
+    parsed: Mapping[str, Any],
+    *,
+    retriever: AccessFilteredRetriever,
+    environment_id: str,
+    run_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], str, str, tuple[SourceRecord, ...], dict[str, Any], dict[str, Any]]:
+    operations = _canonical_operations(parsed["editOperations"])
+    skill = _validate_skill(parsed["skill"])
+    predicted = parsed["predictedEffect"]
+    proposer_version = parsed["proposerVersion"]
+    if not isinstance(predicted, str) or not predicted.strip() or len(predicted) > 500 or not isinstance(proposer_version, str) or not proposer_version.strip():
+        raise LearningError("predicted effect and proposer version are required")
+    evidence_ids = parsed["supportingEvidenceIds"]
+    if not isinstance(evidence_ids, list) or not evidence_ids or not all(isinstance(item, str) and item for item in evidence_ids):
+        raise LearningError("supporting evidence must be a non-empty id array")
+    try:
+        evidence = retriever.require_development_evidence(evidence_ids, environment_id=environment_id, run_id=run_id)
+    except RetrievalError as exc:
+        raise LearningError(str(exc)) from exc
+    config_patch = parsed.get("executionConfigPatch", {})
+    if config_patch and (not isinstance(config_patch, Mapping) or set(config_patch) - {"instructionVariant"}):
+        raise LearningError("execution configuration patch is outside the bounded learner surface")
+    applied_skill: dict[str, Any] = {}
+    applied_config: dict[str, Any] = {}
+    for operation in operations:
+        path = operation["path"]
+        destination = applied_config if path == "executionConfig/instructionVariant" else applied_skill
+        field = "instructionVariant" if path == "executionConfig/instructionVariant" else path.split("/")[-1]
+        destination[field] = operation["value"]
+    if applied_skill != skill:
+        raise LearningError("skill fields must equal the exact values in the applied operations")
+    if applied_config != dict(config_patch):
+        raise LearningError("execution configuration must equal the exact values in the applied operations")
+    bundle_patch = {"operations": operations, "skill": applied_skill, "executionConfigPatch": applied_config}
+    return operations, skill, predicted, proposer_version, evidence, dict(config_patch), bundle_patch
+
+
 class LearningService:
     def __init__(self, retriever: AccessFilteredRetriever, model_runner: AuthenticatedModelRunner, candidate_sink: CandidateSink, active_bundle_hash: ActiveBundleReader) -> None:
         self.retriever = retriever
@@ -324,13 +371,15 @@ class LearningService:
         self.candidate_sink = candidate_sink
         self.active_bundle_hash = active_bundle_hash
 
-    def propose(self, *, run_id: str, environment_id: str, goal: str, base_bundle_hash: str | None = None, environment: Mapping[str, Any] | None = None, feedback: Mapping[str, Any] | None = None, allowed_skill_ids: set[str] | None = None, emit: Callable[[str, str, str | None], None] | None = None, remaining_deadline: float | None = None, cancel: Event | None = None, token_cap: int | None = None) -> LearningProposal:
+    def propose(self, *, run_id: str, environment_id: str, goal: str, base_bundle_hash: str | None = None, environment: Mapping[str, Any] | None = None, feedback: Mapping[str, Any] | None = None, allowed_skill_ids: set[str] | None = None, emit: Callable[[str, str, str | None], None] | None = None, remaining_deadline: float | None = None, cancel: Event | None = None, token_cap: int | None = None, max_repair_attempts: int = 0) -> LearningProposal:
         if cancel is not None and cancel.is_set():
             raise LearningError("learning proposal cancelled before model invocation")
         if remaining_deadline is not None and remaining_deadline <= 0:
             raise LearningError("learning proposal deadline expired before model invocation")
         if token_cap is not None and token_cap <= 0:
             raise LearningError("learning proposal token cap must be positive")
+        if max_repair_attempts < 0 or max_repair_attempts > 1:
+            raise LearningError("learning proposal repair attempts must be 0 or 1")
         active = _require_hash(self.active_bundle_hash(), "active bundle hash")
         if base_bundle_hash is not None and base_bundle_hash != active:
             raise LearningError("candidate base is not the pinned active bundle")
@@ -341,55 +390,60 @@ class LearningService:
         safe_environment["learningContext"] = result.prompt_payload()
         safe_environment["sanitizedFeedback"] = sanitize_feedback(feedback)
         safe_environment["baseBundleHash"] = active
-        safe_environment["proposalContract"] = PROPOSAL_CONTRACT
+        allowed_evidence_ids = [item.source_id for item in result.evidence]
+        safe_environment["proposalContract"] = proposal_contract(allowed_evidence_ids)
         safe_environment["proposalLimits"] = {"maxChangedArtifacts": 3, "maxChangedLogicalLines": _MAX_CHANGED_LINES, "maxPatchBytes": _MAX_PATCH_BYTES}
         runner = self.model_runner
-        runner_kwargs: dict[str, Any] = {"goal": goal, "environment": safe_environment, "emit": emit or (lambda *_: None)}
         parameters = inspect.signature(runner).parameters
         accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-        for name, value in (("remaining_deadline", remaining_deadline), ("cancel", cancel), ("token_cap", token_cap)):
-            if accepts_kwargs or name in parameters:
-                runner_kwargs[name] = value
-        invocation = runner(**runner_kwargs)
-        if cancel is not None and cancel.is_set():
-            raise LearningError("learning proposal cancelled after model invocation")
-        if not all(isinstance(getattr(invocation, attr, None), str) and getattr(invocation, attr).strip() for attr in ("provider", "model", "response_id", "text")):
-            raise LearningError("authenticated model invocation provenance is incomplete")
-        usage = getattr(invocation, "usage", None)
-        if not isinstance(usage, Mapping) or not usage:
-            raise LearningError("authenticated model usage is missing")
-        used_tokens = _usage_tokens(usage)
-        if token_cap is not None and used_tokens is not None and used_tokens > token_cap:
-            raise LearningError("learning proposal exceeded the model token cap")
-        parsed = _parse_model_json(invocation.text)
-        operations = _canonical_operations(parsed["editOperations"])
-        skill = _validate_skill(parsed["skill"])
-        predicted = parsed["predictedEffect"]
-        proposer_version = parsed["proposerVersion"]
-        if not isinstance(predicted, str) or not predicted.strip() or len(predicted) > 500 or not isinstance(proposer_version, str) or not proposer_version.strip():
-            raise LearningError("predicted effect and proposer version are required")
-        evidence_ids = parsed["supportingEvidenceIds"]
-        if not isinstance(evidence_ids, list) or not evidence_ids or not all(isinstance(item, str) and item for item in evidence_ids):
-            raise LearningError("supporting evidence must be a non-empty id array")
-        try:
-            evidence = self.retriever.require_development_evidence(evidence_ids, environment_id=environment_id, run_id=run_id)
-        except RetrievalError as exc:
-            raise LearningError(str(exc)) from exc
-        config_patch = parsed.get("executionConfigPatch", {})
-        if config_patch and (not isinstance(config_patch, Mapping) or set(config_patch) - {"instructionVariant"}):
-            raise LearningError("execution configuration patch is outside the bounded learner surface")
-        applied_skill: dict[str, Any] = {}
-        applied_config: dict[str, Any] = {}
-        for operation in operations:
-            path = operation["path"]
-            destination = applied_config if path == "executionConfig/instructionVariant" else applied_skill
-            field = "instructionVariant" if path == "executionConfig/instructionVariant" else path.split("/")[-1]
-            destination[field] = operation["value"]
-        if applied_skill != skill:
-            raise LearningError("skill fields must equal the exact values in the applied operations")
-        if applied_config != dict(config_patch):
-            raise LearningError("execution configuration must equal the exact values in the applied operations")
-        bundle_patch = {"operations": operations, "skill": applied_skill, "executionConfigPatch": applied_config}
+        total_used_tokens = 0
+        attempt_feedback = sanitize_feedback(feedback)
+        deadline_started = time.monotonic()
+        for attempt in range(max_repair_attempts + 1):
+            if cancel is not None and cancel.is_set():
+                raise LearningError("learning proposal cancelled before model invocation")
+            remaining_tokens = None if token_cap is None else token_cap - total_used_tokens
+            if remaining_tokens is not None and remaining_tokens <= 0:
+                raise LearningError("learning proposal token cap exhausted before repair")
+            attempt_environment = dict(safe_environment)
+            attempt_environment["sanitizedFeedback"] = attempt_feedback
+            attempt_deadline = remaining_deadline
+            if remaining_deadline is not None:
+                attempt_deadline = remaining_deadline - (time.monotonic() - deadline_started)
+                if attempt_deadline <= 0:
+                    raise LearningError("learning proposal deadline expired before repair")
+            runner_kwargs: dict[str, Any] = {"goal": goal, "environment": attempt_environment, "emit": emit or (lambda *_: None)}
+            for name, value in (("remaining_deadline", attempt_deadline), ("cancel", cancel), ("token_cap", remaining_tokens)):
+                if accepts_kwargs or name in parameters:
+                    runner_kwargs[name] = value
+            invocation = runner(**runner_kwargs)
+            if cancel is not None and cancel.is_set():
+                raise LearningError("learning proposal cancelled after model invocation")
+            if not all(isinstance(getattr(invocation, attr, None), str) and getattr(invocation, attr).strip() for attr in ("provider", "model", "response_id", "text")):
+                error = LearningError("authenticated model invocation provenance is incomplete")
+            else:
+                usage = getattr(invocation, "usage", None)
+                if not isinstance(usage, Mapping) or not usage:
+                    error = LearningError("authenticated model usage is missing")
+                else:
+                    used_tokens = _usage_tokens(usage)
+                    if remaining_tokens is not None and used_tokens is not None and used_tokens > remaining_tokens:
+                        raise LearningError("learning proposal exceeded the model token cap")
+                    if used_tokens is not None:
+                        total_used_tokens += used_tokens
+                    try:
+                        parsed = _parse_model_json(invocation.text)
+                        operations, skill, predicted, proposer_version, evidence, config_patch, bundle_patch = _validate_proposal_payload(parsed, retriever=self.retriever, environment_id=environment_id, run_id=run_id)
+                        break
+                    except LearningError as exc:
+                        error = exc
+            if attempt >= max_repair_attempts:
+                raise error
+            if token_cap is not None and _usage_tokens(getattr(invocation, "usage", {})) is None:
+                raise LearningError("cannot repair proposal without token usage") from error
+            attempt_feedback = {"status": "failed", "failureClass": "malformed_proposal", "diagnostic": str(error)[:1000]}
+        else:
+            raise LearningError("learning proposal repair failed")
         patch_bytes = canonical_json(bundle_patch).encode("utf-8")
         if len(patch_bytes) > _MAX_PATCH_BYTES:
             raise LearningError("candidate patch exceeds the byte bound")
