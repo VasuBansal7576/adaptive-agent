@@ -46,14 +46,15 @@ class BenchmarkDriverTests(unittest.TestCase):
             self.assertTrue(first.run_development_smoke("dedicated").complete)
             self.assertEqual(len(calls), 1)
             with store.connect() as conn:
-                benchmark_rows = conn.execute("SELECT benchmark_id, arm, seed, owner_id, status FROM benchmark_task_runs").fetchall()
-                generic_rows = conn.execute("SELECT * FROM task_runs").fetchall()
+                benchmark_rows = conn.execute("SELECT benchmark_id, arm, seed, owner_id, status FROM task_runs WHERE benchmark_id = 'dedicated:smoke'").fetchall()
+                generic_rows = conn.execute("SELECT * FROM task_runs WHERE benchmark_id IS NULL").fetchall()
             self.assertEqual(len(benchmark_rows), 1)
             self.assertEqual(dict(benchmark_rows[0])["owner_id"], "owner-a")
             self.assertEqual(dict(benchmark_rows[0])["status"], "complete")
             self.assertEqual(generic_rows, [])
 
-            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedEvidence(), owner_id="owner-b")
+            # A restart must reuse the durable owner recorded on the cell.
+            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedEvidence(), owner_id="owner-a")
             self.assertTrue(resumed.run_development_smoke("dedicated").complete)
             self.assertEqual(len(calls), 1)
 
@@ -101,7 +102,7 @@ class BenchmarkDriverTests(unittest.TestCase):
             crashing = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, allocation_store=CrashAfterAllocation(), evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle})
             with self.assertRaises(KeyboardInterrupt):
                 crashing.run("gap", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
-            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle})
+            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle}, owner_id=crashing.owner_id)
             result = resumed.run("gap", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
             self.assertTrue(result.failed)
             with store.connect() as conn:
@@ -133,7 +134,7 @@ class BenchmarkDriverTests(unittest.TestCase):
             self.assertTrue(first.failed)
             first_panel = {task_id for task_id, _, _ in calls}
             calls.clear()
-            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle})
+            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle}, owner_id=driver.owner_id)
             second = resumed.run("bench-1", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
             self.assertTrue(second.failed)
             self.assertEqual(first_panel, {task_id for task_id, _, _ in calls})
@@ -189,9 +190,39 @@ class BenchmarkDriverTests(unittest.TestCase):
             with store.connect() as conn:
                 rows = conn.execute(
                     "SELECT status FROM benchmark_task_attempts WHERE benchmark_id = ? ORDER BY rowid",
-                    ("retry-identity",),
+                    ("retry-identity:smoke",),
                 ).fetchall()
             self.assertEqual([row["status"] for row in rows], ["failed", "complete"])
+
+    def test_interrupted_attempt_is_uncertain_and_same_owner_retry_advances_attempt(self):
+        packages = build_environment_packages()
+        protocol = EvaluationProtocol()
+        protocol.freeze(packages)
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            bundle = SkillBundle(skills=[])
+            attempts = []
+
+            class TrustedEvidence:
+                durable = True
+
+                def verify(self, observation, frozen, package):
+                    return True
+
+            def execute(task, frozen_config, selected_bundle):
+                attempts.append(frozen_config.attempt)
+                if len(attempts) == 1:
+                    raise KeyboardInterrupt("worker interrupted")
+                return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, bundle_hash=selected_bundle.content_hash)
+
+            driver = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedEvidence(), owner_id="interrupt-owner")
+            with self.assertRaises(KeyboardInterrupt):
+                driver.run_development_smoke("interrupt")
+            self.assertTrue(driver.run_development_smoke("interrupt").complete)
+            self.assertEqual(attempts, [0, 1])
+            with store.connect() as conn:
+                rows = conn.execute("SELECT status FROM benchmark_task_attempts WHERE benchmark_id = 'interrupt:smoke' ORDER BY rowid").fetchall()
+            self.assertEqual([row["status"] for row in rows], ["uncertain", "complete"])
 
     def test_synthetic_executor_result_is_failed_not_success(self):
         packages = build_environment_packages()
