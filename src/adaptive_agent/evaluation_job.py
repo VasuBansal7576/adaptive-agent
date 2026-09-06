@@ -233,7 +233,11 @@ class EvaluationJob:
             existing = conn.execute("SELECT * FROM evaluation_lifecycle_subcalls WHERE job_id = ? AND stage = ? AND cell_key = ? AND subcall_key = ?", (job_id, stage, cell_key, subcall_key)).fetchone()
             if existing is not None:
                 conn.commit()
-                return {"admissionId": existing["admission_id"], "status": existing["status"], "reused": True}
+                try:
+                    persisted = json.loads(existing["result_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    persisted = {}
+                return {"admissionId": existing["admission_id"], "status": existing["status"], "result": persisted if isinstance(persisted, dict) else {}, "error": existing["error"], "reused": True}
             budget = conn.execute("SELECT * FROM evaluation_lifecycle_budget WHERE job_id = ?", (job_id,)).fetchone()
             if budget is None:
                 conn.rollback()
@@ -260,8 +264,16 @@ class EvaluationJob:
                 conn.rollback()
                 raise EvaluationError("unknown lifecycle subcall admission")
             if row["status"] in {"complete", "failed"}:
+                try:
+                    persisted = json.loads(row["result_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    persisted = {}
                 conn.commit()
-                return {"admissionId": admission_id, "status": row["status"], "reused": True}
+                return {"admissionId": admission_id, "status": row["status"], "result": persisted if isinstance(persisted, dict) else {}, "error": row["error"], "reused": True}
+            if result is None and error:
+                conn.execute("UPDATE evaluation_lifecycle_subcalls SET status = 'failed', error = ?, updated_at = datetime('now') WHERE admission_id = ?", (error, admission_id))
+                conn.commit()
+                return {"admissionId": admission_id, "status": "failed", "result": {}, "error": error, "reused": False}
             usage = payload.get("usage")
             malformed = not isinstance(usage, Mapping) or any(not isinstance(usage.get(key), int) or isinstance(usage.get(key), bool) or usage[key] < 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]
             cost = payload.get("costMicrounits")
