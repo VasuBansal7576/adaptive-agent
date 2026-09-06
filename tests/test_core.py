@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from adaptive_agent.broker import Capability, ToolBroker
+from adaptive_agent.broker import Capability, ProviderExecutionOutcome, ToolBroker, ToolProvider
 from adaptive_agent.candidate import (
     CandidateManager,
     CandidateValidationError,
@@ -205,6 +205,48 @@ class TestSchemaValidation:
 
 
 class TestCapabilityAndBroker:
+    def test_typed_provider_outcome_preserves_effect_and_replays_unchanged(self, broker: ToolBroker, registry: EnvironmentRegistry):
+        registry.register(NEUTRAL_MANIFEST)
+
+        class TypedProvider(ToolProvider):
+            def __init__(self, effect: str) -> None:
+                self._effect = effect
+                self.calls = 0
+
+            def execute(self, run_id: str, tool: str, arguments: dict[str, Any]) -> ProviderExecutionOutcome:
+                self.calls += 1
+                return ProviderExecutionOutcome(
+                    output={"ok": self._effect == "confirmed", "code": "VERSION_CONFLICT"},
+                    effect=self._effect,
+                )
+
+            def effect(self, tool: str) -> str:
+                return "write"
+
+            def version(self, tool: str) -> str:
+                return "1"
+
+        provider = TypedProvider("none")
+        cap = _cap()
+        args = {"record_id": "record-1", "version": 1, "value": "x"}
+        token = broker.issue_approval(ENV, RUN, "update_record", args, "typed-rejected")
+        first = broker.request_tool_call(ENV, _req("update_record", args, key="typed-rejected", token=token), cap, provider)
+        replay = broker.request_tool_call(ENV, _req("update_record", args, key="typed-rejected"), cap, provider)
+
+        assert first.status == "ok"
+        assert first.effect == "none"
+        assert replay.output == first.output
+        assert replay.effect == first.effect
+        assert replay.status == first.status
+        assert provider.calls == 1
+
+        successful = TypedProvider("confirmed")
+        success_args = {"record_id": "record-1", "version": 1, "value": "y"}
+        success_token = broker.issue_approval(ENV, RUN, "update_record", success_args, "typed-success")
+        success = broker.request_tool_call(ENV, _req("update_record", success_args, key="typed-success", token=success_token), cap, successful)
+        assert success.status == "ok"
+        assert success.effect == "confirmed"
+
     def test_capability_enforces_scope_expiry_run_env_tool(self, broker: ToolBroker, registry: EnvironmentRegistry, provider: FakeProvider):
         registry.register(NEUTRAL_MANIFEST)
         provider.reset(RUN)
@@ -250,7 +292,7 @@ class TestCapabilityAndBroker:
 
         token = broker.issue_approval(ENV, RUN, "update_record", args, "w1")
         r = broker.request_tool_call(ENV, _req("update_record", args, key="w1", token=token), cap, provider)
-        assert r.status == "ok"
+        assert r.status == "ok" and r.effect == "confirmed"
 
         # replay returns stored result, does NOT re-consume approval or redispatch
         r2 = broker.request_tool_call(ENV, _req("update_record", args, key="w1"), cap, provider)

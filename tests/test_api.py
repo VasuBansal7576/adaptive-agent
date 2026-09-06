@@ -675,6 +675,30 @@ def test_durable_runtime_builds_production_job_with_bound_executor(tmp_path):
     assert job.arm_bundles[Arm.L] is active
 
 
+def test_fixture_provider_preserves_rejected_and_successful_write_effects():
+    package = build_environment_packages()["finance"]
+    task = package.tasks_for_partition(Partition.DEVELOPMENT)[0]
+    arguments = {
+        "invoice_id": "INV-DEV-000",
+        "payment_id": "PAY-DEV-000",
+        "expected_version": 1,
+    }
+
+    rejected = _FixtureProvider(package, task, "fixture-rejected", seed=1).execute(
+        "fixture-rejected", "finance.invoice.apply_payment", {**arguments, "expected_version": 99}
+    )
+    assert rejected.status == "ok"
+    assert rejected.output["ok"] is False
+    assert rejected.effect == "none"
+
+    successful = _FixtureProvider(package, task, "fixture-successful", seed=1).execute(
+        "fixture-successful", "finance.invoice.apply_payment", arguments
+    )
+    assert successful.status == "ok"
+    assert successful.output["ok"] is True
+    assert successful.effect == "confirmed"
+
+
 def test_runtime_binds_default_stage_runner_and_clean_pins(monkeypatch, tmp_path):
     monkeypatch.setenv("ADAPTIVE_AGENT_IMAGE_DIGEST", "sha256:" + "a" * 64)
     monkeypatch.setattr("adaptive_agent.app.subprocess.run", lambda *args, **kwargs: SimpleNamespace(returncode=0))

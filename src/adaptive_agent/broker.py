@@ -15,7 +15,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from adaptive_agent.environment import (
     EnvironmentRegistry,
@@ -33,11 +33,26 @@ from adaptive_agent.models import (
 from adaptive_agent.store import Store
 
 
+@dataclass(frozen=True)
+class ProviderExecutionOutcome:
+    """Trusted provider result carrying execution status and observed effect.
+
+    Legacy providers may still return a mapping.  The broker deliberately
+    preserves that compatibility by deriving the historical successful-write
+    effect from the registered tool schema.  Typed providers use this outcome
+    when the provider knows that a write was rejected without a side effect.
+    """
+
+    output: dict[str, Any]
+    status: Literal["ok", "error"] = "ok"
+    effect: Literal["none", "confirmed", "unknown"] = "none"
+
+
 class ToolProvider(ABC):
     """Environment-supplied tool implementation. Executed only via the broker."""
 
     @abstractmethod
-    def execute(self, run_id: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def execute(self, run_id: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any] | ProviderExecutionOutcome:
         ...
 
     @abstractmethod
@@ -86,6 +101,18 @@ def _scope_match(scope_value: Any, arg_value: Any) -> bool:
     if isinstance(scope_value, (list, tuple, set)):
         return arg_value in scope_value
     return scope_value == arg_value
+
+
+def _provider_outcome(value: dict[str, Any] | ProviderExecutionOutcome, *, declared_effect: str) -> ProviderExecutionOutcome:
+    """Normalize a provider result without treating its payload as authority."""
+    if isinstance(value, ProviderExecutionOutcome):
+        return value
+    if isinstance(value, dict):
+        return ProviderExecutionOutcome(
+            output=value,
+            effect="confirmed" if declared_effect == "write" else "none",
+        )
+    raise TypeError("provider returned an unsupported execution outcome")
 
 
 @dataclass(frozen=True)
@@ -360,16 +387,21 @@ class ToolBroker:
 
         # Execute
         try:
-            output = {"dryRun": True, "tool": request.tool} if dry_run else provider.execute(request.run_id, request.tool, request.arguments)
-            effect = "none" if dry_run else "confirmed" if provider.effect(request.tool) == "write" else "none"
+            if dry_run:
+                outcome = ProviderExecutionOutcome(output={"dryRun": True, "tool": request.tool})
+            else:
+                outcome = _provider_outcome(
+                    provider.execute(request.run_id, request.tool, request.arguments),
+                    declared_effect=provider.effect(request.tool),
+                )
             result = ToolResult(
                 call_id=request.call_id,
                 tool_version=schema.version,
                 observed_at=datetime.now(timezone.utc),
                 broker_evidence_ref=ArtifactRef(id="pending", version="0", sha256="0" * 64),
-                status="ok",
-                output=output,
-                effect=effect,
+                status=outcome.status,
+                output=outcome.output,
+                effect=outcome.effect,
             )
         except Exception as exc:
             result = ToolResult(
