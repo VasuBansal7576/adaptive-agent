@@ -163,8 +163,8 @@ class LunaChildPlanner:
         text = _text(raw)
         if provider != MODEL_PROVIDER or model not in (MODEL_NAME, "gpt-5.6-luna"):
             raise AdapterError("child model response is not the pinned Luna subscription")
-        if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage or not text:
-            raise AdapterError("child model response lacks response id, text, or usage")
+        if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
+            raise AdapterError("child model response lacks response id or usage")
         observation = {
             "provider": provider,
             "model": MODEL_NAME if model == "gpt-5.6-luna" else model,
@@ -178,6 +178,8 @@ class LunaChildPlanner:
         # Record completed provider usage before enforcing the shared cap. An
         # over-cap receipt remains visible in the ledger and blocks later calls.
         request.budget.record_model_usage(_usage_tokens(usage))
+        if not text:
+            raise AdapterError("child model response lacks text")
         return _bind_kwargs(_parse_plan(text, self.max_code_chars), request.kwargs)
 
 

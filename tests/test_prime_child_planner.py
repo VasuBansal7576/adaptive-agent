@@ -25,7 +25,7 @@ class FakeClient:
         self.calls += 1
         self.last = kwargs
         child_input = kwargs["environment"]["childInput"]
-        text = self.text or '{"name":"child","code":"%d * %d"}' % (
+        text = self.text if self.text is not None else '{"name":"child","code":"%d * %d"}' % (
             child_input["kwargs"]["left"], child_input["kwargs"]["right"]
         )
         return {
@@ -89,6 +89,13 @@ class ChildPlannerTests(unittest.TestCase):
         self.assertEqual(observations[0]["provider"], "openai-codex")
         self.assertEqual(observations[0]["model"], "openai-codex/gpt-5.6-luna")
         self.assertEqual(observations[0]["usage"]["totalTokens"], 3)
+        empty = FakeClient(text="")
+        observations = []
+        ledger = SharedBudget(30, 1000, 4, 1, 100)
+        with self.assertRaises(AdapterError):
+            LunaChildPlanner(empty, observation_sink=observations.append)(request(ledger))
+        self.assertEqual(observations[0]["responseId"], "child-response-1")
+        self.assertEqual(ledger.model_tokens_used, 3)
         over = FakeClient(usage=7)
         observations = []
         ledger = SharedBudget(30, 1000, 4, 1, 5)
