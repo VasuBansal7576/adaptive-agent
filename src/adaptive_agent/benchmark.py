@@ -129,6 +129,37 @@ class ResumableEvaluationDriver:
         expected_count = sum(len(tasks) for tasks in tasks_by_env.values()) * len(self.protocol.seeds) * len(arms)
         return BenchmarkSummary(benchmark_id, partition, tuple(statuses), expected_count)
 
+    def run_development_smoke(self, benchmark_id: str) -> BenchmarkSummary:
+        """Execute one trusted development cell before any held-out panel.
+
+        The smoke receipt is deliberately small, but it still traverses the
+        same frozen callback and evidence verifier as validation and final
+        runs.  A completed receipt is sufficient to prove that the runtime
+        entry is available before allocating protected tasks.
+        """
+        frozen = self.protocol.start_candidate_generation()
+        environment_id = self.protocol.known_environments[0]
+        package = self.packages[environment_id]
+        task = package.tasks_for_partition(Partition.DEVELOPMENT)[0]
+        arm, seed = Arm.B0, self.protocol.seeds[0]
+        prior = self._load(benchmark_id, task.task_id, arm, seed)
+        if prior is not None and prior.status == "complete" and prior.observation is not None and self.evidence_store.verify(prior.observation, frozen, package):
+            return BenchmarkSummary(benchmark_id, Partition.DEVELOPMENT, (prior,), 1)
+        if not self._claim(benchmark_id, task, arm, seed):
+            existing = self._load(benchmark_id, task.task_id, arm, seed)
+            return BenchmarkSummary(benchmark_id, Partition.DEVELOPMENT, (existing,) if existing else (), 1)
+        try:
+            selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
+            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed), selected_bundle)
+            self._validate_observation(observation, task, environment_id, Partition.DEVELOPMENT, seed, arm)
+            if not self.evidence_store.verify(observation, frozen, package):
+                raise EvaluationError("runtime observation lacks trusted persisted evidence")
+            self._save(benchmark_id, task, arm, seed, "complete", None, observation)
+            return BenchmarkSummary(benchmark_id, Partition.DEVELOPMENT, (BenchmarkTaskStatus(task.task_id, environment_id, Partition.DEVELOPMENT, arm, seed, "complete", observation=observation),), 1)
+        except Exception as exc:
+            self._save(benchmark_id, task, arm, seed, "failed", str(exc), None)
+            return BenchmarkSummary(benchmark_id, Partition.DEVELOPMENT, (BenchmarkTaskStatus(task.task_id, environment_id, Partition.DEVELOPMENT, arm, seed, "failed", error=str(exc)),), 1)
+
     def _development_smoke_complete(self, benchmark_id: str) -> bool:
         with self.store._connect() as conn:
             rows = conn.execute("SELECT task_id, environment_id, arm, seed FROM benchmark_task_runs WHERE benchmark_id = ? AND partition = 'development' AND status = 'complete' AND observation_json IS NOT NULL", (benchmark_id,)).fetchall()
