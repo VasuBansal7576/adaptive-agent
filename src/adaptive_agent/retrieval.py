@@ -146,9 +146,21 @@ class ContextItem:
     excerpt: str
     citation: Citation
     score: float
+    environment_id: str | None = None
+    run_id: str | None = None
+    failure: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {"sourceId": self.source_id, "kind": self.kind.value, "excerpt": self.excerpt, "citation": self.citation.to_dict(), "score": self.score}
+        result = {"sourceId": self.source_id, "kind": self.kind.value, "excerpt": self.excerpt, "citation": self.citation.to_dict(), "score": self.score}
+        if self.environment_id is not None:
+            result["environmentId"] = self.environment_id
+        if self.run_id is not None:
+            result["runId"] = self.run_id
+        return result
+
+    def with_excerpt(self, excerpt: str) -> "ContextItem":
+        """Return a bounded view without changing the cited source hash."""
+        return ContextItem(self.source_id, self.kind, excerpt, self.citation, self.score, self.environment_id, self.run_id, self.failure)
 
 
 @dataclass(frozen=True)
@@ -176,6 +188,9 @@ class RetrievalResult:
             "taskState": [item.to_dict() for item in self.task_state],
             "activeSkills": [item.to_dict() for item in self.skills],
         }
+
+    def with_items(self, *, docs: Iterable[ContextItem] = (), evidence: Iterable[ContextItem] = (), task_state: Iterable[ContextItem] = (), skills: Iterable[ContextItem] = ()) -> "RetrievalResult":
+        return RetrievalResult(tuple(docs), tuple(evidence), tuple(task_state), tuple(skills))
 
 
 class SourceProvider(Protocol):
@@ -252,7 +267,16 @@ class AccessFilteredRetriever:
             # bounded.
             if score == 0 and query_tokens and source.kind is not SourceKind.LIVE_EVIDENCE:
                 continue
-            buckets[source.kind].append(ContextItem(source.source_id, source.kind, source.content, Citation(source.source_id, source.content_hash, source.kind), score))
+            buckets[source.kind].append(ContextItem(
+                source.source_id,
+                source.kind,
+                source.content,
+                Citation(source.source_id, source.content_hash, source.kind),
+                score,
+                source.environment_id,
+                source.run_id,
+                source.kind is SourceKind.LIVE_EVIDENCE and source.metadata.get("outcomePassed") is False,
+            ))
             if allowed_source_runs is not None and source.kind is SourceKind.LIVE_EVIDENCE:
                 evidence_run_of[source.source_id] = source.run_id or ""
         result: dict[SourceKind, tuple[ContextItem, ...]] = {}
@@ -265,7 +289,7 @@ class AccessFilteredRetriever:
                 per_run: dict[str, list[ContextItem]] = {}
                 for item in ordered:
                     per_run.setdefault(evidence_run_of.get(item.source_id, ""), []).append(item)
-                result[kind] = tuple(item for run_key in sorted(per_run) for item in per_run[run_key][: self.max_items_per_kind])
+                result[kind] = tuple(item for run_key in sorted(per_run) for item in sorted(per_run[run_key], key=lambda item: (not item.failure, -item.score, item.source_id))[: self.max_items_per_kind])
             else:
                 result[kind] = tuple(ordered[: self.max_items_per_kind])
         return RetrievalResult(docs=result[SourceKind.PUBLIC_DOC], evidence=result[SourceKind.LIVE_EVIDENCE], task_state=result[SourceKind.TASK_STATE], skills=result[SourceKind.SKILL])

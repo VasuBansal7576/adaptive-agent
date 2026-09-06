@@ -149,7 +149,11 @@ class DurableLearningSourceAdapter:
             visibility=visibility,
             trust_class=trust_class,
             verified=True,
-            metadata={"storedVisibility": raw.get("visibility"), "trustedOutcome": raw.get("trustedOutcome", False)},
+            metadata={
+                "storedVisibility": raw.get("visibility"),
+                "trustedOutcome": raw.get("trustedOutcome", False),
+                "outcomePassed": raw.get("outcomePassed"),
+            },
         )
 
 
