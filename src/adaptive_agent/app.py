@@ -1295,6 +1295,7 @@ class DurableRuntime:
         # Rehydrate the immutable receipt ledger when a runtime process is
         # restarted.  A process-local cache alone would undercount failed
         # model calls and charge only the final resumed response.
+        restored_duration = 0.0
         if run_id not in self._run_receipts:
             restored_by_id: dict[str, dict[str, Any]] = {}
             for row in self.controller.store.list_evidence(run_id):
@@ -1306,6 +1307,11 @@ class DurableRuntime:
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     continue
                 prior = artifact.get("receipts") if isinstance(artifact, Mapping) else None
+                accounting_ref = artifact.get("accountingRef") if isinstance(artifact, Mapping) else None
+                if isinstance(accounting_ref, Mapping) and isinstance(accounting_ref.get("sha256"), str):
+                    accounting = self.controller.store.get_artifact(accounting_ref["sha256"])
+                    if isinstance(accounting, Mapping) and isinstance(accounting.get("durationSeconds"), (int, float)):
+                        restored_duration = max(restored_duration, float(accounting["durationSeconds"]))
                 if isinstance(prior, list):
                     for item in prior:
                         if not isinstance(item, Mapping):
@@ -1386,6 +1392,10 @@ class DurableRuntime:
         )
         nominal_proxy_fields = {"costBasis": "nominal_budget_proxy", "billingStatus": "unknown"} if not explicit_cost and nominal_status == "complete" else {}
         usage = dict(canonical_usage(evidence.get("usage")))
+        tool_calls = sum(
+            1 for row in self.controller.store.list_evidence(run_id)
+            if row.get("event_type") == "tool_result"
+        )
         if all_receipts:
             usage.update({key: value for key, value in all_receipts[-1]["usage"].items() if key in cache_keys or key == "cost"})
         frozen_core_planner = evidence.get("corePlannerHash") if isinstance(evidence.get("corePlannerHash"), str) and evidence.get("corePlannerHash") else self.core_planner_hash
@@ -1416,7 +1426,7 @@ class DurableRuntime:
         arm_bundles = run_payload.get("armBundles")
         if isinstance(arm_bundles, Mapping) and arm in arm_bundles and arm_bundles.get(arm) != bundle_hash:
             raise ValueError("model response bundleHash does not match the requested arm bundle")
-        whole_run_duration = max(now - started, 1e-6)
+        whole_run_duration = max(now - started, restored_duration, aggregate_inference, 1e-6)
         economic_status = evidence.get("economicCostStatus")
         if not isinstance(economic_status, str) or aggregate_cost_unknown:
             economic_status = "unknown" if aggregate_cost_unknown else ("measured" if explicit_cost else "unknown")
@@ -1462,6 +1472,7 @@ class DurableRuntime:
             "nominalCostCoverage": nominal_coverage,
             "durationSeconds": whole_run_duration,
             "inferenceDurationSeconds": aggregate_inference,
+            "toolCalls": tool_calls,
             **nominal_proxy_fields,
         }
         accounting_ref = self.controller.store.put_artifact(accounting)
@@ -1545,7 +1556,7 @@ class DurableRuntime:
             stored = self.controller.store.get_run(run_id)
             if stored is not None:
                 metadata = outcome.metadata if isinstance(outcome.metadata, Mapping) else {}
-                return trusted(
+                trusted_result = trusted(
                     run_id,
                     {
                         "runId": run_id,
@@ -1560,6 +1571,16 @@ class DurableRuntime:
                         **({"goal": metadata["goal"]} if isinstance(metadata.get("goal"), str) else {}),
                     },
                 )
+                # Keep evaluator diagnostics such as planner status and
+                # timeout classification in the private outcome row.  The
+                # trusted evidence event remains sanitized by the controller.
+                self.controller.record_outcome(
+                    run_id,
+                    bool(outcome.passed),
+                    score=outcome.score,
+                    metadata={**dict(metadata), "runId": run_id},
+                )
+                return trusted_result
         return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
 
     def _durable_evaluator_evidence(self, run_id: str) -> list[dict[str, Any]]:
