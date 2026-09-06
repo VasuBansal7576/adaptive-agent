@@ -585,12 +585,17 @@ class TestControllerSeam:
         accounting = {
             "responseId": "resp-1", "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
             "usage": usage, "costMicrounits": 100, "durationSeconds": 1.5, "versionRefs": version_refs,
+            "economicCost": {"status": "measured", "microunits": 100},
+            "nominalCostUsd": 0.0001,
+            "billingBasis": "SDK nominal usage cost; subscription billing separate",
         }
         acct_ref = ctl.record_accounting(run_id, accounting, response)
         first = store.get_artifact(acct_ref)
         assert first["responseId"] == "resp-1"
         assert first["aggregateUsage"] == usage and first["responseCount"] == 1
         assert first["aggregateCostMicrounits"] == 100.0 and first["aggregateDurationSeconds"] == 1.5
+        assert first["economicCost"] == {"status": "measured", "microunits": 100}
+        assert first["billingBasis"].startswith("SDK nominal")
 
         # Second receipt (e.g. a retry): per-response usage stays exact while
         # the cumulative aggregates sum every receipt.
@@ -609,6 +614,9 @@ class TestControllerSeam:
         assert second["aggregateCostMicrounits"] == 150.0
         assert second["aggregateDurationSeconds"] == 2.0
         assert second["responseCount"] == 2
+        # Economic-cost aggregation across receipts (first receipt only).
+        assert second["aggregateEconomicCostMicrounits"] == 100.0
+        assert second["economicCostStatuses"] == ["measured"]
 
         # Exact receipts for EvaluationJob: both responses, both accountings,
         # trusted outcome row, run/task/env binding.

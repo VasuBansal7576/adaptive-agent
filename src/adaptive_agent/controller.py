@@ -722,6 +722,24 @@ class Controller:
             v = accounting.get(key)
             if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0 or v != v or v == float("inf"):
                 raise ValueError(f"accounting.{key} must be a finite non-negative number")
+        # Optional c37ba1e/09bedc4 economic-cost fields: exact per-response
+        # values, aggregated below. nominalCostUsd may be None when SDK billing
+        # is unavailable (subscription billing is never measured).
+        economic = accounting.get("economicCost")
+        if economic is not None:
+            if not isinstance(economic, Mapping):
+                raise ValueError("accounting.economicCost must be an object")
+            eco_status = economic.get("status")
+            eco_micro = economic.get("microunits")
+            if not isinstance(eco_status, str) or not eco_status:
+                raise ValueError("accounting.economicCost.status is required")
+            if not isinstance(eco_micro, (int, float)) or isinstance(eco_micro, bool) or eco_micro < 0 or eco_micro != eco_micro:
+                raise ValueError("accounting.economicCost.microunits must be a finite non-negative number")
+        nominal = accounting.get("nominalCostUsd")
+        if nominal is not None and (not isinstance(nominal, (int, float)) or isinstance(nominal, bool) or nominal < 0 or nominal != nominal):
+            raise ValueError("accounting.nominalCostUsd must be null or a finite non-negative number")
+        if "billingBasis" in accounting and not isinstance(accounting["billingBasis"], str):
+            raise ValueError("accounting.billingBasis must be a string")
         # Cumulative aggregates sum EVERY receipt for the run (including
         # retries); this record's own `usage`/`costMicrounits`/`durationSeconds`
         # remain the exact per-response values.
@@ -732,6 +750,9 @@ class Controller:
         }
         agg_cost = float(accounting["costMicrounits"])
         agg_duration = float(accounting["durationSeconds"])
+        agg_econ = float(economic["microunits"]) if isinstance(economic, Mapping) else 0.0
+        eco_statuses: set[str] = {economic["status"]} if isinstance(economic, Mapping) else set()
+        econ_seen = isinstance(economic, Mapping)
         count = 1
         for row in self.store.list_evidence(run_id):
             if row["event_type"] != "accounting_recorded":
@@ -750,6 +771,11 @@ class Controller:
             agg["totalTokens"] += int(u.get("totalTokens", 0))
             agg_cost += float(prior.get("costMicrounits", 0) or 0)
             agg_duration += float(prior.get("durationSeconds", 0) or 0)
+            prior_eco = prior.get("economicCost")
+            if isinstance(prior_eco, dict) and isinstance(prior_eco.get("microunits"), (int, float)):
+                agg_econ += float(prior_eco["microunits"])
+                eco_statuses.add(prior_eco.get("status"))
+                econ_seen = True
             count += 1
         payload = dict(accounting)
         payload.update({
@@ -758,6 +784,9 @@ class Controller:
             "aggregateDurationSeconds": agg_duration,
             "responseCount": count,
         })
+        if econ_seen:
+            payload["aggregateEconomicCostMicrounits"] = agg_econ
+            payload["economicCostStatuses"] = sorted(s for s in eco_statuses if isinstance(s, str))
         ref = self.store.put_artifact(payload)
         self.append_event(run_id, "accounting_recorded", {"accountingRef": ref.model_dump(mode="json")}, "system", "operator")
         return ref
