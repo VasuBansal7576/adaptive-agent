@@ -217,7 +217,7 @@ def test_adaptation_learns_from_support_before_query(monkeypatch):
 
     assert runtime.calls[-2:] == [
         ("known-a-development-0", "L", 17, "primary"),
-        ("known-a-validation-0", "L", 23, "adapted"),
+        ("known-a-final-0", "L", 23, "adapted"),
     ]
     assert admissions == [
         "adaptation:adapt:known-a:support",

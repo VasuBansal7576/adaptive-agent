@@ -896,9 +896,12 @@ class DefaultExperimentStageRunner:
         if not eligible:
             raise ExperimentRuntimeError("transfer training set does not prove leave-one-environment-out exclusion")
         candidate, candidate_receipt = self._candidate_for_excluded_environment(context, environment_id)
-        validation_task = self._task_for_cell(cell_key, "validation", environment_id, 0)
+        # Transfer queries are operational lifecycle evidence, not promotion
+        # evidence. Keep them outside the validation panel so this cell can
+        # never consume the primary promotion task allocation.
+        query_task = self._task_for_cell(cell_key, "final", environment_id, 0)
         observation, evaluation_receipt = self._execute_stage_subcall(
-            validation_task,
+            query_task,
             "L",
             int(self.protocol.seeds[0]),
             candidate,
@@ -914,7 +917,7 @@ class DefaultExperimentStageRunner:
             cell_key,
             [observation],
             self.pins,
-            extra={"environmentId": environment_id, "partition": "validation", "resetBefore": True, "exposed": False, "heldoutAccess": False, "disjointDevelopmentEnvironments": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": list(candidate_receipt["sourceRunIds"]), "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"], "learningReceipt": dict(candidate_receipt)},
+            extra={"environmentId": environment_id, "partition": "final", "resetBefore": True, "exposed": False, "heldoutAccess": False, "disjointDevelopmentEnvironments": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": list(candidate_receipt["sourceRunIds"]), "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"], "learningReceipt": dict(candidate_receipt)},
         )
         return self._merge_receipts(
             receipt,
@@ -933,7 +936,9 @@ class DefaultExperimentStageRunner:
         environment_id = match.group(1)
         candidate = self._candidate(context)
         support = self._task_for_cell(cell_key, "development", environment_id, 0)
-        query = self._task_for_cell(cell_key, "validation", environment_id, 0)
+        # Adaptation support is development-only; its query must be disjoint
+        # from both development support and the validation promotion panel.
+        query = self._task_for_cell(cell_key, "final", environment_id, 0)
         support_observation, support_receipt = self._execute_stage_subcall(
             support,
             "L",
