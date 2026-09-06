@@ -168,7 +168,7 @@ def test_benchmark_write_uses_authorized_batch_mode(monkeypatch, tmp_path):
     run_id = observation.run_id
     assert run_id is not None
     assert runtime.get_run(run_id)["status"] == "succeeded"
-    assert runtime.controller.store.get_run(run_id)["execution_mode"] == "batch"
+    assert runtime.get_run(run_id)["executionMode"] == "batch"
     assert seen["model_responses"]
     assert seen["kernel_events"]
     tool_events = [row for row in runtime.controller.store.list_evidence(run_id) if row["event_type"] == "tool_result"]
