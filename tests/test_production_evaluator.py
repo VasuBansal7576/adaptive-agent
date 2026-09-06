@@ -59,7 +59,7 @@ def test_final_preparer_persists_memory_disabled_ablation_from_learning_bundle(t
     protocol = EvaluationProtocol()
     protocol.freeze(packages)
     store = Store(tmp_path)
-    learned = SkillBundle()
+    learned = SkillBundle(executionConfig={"instruction_variant": "learned procedure memory"})
     store.save_bundle(learned.bundle_id, learned.parent, learned.content_hash, learned.model_dump_json(by_alias=True))
 
     class Controller:
@@ -74,13 +74,24 @@ def test_final_preparer_persists_memory_disabled_ablation_from_learning_bundle(t
             return kwargs
 
     Runtime.packages = packages
-    final = _lifecycle_stages(Runtime(), protocol, declared_retries=0)[-1]
+    runtime = Runtime()
+    final = _lifecycle_stages(runtime, protocol, declared_retries=0)[-1]
     prepared = final.final_preparer({"results": {"learning": {"candidate-generation": {"candidateBundleHash": learned.content_hash}}}})
     assert prepared["ablationBundleHash"]
     ablation_row = store.get_bundle_by_hash(prepared["ablationBundleHash"])
     assert ablation_row is not None
     ablation = SkillBundle.model_validate_json(ablation_row["bundle_json"])
     assert ablation.skills == [] and ablation.execution_config.skill_refs == []
+    assert ablation.execution_config.instruction_variant == "default"
+    assert ablation.bundle_id != learned.bundle_id
+    assert store.get_bundle(learned.bundle_id)["content_hash"] == learned.content_hash
+
+    # Reopening the lifecycle binds the same durable A bundle and does not
+    # replace the learned bundle or create a second ablation identity.
+    prepared_again = final.final_preparer({"results": {"learning": {"candidate-generation": {"candidateBundleHash": learned.content_hash}}}})
+    assert prepared_again == prepared
+    assert store.get_bundle(ablation.bundle_id)["content_hash"] == ablation.content_hash
+    assert runtime._evaluation_arm_bundles["A"] == ablation.content_hash
 
 
 def test_bound_private_outcome_requires_trusted_canonical_identity():
