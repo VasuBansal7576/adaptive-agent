@@ -66,6 +66,35 @@ class PrimeRuntimeTests(unittest.TestCase):
         self.assertEqual(denied.status, "error")
         self.assertIn("denied", denied.error["evalue"])
 
+    def test_discovered_ids_require_exact_current_run_match(self):
+        root = Path(tempfile.mkdtemp(prefix="adaptive-test-"))
+        self.adapter = PrimeRuntimeAdapter(
+            PrimeRuntimeConfig(task_id="run-current", root_dir=root),
+            broker=CapabilityBroker("run-current", authorizer=lambda _cap, args: dict(args)),
+        )
+        self.adapter.broker.register(Capability("run-current:echo", "echo", "1", "read", "run", "never"))
+
+        discovered = self.adapter.execute(
+            'from rlm import host_request\nawait host_request("capabilities.discover")'
+        )
+        self.assertEqual(discovered.status, "ok")
+        self.assertIn("run-current:echo", discovered.result)
+
+        called = self.adapter.execute(
+            'from rlm import host_request\nawait host_request("broker.call", '
+            '{"capabilityId":"run-current:echo", "arguments":{"n":1}})'
+        )
+        self.assertEqual(called.status, "ok")
+
+        for capability_id in ("echo", "run-foreign:echo"):
+            denied = self.adapter.execute(
+                'from rlm import host_request\nawait host_request("broker.call", '
+                f'{{"capabilityId":{capability_id!r}, "arguments":{{}}}})'
+            )
+            self.assertEqual(denied.status, "error")
+            self.assertIn("capability is not granted", denied.error["evalue"])
+            self.assertIn("capabilities.discover", denied.error["evalue"])
+
     def test_docker_cleanup_label_is_trusted_and_required(self):
         adapter = self.make(ao_session_id="trusted-session")
         self.assertEqual(adapter.cleanup_label, "ao.session=trusted-session")

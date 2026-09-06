@@ -184,6 +184,14 @@ def test_system_prompt_uses_first_class_environment_and_preserves_distinct_skill
     assert "caller-skill" in standalone
 
 
+def test_system_prompt_documents_exact_discovery_contract_for_tool_calls():
+    prompt = LunaPlanner(None, None, None)._system_prompt({}, ())
+    assert 'host_request("capabilities.discover")' in prompt
+    assert "exact current-run capability ids" in prompt
+    assert "exact discovered id for the tool" in prompt
+    assert "do not construct, copy, alias, or suffix-match ids" in prompt
+
+
 def test_system_prompt_deduplicates_overlapping_skills_by_full_value():
     shared = {"id": "shared", "procedure": "same"}
     environment = {"activeSkills": [shared]}
