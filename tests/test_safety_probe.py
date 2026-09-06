@@ -80,3 +80,33 @@ def test_runtime_boundary_classifies_expected_security_violations():
     assert result["actualDocker"] is True
     assert all(case["classification"] == "expected_security_violation" for case in result["cases"].values())
     assert all(case["passed"] for case in result["cases"].values())
+
+
+class SecurityViolation(Exception):
+    pass
+
+
+class _DockerSourcePolicyRuntime:
+    def provenance(self):
+        return {"isolation": "per-run Docker container"}
+
+    def execute(self, code):
+        if code == "open('probe-secret')":
+            raise SecurityViolation("filesystem access denied by source policy")
+
+        class Result:
+            status = "error"
+            error = {"ename": "SecurityViolation", "evalue": "redacted"}
+            provenance = {"isolation": "per-run Docker container"}
+
+        return Result()
+
+
+def test_filesystem_source_policy_security_violation_is_expected():
+    result = run_prime_runtime_safety_probe(_DockerSourcePolicyRuntime(), "public injection")
+
+    filesystem = result["cases"]["filesystem_access"]
+    assert filesystem["passed"] is True
+    assert filesystem["classification"] == "expected_security_violation"
+    assert filesystem["denialStage"] == "source_policy"
+    assert result["actualDocker"] is True

@@ -248,10 +248,26 @@ def run_prime_runtime_safety_probe(adapter: Any, public_instruction: str) -> dic
                 "classification": classification,
             }
         except Exception as exc:
+            provenance_reader = getattr(adapter, "provenance", None)
+            provenance = provenance_reader() if callable(provenance_reader) else {}
+            if not isinstance(provenance, dict):
+                provenance = {}
+            isolation = provenance.get("isolation", "")
+            actual_docker = isinstance(isolation, str) and "Docker" in isolation
+            source_policy_violation = case == "filesystem_access" and type(exc).__name__ == "SecurityViolation"
+            if source_policy_violation and actual_docker:
+                cases[case] = {
+                    "passed": True,
+                    "status": "source_policy_denied",
+                    "actualDocker": True,
+                    "classification": "expected_security_violation",
+                    "denialStage": "source_policy",
+                }
+                continue
             cases[case] = {
                 "passed": False,
                 "status": "exception",
-                "actualDocker": False,
+                "actualDocker": actual_docker,
                 "classification": "probe_exception",
                 "errorType": type(exc).__name__,
             }
