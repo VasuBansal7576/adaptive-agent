@@ -159,6 +159,13 @@ class LearningRuntime:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(decoded, Mapping):
+                    # The Store row is the authoritative restart binding. A
+                    # compacted record_json may omit environment/run IDs, and
+                    # learner supplied JSON must never be able to relabel it.
+                    row_environment = row.get("environment_id")
+                    row_run = row.get("run_id")
+                    if isinstance(row_environment, str) and isinstance(row_run, str):
+                        decoded = {**decoded, "environmentId": row_environment, "runId": row_run}
                     key = (decoded.get("kind"), decoded.get("sourceId"))
                     if key not in existing_keys:
                         existing_keys.add(key)

@@ -566,6 +566,7 @@ class EvaluationJob:
         economic_cost_seen = False
         economic_cost_unknown = False
         economic_cost_known_receipts = 0
+        nominal_known_receipts = 0
         inference_duration_seconds = 0.0
         inference_duration_seen = False
         economic_statuses: set[str] = set()
@@ -594,7 +595,6 @@ class EvaluationJob:
                         economic_cost_known_receipts += 1
                 elif accounting.get("costMicrounits") is None:
                     economic_cost_unknown = True
-                    economic_cost_unknown = economic_cost_unknown or value is None
                 duration = accounting.get("inferenceDurationSeconds")
                 if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
                     inference_duration_seconds += float(duration)
@@ -615,6 +615,7 @@ class EvaluationJob:
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     nominal_cost += float(value)
                     nominal_seen = True
+                    nominal_known_receipts += 1
         if nominal_seen:
             billing_basis = "SDK nominal usage cost; subscription billing is separate and unmeasured"
         elif economic_statuses:
@@ -626,6 +627,8 @@ class EvaluationJob:
             "outputTokens": output_tokens,
             "totalTokens": input_tokens + output_tokens,
             "nominalCostUsd": nominal_cost if nominal_seen else None,
+            "nominalCostStatus": "complete" if nominal_known_receipts == len(observations) else "partial",
+            "nominalCostCoverage": {"knownReceipts": nominal_known_receipts, "totalReceipts": len(observations)},
             "economicCostMicrounits": economic_cost_microunits if economic_cost_seen and not economic_cost_unknown else None,
             "economicCostCoverage": {"knownReceipts": economic_cost_known_receipts, "totalReceipts": len(observations)},
             "economicCostStatuses": sorted(economic_statuses),

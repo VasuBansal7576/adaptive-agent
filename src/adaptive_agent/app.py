@@ -450,7 +450,35 @@ class DurableRuntime:
         result = job.run(evaluation_id, "validation", base_hash=str(queued["base_hash"]), candidate_hash=candidate_hash, candidate_id=candidate_id)
         result_payload = result.report.to_dict() if hasattr(result.report, "to_dict") else result.report
         stored_report = self.controller.store.get_evaluation(evaluation_id)
+        # EvaluationJob persists its execution record separately from the
+        # operator-facing evaluation table. Mirror every measured report under
+        # the queue ID so replay and readback use one durable identity.
+        if isinstance(result_payload, Mapping):
+            self.controller.store.save_evaluation(
+                evaluation_id,
+                {
+                    "candidate_hash": queued["candidate_hash"],
+                    "base_hash": queued["base_hash"],
+                    "protocol_hash": queued["protocol_hash"],
+                    "partition_ref": queued["partition_ref"],
+                    "report_json": json.dumps(dict(result_payload), sort_keys=True),
+                    "validity": str(result_payload.get("validityStatus", result.status)),
+                },
+            )
+            stored_report = self.controller.store.get_evaluation(evaluation_id)
         trusted = bool(isinstance(result_payload, Mapping) and stored_report is not None and self._verify_evaluation_report(result_payload, stored_report))
+        terminal_state = "failed" if result.status == "failed" else "completed"
+        queue_payload = dict(result_payload) if isinstance(result_payload, Mapping) else {
+            "evaluationId": evaluation_id,
+            "candidateId": candidate_id,
+            "state": result.status,
+            "trusted": trusted,
+            "error": result.error,
+        }
+        self.controller.store.save_evaluation_queue(
+            evaluation_id,
+            {**queued, "state": terminal_state, "payload_json": json.dumps(queue_payload, sort_keys=True), "updated_at": datetime.now(timezone.utc).isoformat()},
+        )
         return {"evaluationId": evaluation_id, "candidateId": candidate_id, "state": result.status, "trusted": trusted, "error": result.error}
 
     def execute_evaluation_task(self, task: Any, frozen_config: Any, bundle: Any) -> Any:
@@ -1125,6 +1153,8 @@ class DurableRuntime:
         aggregate_cost_unknown = any(status == "unknown" for status in economic_statuses) or any("costMicrounits" not in item for item in all_receipts)
         nominal_values = [float(item["nominalCostUsd"]) for item in all_receipts if "nominalCostUsd" in item]
         nominal_cost_usd = sum(nominal_values) if nominal_values else None
+        nominal_coverage = {"knownReceipts": len(nominal_values), "totalReceipts": len(all_receipts)}
+        nominal_status = "complete" if nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"] else "partial"
         usage = dict(canonical_usage(evidence.get("usage")))
         if all_receipts:
             usage.update({key: value for key, value in all_receipts[-1]["usage"].items() if key in cache_keys or key == "cost"})
@@ -1179,6 +1209,8 @@ class DurableRuntime:
             "versionRefs": version_refs,
             "planner": {"responseId": response_id, "modelProfile": model, "corePlannerHash": frozen_core_planner, "versionRefs": version_refs, "bundleHash": bundle_hash, "arm": arm, "seed": seed},
             "nominalCostUsd": nominal_cost_usd,
+            "nominalCostStatus": nominal_status,
+            "nominalCostCoverage": nominal_coverage,
         }
         accounting = {
             "responseId": response_id,
@@ -1195,6 +1227,8 @@ class DurableRuntime:
             "costMicrounits": aggregate_cost if explicit_cost else None,
             "economicCost": {"status": economic_status, "microunits": aggregate_cost if explicit_cost and not aggregate_cost_unknown else None, "coverage": {"knownReceipts": sum(1 for item in all_receipts if "costMicrounits" in item), "totalReceipts": len(all_receipts)}},
             "nominalCostUsd": nominal_cost_usd,
+            "nominalCostStatus": nominal_status,
+            "nominalCostCoverage": nominal_coverage,
             "durationSeconds": whole_run_duration,
             "inferenceDurationSeconds": aggregate_inference,
         }
@@ -1668,8 +1702,15 @@ def create_runtime_app(
     durable_runtime = DurableRuntime(controller, registry, packages, model_runner=model_runner, evaluator=evaluator, model_ref=model_ref, budget_ref=budget_ref, control_plane=plane, package_bindings=package_bindings, learning_model_client=learning_model_client, evaluation_executor=evaluation_executor, experiment_stage_runner=experiment_stage_runner)
     app = create_app(plane, durable_runtime=durable_runtime)
     app.state.controller = controller
-    if evaluation_protocol is not None:
-        app.state.evaluation_driver = durable_runtime.build_evaluation_driver(evaluation_protocol, evaluation_arm_bundles)
+    if evaluation_protocol is None:
+        from adaptive_agent.evaluation import EvaluationProtocol
+
+        evaluation_protocol = EvaluationProtocol(
+            image_digest=durable_runtime.image_digest,
+            core_planner_hash=durable_runtime.core_planner_hash,
+        )
+        evaluation_protocol.freeze(durable_runtime.packages)
+    app.state.evaluation_driver = durable_runtime.build_evaluation_driver(evaluation_protocol, evaluation_arm_bundles)
     resolved_console = Path(console_dist) if console_dist is not None else Path(__file__).resolve().parents[2] / "console" / "dist"
     if resolved_console.is_dir():
         from fastapi.staticfiles import StaticFiles

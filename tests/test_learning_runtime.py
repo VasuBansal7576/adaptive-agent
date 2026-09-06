@@ -10,6 +10,7 @@ import pytest
 
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tests"))
 core_src = os.environ.get("ADAPTIVE_AGENT_CORE_SRC")
 if core_src:
     import adaptive_agent

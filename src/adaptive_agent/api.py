@@ -1105,6 +1105,8 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
                 raise ValueError("evaluation launch requires the durable runtime")
             if getattr(runtime, "_evaluation_protocol", None) is None:
                 raise ValueError("runtime evaluation launch requires evaluator-owned EvaluationJob.run")
+            if payload.protocol_hash is not None or payload.partition_ref is not None:
+                raise ValueError("runtime evaluation launch requires evaluator-owned EvaluationJob.run")
             # Launch bindings are resolved from the server's frozen protocol;
             # legacy client-supplied pin fields are intentionally discarded.
             queued = runtime.queue_evaluation(payload.model_copy(update={"protocol_hash": None, "partition_ref": None}))
