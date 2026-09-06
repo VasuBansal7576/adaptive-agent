@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from adaptive_agent.api import CandidateProposalRequest, ControlPlane, EvaluationRequest, create_app, make_authenticated_model_runner
 from adaptive_agent.app import _FixtureProvider, create_runtime_app
-from adaptive_agent.evaluation import Arm, EvaluationProtocol, EvaluationRunner, ModelProvenance, Partition, RunObservation, build_environment_packages
+from adaptive_agent.evaluation import Arm, EvaluationProtocol, EvaluationRunner, ModelProvenance, Partition, PromotionEvidenceRefused, RunObservation, build_environment_packages
 from adaptive_agent.evaluation_store import build_durable_evaluation_runner
 from adaptive_agent.store import Store
 from adaptive_agent.environment import EnvironmentRegistry
@@ -100,7 +100,7 @@ def _real_development_evidence(tmp_path):
     return artifact.sha256, evidence.evidence_id
 
 
-def _persist_real_observation(store, frozen, package, arm, task, seed, index):
+def _persist_real_observation(store, frozen, package, arm, task, seed, index, *, model_provenance=ModelProvenance.REAL_MODEL):
     """Persist one evaluator receipt satisfying SQLiteRunEvidenceStore pins."""
     from adaptive_agent.evaluation import BudgetSpec
 
@@ -163,7 +163,7 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index):
     )
     store.append_evidence(
         f"evaluation-outcome-{index}",
-        {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0},
+        {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "operator", "redacted": 0},
     )
     config_hashes = {
         "model": sha256_json({"profile": frozen.inputs["modelProfile"], "provider": frozen.inputs["provider"]}),
@@ -184,7 +184,7 @@ def _persist_real_observation(store, frozen, package, arm, task, seed, index):
         0,
         1,
         1.0,
-        model_provenance=ModelProvenance.REAL_MODEL,
+        model_provenance=model_provenance,
         model_profile=str(frozen.inputs["modelProfile"]),
         core_planner_hash=str(frozen.inputs["corePlannerHash"]),
         budget=BudgetSpec(),
@@ -805,7 +805,7 @@ def test_candidate_evaluation_decision_and_rollback_boundaries(tmp_path):
     assert api.post(f"/candidates/{candidate_id}/rollback", json={"reason": "operator safety rollback"}).status_code == 200
 
 
-def test_trusted_evaluation_runner_report_is_pinned_before_decision(tmp_path):
+def test_synthetic_evaluation_report_is_refused_before_promotion(tmp_path):
     packages = build_environment_packages()
     protocol = EvaluationProtocol()
     protocol.freeze(packages)
@@ -817,7 +817,16 @@ def test_trusted_evaluation_runner_report_is_pinned_before_decision(tmp_path):
     def execute(arm, package, task, seed):
         nonlocal index
         index += 1
-        return _persist_real_observation(eval_store, protocol.start_candidate_generation(), package, arm, task, seed, index)
+        return _persist_real_observation(
+            eval_store,
+            protocol.start_candidate_generation(),
+            package,
+            arm,
+            task,
+            seed,
+            index,
+            model_provenance=ModelProvenance.SYNTHETIC_MODEL,
+        )
 
     plane = ControlPlane()
     base_hash = plane.active_bundle_hash
@@ -826,26 +835,9 @@ def test_trusted_evaluation_runner_report_is_pinned_before_decision(tmp_path):
         supportingEvidenceIds=[_real_development_evidence(tmp_path)[1]], predictedEffect="improves accuracy", proposerVersion="test",
     ))
     report = runner.run_validation(base_hash=base_hash, candidate_hash=candidate["candidateId"], execute=execute)
-    report.require_promotion_evidence(protocol, packages)
-    serialized = report.to_dict()
-    assert serialized["promotionEligible"] is True
-    assert serialized["exposure"][0]["environment_id"] == "finance"
-
-    evaluation = plane.queue_evaluation(EvaluationRequest(
-        candidateId=candidate["candidateId"], baseBundleHash=base_hash, protocolHash=report.protocol_hash,
-        partitionRef={"id": "validation", "version": "1", "sha256": report.partition_hashes["finance:validation"]},
-    ))
-    class ForgedCandidateReport:
-        def to_dict(self):
-            value = dict(serialized)
-            value["candidateHash"] = "another-candidate"
-            return value
-
-    with pytest.raises(ValueError, match="candidate hash"):
-        plane.record_trusted_evaluation(evaluation["evaluationId"], ForgedCandidateReport())
-    recorded = plane.record_trusted_evaluation(evaluation["evaluationId"], report)
-    assert recorded["state"] == "valid"
-    assert recorded["report"]["evaluatorTrusted"] is True
+    assert report.promotion_eligible is False
+    with pytest.raises(PromotionEvidenceRefused, match="not attested"):
+        report.require_promotion_evidence(protocol, packages)
 
 
 def test_prime_bridge_records_parent_owned_model_observation():
