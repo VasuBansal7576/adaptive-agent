@@ -544,17 +544,28 @@ class LunaPlanner:
         return PlannerResult("budget_exhausted", None, self.limits.max_turns, model_tokens, kernel_steps, tuple(response_ids), tuple(events))
 
     def _system_prompt(self, environment: Mapping[str, Any], active_skills: Sequence[Mapping[str, Any]]) -> str:
-        public = _redact({"environment": environment, "activeSkills": list(active_skills)})
-        contract = _bounded_text(public, self.limits.max_context_chars)
-        return (
+        prompt = (
             "You are the authenticated Luna planner. Generate a generic solution for the supplied goal. "
             "Use public docs, tool schemas, policy, and active skills as contracts. "
             "Return exactly one JSON object: {\\\"action\\\":\\\"execute\\\",\\\"code\\\":\\\"...\\\"} "
             "for Python to run in the task-scoped Prime kernel, or {\\\"action\\\":\\\"finish\\\",\\\"answer\\\":\\\"...\\\"}. "
             "Use `from rlm import host_request` and await host_request(\"broker.call\", {\"capabilityId\": \"...\", \"arguments\": {...}}) for tools; do not import the rlm module itself. "
             "Never import credentials, access the host, or invent outcomes. "
-            "A tool result or error is feedback for the next turn. The contract context is:\n" + contract
+            "A tool result or error is feedback for the next turn. The first-class `environment` request field is the authoritative task contract, including task context, public docs, capabilities, tool schemas, schema, and budget."
         )
+        environment_skills = environment.get("activeSkills")
+        explicit_skills = list(active_skills)
+        if "activeSkills" not in environment:
+            supplemental = explicit_skills
+            label = "The caller supplied these active skills because the environment has none:"
+        else:
+            normalized_environment_skills = list(environment_skills) if isinstance(environment_skills, Sequence) and not isinstance(environment_skills, (str, bytes)) else environment_skills
+            supplemental = explicit_skills if normalized_environment_skills != explicit_skills else []
+            label = "These additional caller-provided active skills supplement the authoritative environment activeSkills:"
+        if supplemental:
+            skills = _bounded_text(_redact({"activeSkills": supplemental}), self.limits.max_context_chars)
+            prompt += f" {label}\n{skills}"
+        return prompt
 
     def _bounded_history(self, messages: Sequence[Mapping[str, str]]) -> list[Mapping[str, str]]:
         """Keep the system prompt and newest turns within the context cap."""
