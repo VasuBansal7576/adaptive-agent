@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -20,6 +21,26 @@ from adaptive_agent.models import ArtifactRef, sha256_json
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|bearer)\s*[:=]\s*\S+"),
+)
+
+
+def sanitize_for_learner(value: Any) -> Any:
+    if isinstance(value, str):
+        for pattern in _SECRET_PATTERNS:
+            value = pattern.sub("[REDACTED]", value)
+        return value
+    if isinstance(value, dict):
+        return {key: sanitize_for_learner(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_for_learner(item) for item in value]
+    return value
 
 
 class Store:
@@ -842,7 +863,7 @@ class Store:
             calls = [dict(row) for row in conn.execute("SELECT * FROM tool_calls WHERE run_id = ? ORDER BY rowid", (run_id,)).fetchall()]
         evidence_by_call: dict[str, dict[str, Any]] = {}
         for event in self.list_evidence(run_id):
-            if event.get("event_type") != "tool_result":
+            if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker" or event.get("visibility") not in {"learner", "operator"}:
                 continue
             try:
                 ref = json.loads(event["source_ref"])
@@ -851,15 +872,6 @@ class Store:
                 continue
             if isinstance(payload, dict) and isinstance(payload.get("callId"), str):
                 evidence_by_call[payload["callId"]] = event
-
-        def safe(value: Any) -> Any:
-            if isinstance(value, str):
-                return value
-            if isinstance(value, dict):
-                return {str(key): safe(item) for key, item in value.items() if str(key).lower() not in {"approvaltoken", "secret", "token", "password", "credential", "authorization"}}
-            if isinstance(value, list):
-                return [safe(item) for item in value]
-            return value
 
         out: list[dict[str, Any]] = []
         matched: set[str] = set()
@@ -892,7 +904,7 @@ class Store:
                 matched.add(call["call_id"])
             out.append({
                 "callId": call["call_id"], "evidenceId": event.get("evidence_id"), "tool": call["tool"],
-                "input": safe(arguments), "result": safe(output), "status": status,
+                "input": sanitize_for_learner(arguments), "result": sanitize_for_learner(output), "status": status,
                 "errorCode": error_code, "retry": retry, "version": version, "effect": effect,
                 "idempotencyKey": call["idempotency_key"], "argumentsSha256": sha256_json(arguments),
                 "resultSha256": result_hash, "evidenceContentHash": event.get("content_hash"),
@@ -902,22 +914,23 @@ class Store:
         # Older runtime versions persisted tool-result evidence without a
         # prepared-call row. Preserve that history as a minimal safe record.
         for event in self.list_evidence(run_id):
-            if event.get("event_type") != "tool_result":
+            if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker" or event.get("visibility") not in {"learner", "operator"}:
                 continue
             try:
                 ref = json.loads(event["source_ref"])
                 payload = self.get_artifact(ref["sha256"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                payload = {}
-            if not isinstance(payload, dict):
+                payload = None
+            if payload is not None and not isinstance(payload, dict):
                 continue
+            payload = payload or {}
             call_id = payload.get("callId")
             if isinstance(call_id, str) and call_id in matched:
                 continue
             error = payload.get("error")
             out.append({
                 "callId": call_id, "evidenceId": event.get("evidence_id"), "tool": payload.get("tool"),
-                "input": None, "result": safe(payload.get("output")), "status": payload.get("status"),
+                "input": None, "result": sanitize_for_learner(payload.get("output")), "status": payload.get("status"),
                 "errorCode": error.get("code") if isinstance(error, dict) else None,
                 "retry": error.get("retry") if isinstance(error, dict) else None,
                 "version": payload.get("toolVersion"), "effect": payload.get("effect"),
