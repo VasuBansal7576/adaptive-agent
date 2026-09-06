@@ -1029,6 +1029,21 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
             raise HTTPException(status_code=422, detail="runId does not match path")
         return _launch_learning(payload)
 
+    @app.get("/learning/runtime")
+    def learning_runtime(
+        environment_id: str | None = Query(None, alias="environmentId", min_length=1),
+        run_id: str = Query(..., alias="runId", min_length=1),
+    ) -> JsonObject:
+        """Expose the Store-owned learner projection for one development run."""
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="durable learning runtime is not configured")
+        try:
+            return runtime.learning_runtime(environment_id=environment_id, run_id=run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (LearningStoreError, PermissionError, ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.get("/skills")
     def skills() -> list[JsonObject]:
         return []

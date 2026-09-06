@@ -126,6 +126,64 @@ def test_durable_cancelled_run_cannot_be_reopened(tmp_path):
     assert calls == 0
 
 
+def test_learning_runtime_uses_durable_projection_and_excludes_operator_evidence(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "learning-runtime"}).json()
+    run_id = run["runId"]
+    store = app.state.durable_runtime.controller.store
+    stored_run = store.get_run(run_id)
+    assert stored_run is not None
+    stored_run["status"] = "succeeded"
+    store.save_run(run_id, stored_run)
+
+    public_ref = store.put_artifact({"result": "safe"})
+    store.append_evidence(
+        "learning-safe",
+        {
+            "run_id": run_id,
+            "sequence": 1,
+            "event_type": "tool_result",
+            "content_hash": public_ref.sha256,
+            "source_ref": public_ref.model_dump_json(),
+            "trust_class": "broker",
+            "visibility": "learner",
+            "redacted": 1,
+        },
+    )
+    hidden_ref = store.put_artifact({"answer": "operator secret"})
+    store.append_evidence(
+        "learning-hidden",
+        {
+            "run_id": run_id,
+            "sequence": 2,
+            "event_type": "tool_result",
+            "content_hash": hidden_ref.sha256,
+            "source_ref": hidden_ref.model_dump_json(),
+            "trust_class": "broker",
+            "visibility": "operator",
+            "redacted": 1,
+        },
+    )
+    store.save_outcome("learning-outcome", {"run_id": run_id, "passed": 1, "score": 1.0, "metadata_json": "{}", "checked_at": "now"})
+
+    response = api.get("/learning/runtime", params={"environmentId": "finance", "runId": run_id})
+    assert response.status_code == 200
+    projected = response.json()
+    assert projected["environmentId"] == "finance"
+    assert projected["runId"] == run_id
+    assert projected["publicDocs"]
+    assert any(row["evidence_id"] == "learning-safe" for row in projected["developmentEvidence"])
+    encoded = response.text
+    assert "learning-hidden" not in encoded
+    assert "operator secret" not in encoded
+    inferred = api.get("/learning/runtime", params={"runId": run_id})
+    assert inferred.status_code == 200
+    assert inferred.json()["environmentId"] == "finance"
+
+
 def test_durable_restart_does_not_reopen_claimed_run(tmp_path):
     first_app = create_runtime_app(data_dir=tmp_path)
     first_api = TestClient(first_app, base_url="http://127.0.0.1")

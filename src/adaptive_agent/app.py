@@ -424,6 +424,44 @@ class DurableRuntime:
             candidate["candidateId"] = candidate.pop("candidate_id")
         return {"actionId": f"learn_{__import__('uuid').uuid4().hex}", "runId": payload.run_id, "predictedEffect": proposal.candidate_payload["predictedEffect"], "evidenceIds": proposal.candidate_payload["supportingEvidenceIds"], "proposalRef": self.controller.store.put_artifact(proposal.bundle_patch).model_dump(mode="json", by_alias=True), "candidate": candidate, "status": "staged", "createdAt": __import__("adaptive_agent.api", fromlist=["_now"])._now()}
 
+    def learning_runtime(self, *, environment_id: str | None = None, run_id: str) -> dict[str, Any]:
+        """Return the narrow learner context for one durable development run.
+
+        The Store owns the projection and its visibility rules.  This adapter
+        only binds the requested run to its registered environment before
+        returning the public documents and trusted development evidence.
+        """
+        store = self.controller.store
+        run = store.get_run(run_id)
+        if run is None:
+            raise KeyError("run not found")
+        if environment_id is None:
+            environment_id = run.get("environment_id")
+        if not isinstance(environment_id, str) or not environment_id:
+            raise ValueError("run environment binding is missing")
+        environment = store.get_environment(environment_id)
+        if environment is None:
+            raise KeyError("environment not found")
+        if run.get("environment_id") != environment_id:
+            raise ValueError("run does not belong to environment")
+        task_id = run.get("task_id")
+        task = store.get_task(task_id) if isinstance(task_id, str) else None
+        if task is None:
+            raise KeyError("run task not found")
+        if task.get("environment_id") != environment_id or task.get("partition") != "development":
+            raise ValueError("learning runtime requires a development task")
+        public_docs = store.get_public_docs(environment_id)
+        # Keep this API on the narrow Store projection.  The broader learning
+        # feed also contains broker-call joins for the internal learner and
+        # must not become an HTTP path for operator or evaluator evidence.
+        development_evidence = store.list_learner_evidence(environment_id=environment_id, run_id=run_id)
+        return {
+            "environmentId": environment_id,
+            "runId": run_id,
+            "publicDocs": public_docs,
+            "developmentEvidence": development_evidence,
+        }
+
     def list_environments(self) -> list[dict[str, Any]]:
         registered = {task.environment_ref.id for task in self._tasks.values()}
         return [{"environmentId": name, "version": package.manifest.version, "validationState": "valid", "evaluatorReady": callable(getattr(package, "evaluate", None)) and not isinstance(package, _RegisteredPackage), "toolCount": len(package.manifest.tool_schemas), "policyScope": package.manifest.policy_ref.id, "executionModes": list(package.manifest.execution_modes), "capabilities": list(package.manifest.capabilities)} for name, package in self.packages.items() if name in registered]
