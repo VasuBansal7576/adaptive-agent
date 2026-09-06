@@ -764,7 +764,9 @@ class Store:
                     records.append({"kind": "public_doc", "sourceId": ref.get("id", ref["sha256"]), "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "visibility": "public"})
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 pass
-        trusted = self.has_trusted_outcome(run_id)
+        trusted_row = self.get_outcome_by_run_id(run_id)
+        trusted = isinstance(trusted_row, Mapping)
+        outcome_passed = bool(trusted_row.get("passed")) if trusted_row is not None else False
         for row in self.list_evidence(run_id):
             if row.get("visibility") != "learner":
                 continue
@@ -781,7 +783,7 @@ class Store:
             records.append({"kind": "live_evidence", "sourceId": row["evidence_id"], "content": text, "contentHash": content_digest, "environmentId": environment_id, "runId": run_id, "partition": provenance.get("partition"), "visibility": "learner", "trustClass": row.get("trust_class"), "trustedOutcome": trusted})
         if trusted:
             text = "A trusted evaluator outcome is stored for this development run."
-            records.append({"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True})
+            records.append({"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": trusted, "outcomePassed": outcome_passed})
         return records
 
     def evidence_provenance(self, evidence_id: str) -> dict[str, Any] | None:

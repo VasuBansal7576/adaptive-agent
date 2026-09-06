@@ -120,7 +120,7 @@ class DurableLearningSourceAdapter:
             content = json.dumps(get_artifact(source_ref_data["sha256"]), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
             records.append({"kind": "live_evidence", "sourceId": row["evidence_id"], "content": content, "contentHash": row["content_hash"], "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": row["visibility"], "trustClass": row["trust_class"], "trustedOutcome": trusted_outcome})
         if trusted_outcome:
-            records.append({"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": "A trusted evaluator outcome is stored for this development run.", "contentHash": content_hash("A trusted evaluator outcome is stored for this development run."), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True})
+            records.append({"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": "A trusted evaluator outcome is stored for this development run.", "contentHash": content_hash("A trusted evaluator outcome is stored for this development run."), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": trusted_outcome})
         return records
 
     def retriever(self, *, environment_id: str, run_id: str) -> AccessFilteredRetriever:
