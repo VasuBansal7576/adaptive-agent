@@ -1012,6 +1012,9 @@ class EvaluationProtocol:
             raise EvaluationError(f"missing fixture packages: {sorted(missing)}")
         fixture_hashes = {name: packages[name].public_fixture_hash() for name in required}
         partition_hashes = {f"{name}:{partition.value}": packages[name].partition_hash(partition) for name in required for partition in Partition}
+        required_auxiliary_count = self.validation_candidate_limit * self.tasks_per_environment + self.auxiliary_query_tasks_per_environment
+        if any(len(packages[name].tasks_for_partition(Partition.VALIDATION)) < required_auxiliary_count for name in self.known_environments):
+            raise EvaluationError("validation pool lacks the frozen auxiliary query allocation")
         auxiliary = {
             name: {
                 "transfer": packages[name].tasks_for_partition(Partition.VALIDATION)[self.validation_candidate_limit * self.tasks_per_environment].task_id,
@@ -1019,8 +1022,6 @@ class EvaluationProtocol:
             }
             for name in self.known_environments
         }
-        if any(len(packages[name].tasks_for_partition(Partition.VALIDATION)) < self.validation_candidate_limit * self.tasks_per_environment + self.auxiliary_query_tasks_per_environment for name in self.known_environments):
-            raise EvaluationError("validation pool lacks the frozen auxiliary query allocation")
         payload = self.to_dict(include_frozen=False) | {"fixtureHashes": fixture_hashes, "partitionHashes": partition_hashes, "auxiliaryQueryAllocations": auxiliary}
         frozen = FrozenProtocol(sha256_json(payload), fixture_hashes, partition_hashes, payload)
         object.__setattr__(self, "_frozen", frozen)

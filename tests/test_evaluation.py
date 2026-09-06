@@ -428,3 +428,12 @@ class EvaluationTests(unittest.TestCase):
         final = {task.task_id for task in packages[name].tasks_for_partition(Partition.FINAL)}
         development = {task.task_id for task in packages[name].tasks_for_partition(Partition.DEVELOPMENT)}
         assert {ids["transfer"], ids["adaptation"]}.isdisjoint(primary | final | development)
+
+  def test_freeze_rejects_a_validation_pool_before_auxiliary_indexing(self):
+    from unittest.mock import patch
+
+    packages = build_environment_packages()
+    original = packages["finance"].tasks_for_partition
+    with patch.object(packages["finance"], "tasks_for_partition", side_effect=lambda partition: original(partition)[:60] if partition is Partition.VALIDATION else original(partition)):
+        with self.assertRaisesRegex(EvaluationError, "auxiliary query allocation"):
+            EvaluationProtocol().freeze(packages)
