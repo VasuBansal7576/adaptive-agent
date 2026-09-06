@@ -29,7 +29,7 @@ from adaptive_agent.environment import EnvironmentRegistry
 from adaptive_agent.evaluation import build_environment_packages, sha256_json, FixtureSession, Outcome as FixtureOutcome, TrustedEvaluatorRegistry
 from adaptive_agent.learning import LearningService, PlannerLearningAdapter
 from adaptive_agent.learning_store import DurableLearningSourceAdapter, CandidateManagerLearningAdapter, LearningStoreError
-from adaptive_agent.learning_runtime import LearningRuntime, LearningRuntimeError
+from adaptive_agent.learning_runtime import LEARNING_SOURCE_RUN_CAP, LearningRuntime, LearningRuntimeError
 from adaptive_agent.planner import PrimeCliModelClient, LunaPlanner, PlannerResult, PlannerLimits
 from adaptive_agent.prime_child_planner import LunaChildPlanner
 from adaptive_agent.prime_runtime import Capability as PrimeCapability, CapabilityBroker, PrimeRuntimeAdapter, PrimeRuntimeConfig
@@ -1008,8 +1008,38 @@ class DurableRuntime:
         return decision.model_dump(mode="json", by_alias=True)
 
     def launch_learning(self, payload: Any) -> dict[str, Any]:
-        stored = self.controller.store.get_run(payload.run_id)
-        run = self.controller.get_run(payload.run_id)
+        # Single-run callers send runId only; multi-run learning declares the
+        # bounded source set via runIds.  Every listed run must be a completed
+        # development run with a trusted outcome — invalid sources fail closed.
+        raw_ids = getattr(payload, "run_ids", None) or []
+        if not isinstance(raw_ids, (list, tuple)) or any(not isinstance(run_id, str) or not run_id for run_id in raw_ids):
+            raise KeyError("learning source set is malformed")
+        requested = [payload.run_id] if getattr(payload, "run_id", None) else []
+        requested += list(raw_ids)
+        source_ids = list(dict.fromkeys(requested))
+        if not source_ids:
+            raise KeyError("run not found")
+        # Reject oversized source sets before any evidence is materialized.
+        if len(source_ids) > LEARNING_SOURCE_RUN_CAP:
+            raise KeyError("learning source set exceeds the frozen bound")
+        store = self.controller.store
+        bindings: list[tuple[str, str]] = []
+        for run_id in source_ids:
+            stored_run = store.get_run(run_id)
+            if not isinstance(stored_run, Mapping) or stored_run.get("status") not in {"succeeded", "failed", "cancelled", "timed_out", "outcome_unknown"}:
+                raise KeyError("learning source is not a completed run")
+            source_task = store.get_task(stored_run["task_id"])
+            if not isinstance(source_task, Mapping) or source_task.get("partition") != "development":
+                raise KeyError("learning source is not a development run")
+            if store.get_outcome_by_run_id(run_id) is None:
+                raise KeyError("learning source lacks a trusted outcome")
+            bindings.append((str(stored_run["environment_id"]), run_id))
+        # Deterministic exposure order: (environment, run); an explicit runId
+        # caller keeps that run as the proposal's primary identity.
+        ordered_ids = [run_id for _env, run_id in sorted(bindings)]
+        primary_id = payload.run_id if getattr(payload, "run_id", None) else ordered_ids[0]
+        stored = store.get_run(primary_id)
+        run = self.controller.get_run(primary_id)
         if stored is None or run is None:
             raise KeyError("run not found")
         package = self.packages.get(stored["environment_id"])
@@ -1021,12 +1051,20 @@ class DurableRuntime:
             self._learning_runtime = LearningRuntime.build(store=self.controller.store, manager=self.controller.candidates, model_client=model_client)
         before = {
             row.get("evidence_id")
-            for row in self.controller.store.list_evidence(payload.run_id)
+            for row in self.controller.store.list_evidence(primary_id)
             if row.get("event_type") == "learning_model_observation"
         }
-        proposal = self._learning_runtime.propose_completed_run(payload.run_id, goal=task["goal"] if isinstance(task, Mapping) else None, feedback={"status": run.status.value})
+        goal = task["goal"] if isinstance(task, Mapping) else None
+        status_feedback = run.status.value
+        if len(ordered_ids) > 1:
+            propose_multi = getattr(self._learning_runtime, "propose_completed_runs", None)
+            if not callable(propose_multi):
+                raise LearningRuntimeError("runtime lacks the multi-run learning seam")
+            proposal = propose_multi(ordered_ids, primary_run_id=primary_id, goal=goal, feedback={"status": status_feedback})
+        else:
+            proposal = self._learning_runtime.propose_completed_run(primary_id, goal=goal, feedback={"status": status_feedback})
         learning_rows = [
-            row for row in self.controller.store.list_evidence(payload.run_id)
+            row for row in self.controller.store.list_evidence(primary_id)
             if row.get("event_type") == "learning_model_observation" and row.get("evidence_id") not in before
         ]
         learning_accounting = {"wallSeconds": 0.0, "accountingComplete": bool(learning_rows)}
@@ -1070,7 +1108,10 @@ class DurableRuntime:
         candidate = dict(proposal.authoritative_candidate)
         if "candidate_id" in candidate:
             candidate["candidateId"] = candidate.pop("candidate_id")
-        return {"actionId": f"learn_{__import__('uuid').uuid4().hex}", "runId": payload.run_id, "predictedEffect": proposal.candidate_payload["predictedEffect"], "evidenceIds": proposal.candidate_payload["supportingEvidenceIds"], "proposalRef": self.controller.store.put_artifact(proposal.bundle_patch).model_dump(mode="json", by_alias=True), "candidate": candidate, "status": "staged", "createdAt": __import__("adaptive_agent.api", fromlist=["_now"])._now(), **learning_accounting}
+        result = {"actionId": f"learn_{__import__('uuid').uuid4().hex}", "runId": primary_id, "predictedEffect": proposal.candidate_payload["predictedEffect"], "evidenceIds": proposal.candidate_payload["supportingEvidenceIds"], "proposalRef": self.controller.store.put_artifact(proposal.bundle_patch).model_dump(mode="json", by_alias=True), "candidate": candidate, "status": "staged", "createdAt": __import__("adaptive_agent.api", fromlist=["_now"])._now(), **learning_accounting}
+        if len(ordered_ids) > 1:
+            result["sourceRunIds"] = ordered_ids
+        return result
 
     def learning_runtime(self, *, environment_id: str | None = None, run_id: str) -> dict[str, Any]:
         """Return the narrow learner context for one durable development run.

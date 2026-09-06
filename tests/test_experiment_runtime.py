@@ -43,7 +43,14 @@ class Store:
         return None
 
     def get_run(self, run_id):
-        return {"status": "succeeded"} if run_id == "dev-run" else None
+        env = getattr(self, "run_envs", {}).get(run_id, "known-b")
+        return {"status": "succeeded", "environment_id": env, "task_id": "dev-task"} if run_id == "dev-run" else None
+
+    def get_task(self, task_id):
+        return {"partition": "development", "goal": "dev goal"} if task_id == "dev-task" else None
+
+    def put_artifact(self, data):
+        return SimpleNamespace(model_dump=lambda **_kw: {"id": "sel", "version": "1", "sha256": "selsha"})
 
     def get_outcome_by_run_id(self, run_id):
         return {"passed": 1} if run_id == "dev-run" else None
@@ -652,3 +659,321 @@ def test_transfer_charged_subcalls_are_accounted_once_by_real_evaluation_job(tmp
     assert accounting["costMicrounits"] == 18
     assert accounting["inputTokens"] == 11
     assert accounting["outputTokens"] == 10
+
+
+# ------------------------------------------------------------------
+# Multi-run development evidence selection (learning aggregation seam)
+
+
+class _MultiRunStore:
+    """Fake store carrying per-run bindings for learning-selection tests."""
+
+    def __init__(self):
+        self.runs: dict[str, dict] = {}
+        self.tasks: dict[str, dict] = {}
+        self.outcomes: dict[str, dict] = {}
+        self.persisted: list[dict] = []
+
+    def add_run(self, run_id, env, status="succeeded", task=None, outcome=None, partition="development"):
+        task_id = task or f"task-{run_id}"
+        self.runs[run_id] = {"status": status, "environment_id": env, "task_id": task_id}
+        self.tasks[task_id] = {"partition": partition, "goal": "g", "version": "1"}
+        self.outcomes[run_id] = outcome if outcome is not None else {"passed": status == "succeeded"}
+        return run_id
+
+    def get_run(self, run_id):
+        return self.runs.get(run_id)
+
+    def get_task(self, task_id):
+        return self.tasks.get(task_id)
+
+    def get_outcome_by_run_id(self, run_id):
+        return self.outcomes.get(run_id)
+
+    def list_evidence(self, _run_id):
+        return []
+
+    def put_artifact(self, data):
+        self.persisted.append(data)
+        return SimpleNamespace(model_dump=lambda **_kw: {"id": "sel", "version": "1", "sha256": "selsha"})
+
+
+def _multi_runtime():
+    runtime = Runtime()
+    runtime.controller.store = _MultiRunStore()
+    captured = []
+    runtime.launch_learning = lambda payload: (captured.append(payload) or {
+        "candidate": {"candidateId": "cand", "candidateBundleHash": "cand", "baseBundleHash": "base"},
+    })
+    runtime.captured = captured
+    return runtime
+
+
+def _learning_runner(runtime, monkeypatch):
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, ["learning-ref"]))
+    monkeypatch.setattr(experiment_runtime, "_load_bundle", lambda _runtime, content_hash: Bundle(content_hash))
+    return runner
+
+
+def _training_context(*env_runlists):
+    """Build receipts: (env, [run_ids]) tuples -> context with training results."""
+    results = {}
+    for env, runs in env_runlists:
+        for index, run_id in enumerate(runs):
+            results[f"{env}-development-{index}"] = {"environmentId": env, "runIds": [run_id], "status": "complete"}
+    return {"stage": "learning", "results": {"training": results}}
+
+
+def test_learning_selects_bounded_multi_run_set_across_domains(monkeypatch):
+    runtime = _multi_runtime()
+    store = runtime.controller.store
+    for env, runs in (("known-a", ["a1", "a2"]), ("known-b", ["b1"]), ("known-c", ["c1", "c2"])):
+        for run_id in runs:
+            store.add_run(run_id, env)
+    store.add_run("b1", "known-b", status="failed", outcome={"passed": False})  # failed attempt eligible
+    runner = _learning_runner(runtime, monkeypatch)
+    context = _training_context(("known-a", ["a1", "a2"]), ("known-b", ["b1"]), ("known-c", ["c1", "c2"]))
+
+    receipt = runner(cell_key="learning-0", context=context)
+
+    # Later runs beyond the first receipt's run affect the learner context.
+    payload = runtime.captured[-1]
+    assert payload.run_ids == ["a1", "b1", "c1", "a2", "c2"]  # stratified: one per env first
+    assert "b1" in payload.run_ids  # the failed attempt is a source
+    assert receipt["sourceRunIds"] == payload.run_ids
+    assert receipt["ignoredRunIds"] == []
+    assert receipt["learningSelection"]["sourceRunIds"] == payload.run_ids
+    assert receipt["learningSelection"]["excludedEnvironment"] is None
+    assert store.persisted[-1]["sourceRunIds"] == payload.run_ids
+
+
+def test_learning_cap_declares_ignored_runs(monkeypatch):
+    runtime = _multi_runtime()
+    store = runtime.controller.store
+    runs = []
+    for env in ("known-a", "known-b", "known-c"):
+        for index in range(4):
+            run_id = f"{env}{index}"
+            store.add_run(run_id, env)
+            runs.append(run_id)
+    runner = _learning_runner(runtime, monkeypatch)
+    context = _training_context(*[(env, [f"{env}{i}" for i in range(4)]) for env in ("known-a", "known-b", "known-c")])
+
+    receipt = runner(cell_key="learning-0", context=context)
+
+    selected = receipt["sourceRunIds"]
+    assert len(selected) == runner._DEFAULT_LEARNING_SOURCE_CAP  # 8
+    assert set(receipt["ignoredRunIds"]) == set(runs) - set(selected)
+    assert receipt["learningSelection"]["maxRuns"] == runner._DEFAULT_LEARNING_SOURCE_CAP
+
+
+def test_learning_selection_is_deterministic(monkeypatch):
+    runtime = _multi_runtime()
+    store = runtime.controller.store
+    for env, runs in (("known-a", ["a2", "a1"]), ("known-b", ["b1"])):
+        for run_id in runs:
+            store.add_run(run_id, env)
+    runner = _learning_runner(runtime, monkeypatch)
+    context = _training_context(("known-a", ["a1", "a2"]), ("known-b", ["b1"]))
+
+    first = runner(cell_key="learning-0", context=context)["sourceRunIds"]
+    second = runner(cell_key="learning-0", context=context)["sourceRunIds"]
+    assert first == second == ["a1", "b1", "a2"]
+
+
+def test_leave_out_candidate_excludes_domain_and_declares_ignored(monkeypatch):
+    runtime = _multi_runtime()
+    store = runtime.controller.store
+    for env, runs in (("known-a", ["a1", "a2"]), ("known-b", ["b1"]), ("known-c", ["c1"])):
+        for run_id in runs:
+            store.add_run(run_id, env)
+    runner = _learning_runner(runtime, monkeypatch)
+    context = _training_context(("known-a", ["a1", "a2"]), ("known-b", ["b1"]), ("known-c", ["c1"]))
+
+    _bundle, receipt = runner._candidate_for_excluded_environment(context, "known-a")
+
+    selected = receipt["sourceRunIds"]
+    assert "a1" not in selected and "a2" not in selected
+    assert set(selected) == {"b1", "c1"}
+    assert set(receipt["ignoredRunIds"]) == {"a1", "a2"}
+    assert receipt["learningSelection"]["excludedEnvironment"] == "known-a"
+
+
+@pytest.mark.parametrize("mutate", ["nonterminal", "no_outcome", "non_dev_partition", "env_mismatch"])
+def test_learning_rejects_invalid_sources_fail_closed(monkeypatch, mutate):
+    runtime = _multi_runtime()
+    store = runtime.controller.store
+    store.add_run("good", "known-a")
+    store.add_run("bad", "known-b")
+    if mutate == "nonterminal":
+        store.runs["bad"]["status"] = "running"
+    elif mutate == "no_outcome":
+        store.outcomes.pop("bad")
+    elif mutate == "non_dev_partition":
+        store.tasks["task-bad"]["partition"] = "validation"
+    elif mutate == "env_mismatch":
+        store.runs["bad"]["environment_id"] = "known-c"
+    runner = _learning_runner(runtime, monkeypatch)
+    context = _training_context(("known-a", ["good"]), ("known-b", ["bad"]))
+
+    with pytest.raises(ExperimentRuntimeError):
+        runner(cell_key="learning-0", context=context)
+    assert runtime.captured == []  # nothing dispatched
+
+
+def test_learning_admission_binds_the_selected_source_set(monkeypatch):
+    runtime = _multi_runtime()
+    store = runtime.controller.store
+    for env, runs in (("known-a", ["a1"]), ("known-b", ["b1"]), ("known-c", ["c1"])):
+        for run_id in runs:
+            store.add_run(run_id, env)
+    runner = _learning_runner(runtime, monkeypatch)
+    context = _training_context(("known-a", ["a1"]), ("known-b", ["b1"]), ("known-c", ["c1"]))
+    admissions = []
+    context["admitSubcall"] = lambda key, **_e: admissions.append(key) or {"admissionId": key, "status": "reserved", "reused": False, "dispatchAllowed": True}
+    context["recordSubcall"] = lambda admission_id, *, result=None, error=None: None
+
+    receipt = runner(cell_key="learning-0", context=context)
+
+    assert admissions == [f"learning:learning-0:{','.join(receipt['sourceRunIds'])}"]
+    assert receipt["sourceRunIds"] == ["a1", "b1", "c1"]
+
+
+def test_learning_request_supports_optional_run_ids():
+    from adaptive_agent.api import LearningRequest
+
+    single = LearningRequest(runId="run-1")
+    assert single.run_id == "run-1" and single.run_ids == []
+    multi = LearningRequest(runIds=["run-1", "run-2"])
+    assert multi.run_id is None and multi.run_ids == ["run-1", "run-2"]
+    both = LearningRequest(runId="run-0", runIds=["run-1"])
+    assert both.run_id == "run-0" and both.run_ids == ["run-1"]
+
+
+def test_propose_completed_runs_binds_declared_source_set(monkeypatch):
+    """The multi-run runtime seam validates every source and exposes exactly
+    the declared (environment, run) set to the retriever."""
+    from adaptive_agent.learning_runtime import LearningRuntime
+    from adaptive_agent.retrieval import SourceRecord, SourceKind, content_hash
+
+    store = _MultiRunStore()
+    store.add_run("a1", "known-a")
+    store.add_run("b1", "known-b", status="failed", outcome={"passed": False})
+    store.add_run("c1", "known-c")
+
+    def fake_source(run_id, env):
+        return SourceRecord(
+            source_id=f"src-{run_id}", kind=SourceKind.LIVE_EVIDENCE, content="ev", content_hash=content_hash("ev"),
+            environment_id=env, run_id=run_id, partition="development", visibility="learner", trust_class="broker",
+        )
+
+    class FakeAdapter:
+        def records_from_raw(self, records, *, environment_id, run_id):
+            return [fake_source(run_id, environment_id) for _record in records]
+
+    calls = {}
+
+    def fake_propose(**kwargs):
+        calls.update(kwargs)
+        return SimpleNamespace(candidate_payload={"predictedEffect": "x", "supportingEvidenceIds": []}, authoritative_candidate={})
+
+    runtime = LearningRuntime(
+        store=store,
+        manager=None,
+        source_adapter=FakeAdapter(),
+        candidate_adapter=None,
+        service=SimpleNamespace(retriever=None, model_runner=SimpleNamespace(client=object()), propose=fake_propose),
+        token_budget=100,
+        wall_seconds=10,
+    )
+    monkeypatch.setattr(LearningRuntime, "_materialize_run_records", lambda self, *, environment_id, run_id, public_documents=(): [{"kind": "task_state", "sourceId": f"o:{run_id}", "runId": run_id, "environmentId": environment_id}])
+
+    proposal = runtime.propose_completed_runs(["c1", "a1", "b1"], primary_run_id="b1", goal="g")
+
+    # Later runs entered the learner's retrieval scope: the declared set spans
+    # all three environments, ordered with the primary first.
+    assert calls["run_id"] == "b1"
+    assert calls["source_runs"] == frozenset({("known-a", "a1"), ("known-b", "b1"), ("known-c", "c1")})
+    assert calls["feedback"]["sourceRunIds"] == ["b1", "a1", "c1"]
+    assert calls["feedback"]["status"] == "failed"  # primary is the failed run
+    sources = runtime.service.retriever.provider.list_sources()
+    assert {s.run_id for s in sources} == {"a1", "b1", "c1"}
+
+    # Invalid sources fail closed.
+    store.runs["c1"]["status"] = "running"
+    with pytest.raises(Exception):
+        runtime.propose_completed_runs(["a1", "c1"], primary_run_id="a1", goal="g")
+
+
+def test_learning_selection_prefers_failed_runs_without_dropping_env_coverage(monkeypatch):
+    """A failed run sorts after successes alphabetically; selection must still
+    include it deterministically while covering every eligible environment."""
+    runtime = _multi_runtime()
+    store = runtime.controller.store
+    # known-a: only the success would be picked by id order within cap-free
+    # first-pass; the failure ("zz") must still enter via the swap pass when
+    # it would otherwise be cut by the bound.
+    store.add_run("a0", "known-a")
+    store.add_run("zz", "known-a", status="failed", outcome={"passed": False})
+    store.add_run("b1", "known-b")
+    store.add_run("c1", "known-c")
+    runner = _learning_runner(runtime, monkeypatch)
+    context = _training_context(
+        ("known-a", ["a0", "zz"]),
+        ("known-b", ["b1"]),
+        ("known-c", ["c1"]),
+    )
+
+    receipt = runner(cell_key="learning-0", context=context)
+
+    # Failed-first ordering: "zz" precedes "a0" inside known-a despite id sort.
+    assert receipt["sourceRunIds"] == ["zz", "b1", "c1", "a0"]
+    assert receipt["ignoredRunIds"] == []
+
+
+def test_learning_selection_swaps_in_failure_under_tight_cap(monkeypatch):
+    runtime = _multi_runtime()
+    store = runtime.controller.store
+    store.add_run("a0", "known-a")
+    store.add_run("zz", "known-a", status="failed", outcome={"passed": False})
+    store.add_run("b1", "known-b")
+    store.add_run("c1", "known-c")
+    runner = _learning_runner(runtime, monkeypatch)
+    # Pin a smaller bound through the frozen inputs.
+    runner.inputs = {**runner.inputs, "learningSelection": {"maxRuns": 3}}
+    context = _training_context(
+        ("known-a", ["a0", "zz"]),
+        ("known-b", ["b1"]),
+        ("known-c", ["c1"]),
+    )
+
+    receipt = runner(cell_key="learning-0", context=context)
+
+    # Cap 3 with 3 envs: failed-first ordering already picks "zz" for known-a.
+    assert receipt["sourceRunIds"] == ["zz", "b1", "c1"]
+    assert receipt["ignoredRunIds"] == ["a0"]
+
+
+def test_learning_rejects_oversized_source_set(monkeypatch):
+    from adaptive_agent.learning_runtime import LearningRuntime, LEARNING_SOURCE_RUN_CAP
+
+    store = _MultiRunStore()
+    for index in range(LEARNING_SOURCE_RUN_CAP + 1):
+        store.add_run(f"r{index}", "known-a")
+
+    runtime = LearningRuntime(
+        store=store,
+        manager=None,
+        source_adapter=None,
+        candidate_adapter=None,
+        service=SimpleNamespace(retriever=None, model_runner=SimpleNamespace(client=object()), propose=lambda **kw: None),
+        token_budget=100,
+        wall_seconds=10,
+    )
+
+    with pytest.raises(Exception, match="exceeds the frozen bound"):
+        runtime.propose_completed_runs([f"r{i}" for i in range(LEARNING_SOURCE_RUN_CAP + 1)], primary_run_id="r0", goal="g")
+
+    with pytest.raises(Exception, match="malformed"):
+        runtime.propose_completed_runs(["r0", 7], primary_run_id="r0", goal="g")

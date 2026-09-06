@@ -175,7 +175,10 @@ class CreateRunRequest(ApiModel):
 
 
 class LearningRequest(ApiModel):
-    run_id: str = Field(alias="runId", min_length=1)
+    # runId stays optional-but-supported for single-run callers; runIds names
+    # the bounded multi-run source set when provided. At least one is required.
+    run_id: str | None = Field(default=None, alias="runId", min_length=1)
+    run_ids: list[str] = Field(default_factory=list, alias="runIds")
     # The completed run is the sole source of learning evidence and proposal
     # metadata.  Keep the legacy fields optional for older callers, but do not
     # require operators to invent values that the durable runtime ignores.

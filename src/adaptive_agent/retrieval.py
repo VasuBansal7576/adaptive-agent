@@ -201,8 +201,25 @@ class AccessFilteredRetriever:
         self.provider = provider
         self.max_items_per_kind = max_items_per_kind
 
-    def _allowed(self, source: SourceRecord, *, environment_id: str, run_id: str, allowed_skill_ids: set[str] | None) -> bool:
+    def _allowed(self, source: SourceRecord, *, environment_id: str, run_id: str, allowed_skill_ids: set[str] | None, allowed_source_runs: frozenset[tuple[str, str]] | None = None) -> bool:
         if not source.active or not source.verified or source.visibility != "learner":
+            return False
+        if allowed_source_runs is not None:
+            # Declared multi-run exposure set: only sources whose
+            # (environment, run) pair was explicitly selected may enter the
+            # learner context — anything outside the set stays fail-closed.
+            allowed_envs = {env for env, _run in allowed_source_runs}
+            if source.environment_id not in {None, *allowed_envs}:
+                return False
+            if source.kind is SourceKind.PUBLIC_DOC:
+                return source.trust_class in {"operator", "system"}
+            bound = (source.environment_id, source.run_id) in allowed_source_runs
+            if source.kind is SourceKind.LIVE_EVIDENCE:
+                return bound and source.partition == "development" and source.trust_class in {"broker", "evaluator", "system"}
+            if source.kind is SourceKind.TASK_STATE:
+                return bound and source.trust_class in {"system", "broker"}
+            if source.kind is SourceKind.SKILL:
+                return source.metadata.get("bundleState") == "active" and (allowed_skill_ids is None or source.source_id in allowed_skill_ids)
             return False
         if source.environment_id not in {None, environment_id}:
             return False
@@ -216,14 +233,15 @@ class AccessFilteredRetriever:
             return source.metadata.get("bundleState") == "active" and (allowed_skill_ids is None or source.source_id in allowed_skill_ids)
         return False
 
-    def search(self, query: str, *, environment_id: str, run_id: str, allowed_skill_ids: set[str] | None = None) -> RetrievalResult:
+    def search(self, query: str, *, environment_id: str, run_id: str, allowed_skill_ids: set[str] | None = None, allowed_source_runs: frozenset[tuple[str, str]] | None = None) -> RetrievalResult:
         query_tokens = _tokens(query)
+        evidence_run_of: dict[str, str] = {}
         buckets: dict[SourceKind, list[ContextItem]] = {kind: [] for kind in SourceKind}
         # Do not rank first and filter later.  This loop is intentionally the
         # only place where provider records become learner-visible context.
         for raw in self.provider.list_sources():
             source = raw if isinstance(raw, SourceRecord) else SourceRecord.from_mapping(raw)
-            if not self._allowed(source, environment_id=environment_id, run_id=run_id, allowed_skill_ids=allowed_skill_ids):
+            if not self._allowed(source, environment_id=environment_id, run_id=run_id, allowed_skill_ids=allowed_skill_ids, allowed_source_runs=allowed_source_runs):
                 continue
             overlap = len(query_tokens & _tokens(source.content))
             score = overlap / max(len(query_tokens), 1)
@@ -235,19 +253,31 @@ class AccessFilteredRetriever:
             if score == 0 and query_tokens and source.kind is not SourceKind.LIVE_EVIDENCE:
                 continue
             buckets[source.kind].append(ContextItem(source.source_id, source.kind, source.content, Citation(source.source_id, source.content_hash, source.kind), score))
+            if allowed_source_runs is not None and source.kind is SourceKind.LIVE_EVIDENCE:
+                evidence_run_of[source.source_id] = source.run_id or ""
         result: dict[SourceKind, tuple[ContextItem, ...]] = {}
         for kind, items in buckets.items():
-            result[kind] = tuple(sorted(items, key=lambda item: (-item.score, item.source_id))[: self.max_items_per_kind])
+            ordered = sorted(items, key=lambda item: (-item.score, item.source_id))
+            if kind is SourceKind.LIVE_EVIDENCE and allowed_source_runs is not None:
+                # Bound evidence per selected run first so one chatty run
+                # cannot consume the whole window and erase environment or
+                # failure coverage; rank within each run deterministically.
+                per_run: dict[str, list[ContextItem]] = {}
+                for item in ordered:
+                    per_run.setdefault(evidence_run_of.get(item.source_id, ""), []).append(item)
+                result[kind] = tuple(item for run_key in sorted(per_run) for item in per_run[run_key][: self.max_items_per_kind])
+            else:
+                result[kind] = tuple(ordered[: self.max_items_per_kind])
         return RetrievalResult(docs=result[SourceKind.PUBLIC_DOC], evidence=result[SourceKind.LIVE_EVIDENCE], task_state=result[SourceKind.TASK_STATE], skills=result[SourceKind.SKILL])
 
-    def require_development_evidence(self, evidence_ids: Iterable[str], *, environment_id: str, run_id: str) -> tuple[SourceRecord, ...]:
+    def require_development_evidence(self, evidence_ids: Iterable[str], *, environment_id: str, run_id: str, allowed_source_runs: frozenset[tuple[str, str]] | None = None) -> tuple[SourceRecord, ...]:
         requested = tuple(dict.fromkeys(str(item) for item in evidence_ids))
         if not requested:
             raise RetrievalError("at least one development evidence citation is required")
         available: dict[str, SourceRecord] = {}
         for raw in self.provider.list_sources():
             source = raw if isinstance(raw, SourceRecord) else SourceRecord.from_mapping(raw)
-            if source.kind is SourceKind.LIVE_EVIDENCE and self._allowed(source, environment_id=environment_id, run_id=run_id, allowed_skill_ids=None):
+            if source.kind is SourceKind.LIVE_EVIDENCE and self._allowed(source, environment_id=environment_id, run_id=run_id, allowed_skill_ids=None, allowed_source_runs=allowed_source_runs):
                 available[source.source_id] = source
         missing = [source_id for source_id in requested if source_id not in available]
         if missing:
