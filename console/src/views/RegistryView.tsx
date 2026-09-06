@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ConsoleTransport, EnvironmentPackageForm, EnvironmentRegistration } from "../api/transport";
+import { sourceLabelFor } from "../api/sourceLabels";
 import { EXECUTION_MODES, REQUIRED_PACKAGE_FIELDS, EMPTY_PACKAGE_FORM, formToRegistration } from "../api/transport";import type { EnvironmentPackageSummary } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
 import { Banner, EmptyState, LoadingState } from "../components/ui";
@@ -111,7 +112,7 @@ export function RegistryView({
                   <p className="font-medium text-slate-100">
                     {env.environmentId} <span className="text-slate-500">v{env.version}</span>{" "}
                     <span className="rounded bg-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-300">
-                      simulated business fixture
+                      {sourceLabelFor(env.environmentId).tag}
                     </span>
                   </p>
                   <StatusBadge status={env.validationState === "valid" ? "validated" : "invalid"} />
