@@ -73,6 +73,8 @@ const EVALUATIONS = [
   { evaluationId: "eval_acc010_legacy", state: "completed", trusted: true, validity: "valid" },
 ];
 
+let DIAGNOSTICS = [];
+
 const FIXTURES = {
   "/session": { authenticated: true, transport: "fixture" },
   "/run-options": { modelProfiles: [{ ref: { id: "model-profile", version: "1", sha256: "c".repeat(64) }, label: "Luna", provider: "openai-codex", model: "openai-codex/gpt-5.6-luna" }], budgetDefaults: { modelTokens: 20000, toolCalls: 32, childRuns: 0, wallTimeSeconds: 90, costMicrounits: 100000, currency: "USD", budgetRef: { id: "budget-default", version: "1", sha256: "a".repeat(64) } }, budgetRef: { id: "budget-default", version: "1", sha256: "a".repeat(64) } },
@@ -143,6 +145,65 @@ const server = createServer((req, res) => {
       res.end(JSON.stringify(found));
       return;
     }
+  }
+  if (req.method === "GET" && path === "/diagnostics") {
+    // deterministic progress: one of the 6 cells completes per poll
+    DIAGNOSTICS = DIAGNOSTICS.map((d) => {
+      if (d.state !== "queued" && d.state !== "running") return d;
+      const completedCells = Math.min(6, d.completedCells + 1);
+      const state = completedCells === 6 ? "completed" : "running";
+      return {
+        ...d,
+        state,
+        completedCells,
+        updatedAt: "2026-09-06T12:01:00Z",
+        armSummaries: completed
+          ? [
+              { arm: "B0", completed: 3, successes: 2, meanScore: 0.55, totalTokens: 4200, wallDurationSeconds: 240 },
+              { arm: "L", completed: 3, successes: 3, meanScore: 0.9, totalTokens: 5100, wallDurationSeconds: 262 },
+            ]
+          : d.armSummaries,
+      };
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(DIAGNOSTICS));
+    return;
+  }
+  if (req.method === "POST" && path === "/diagnostics/launch") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const input = JSON.parse(body || "{}");
+      const diag = {
+        diagnosticId: `diag_acc010_${String(DIAGNOSTICS.length + 1).padStart(3, "0")}`,
+        candidateId: String(input.candidateId ?? "cand_acc010_validated"),
+        baseBundleHash: String(input.baseBundleHash ?? "2".repeat(64)),
+        candidateBundleHash: "6".repeat(64),
+        state: "queued",
+        completedCells: 0,
+        totalCells: 6,
+        startedAt: "2026-09-06T12:00:00Z",
+        updatedAt: "2026-09-06T12:00:00Z",
+        armSummaries: [],
+        error: null,
+        promotionEligible: false,
+      };
+      DIAGNOSTICS = [diag, ...DIAGNOSTICS];
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ diagnosticId: diag.diagnosticId, state: diag.state }));
+    });
+    return;
+  }
+  if (req.method === "POST" && /^\/diagnostics\/[^/]+\/cancel$/.test(path)) {
+    const id = decodeURIComponent(path.split("/")[2]);
+    DIAGNOSTICS = DIAGNOSTICS.map((d) =>
+      d.diagnosticId === id && (d.state === "queued" || d.state === "running")
+        ? { ...d, state: "cancelled", error: "cancelled by operator" }
+        : d,
+    );
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
   }
   if (path === "/health") {
     res.writeHead(200, { "content-type": "application/json" });

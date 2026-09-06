@@ -1,5 +1,6 @@
 import type {
   CandidateDiff,
+  DiagnosticRecord,
   EnvironmentPackageSummary,
   RunEvent,
   RunOptions,
@@ -277,6 +278,8 @@ let candidateCatalog: CandidateDiff[] = [
   },
 ];
 
+let diagnosticCatalog: DiagnosticRecord[] = [];
+
 let environmentCatalog: EnvironmentPackageSummary[] = [
   { environmentId: "finance-sim", version: "1.2.0", validationState: "valid", evaluatorReady: true, toolCount: 4, policyScope: "finance/ledger/*" },
   { environmentId: "support-sim", version: "0.9.1", validationState: "valid", evaluatorReady: false, toolCount: 3, policyScope: "support/tickets/*" },
@@ -464,6 +467,58 @@ export function createSimulationTransport(options?: {
         // legacy malformed metadata: preserved explicitly unverified
         { evaluationId: "eval-sim-legacy", state: "completed", trusted: true, validity: "valid" },
       ] as never;
+    },
+
+    async launchDiagnostic(input: { candidateId: string; baseBundleHash: string }) {
+      const diagnosticId = `diag-sim-${(learningActionCount += 1).toString().padStart(3, "0")}`;
+      diagnosticCatalog = [
+        {
+          diagnosticId,
+          candidateId: input.candidateId,
+          baseBundleHash: input.baseBundleHash,
+          candidateBundleHash: "d".repeat(64),
+          state: "queued",
+          completedCells: 0,
+          totalCells: 6,
+          startedAt: "2026-09-06T12:00:00Z",
+          updatedAt: "2026-09-06T12:00:00Z",
+          armSummaries: [],
+          error: null,
+          promotionEligible: false as const,
+        },
+        ...diagnosticCatalog,
+      ];
+      return { diagnosticId, state: "queued" as const };
+    },
+
+    async listDiagnostics() {
+      // deterministic progress: one cell completes per poll until 6/6
+      diagnosticCatalog = diagnosticCatalog.map((d) => {
+        if (d.state === "cancelled" || d.state === "completed" || d.state === "failed") return d;
+        const nextCells = Math.min(6, d.completedCells + 1);
+        const completed = nextCells === 6;
+        return {
+          ...d,
+          state: (completed ? "completed" : "running") as DiagnosticRecord["state"],
+          completedCells: nextCells,
+          updatedAt: "2026-09-06T12:01:00Z",
+          armSummaries: completed
+            ? [
+                { arm: "B0" as const, completed: 3, successes: 2, meanScore: 0.55, totalTokens: 4200, wallDurationSeconds: 240 },
+                { arm: "L" as const, completed: 3, successes: 3, meanScore: 0.9, totalTokens: 5100, wallDurationSeconds: 262 },
+              ]
+            : d.armSummaries,
+        };
+      });
+      return structuredClone(diagnosticCatalog);
+    },
+
+    async cancelDiagnostic(diagnosticId: string) {
+      diagnosticCatalog = diagnosticCatalog.map((d) =>
+        d.diagnosticId === diagnosticId && (d.state === "queued" || d.state === "running")
+          ? { ...d, state: "cancelled" as const, error: "cancelled by operator", updatedAt: "2026-09-06T12:02:00Z" }
+          : d,
+      );
     },
 
     async reconnect() {

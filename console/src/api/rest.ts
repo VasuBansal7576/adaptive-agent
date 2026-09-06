@@ -16,6 +16,7 @@ import {
   parseRuns,
   parseSkills,
   normalizeSseEvent,
+  parseDiagnostics,
   parseRunOptions,
   parseTasks,
 } from "./validate";
@@ -466,6 +467,23 @@ export function createRestTransport(baseUrl: string = defaultApiBase()): Console
       validated(json("/evaluations"), (value) =>
         arr2evals(value),
       ),
+
+    launchDiagnostic: async (input: { candidateId: string; baseBundleHash: string }) => {
+      const action = (await json("/diagnostics/launch", {
+        method: "POST",
+        body: JSON.stringify({ candidateId: input.candidateId, baseBundleHash: input.baseBundleHash }),
+      })) as Record<string, unknown>;
+      const diagnosticId = typeof action.diagnosticId === "string" ? action.diagnosticId : "";
+      const state = typeof action.state === "string" ? action.state : "queued";
+      if (!diagnosticId) throw new SchemaError("diagnostic.diagnosticId");
+      return { diagnosticId, state };
+    },
+
+    listDiagnostics: () => validated(json("/diagnostics"), parseDiagnostics),
+
+    cancelDiagnostic: (diagnosticId: string) =>
+      json(`/diagnostics/${encodeURIComponent(diagnosticId)}/cancel`, { method: "POST", body: "{}" }).then(() => undefined),
+
 
     launchLearningCycle: async (input: LearningCycleInput) => {
       const action = (await json("/learning/launch", {

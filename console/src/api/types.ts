@@ -222,6 +222,32 @@ export type EvaluationJob = {
   report?: EvaluationReportProjection;
 };
 
+/** Per-arm measured results from a quick development comparison. */
+export type DiagnosticArmSummary = {
+  arm: "B0" | "L";
+  completed: number;
+  successes: number;
+  meanScore: number;
+  totalTokens: number;
+  wallDurationSeconds: number;
+};
+
+/** One quick development comparison (diagnostic) row. */
+export type DiagnosticRecord = {
+  diagnosticId: string;
+  candidateId: string;
+  baseBundleHash: string;
+  candidateBundleHash: string;
+  state: "queued" | "running" | "completed" | "failed" | "cancelled";
+  completedCells: number;
+  totalCells: number;
+  startedAt: string;
+  updatedAt: string;
+  armSummaries: DiagnosticArmSummary[];
+  error: string | null;
+  promotionEligible: false;
+};
+
 /** GET /environments/{id}/tasks: registered task goals a run may target. */
 export type TaskOption = {
   taskId: string;

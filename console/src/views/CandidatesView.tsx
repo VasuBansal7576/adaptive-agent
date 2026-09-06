@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import type { ConsoleTransport, LearningCycleInput } from "../api/transport";
-import type { CandidateDiff, EvaluationJob, EvaluationReportProjection, RunRecord } from "../api/types";
+import type { CandidateDiff, DiagnosticRecord, EvaluationJob, EvaluationReportProjection, RunRecord } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
 import { Banner, EmptyState, LoadingState, Modal } from "../components/ui";
 
@@ -45,8 +45,48 @@ export function CandidatesView({
   }, [learningRequest]);
   const [notice, setNotice] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
   const learningButtonRef = useRef<HTMLButtonElement>(null);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticRecord[] | null>(null);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  const [launching, setLaunching] = useState(false);
   const [evalJobs, setEvalJobs] = useState<EvaluationJob[] | null>(null);
   const [evalJobsError, setEvalJobsError] = useState<string | null>(null);
+
+  // quick development comparison rows follow the candidate list
+  useEffect(() => {
+    let cancelled = false;
+    transport
+      .listDiagnostics()
+      .then((rows) => {
+        if (!cancelled) {
+          setDiagnosticsError(null);
+          setDiagnostics(rows);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) setDiagnosticsError(error instanceof Error ? error.message : "diagnostics unavailable");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [transport, candidates]);
+
+  // live poll while any diagnostic is queued/running (progress x/6)
+  useEffect(() => {
+    const active = (diagnostics ?? []).some((d) => d.state === "queued" || d.state === "running");
+    if (!active) return;
+    const timer = setTimeout(() => {
+      transport
+        .listDiagnostics()
+        .then((rows) => {
+          setDiagnosticsError(null);
+          setDiagnostics(rows);
+        })
+        .catch((error) => {
+          setDiagnosticsError(error instanceof Error ? error.message : "diagnostics unavailable");
+        });
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [diagnostics, transport]);
 
   // evaluation job statuses follow the candidate list
   useEffect(() => {
@@ -104,6 +144,42 @@ export function CandidatesView({
     }
   };
 
+  // quick development comparison: 3 public development tasks x baseline/learned.
+  // A development check, NOT promotion evidence; the trusted gate is unchanged.
+  const latestValidated = candidates.find((c) => c.state === "validated" || c.state === "evaluating" || c.state === "promoted");
+  const activeDiagnosticForLatest = (diagnostics ?? []).find(
+    (d) => d.candidateId === latestValidated?.candidateId && (d.state === "queued" || d.state === "running"),
+  );
+  const launchDiagnostic = async () => {
+    if (!latestValidated?.baseBundleHash) {
+      onActionError(`Quick comparison unavailable for ${latestValidated?.candidateId ?? "candidate"}: no base bundle hash.`);
+      return;
+    }
+    setLaunching(true);
+    try {
+      await transport.launchDiagnostic({ candidateId: latestValidated.candidateId, baseBundleHash: latestValidated.baseBundleHash });
+      const rows = await transport.listDiagnostics();
+      setDiagnostics(rows);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Diagnostic launch failed";
+      const correlationId = (error as { correlationId?: string } | null)?.correlationId ?? null;
+      onActionError(`Quick comparison launch failed: ${message}`, correlationId);
+    } finally {
+      setLaunching(false);
+    }
+  };
+
+  const cancelDiagnostic = async (diagnosticId: string) => {
+    try {
+      await transport.cancelDiagnostic(diagnosticId);
+      const rows = await transport.listDiagnostics();
+      setDiagnostics(rows);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Cancel failed";
+      onActionError(`Cancel failed: ${message}`, (error as { correlationId?: string } | null)?.correlationId ?? null);
+    }
+  };
+
   const submitRollback = async () => {
     if (!rollbackTarget) return;
     setBusy(true);
@@ -149,6 +225,16 @@ export function CandidatesView({
       )}
 
       {notice && <Banner tone={notice.tone} title={notice.text.replace(/^[✓✗] /, "")} />}
+
+      <DiagnosticsPanel
+        diagnostics={diagnostics}
+        error={diagnosticsError}
+        latestValidated={latestValidated}
+        launching={launching}
+        activeDiagnostic={activeDiagnosticForLatest ?? null}
+        onLaunch={() => void launchDiagnostic()}
+        onCancel={(id) => void cancelDiagnostic(id)}
+      />
 
       {evalJobsError && (
         <Banner tone="warn" title={`Evaluation status unavailable: ${evalJobsError}`} role="alert" />
@@ -600,5 +686,121 @@ function ActualReportPanel({ report, evaluationId }: { report: EvaluationReportP
         </ul>
       )}
     </div>
+  );
+}
+
+const DIAGNOSTIC_ESTIMATE =
+  "Quick development comparison: 6 runs (3 public development tasks, baseline and learned). Estimated a few minutes.";
+
+function DiagnosticsPanel({
+  diagnostics,
+  error,
+  latestValidated,
+  launching,
+  activeDiagnostic,
+  onLaunch,
+  onCancel,
+}: {
+  diagnostics: DiagnosticRecord[] | null;
+  error: string | null;
+  latestValidated?: CandidateDiff;
+  launching: boolean;
+  activeDiagnostic: DiagnosticRecord | null;
+  onLaunch: () => void;
+  onCancel: (diagnosticId: string) => void;
+}) {
+  return (
+    <section aria-labelledby="diagnostics-heading" className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 id="diagnostics-heading" className="text-sm font-semibold text-slate-100">
+            Quick comparison
+          </h3>
+          <p className="mt-0.5 text-[11px] text-slate-500">
+            Development check, not promotion evidence. {DIAGNOSTIC_ESTIMATE}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onLaunch}
+            disabled={launching || !!activeDiagnostic || !latestValidated}
+            className="rounded-md bg-sky-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-60"
+            title="Runs 3 public development tasks on baseline and learned arms"
+          >
+            {launching || activeDiagnostic ? "Quick comparison in progress…" : "Quick comparison"}
+          </button>
+          <span
+            className="rounded-md border border-slate-600 px-3 py-1.5 text-xs font-medium text-slate-400"
+            title="Full validation runs the 360-run panel and takes hours; only the trusted evaluator gates promotion"
+          >
+            Full validation (360 runs)
+          </span>
+        </div>
+      </div>
+
+      {error && <Banner tone="warn" title={`Diagnostics unavailable: ${error}`} role="alert" />}
+
+      {diagnostics === null && !error ? (
+        <p role="status" className="mt-3 text-[13px] text-slate-400">Loading diagnostics…</p>
+      ) : (diagnostics ?? []).length === 0 ? (
+        <p role="status" className="mt-3 text-[13px] text-slate-400">
+          No quick comparisons yet. Stage a candidate, then run one against its base.
+        </p>
+      ) : (
+        <ul className="mt-3 space-y-2">
+          {(diagnostics ?? []).map((d) => (
+            <li key={d.diagnosticId} className="rounded-lg bg-slate-800/60 px-3 py-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="break-all font-mono text-xs text-slate-300">{d.diagnosticId}</span>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-xs text-slate-400">
+                    {d.completedCells}/{d.totalCells} runs
+                  </span>
+                  <StatusBadge status={d.state} />
+                  {(d.state === "queued" || d.state === "running") && (
+                    <button
+                      type="button"
+                      onClick={() => onCancel(d.diagnosticId)}
+                      className="rounded-md border border-rose-700 px-2.5 py-1 text-[11px] font-medium text-rose-300 hover:bg-rose-950/60"
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
+              </div>
+              {d.error && <p className="mt-1 text-[11px] text-rose-300">{d.error}</p>}
+              {d.armSummaries.length > 0 && (
+                <table className="mt-2 w-full text-[11px]">
+                  <caption className="sr-only">Development comparison arm results</caption>
+                  <thead>
+                    <tr className="text-left text-slate-500">
+                      <th scope="col" className="pr-2 font-medium">Arm</th>
+                      <th scope="col" className="pr-2 font-medium">Completed</th>
+                      <th scope="col" className="pr-2 font-medium">Successes</th>
+                      <th scope="col" className="pr-2 font-medium">Mean score</th>
+                      <th scope="col" className="pr-2 font-medium">Tokens</th>
+                      <th scope="col" className="font-medium">Wall (s)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {d.armSummaries.map((a) => (
+                      <tr key={a.arm} className="border-t border-slate-700/60 text-slate-200">
+                        <th scope="row" className="py-1 pr-2 text-left font-mono">{a.arm}</th>
+                        <td className="py-1 pr-2">{a.completed}</td>
+                        <td className="py-1 pr-2">{a.successes}</td>
+                        <td className="py-1 pr-2">{a.meanScore.toFixed(2)}</td>
+                        <td className="py-1 pr-2">{a.totalTokens}</td>
+                        <td className="py-1">{a.wallDurationSeconds}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }

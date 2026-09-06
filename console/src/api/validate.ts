@@ -9,6 +9,7 @@ import type {
   ApprovalRequest,
   ArtifactRef,
   CandidateDiff,
+  DiagnosticRecord,
   EnvironmentPackageSummary,
   RunEvent,
   RunOptions,
@@ -395,6 +396,55 @@ export function parseEnvironments(value: unknown): EnvironmentPackageSummary[] {
       env.capabilities = arr(o.capabilities, `environments[${i}].capabilities`).map((c) => str(c, `environments[${i}].capabilities[]`));
     }
     return env;
+  });
+}
+
+const DIAG_STATES = ["queued", "running", "completed", "failed", "cancelled"] as const;
+
+export function parseDiagnostics(value: unknown): DiagnosticRecord[] {
+  return arr(value, "diagnostics").map((item, i) => {
+    const o = obj(item, `diagnostics[${i}]`);
+    const field = `diagnostics[${i}]`;
+    const diagnosticId = str(o.diagnosticId, `${field}.diagnosticId`);
+    const candidateId = str(o.candidateId, `${field}.candidateId`);
+    const baseBundleHash = str(o.baseBundleHash, `${field}.baseBundleHash`);
+    const candidateBundleHash = str(o.candidateBundleHash, `${field}.candidateBundleHash`);
+    const state = oneOf(o.state, DIAG_STATES, `${field}.state`);
+    const completedCells = num(o.completedCells, `${field}.completedCells`);
+    const totalCells = num(o.totalCells, `${field}.totalCells`);
+    if (totalCells !== 6) throw new SchemaError(`${field}.totalCells`);
+    const startedAt = str(o.startedAt, `${field}.startedAt`);
+    const updatedAt = str(o.updatedAt, `${field}.updatedAt`);
+    const arms = arr(o.armSummaries, `${field}.armSummaries`).map((raw, j) => {
+      const a = obj(raw, `${field}.armSummaries[${j}]`);
+      const armName = oneOf(a.arm, ["B0", "L"] as const, `${field}.armSummaries[${j}].arm`);
+      return {
+        arm: armName,
+        completed: num(a.completed, `${field}.armSummaries[${j}].completed`),
+        successes: num(a.successes, `${field}.armSummaries[${j}].successes`),
+        meanScore: num(a.meanScore, `${field}.armSummaries[${j}].meanScore`),
+        totalTokens: num(a.totalTokens, `${field}.armSummaries[${j}].totalTokens`),
+        wallDurationSeconds: num(a.wallDurationSeconds, `${field}.armSummaries[${j}].wallDurationSeconds`),
+      };
+    });
+    if (o.error !== undefined && o.error !== null && typeof o.error !== "string") {
+      throw new SchemaError(`${field}.error`);
+    }
+    if (o.promotionEligible !== false) throw new SchemaError(`${field}.promotionEligible`);
+    return {
+      diagnosticId,
+      candidateId,
+      baseBundleHash,
+      candidateBundleHash,
+      state,
+      completedCells,
+      totalCells,
+      startedAt,
+      updatedAt,
+      armSummaries: arms,
+      error: (o.error as string | undefined) ?? null,
+      promotionEligible: false,
+    };
   });
 }
 

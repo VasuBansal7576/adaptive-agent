@@ -1,6 +1,7 @@
 import type {
   ApprovalRequest,
   CandidateDiff,
+  DiagnosticRecord,
   EnvironmentPackageSummary,
   EvaluationJob,
   RunEvent,
@@ -56,6 +57,12 @@ export interface ConsoleTransport {
   launchEvaluation(input: { candidateId: string; baseBundleHash: string }): Promise<{ evaluationId: string; state: string }>;
   /** Evaluation job statuses (GET /evaluations). */
   listEvaluations(): Promise<EvaluationJob[]>;
+  /** Quick development comparison: launch (POST /diagnostics/launch). */
+  launchDiagnostic(input: { candidateId: string; baseBundleHash: string }): Promise<{ diagnosticId: string; state: string }>;
+  /** Quick development comparison rows (GET /diagnostics). */
+  listDiagnostics(): Promise<DiagnosticRecord[]>;
+  /** Cancel a quick comparison (POST /diagnostics/{id}/cancel). */
+  cancelDiagnostic(diagnosticId: string): Promise<void>;
   validateEnvironmentPackage(fields: EnvironmentPackageForm): Promise<{ ok: boolean; missingFields: string[] }>;
 }
 

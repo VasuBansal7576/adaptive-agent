@@ -364,6 +364,67 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect((document.body.textContent || "").toLowerCase()).not.toContain("appworld");
   });
 
+  it("quick comparison: launches 6-run development check, shows progress and per-arm results, cancels", { timeout: 30000 }, async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const launched: Array<{ candidateId: string; baseBundleHash: string }> = [];
+    const transport: ConsoleTransport = {
+      ...sim,
+      launchDiagnostic: async (input) => {
+        launched.push(input);
+        return sim.launchDiagnostic(input);
+      },
+    };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+
+    // compact honest copy: development check, not promotion evidence; estimate + 6 runs
+    expect(await screen.findByText(/Development check, not promotion evidence/)).toBeInTheDocument();
+    expect(await screen.findByText(/6 runs \(3 public development tasks, baseline and learned\)/)).toBeInTheDocument();
+    expect(await screen.findByText(/Estimated a few minutes/)).toBeInTheDocument();
+
+    // launch: primary action after Learn
+    await user.click(await screen.findByRole("button", { name: /Quick comparison/ }));
+    await waitFor(() => expect(launched.length).toBe(1));
+    // duplicate launch disabled while an active diagnostic exists
+    await waitFor(() => expect(screen.getByRole("button", { name: /Quick comparison in progress/ })).toBeDisabled());
+
+    // live poll progresses 0/6 -> 6/6 with per-arm results (2s cadence)
+    await waitFor(
+      () => expect(screen.getByText("6/6 runs")).toBeInTheDocument(),
+      { timeout: 20000 },
+    );
+    expect((await screen.findAllByText("B0")).length).toBeGreaterThanOrEqual(1);
+    expect((await screen.findAllByText("L")).length).toBeGreaterThanOrEqual(1);
+    // never conflated with promotion evidence
+    expect(screen.getAllByText(/Development check, not promotion evidence/).length).toBeGreaterThanOrEqual(1);
+
+    // second diagnostic: cancel path
+    await user.click(await screen.findByRole("button", { name: "Quick comparison" }));
+    await waitFor(() => expect(screen.getAllByText(/2\/6 runs|1\/6 runs/)[0]).toBeInTheDocument(), { timeout: 12000 });
+    const cancelButtons = screen.getAllByRole("button", { name: "Cancel" });
+    await user.click(cancelButtons[cancelButtons.length - 1]);
+    await waitFor(() => expect(screen.getAllByText("Cancelled").length).toBeGreaterThanOrEqual(1), { timeout: 4000 });
+  });
+
+  it("diagnostic parse: rejects malformed rows and wrong totalCells instead of silently rendering", async () => {
+    const { parseDiagnostics, SchemaError } = await import("../api/validate");
+    expect(() => parseDiagnostics([{ diagnosticId: "d1", candidateId: "c", baseBundleHash: "b", candidateBundleHash: "cb", state: "running", completedCells: 1, totalCells: 12, startedAt: "t", updatedAt: "t", armSummaries: [], error: null, promotionEligible: false }])).toThrow(SchemaError);
+    expect(() => parseDiagnostics([{ diagnosticId: "d1", candidateId: "c", baseBundleHash: "b", candidateBundleHash: "cb", state: "completed", completedCells: 6, totalCells: 6, startedAt: "t", updatedAt: "t", armSummaries: [{ arm: "X" }], error: null, promotionEligible: false }])).toThrow(SchemaError);
+    expect(() => parseDiagnostics([{ diagnosticId: "d1", candidateId: "c", baseBundleHash: "b", candidateBundleHash: "cb", state: "completed", completedCells: 6, totalCells: 6, startedAt: "t", updatedAt: "t", armSummaries: [], error: null, promotionEligible: true }])).toThrow(SchemaError);
+  });
+
+  it("full validation stays a secondary explicit long-running action", async () => {
+    render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
+    await userEvent.setup().click(await screen.findByRole("tab", { name: "Candidates" }));
+    const full = await screen.findByText("Full validation (360 runs)");
+    expect(full).toBeInTheDocument();
+    // presented as notice text, never as a quick check
+    expect(full.getAttribute("title")).toContain("takes hours");
+    // it is NOT a launch button for the diagnostics flow
+    expect(full.tagName).toBe("SPAN");
+  });
+
   it("opens the learning-cycle dialog from the empty-candidates state (regression)", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
