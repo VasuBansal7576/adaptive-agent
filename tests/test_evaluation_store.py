@@ -60,6 +60,11 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             row = RunObservation(task.task_id, "finance", Partition.VALIDATION, 17, Arm.L, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, response_id=response_id, accounting_ref=accounting_ref.sha256, evidence_ref="evidence-1", outcome_ref="outcome-1", config_hashes=expected, run_id=run_id)
             verifier = SQLiteRunEvidenceStore(store)
             self.assertTrue(verifier.verify(row, frozen, package))
+            canonical_outcome = store.get_evidence("outcome-1")
+            self.assertIsNotNone(canonical_outcome)
+            self.assertEqual(canonical_outcome["visibility"], "operator")
+            learner_evidence = store.list_learning_evidence(environment_id="finance", run_id=run_id)
+            self.assertFalse(any(item.get("sourceId") == "outcome-1" for item in learner_evidence))
             nominal_accounting = store.put_artifact({
                 "responseId": response_id,
                 "runId": run_id,
