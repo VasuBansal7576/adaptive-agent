@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import dataclasses
+from unittest.mock import patch
 from pathlib import Path
 
 from adaptive_agent.evaluation_store import (
@@ -76,6 +77,31 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             store.append_evidence("corrupt", {"run_id": run_id, "sequence": 3, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": store.put_artifact(["not", "object"]).model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
             self.assertFalse(verifier.verify(dataclasses.replace(row, evidence_ref="corrupt"), frozen, package))
 
+            # Private evaluator outcomes are valid when their trust and CAS
+            # bindings are intact; learner visibility is enforced elsewhere.
+            store.append_evidence("private-outcome", {"run_id": run_id, "sequence": 5, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0})
+            self.assertTrue(verifier.verify(dataclasses.replace(row, outcome_ref="private-outcome"), frozen, package))
+            self.assertFalse(verifier.verify(dataclasses.replace(row, evidence_ref="private-outcome"), frozen, package))
+            self.assertFalse(verifier.verify(dataclasses.replace(row, outcome_ref="missing-trusted-outcome"), frozen, package))
+
+            original_get_evidence = store.get_evidence
+            def untrusted(evidence_id):
+                value = original_get_evidence(evidence_id)
+                if value is not None:
+                    value = dict(value)
+                    value["trust_class"] = "untrusted"
+                return value
+            with patch.object(store, "get_evidence", side_effect=untrusted):
+                self.assertFalse(verifier.verify(row, frozen, package))
+
+            tampered_outcome = store.put_artifact({**outcome, "passed": False})
+            store.append_evidence("tampered-outcome", {"run_id": run_id, "sequence": 6, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": tampered_outcome.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0})
+            self.assertFalse(verifier.verify(dataclasses.replace(row, outcome_ref="tampered-outcome"), frozen, package))
+            for index, (field, value) in enumerate((("arm", "B0"), ("seed", 999), ("bundleHash", "f" * 64)), start=7):
+                relabeled = store.put_artifact({**outcome, field: value})
+                evidence_id = f"relabeled-outcome-{field}"
+                store.append_evidence(evidence_id, {"run_id": run_id, "sequence": index, "event_type": "trusted_outcome", "content_hash": relabeled.sha256, "source_ref": relabeled.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0})
+                self.assertFalse(verifier.verify(dataclasses.replace(row, outcome_ref=evidence_id), frozen, package))
 
 if __name__ == "__main__":
     unittest.main()
