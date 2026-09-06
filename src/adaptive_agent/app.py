@@ -604,30 +604,72 @@ class DurableRuntime:
             raise LearningRuntimeError("evaluation run did not produce trusted model and outcome evidence")
         model_row = model_rows[-1]
         model_payload = self.controller.store.get_artifact(json.loads(model_row["source_ref"])["sha256"])
-        accounting_ref = model_payload.get("accountingRef", {}).get("sha256") if isinstance(model_payload, Mapping) else None
-        accounting = self.controller.store.get_artifact(accounting_ref) if isinstance(accounting_ref, str) else {}
-        # Kernel and broker work can finish after the final model response.
-        # Publish a new immutable accounting artifact for the completed run so
-        # the observation charges terminal work without rewriting prior evidence.
-        if isinstance(accounting, Mapping):
-            final_accounting = dict(accounting)
-            final_accounting["toolCalls"] = sum(1 for row in evidence_rows if row.get("event_type") == "tool_result")
-            final_accounting["durationSeconds"] = max(float(accounting.get("durationSeconds", 0) or 0), time.monotonic() - execution_started)
-            final_accounting["inferenceDurationSeconds"] = float(accounting.get("inferenceDurationSeconds", 0) or 0)
-            accounting_ref = self.controller.store.put_artifact(final_accounting).sha256
-            accounting = final_accounting
-            # Bind the terminal artifact to the immutable run projection so a
-            # fresh runtime and stage recovery resolve the same accounting.
-            run_row = self.controller.store.get_run(run.run_id)
-            if run_row is not None:
-                try:
-                    run_json = json.loads(run_row.get("run_json", "{}"))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    run_json = {}
-                if isinstance(run_json, dict):
-                    run_json["finalAccountingRef"] = accounting_ref
-                    run_row["run_json"] = json.dumps(run_json, sort_keys=True)
-                    self.controller.store.save_run(run.run_id, run_row)
+        if not isinstance(model_payload, Mapping):
+            raise LearningRuntimeError("evaluation model receipt is missing")
+        run_row = self.controller.store.get_run(run.run_id)
+        try:
+            run_payload = json.loads(run_row.get("run_json", "{}")) if run_row is not None else {}
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LearningRuntimeError("evaluation run identity is malformed") from exc
+        if not isinstance(run_payload, dict):
+            raise LearningRuntimeError("evaluation run identity is malformed")
+        bound_ref = run_payload.get("finalAccountingRef")
+        if bound_ref is not None:
+            # A terminal receipt is immutable once bound.  A missing or
+            # malformed bound artifact fails closed instead of falling back to
+            # a model receipt and silently losing terminal metrics.
+            if not isinstance(bound_ref, str) or not bound_ref:
+                raise LearningRuntimeError("evaluation terminal accounting reference is malformed")
+            accounting_ref = bound_ref
+            try:
+                accounting = self.controller.store.get_artifact(accounting_ref)
+            except KeyError as exc:
+                raise LearningRuntimeError("evaluation terminal accounting receipt is missing") from exc
+            if not isinstance(accounting, Mapping):
+                raise LearningRuntimeError("evaluation terminal accounting receipt is missing")
+        else:
+            model_accounting_ref = model_payload.get("accountingRef")
+            accounting_ref = model_accounting_ref.get("sha256") if isinstance(model_accounting_ref, Mapping) else None
+            if not isinstance(accounting_ref, str) or not accounting_ref:
+                raise LearningRuntimeError("evaluation model accounting receipt is missing")
+            try:
+                accounting = self.controller.store.get_artifact(accounting_ref)
+            except KeyError as exc:
+                raise LearningRuntimeError("evaluation model accounting receipt is missing") from exc
+            # Kernel and broker work can finish after the final model response.
+            # Publish one immutable accounting artifact for the completed run
+            # so replays resolve the exact same terminal metrics.
+            if isinstance(accounting, Mapping):
+                final_accounting = dict(accounting)
+                final_accounting["toolCalls"] = sum(1 for row in evidence_rows if row.get("event_type") == "tool_result")
+                final_accounting["durationSeconds"] = max(float(accounting.get("durationSeconds", 0) or 0), time.monotonic() - execution_started)
+                final_accounting["inferenceDurationSeconds"] = float(accounting.get("inferenceDurationSeconds", 0) or 0)
+                accounting_ref = self.controller.store.put_artifact(final_accounting).sha256
+                accounting = final_accounting
+                # Bind the terminal artifact to the durable run projection once.
+                run_row = self.controller.store.get_run(run.run_id)
+                if run_row is not None:
+                    try:
+                        run_json = json.loads(run_row.get("run_json", "{}"))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        run_json = {}
+                    if isinstance(run_json, dict):
+                        run_json["finalAccountingRef"] = accounting_ref
+                        run_row["run_json"] = json.dumps(run_json, sort_keys=True)
+                        self.controller.store.save_run(run.run_id, run_row)
+            else:
+                raise LearningRuntimeError("evaluation model accounting receipt is missing")
+        if (
+            accounting.get("responseId") != model_payload.get("responseId")
+            or accounting.get("runId") != run.run_id
+            or accounting.get("taskId") != task_id
+            or accounting.get("environmentId") != env_id
+            or accounting.get("arm") != arm_value
+            or accounting.get("seed") != seed
+            or accounting.get("bundleHash") != bundle_hash
+            or accounting.get("versionRefs") != model_payload.get("versionRefs")
+        ):
+            raise LearningRuntimeError("evaluation terminal accounting receipt is not bound to the model receipt")
         # Evaluator evidence references name the durable evidence row; the
         # row's sourceRef points at the immutable outcome artifact.
         outcome_ref = outcome_rows[-1]["evidence_id"]

@@ -167,6 +167,34 @@ class SQLiteRunEvidenceStore:
             return False
         if not all(isinstance(value, dict) for value in (response, accounting, outcome)):
             return False
+        response_accounting_ref = response.get("accountingRef")
+        if isinstance(response_accounting_ref, dict):
+            response_accounting_ref = response_accounting_ref.get("sha256")
+        if response_accounting_ref is not None and (not isinstance(response_accounting_ref, str) or not response_accounting_ref):
+            return False
+        bound_final_ref = run_payload.get("finalAccountingRef")
+        if bound_final_ref is not None:
+            if not isinstance(bound_final_ref, str) or bound_final_ref != observation.accounting_ref or not isinstance(response_accounting_ref, str):
+                return False
+        elif response_accounting_ref is not None and response_accounting_ref != observation.accounting_ref:
+            return False
+        if isinstance(response_accounting_ref, str) and response_accounting_ref != observation.accounting_ref:
+            try:
+                original_accounting = self.store.get_artifact(response_accounting_ref)
+            except KeyError:
+                return False
+            if not isinstance(original_accounting, dict):
+                return False
+            # The terminal receipt may extend only terminal execution fields.
+            # Usage, cost, identity, and canonical version pins remain bound to
+            # the authenticated model receipt and cannot be rewritten in a
+            # replay or by a tampered run binding.
+            mutable_terminal_fields = {"durationSeconds", "inferenceDurationSeconds", "toolCalls"}
+            if any(
+                key not in mutable_terminal_fields and accounting.get(key) != original_accounting.get(key)
+                for key in set(accounting) | set(original_accounting)
+            ):
+                return False
         receipts = accounting.get("receipts")
         aggregate_usage = accounting.get("aggregateUsage")
         if receipts is not None:

@@ -270,6 +270,9 @@ class RunRecord(BaseModel):
     seed: int | None = None
     bundle_hash: str | None = Field(None, alias="bundleHash")
     arm_bundles: dict[str, str] = Field(default_factory=dict, alias="armBundles")
+    # Evaluator-owned terminal accounting is bound after execution and must
+    # survive process restart without changing the public run identity.
+    final_accounting_ref: str | None = Field(None, alias="finalAccountingRef")
 
 
 class StepRecord(BaseModel):
