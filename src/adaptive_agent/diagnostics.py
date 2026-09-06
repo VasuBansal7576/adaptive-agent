@@ -145,6 +145,7 @@ class DevelopmentDiagnosticManager:
                 value.get("error")
                 or "persisted diagnostic evidence is unavailable or invalid"
             )
+            value["_integrity_invalid"] = True
         return value
 
     def _public(self, r: Mapping[str, Any]) -> dict[str, Any]:
@@ -154,7 +155,7 @@ class DevelopmentDiagnosticManager:
             "baseBundleHash": r["base_bundle_hash"],
             "candidateBundleHash": r["candidate_bundle_hash"],
             "protocolHash": r["protocol_hash"],
-            "state": r["state"],
+            "state": "failed" if r.get("_integrity_invalid") else r["state"],
             "completedCells": int(r.get("completed_cells", 0)),
             "totalCells": 6,
             "startedAt": r.get("started_at"),
@@ -208,6 +209,7 @@ class DevelopmentDiagnosticManager:
                 if row["status"] != "completed":
                     continue
                 if record is not None and not self._validate_cached(row, record):
+                    infra += 1
                     continue
                 completed += 1
                 try:
@@ -731,9 +733,19 @@ class DevelopmentDiagnosticManager:
                 if invalid_cells:
                     placeholders = ",".join("?" for _ in invalid_cells)
                     conn.execute(
-                        f"UPDATE diagnostic_cells SET status='queued',result_json='{{}}',receipt_ref=NULL,failure_class=NULL,error=NULL,observation_json=NULL,updated_at=? WHERE diagnostic_id=? AND cell_key IN ({placeholders})",
+                        f"UPDATE diagnostic_cells SET status='failed',failure_class='evidence_integrity',error='persisted diagnostic evidence failed verification',updated_at=? WHERE diagnostic_id=? AND cell_key IN ({placeholders})",
                         (_now(), diagnostic_id, *invalid_cells),
                     )
+                    conn.execute(
+                        "UPDATE diagnostics SET state='failed',error=?,updated_at=? WHERE diagnostic_id=?",
+                        (
+                            "persisted diagnostic evidence failed verification",
+                            _now(),
+                            diagnostic_id,
+                        ),
+                    )
+                    conn.commit()
+                    return self.get(diagnostic_id)
                 conn.execute(
                     "UPDATE diagnostics SET state='running',owner_id=?,started_at=COALESCE(started_at,?),updated_at=? WHERE diagnostic_id=?",
                     (self._owner_id, _now(), _now(), diagnostic_id),
