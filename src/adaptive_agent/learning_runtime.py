@@ -121,6 +121,8 @@ class LearningRuntime:
         existing_rows = existing_reader(environment_id=environment_id, run_id=run_id) if callable(existing_reader) else ()
         existing_records: list[Mapping[str, Any]] = []
         existing_keys: set[tuple[Any, Any]] = set()
+        existing_indexes: dict[tuple[Any, Any], int] = {}
+        encoded_keys: set[tuple[Any, Any]] = set()
         for row in existing_rows or ():
             if not isinstance(row, Mapping):
                 continue
@@ -134,18 +136,64 @@ class LearningRuntime:
                     key = (decoded.get("kind"), decoded.get("sourceId"))
                     if key not in existing_keys:
                         existing_keys.add(key)
+                        existing_indexes[key] = len(existing_records)
                         existing_records.append(decoded)
+                    elif key not in encoded_keys:
+                        existing_records[existing_indexes[key]] = decoded
+                    encoded_keys.add(key)
             elif isinstance(row.get("kind"), str):
                 key = (row.get("kind"), row.get("sourceId"))
                 if key not in existing_keys:
                     existing_keys.add(key)
+                    existing_indexes[key] = len(existing_records)
                     existing_records.append(row)
 
-        # Materialized records remain the restart source of truth and are
-        # supplied directly to retrieval.  The key set keeps legacy record-ID
-        # conventions from creating duplicate learner sources.
-        raw_records: list[Mapping[str, Any]] = list(existing_records)
-        materialized_keys: set[tuple[Any, Any]] = set(existing_keys)
+        # Materialized records remain the restart source of truth, but only
+        # after their content, bindings, and derived-evidence provenance have
+        # been revalidated.  This prevents a legacy fallback row from becoming
+        # learner context merely because it has the right record shape.
+        raw_records: list[Mapping[str, Any]] = []
+        materialized_keys: set[tuple[Any, Any]] = set()
+        for record in existing_records:
+            kind = record.get("kind")
+            key = (kind, record.get("sourceId"))
+            content = record.get("content")
+            if not isinstance(content, str) or record.get("contentHash") != content_hash(content):
+                continue
+            if kind == "public_doc":
+                valid = record.get("environmentId") == environment_id and record.get("visibility") == "public"
+            elif kind == "task_state":
+                valid = record.get("environmentId") == environment_id and record.get("runId") == run_id and record.get("visibility") == "learner" and record.get("trustedOutcome") is True
+            elif kind == "live_evidence":
+                source_id = record.get("sourceId")
+                get_evidence = getattr(self.store, "get_evidence", None)
+                derived = get_evidence(source_id) if callable(get_evidence) and isinstance(source_id, str) else None
+                # Older persisted projections predate the derived-evidence
+                # provenance row and sourceContentHash field. They are still
+                # eligible as restart input when the Store returned the
+                # encoded, content-hashed materialized record itself. Direct
+                # legacy fallback rows never receive this compatibility path.
+                legacy_materialized = key in encoded_keys
+                valid = (
+                    isinstance(source_id, str) and (source_id.startswith("broker:") or legacy_materialized)
+                    and record.get("environmentId") == environment_id and record.get("runId") == run_id
+                    and record.get("partition") == "development" and record.get("visibility") == "learner"
+                    and record.get("trustClass") == "broker" and record.get("trustedOutcome") is True
+                    and (
+                        legacy_materialized
+                        or (
+                            isinstance(record.get("sourceContentHash"), str)
+                            and isinstance(derived, Mapping) and derived.get("event_type") == "learning_evidence_projection"
+                            and derived.get("run_id") == run_id and derived.get("visibility") == "learner"
+                            and derived.get("redacted") == 1 and derived.get("trust_class") == "broker"
+                        )
+                    )
+                )
+            else:
+                valid = False
+            if valid:
+                raw_records.append(record)
+                materialized_keys.add(key)
 
         def persist(record_id: str, record: Mapping[str, Any]) -> None:
             key = (record.get("kind"), record.get("sourceId"))
@@ -178,7 +226,7 @@ class LearningRuntime:
                 raise LearningRuntimeError("completed run public manifest reference is missing")
             docs = [{**doc, "content": self.store.get_artifact(doc["sha256"])} for doc in manifest.get("docs", [])]
         if not docs:
-            docs = [record for record in existing_records if record.get("kind") == "public_doc"]
+            docs = [record for record in raw_records if record.get("kind") == "public_doc"]
         supplied_docs = {}
         for supplied in public_documents or ():
             if hasattr(supplied, "document_id"):
