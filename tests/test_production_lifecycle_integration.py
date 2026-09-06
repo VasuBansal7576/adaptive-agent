@@ -212,7 +212,8 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
         assert payload["auxiliarySummaries"]["transfer"]["queryCount"] == 3
         assert payload["auxiliarySummaries"]["adaptation"]["queryCount"] == 3
         assert payload["auxiliaryOverhead"]["transfer"]["supportAndLearningIncluded"] is True
-        assert payload["auxiliaryOverhead"]["adaptation"]["supportAndLearning"]["totalTokens"] > 0
+        assert payload["auxiliaryOverhead"]["adaptation"]["support"]["totalTokens"] > 0
+        assert payload["auxiliaryOverhead"]["adaptation"]["learning"]["totalTokens"] > 0
         assert payload["auxiliaryExposure"]["transfer"]["sourceRunIds"]
         assert payload["auxiliaryExposure"]["transfer"]["taskIds"]
         assert payload["auxiliaryExposure"]["adaptation"]["taskIds"]
