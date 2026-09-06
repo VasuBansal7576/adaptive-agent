@@ -102,7 +102,7 @@ class Runtime:
         return True
 
     def establish_clean_experiment(self, protocol):
-        return {"clean": True, "provenanceRef": "clean-provenance"}
+        return {"clean": True, "actualDocker": True, "provenanceRef": "clean-provenance"}
 
 
 class Protocol:
@@ -192,7 +192,21 @@ def test_adaptation_learns_from_support_before_query(monkeypatch):
     monkeypatch.setattr(runner, "_candidate", lambda _context: Bundle("primary"))
     monkeypatch.setattr(experiment_runtime, "_load_bundle", lambda _runtime, content_hash: Bundle(content_hash))
     monkeypatch.setattr(runner, "_learning_observation_usage", lambda _run_id, **_: ({"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, ["learning-ref"]))
-    context = {"results": {"learning": {"candidate-generation": {"candidateBundleHash": "primary"}}}}
+    admissions = []
+    checkpoints = []
+
+    def admit(key, **_estimates):
+        admissions.append(key)
+        return {"admissionId": key, "status": "reserved", "reused": False}
+
+    def record(admission_id, *, result=None, error=None):
+        checkpoints.append((admission_id, result, error))
+
+    context = {
+        "results": {"learning": {"candidate-generation": {"candidateBundleHash": "primary"}}},
+        "admitSubcall": admit,
+        "recordSubcall": record,
+    }
 
     runner._adaptation("adapt:known-a", context, 0)
 
@@ -200,6 +214,12 @@ def test_adaptation_learns_from_support_before_query(monkeypatch):
         ("known-a-development-0", "L", 17, "primary"),
         ("known-a-validation-0", "L", 23, "adapted"),
     ]
+    assert admissions == [
+        "adaptation:adapt:known-a:support",
+        "learning:adapt:known-a:run-1",
+        "adaptation:adapt:known-a:query",
+    ]
+    assert all(error is None for _, _, error in checkpoints)
 
 
 def test_partial_known_cost_remains_unknown():
@@ -231,7 +251,7 @@ def test_event_type_only_evidence_is_not_accepted():
 
 def test_bootstrap_requires_clean_provenance_receipt():
     runtime = Runtime()
-    runtime.establish_clean_experiment = lambda _protocol: {"clean": False, "provenanceRef": "dirty"}
+    runtime.establish_clean_experiment = lambda _protocol: {"clean": False, "actualDocker": True, "provenanceRef": "dirty"}
     runner = DefaultExperimentStageRunner(runtime, Protocol())
 
     with pytest.raises(ExperimentRuntimeError, match="provenance"):
