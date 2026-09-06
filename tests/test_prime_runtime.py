@@ -106,7 +106,7 @@ class PrimeRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "error")
         self.assertEqual(calls, [])
 
-        retry = self.make(child_runs=1)
+        retry = self.make(child_runs=2)
         attempts = []
         def planner(request):
             attempts.append(request)
@@ -118,6 +118,10 @@ class PrimeRuntimeTests(unittest.TestCase):
         second = retry.execute("from rlm import host_request\nawait host_request('rlm.run', {'prompt':'second', 'kwargs':{}})")
         self.assertEqual(first.status, "error")
         self.assertEqual(second.status, "ok")
+        self.assertEqual(len(attempts), 2)
+        third = retry.execute("from rlm import host_request\nawait host_request('rlm.run', {'prompt':'third', 'kwargs':{}})")
+        self.assertEqual(third.status, "error")
+        self.assertIn("shared child budget", third.error["evalue"])
         self.assertEqual(len(attempts), 2)
 
     def test_learner_requested_child_uses_trusted_planner_and_shared_budget(self):
