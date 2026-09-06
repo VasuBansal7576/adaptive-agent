@@ -654,18 +654,31 @@ class Controller:
     def record_trusted_outcome(self, run_id: str, outcome: Mapping[str, Any]) -> EvidenceRecord:
         """Record the evaluator-owned outcome bound to a model response."""
         row = self._run_row(run_id)
+        payload = dict(outcome)
+        if not payload.get("responseId"):
+            for evidence in reversed(self.store.list_evidence(run_id)):
+                if evidence.get("event_type") != "model_response":
+                    continue
+                try:
+                    source_ref = json.loads(evidence["source_ref"])
+                    response = self.store.get_artifact(source_ref["sha256"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(response, Mapping) and isinstance(response.get("responseId"), str) and response["responseId"]:
+                    payload["responseId"] = response["responseId"]
+                    break
         for key in ("responseId", "runId", "taskId", "environmentId"):
-            if not outcome.get(key):
+            if not payload.get(key):
                 raise ValueError(f"outcome.{key} is required")
-        if outcome["runId"] != run_id or outcome["taskId"] != row["task_id"] or outcome["environmentId"] != row["environment_id"]:
+        if payload["runId"] != run_id or payload["taskId"] != row["task_id"] or payload["environmentId"] != row["environment_id"]:
             raise ValueError("outcome run/task/environment pins do not match the run")
-        if not isinstance(outcome.get("passed"), bool) or not isinstance(outcome.get("reliable"), bool):
+        if not isinstance(payload.get("passed"), bool) or not isinstance(payload.get("reliable"), bool):
             raise ValueError("outcome.passed/reliable must be booleans")
-        sv = outcome.get("safetyViolations")
+        sv = payload.get("safetyViolations")
         if not isinstance(sv, int) or isinstance(sv, bool) or sv < 0:
             raise ValueError("outcome.safetyViolations must be a non-negative integer")
-        ev = self.append_event(run_id, "trusted_outcome", dict(outcome), "evaluator", "operator")
-        self.record_outcome(run_id, bool(outcome["passed"]), None, dict(outcome))
+        ev = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "evaluator_only")
+        self.record_outcome(run_id, bool(payload["passed"]), None, payload)
         return ev
 
     # ------------------------------------------------------------------ EVAL-004/005 probe executor

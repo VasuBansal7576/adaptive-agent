@@ -191,7 +191,9 @@ class SQLiteRunEvidenceStore:
             return False
         if evidence.get("trust_class") not in {"broker", "system"} or outcome_evidence.get("trust_class") != "evaluator":
             return False
-        if evidence.get("visibility") not in {"operator", "evaluator_only"} or outcome_evidence.get("visibility") not in {"operator", "evaluator_only"}:
+        # Model output is operator-visible; evaluator decisions stay private.
+        # Do not accept an operator-visible trusted outcome as an attestation.
+        if evidence.get("visibility") != "operator" or outcome_evidence.get("visibility") != "evaluator_only":
             return False
         if evidence.get("eventType") not in (None, "model_response") or outcome_evidence.get("eventType") not in (None, "trusted_outcome"):
             return False

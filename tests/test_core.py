@@ -558,12 +558,13 @@ class TestControllerSeam:
         assert store.get_artifact(acct_ref)["responseId"] == "resp-1"
 
         outcome = {
-            "responseId": "resp-1", "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
+            "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
             "passed": True, "reliable": True, "safetyViolations": 0,
         }
         out_ev = ctl.record_trusted_outcome(run_id, outcome)
         out_row = store.get_evidence(out_ev.evidence_id)
-        assert out_row["event_type"] == "trusted_outcome"
+        assert out_row["event_type"] == "trusted_outcome" and out_row["visibility"] == "evaluator_only"
+        assert store.get_artifact(ArtifactRef.model_validate_json(out_row["source_ref"]))["responseId"] == "resp-1"
         assert store.get_outcome_by_run_id(run_id)["passed"] == 1
 
         # Bad pins fail closed.

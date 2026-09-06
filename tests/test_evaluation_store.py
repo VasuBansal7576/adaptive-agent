@@ -103,10 +103,20 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             accounting_ref = store.put_artifact({"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "usage": usage, "costMicrounits": 1, "durationSeconds": 1.0, "versionRefs": version_refs, "arm": "L", "seed": 17, "bundleHash": bundle.content_hash})
             outcome = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "arm": "L", "seed": 17, "bundleHash": bundle.content_hash, "passed": True, "reliable": True, "safetyViolations": 0}
             outcome_ref = store.put_artifact(outcome)
-            store.append_evidence("outcome-1", {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "operator", "redacted": 0})
+            # A fresh evaluator store must verify a private trusted outcome;
+            # no operator-visible outcome is used as a prerequisite.
+            store.append_evidence("outcome-1", {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0})
             expected = {"model": sha256_json({"profile": protocol.model_profile, "provider": protocol.provider}), "planner": protocol.core_planner_hash, "budget": sha256_json(frozen.inputs["runBudget"]), "policy": sha256_json(package.manifest.policy_ref), "schema": sha256_json(package.manifest.tool_schemas), "image": protocol.image_digest}
             row = RunObservation(task.task_id, "finance", Partition.VALIDATION, 17, Arm.L, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, response_id=response_id, accounting_ref=accounting_ref.sha256, evidence_ref="evidence-1", outcome_ref="outcome-1", config_hashes=expected, run_id=run_id, bundle_hash=bundle.content_hash)
             verifier = SQLiteRunEvidenceStore(store)
+            self.assertTrue(verifier.verify(row, frozen, package))
+            with store.connect() as conn:
+                conn.execute("UPDATE evidence SET visibility = 'operator' WHERE evidence_id = ?", ("outcome-1",))
+                conn.commit()
+            self.assertFalse(verifier.verify(row, frozen, package))
+            with store.connect() as conn:
+                conn.execute("UPDATE evidence SET visibility = 'evaluator_only' WHERE evidence_id = ?", ("outcome-1",))
+                conn.commit()
             self.assertTrue(verifier.verify(row, frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, response_id="wrong"), frozen, package))
             self.assertFalse(verifier.verify(dataclasses.replace(row, run_id="wrong"), frozen, package))
@@ -124,7 +134,7 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             store.append_evidence("corrupt", {"run_id": run_id, "sequence": 3, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": store.put_artifact(["not", "object"]).model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
             self.assertFalse(verifier.verify(dataclasses.replace(row, evidence_ref="corrupt"), frozen, package))
 
-            # Private evaluator outcomes are valid when their trust and CAS
+            # A second private reference remains valid when its trust and CAS
             # bindings are intact; learner visibility is enforced elsewhere.
             store.append_evidence("private-outcome", {"run_id": run_id, "sequence": 5, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0})
             self.assertTrue(verifier.verify(dataclasses.replace(row, outcome_ref="private-outcome"), frozen, package))
