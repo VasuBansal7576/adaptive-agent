@@ -212,10 +212,6 @@ class SharedBudget:
                 raise SecurityViolation("shared child budget is exhausted or cancelled")
             self.child_runs_used += 1
 
-    def release_child(self) -> None:
-        with self.lock:
-            self.child_runs_used = max(0, self.child_runs_used - 1)
-
     def record_model_usage(self, tokens: int) -> None:
         if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
             raise AdapterError("model token usage must be a non-negative integer")
@@ -960,14 +956,12 @@ class PrimeRuntimeAdapter:
                 raise SecurityViolation("child run budget exhausted: trusted child planner is not configured")
             if self._depth >= self.config.max_child_depth:
                 raise SecurityViolation("child depth budget exhausted")
-            # Reserve before invoking the potentially paid parent model. A
-            # malformed planner response refunds this reservation below.
+            # Reserve before invoking the potentially paid parent model.
+            # Failed planning attempts remain consumed: without a trusted
+            # provider usage receipt, refunding would permit repeated paid calls
+            # to bypass the shared ledger.
             self._budget.reserve_child()
-            try:
-                plan, request = self._plan_child(payload)
-            except Exception:
-                self._budget.release_child()
-                raise
+            plan, request = self._plan_child(payload)
             result = self._execute_child_reserved(plan.code, timeout=min(self.config.max_cell_seconds, request.remaining_seconds))
             return {
                 "rlm_child_id": f"{self.config.task_id}-child-{self._children}",
