@@ -93,6 +93,24 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
   // stream lifecycle for the selected run: open from the acknowledged cursor,
   // close when the selection or transport changes; reconnectNonce forces a
   // manual stream reopen (stale banner) while preserving the cursor
+  const lastRecordRefresh = useRef(0);
+  const refreshRunRecords = useCallback(async () => {
+    // throttle background record refreshes
+    if (Date.now() - lastRecordRefresh.current < 2000) return;
+    lastRecordRefresh.current = Date.now();
+    try {
+      const runs = await transport.listRuns();
+      dispatch({ type: "runsRefreshed", runs });
+    } catch {
+      /* keep the current view; the stale/retry paths surface connection issues */
+    }
+  }, [transport]);
+
+  useEffect(() => {
+    // after a stream closes (terminal or restart), refresh the actual records
+    if (state.connection === "closed") void refreshRunRecords();
+  }, [state.connection, refreshRunRecords]);
+
   useEffect(() => {
     closeStreamRef.current?.();
     closeStreamRef.current = null;
@@ -101,7 +119,12 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     const cursor = state.cursors[runId] ?? 0;
     dispatch({ type: "connection", state: "connecting" });
     const close = transport.openRunStream(runId, cursor, {
-      onEvent: (event) => dispatch({ type: "event", event }),
+      onEvent: (event) => {
+        dispatch({ type: "event", event });
+        // plane-shape status/approval events carry no validated status field:
+        // refresh the authoritative RunRecord instead of parsing display text
+        if (!event.runStatus && (event.kind === "status" || event.kind === "approval")) void refreshRunRecords();
+      },
       onState: (connection) => {
         if (connection !== "closed") dispatch({ type: "connection", state: connection });
       },

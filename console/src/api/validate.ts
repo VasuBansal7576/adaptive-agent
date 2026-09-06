@@ -125,6 +125,18 @@ const SUMMARY_BY_TYPE: Record<string, string> = {
   approval: "Approval recorded",
 };
 
+/** Durable lifecycle event types -> authoritative RunStatus transitions.
+ *  Status is taken ONLY from the validated event type, never display text. */
+const EVENT_TYPE_TO_STATUS: Record<string, RunStatus> = {
+  run_created: "queued",
+  run_started: "running",
+  run_completed: "succeeded",
+  run_succeeded: "succeeded",
+  run_failed: "failed",
+  run_cancelled: "cancelled",
+  run_timed_out: "timed_out",
+};
+
 /** Durable evidence event types -> console event kinds. */
 const EVENT_TYPE_TO_KIND: Record<string, RunEvent["kind"]> = {
   run_created: "status",
@@ -217,6 +229,9 @@ export function normalizeSseEvent(value: unknown, field: string): RunEvent {
     visibility: typeof data.visibility === "string" ? data.visibility : undefined,
     redacted: typeof data.redacted === "boolean" ? data.redacted : typeof data.redacted === "number" ? data.redacted === 1 : undefined,
   };
+  // lifecycle status comes from the validated event type only
+  const statusTransition = EVENT_TYPE_TO_STATUS[eventType];
+  if (statusTransition) event.runStatus = statusTransition;
   return event;
 }
 

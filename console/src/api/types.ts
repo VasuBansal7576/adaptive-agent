@@ -70,6 +70,9 @@ export type RunEvent = {
   approval?: ApprovalRequest;
   /** provenance from the durable evidence row; expandable in the UI */
   evidence?: EvidenceProvenance;
+  /** authoritative status transition derived from the validated event TYPE
+   *  (never from display text); absent for non-lifecycle events */
+  runStatus?: RunStatus;
 };
 
 export type ApprovalRequest = {

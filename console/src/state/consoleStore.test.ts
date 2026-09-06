@@ -44,12 +44,17 @@ describe("event cursor semantics", () => {
     expect(s1.events["r1"]).toBeUndefined();
   });
 
-  it("derives run status from status events", () => {
-    let s = applyEvent(state, ev(1, "Run queued and pinned to bundle v7."));
-    expect(s.runs[0].status).toBe("running"); // 'queued' only applies while already queued
-    s = applyEvent(s, ev(2, "Approval required for ledger.append (write)."));
-    expect(s.runs[0].status).toBe("awaiting_approval");
-    s = applyEvent(s, ev(3, "Run succeeded."));
-    expect(s.runs[0].status).toBe("succeeded");
+  it("status changes ONLY via validated lifecycle transitions or record refresh", () => {
+    // durable lifecycle events carry runStatus from the event TYPE
+    let s = applyEvent(state, { ...ev(1), runStatus: "queued" } as RunEvent);
+    expect(s.runs[0].status).toBe("queued");
+    s = applyEvent(s, { ...ev(2), runStatus: "running" } as RunEvent);
+    expect(s.runs[0].status).toBe("running");
+    s = applyEvent(s, { ...ev(3), runStatus: "failed" } as RunEvent);
+    expect(s.runs[0].status).toBe("failed");
+    // plane-shape status events with no validated field NEVER change status,
+    // regardless of their display text
+    s = applyEvent(s, ev(4, "Run started in interactive mode with authenticated model runner."));
+    expect(s.runs[0].status).toBe("failed");
   });
 });
