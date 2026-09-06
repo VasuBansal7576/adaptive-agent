@@ -785,16 +785,20 @@ class DurableRuntime:
     def list_evaluations(self) -> list[dict[str, Any]]:
         out = []
         report_ids: set[str] = set()
+        queue_rows = {
+            str(row["evaluation_id"]): row
+            for row in self.controller.store.list_evaluation_queue()
+            if isinstance(row.get("evaluation_id"), str)
+        }
 
         def public_job(payload: Mapping[str, Any], *, evaluation_id: str | None = None, row: Mapping[str, Any] | None = None) -> dict[str, Any]:
             value = dict(payload)
             if evaluation_id is not None:
                 value.setdefault("evaluationId", evaluation_id)
             if row is not None:
-                value.setdefault("candidateId", row.get("candidate_id"))
-                value.setdefault("baseBundleHash", row.get("base_hash"))
-                value.setdefault("protocolHash", row.get("protocol_hash"))
-                value.setdefault("state", row.get("state"))
+                for output_key, row_key in (("candidateId", "candidate_id"), ("baseBundleHash", "base_hash"), ("protocolHash", "protocol_hash"), ("state", "state")):
+                    if output_key not in value and row.get(row_key) is not None:
+                        value[output_key] = row[row_key]
             if "candidate_id" in value:
                 value["candidateId"] = value.pop("candidate_id")
             if "base_hash" in value:
@@ -803,11 +807,24 @@ class DurableRuntime:
                 value["protocolHash"] = value.pop("protocol_hash")
             if "validity" in value and "validityStatus" not in value:
                 value["validityStatus"] = value.pop("validity")
-            state = value.get("state")
             canonical = bool(row is not None and self._verify_evaluation_report(value, row))
+            raw_state = value.get("state")
+            if raw_state in {"completed", "complete", "decided", "failed", "error", "incomplete"}:
+                value["state"] = "valid" if canonical else "invalid"
+            elif raw_state not in {"queued", "running", "valid", "invalid", "cancelled"}:
+                validity = value.get("validityStatus")
+                value["state"] = "valid" if canonical and validity == "valid" else "invalid"
             value["trusted"] = canonical
             if not canonical:
                 value.setdefault("trustReason", "unverified evaluator report")
+                if "reason" not in value:
+                    error = value.get("error")
+                    if isinstance(error, Mapping) and isinstance(error.get("message"), str):
+                        value["reason"] = error["message"]
+                    elif isinstance(error, str) and error:
+                        value["reason"] = error
+                    else:
+                        value["reason"] = value["trustReason"]
             return value
 
         for row in self.controller.store.list_evaluations():
@@ -815,13 +832,16 @@ class DurableRuntime:
                 report = json.loads(row["report_json"])
                 if isinstance(report, dict):
                     report_id = str(row.get("report_id", report.get("evaluationId", "")))
-                    normalized = public_job(report, evaluation_id=report_id or None, row=row)
+                    # The report table stores evaluator output; queue metadata
+                    # owns the operator-facing candidate and lifecycle fields.
+                    metadata = queue_rows.get(report_id)
+                    normalized = public_job(report, evaluation_id=report_id or None, row=metadata or row)
                     out.append(normalized)
                     if report_id:
                         report_ids.add(report_id)
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-        for row in self.controller.store.list_evaluation_queue():
+        for row in queue_rows.values():
             try:
                 queued = json.loads(row["payload_json"])
             except (TypeError, ValueError, json.JSONDecodeError):
