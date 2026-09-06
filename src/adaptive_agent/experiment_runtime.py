@@ -254,7 +254,7 @@ class DefaultExperimentStageRunner:
         if not callable(provenance):
             raise ExperimentRuntimeError("runtime lacks clean experiment provenance seam")
         clean = _mapping(provenance(self.protocol), "clean experiment provenance")
-        if clean.get("clean") is not True or not isinstance(clean.get("provenanceRef"), str) or not clean["provenanceRef"]:
+        if clean.get("clean") is not True or clean.get("actualDocker") is not True or not isinstance(clean.get("provenanceRef"), str) or not clean["provenanceRef"]:
             raise ExperimentRuntimeError("experiment provenance is not clean")
         return {
             "stage": "bootstrap",
@@ -276,6 +276,7 @@ class DefaultExperimentStageRunner:
             "exposedEnvironments": list(known),
             "sealedEnvironment": self.protocol.sealed_environment,
             "provenanceRef": clean["provenanceRef"],
+            "actualDocker": True,
         }
 
     def _task_for_cell(self, cell_key: str, partition: str, environment_id: str | None = None, index: int = 0) -> Any:
@@ -312,6 +313,39 @@ class DefaultExperimentStageRunner:
         if not isinstance(outcome_row, Mapping) or outcome_row.get("event_type") != "trusted_outcome":
             raise ExperimentRuntimeError("observation outcome evidence is not evaluator-owned")
         return observation
+
+    def _execute_stage_subcall(
+        self,
+        task: Any,
+        arm: str,
+        seed: int,
+        bundle: Any,
+        attempt: int,
+        context: Mapping[str, Any],
+        stage: str,
+        cell_key: str,
+        subcall_key: str,
+    ) -> tuple[Any, Mapping[str, Any]]:
+        admission = self._admit_subcall(context, f"{stage}:{cell_key}:{subcall_key}")
+        if admission is not None and admission.get("reused") is True:
+            raise ExperimentRuntimeError("nested evaluation checkpoint requires durable observation recovery")
+        try:
+            observation = self._execute(task, arm, seed, bundle, attempt)
+            receipt = _observation_receipt(
+                self.runtime,
+                stage,
+                f"{cell_key}:subcall:{subcall_key}",
+                [observation],
+                self.pins,
+                extra={"subcallKey": subcall_key, "arm": arm, "seed": seed, "taskIds": [_task_id(task)]},
+            )
+            if admission is not None:
+                receipt["nestedAdmissionId"] = admission.get("admissionId")
+        except Exception as exc:
+            self._record_subcall(admission, error=str(exc))
+            raise
+        self._record_subcall(admission, result=receipt)
+        return observation, receipt
 
     def _training(self, cell_key: str, attempt: int) -> Mapping[str, Any]:
         task = next(
@@ -379,7 +413,10 @@ class DefaultExperimentStageRunner:
             return recovered
         try:
             result = self.runtime.launch_learning(SimpleNamespace(run_id=run_id))
-            receipt = self._learning_receipt(cell_key, run_id, result, bind_primary=bind_primary, prior_learning_refs=baseline_refs)
+            receipt = dict(self._learning_receipt(cell_key, run_id, result, bind_primary=bind_primary, prior_learning_refs=baseline_refs))
+            if admission is not None:
+                receipt["nestedAdmissionId"] = admission.get("admissionId")
+                receipt["nestedAdmissions"] = [admission.get("admissionId")]
         except Exception as exc:
             self._record_subcall(admission, error=str(exc))
             raise
@@ -444,6 +481,8 @@ class DefaultExperimentStageRunner:
             "candidateBundleHash": candidate_hash,
             "sourceRunIds": [run_id],
             "modelObservationRefs": learning_refs,
+            "nestedAdmissions": [],
+            "nestedCheckpoints": list(learning_refs),
         }
 
     def _candidate_for_excluded_environment(self, context: Mapping[str, Any], excluded: str) -> tuple[Any, Mapping[str, Any]]:
@@ -527,14 +566,24 @@ class DefaultExperimentStageRunner:
             raise ExperimentRuntimeError("transfer training set does not prove leave-one-environment-out exclusion")
         candidate, candidate_receipt = self._candidate_for_excluded_environment(context, environment_id)
         validation_task = self._task_for_cell(cell_key, "validation", environment_id, 0)
-        observation = self._execute(validation_task, "L", int(self.protocol.seeds[0]), candidate, attempt)
+        observation, _ = self._execute_stage_subcall(
+            validation_task,
+            "L",
+            int(self.protocol.seeds[0]),
+            candidate,
+            attempt,
+            context,
+            "transfer",
+            cell_key,
+            "evaluation",
+        )
         return _observation_receipt(
             self.runtime,
             "transfer",
             cell_key,
             [observation],
             self.pins,
-            extra={"environmentId": environment_id, "partition": "validation", "resetBefore": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": list(candidate_receipt["sourceRunIds"]), "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"], "learningReceipt": dict(candidate_receipt)},
+            extra={"environmentId": environment_id, "partition": "validation", "resetBefore": True, "exposed": False, "heldoutAccess": False, "disjointDevelopmentEnvironments": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": list(candidate_receipt["sourceRunIds"]), "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"], "learningReceipt": dict(candidate_receipt)},
         )
         return self._merge_receipts(receipt, candidate_receipt)
 
@@ -546,7 +595,17 @@ class DefaultExperimentStageRunner:
         candidate = self._candidate(context)
         support = self._task_for_cell(cell_key, "development", environment_id, 0)
         query = self._task_for_cell(cell_key, "validation", environment_id, 0)
-        support_observation = self._execute(support, "L", int(self.protocol.seeds[0]), candidate, attempt)
+        support_observation, _ = self._execute_stage_subcall(
+            support,
+            "L",
+            int(self.protocol.seeds[0]),
+            candidate,
+            attempt,
+            context,
+            "adaptation",
+            cell_key,
+            "support",
+        )
         support_learning = self._candidate_from_run(
             getattr(support_observation, "run_id"),
             cell_key,
@@ -554,14 +613,24 @@ class DefaultExperimentStageRunner:
             context=context,
         )
         adapted_candidate = _load_bundle(self.runtime, support_learning["candidateBundleHash"])
-        query_observation = self._execute(query, "L", int(self.protocol.seeds[1]), adapted_candidate, attempt)
+        query_observation, _ = self._execute_stage_subcall(
+            query,
+            "L",
+            int(self.protocol.seeds[1]),
+            adapted_candidate,
+            attempt,
+            context,
+            "adaptation",
+            cell_key,
+            "query",
+        )
         receipt = _observation_receipt(
             self.runtime,
             "adaptation",
             cell_key,
             [support_observation, query_observation],
             self.pins,
-            extra={"environmentId": environment_id, "resetBefore": True, "supportTaskIds": [_task_id(support)], "queryTaskIds": [_task_id(query)], "queryExposedToLearning": False},
+            extra={"environmentId": environment_id, "resetBefore": True, "supportTaskIds": [_task_id(support)], "queryTaskIds": [_task_id(query)], "supportExposedToQuery": False, "queryExposedToLearning": False, "supportQueryDisjoint": True},
         )
         receipt["supportRunIds"] = [getattr(support_observation, "run_id")]
         receipt["queryRunIds"] = [getattr(query_observation, "run_id")]
@@ -620,6 +689,8 @@ class DefaultExperimentStageRunner:
             "costMicrounits": 0,
             "pins": dict(self.pins),
             "safetyCaseId": cell_key,
+            "registeredCaseIds": [cell_key],
+            "passedCaseIds": [cell_key],
             "safetyEvidence": result.get("evidence", result.get("detail")),
             "probeDurationSeconds": result.get("wallSeconds", wall_seconds),
         }
@@ -678,7 +749,7 @@ class DefaultExperimentStageRunner:
             cell_key,
             [observation],
             self.pins,
-            extra={"partition": stage, "environmentId": environment_id, "taskIds": [_task_id(task)], "arm": arm, "seed": seed, "sealed": stage == "final"},
+            extra={"partition": stage, "environmentId": environment_id, "taskIds": [_task_id(task)], "arm": arm, "seed": seed, "sealed": stage == "final", "heldout": stage == "final" and environment_id == self.protocol.sealed_environment, "heldoutAccess": False},
         )
 
 
