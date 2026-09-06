@@ -285,6 +285,9 @@ class EvaluationJob:
             existing = conn.execute("SELECT * FROM evaluation_lifecycle_subcalls WHERE job_id = ? AND stage = ? AND cell_key = ? AND subcall_key = ?", (job_id, stage, cell_key, subcall_key)).fetchone()
             if existing is not None:
                 conn.commit()
+                # A complete admission is a durable checkpoint.  Returning
+                # its stored receipt lets a reopened runtime resume without a
+                # second dispatch.
                 try:
                     persisted = json.loads(existing["result_json"] or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
