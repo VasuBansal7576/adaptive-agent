@@ -395,10 +395,6 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               onCancel={(run) => void cancelRun(run.runId)}
               onCreateRun={createRun}
               onLearnFromRun={(runId) => {
-                // the invoking control unmounts when the tab switches: mark it
-                // so the dialog can return focus here on close
-                const invoker = document.activeElement;
-                if (invoker instanceof HTMLElement) invoker.setAttribute("data-acc010-focus-return", "");
                 setLearningRequest({ runId });
                 setActiveTab("candidates");
               }}
