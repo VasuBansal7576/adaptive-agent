@@ -423,7 +423,7 @@ export function parseDiagnostics(value: unknown): DiagnosticRecord[] {
       // meanScore is null until a task completes for this arm; never coerced to 0
       const meanScore: number | null =
         a.meanScore === null || a.meanScore === undefined ? null : num(a.meanScore, `${field}.armSummaries[${j}].meanScore`);
-      return {
+      const arm: DiagnosticRecord["armSummaries"][number] = {
         arm: armName,
         completed: num(a.completed, `${field}.armSummaries[${j}].completed`),
         successes: num(a.successes, `${field}.armSummaries[${j}].successes`),
@@ -431,12 +431,17 @@ export function parseDiagnostics(value: unknown): DiagnosticRecord[] {
         totalTokens: num(a.totalTokens, `${field}.armSummaries[${j}].totalTokens`),
         wallDurationSeconds: num(a.wallDurationSeconds, `${field}.armSummaries[${j}].wallDurationSeconds`),
       };
+      if (a.infrastructureErrors !== undefined) {
+        arm.infrastructureErrors = num(a.infrastructureErrors, `${field}.armSummaries[${j}].infrastructureErrors`);
+      }
+      return arm;
     });
     if (o.error !== undefined && o.error !== null && typeof o.error !== "string") {
       throw new SchemaError(`${field}.error`);
     }
     if (o.promotionEligible !== false) throw new SchemaError(`${field}.promotionEligible`);
-    return {
+    const resumable = o.resumable;
+    const row: DiagnosticRecord = {
       diagnosticId,
       candidateId,
       baseBundleHash,
@@ -450,6 +455,8 @@ export function parseDiagnostics(value: unknown): DiagnosticRecord[] {
       error: (o.error as string | undefined) ?? null,
       promotionEligible: false,
     };
+    if (typeof resumable === "boolean") row.resumable = resumable;
+    return row;
   });
 }
 

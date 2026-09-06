@@ -475,6 +475,9 @@ export function createSimulationTransport(options?: {
       const existing = diagnosticCatalog.find(
         (d) => d.candidateId === input.candidateId && d.baseBundleHash === input.baseBundleHash,
       );
+      // resume semantics: relaunching a queued/running/resumable row returns
+      // the SAME id and continues from its current cells (no extra completed
+      // calls); a completed row returns its stored results
       if (existing) return { diagnosticId: existing.diagnosticId, state: existing.state };
       const diagnosticId = `diag-sim-${(learningActionCount += 1).toString().padStart(3, "0")}`;
       diagnosticCatalog = [
@@ -491,6 +494,7 @@ export function createSimulationTransport(options?: {
           armSummaries: [],
           error: null,
           promotionEligible: false as const,
+          resumable: true,
         },
         ...diagnosticCatalog,
       ];
@@ -507,6 +511,7 @@ export function createSimulationTransport(options?: {
           return {
             ...d,
             state: "cancelled" as const,
+            resumable: false,
             error: "cancellation requested by operator",
             updatedAt: "2026-09-06T12:02:00Z",
           };
@@ -515,6 +520,7 @@ export function createSimulationTransport(options?: {
           return {
             ...d,
             state: "running" as const,
+            resumable: true,
             startedAt: "2026-09-06T12:00:30Z",
             updatedAt: "2026-09-06T12:00:30Z",
           };
@@ -524,12 +530,13 @@ export function createSimulationTransport(options?: {
         return {
           ...d,
           state: (completed ? "completed" : "running") as DiagnosticRecord["state"],
+          resumable: !completed,
           completedCells: nextCells,
           updatedAt: "2026-09-06T12:01:00Z",
           armSummaries: completed
             ? [
-                { arm: "B0" as const, completed: 3, successes: 2, meanScore: 0.55, totalTokens: 4200, wallDurationSeconds: 240 },
-                { arm: "L" as const, completed: 3, successes: 3, meanScore: 0.9, totalTokens: 5100, wallDurationSeconds: 262 },
+                { arm: "B0" as const, completed: 3, successes: 2, meanScore: 0.55, totalTokens: 4200, wallDurationSeconds: 240, infrastructureErrors: 1 },
+                { arm: "L" as const, completed: 3, successes: 3, meanScore: 0.9, totalTokens: 5100, wallDurationSeconds: 262, infrastructureErrors: 0 },
               ]
             : d.armSummaries.map((a) => ({ ...a, meanScore: a.meanScore ?? null })),
         };

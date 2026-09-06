@@ -200,6 +200,20 @@ export function CandidatesView({
     }
   };
 
+  // resume a resumable row: same launch call, the backend resumes the SAME id
+  // from its cached cells (no extra completed calls)
+  const resumeDiagnostic = async (row: DiagnosticRecord) => {
+    try {
+      await transport.launchDiagnostic({ candidateId: row.candidateId, baseBundleHash: row.baseBundleHash });
+      const rows = await transport.listDiagnostics();
+      setDiagnostics(rows);
+      diagnosticsActiveRef.current = rows.some((d) => d.state === "queued" || d.state === "running");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Resume failed";
+      onActionError(`Resume failed: ${message}`, (error as { correlationId?: string } | null)?.correlationId ?? null);
+    }
+  };
+
   const cancelDiagnostic = async (diagnosticId: string) => {
     try {
       await transport.cancelDiagnostic(diagnosticId);
@@ -264,6 +278,7 @@ export function CandidatesView({
         launching={launching}
         activeDiagnostic={activeDiagnosticForLatest ?? null}
         onLaunch={() => void launchDiagnostic()}
+        onResume={(row) => void resumeDiagnostic(row)}
         onCancel={(id) => void cancelDiagnostic(id)}
       />
 
@@ -740,6 +755,7 @@ function DiagnosticsPanel({
   launching,
   activeDiagnostic,
   onLaunch,
+  onResume,
   onCancel,
 }: {
   diagnostics: DiagnosticRecord[] | null;
@@ -748,6 +764,7 @@ function DiagnosticsPanel({
   launching: boolean;
   activeDiagnostic: DiagnosticRecord | null;
   onLaunch: () => void;
+  onResume: (row: DiagnosticRecord) => void;
   onCancel: (diagnosticId: string) => void;
 }) {
   return (
@@ -803,6 +820,16 @@ function DiagnosticsPanel({
                     {d.completedCells}/{d.totalCells} runs
                   </span>
                   <StatusBadge status={d.state} />
+                  {d.resumable && !pendingCancel(d) && (
+                    <button
+                      type="button"
+                      onClick={() => onResume(d)}
+                      className="rounded-md border border-sky-700 px-2.5 py-1 text-[11px] font-medium text-sky-300 hover:bg-sky-950/60"
+                      title="Resumes the SAME diagnostic from its cached cells; no extra completed calls"
+                    >
+                      Resume comparison
+                    </button>
+                  )}
                   {(d.state === "queued" || d.state === "running") && !pendingCancel(d) && (
                     <button
                       type="button"
@@ -828,6 +855,9 @@ function DiagnosticsPanel({
                       <th scope="col" className="pr-2 font-medium">Mean score</th>
                       <th scope="col" className="pr-2 font-medium">Tokens</th>
                       <th scope="col" className="font-medium">Wall (s)</th>
+                      {d.armSummaries.some((a) => (a.infrastructureErrors ?? 0) > 0) && (
+                        <th scope="col" className="font-medium">Infra errors</th>
+                      )}
                     </tr>
                   </thead>
                   <tbody>
@@ -839,6 +869,9 @@ function DiagnosticsPanel({
                         <td className="py-1 pr-2">{a.meanScore === null ? "not measured" : a.meanScore.toFixed(2)}</td>
                         <td className="py-1 pr-2">{a.totalTokens}</td>
                         <td className="py-1">{a.wallDurationSeconds}</td>
+                        {(a.infrastructureErrors ?? 0) > 0 || d.armSummaries.some((x) => (x.infrastructureErrors ?? 0) > 0) ? (
+                          <td className="py-1">{a.infrastructureErrors ?? 0}</td>
+                        ) : null}
                       </tr>
                     ))}
                   </tbody>

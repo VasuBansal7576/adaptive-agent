@@ -227,10 +227,13 @@ export type DiagnosticArmSummary = {
   arm: "B0" | "L";
   completed: number;
   successes: number;
-  /** null until at least one task completes for this arm; never coerced to 0 */
+  /** null until at least one task completes for this arm; never coerced to 0;
+   *  excludes infrastructure failures */
   meanScore: number | null;
   totalTokens: number;
   wallDurationSeconds: number;
+  /** failed-cell count from backend receipt verification (optional) */
+  infrastructureErrors?: number;
 };
 
 /** One quick development comparison (diagnostic) row. */
@@ -245,6 +248,9 @@ export type DiagnosticRecord = {
   /** null while queued (not yet started); never coerced */
   startedAt: string | null;
   updatedAt: string;
+  /** true only for a queued/running job with no current worker flock owner;
+   *  a resumable row can be resumed via launch with the same candidate/base */
+  resumable?: boolean;
   armSummaries: DiagnosticArmSummary[];
   error: string | null;
   promotionEligible: false;

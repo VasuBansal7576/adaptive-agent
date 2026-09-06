@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { createSimulationTransport } from "../api/simulation";
 import type { ConsoleTransport } from "../api/transport";
-import type { RunRecord } from "../api/types";
+import type { DiagnosticRecord, RunRecord } from "../api/types";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 
 beforeEach(() => {
@@ -416,6 +416,51 @@ describe("qa regressions: createRun recovery and honesty", () => {
     const cancelledRow = rows.find((r) => r.diagnosticId === diag2.diagnosticId);
     expect(cancelledRow?.state).toBe("cancelled");
     expect(cancelledRow?.error).toContain("cancellation requested by operator");
+  });
+
+  it("diagnostic resume: reload restores a resumable row; resume keeps the SAME id and continues cells; infrastructureErrors shown when nonzero", { timeout: 30000 }, async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    // launch a fresh diagnostic for a DIFFERENT frozen candidate/base (module
+    // state is shared within the file; a relaunch would be idempotent-completed)
+    const launched = await sim.launchDiagnostic({ candidateId: "cand-sim-205", baseBundleHash: "d".repeat(64) });
+    // simulate progress to a resumable mid-state (2/6)
+    await sim.listDiagnostics();
+    let rows = await sim.listDiagnostics();
+    while (rows[0].completedCells < 2) rows = await sim.listDiagnostics();
+    expect(rows[0].resumable).toBe(true);
+
+    const transport: ConsoleTransport = {
+      ...sim,
+      // reload: the mount fetch restores the resumable row from the server
+      listDiagnostics: async () => sim.listDiagnostics(),
+    };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    const resumeButtons = await screen.findAllByRole("button", { name: "Resume comparison" });
+    expect(resumeButtons.length).toBeGreaterThanOrEqual(1);
+
+    // resume keeps the SAME id and continues from the cached cells
+    const beforeCells = (await sim.listDiagnostics())[0].completedCells;
+    await user.click(resumeButtons[0]);
+    await waitFor(() => {
+      const shown = (document.body.textContent || "").match(/(\d+)\/6 runs/);
+      expect(shown && Number(shown[1])).toBeGreaterThanOrEqual(beforeCells);
+    }, { timeout: 15000 });
+    const after = await sim.listDiagnostics();
+    expect(after[0].diagnosticId).toBe(launched.diagnosticId); // SAME id
+    // completion carries infrastructureErrors; B0 shows 1
+    await waitFor(
+      async () => {
+        const current = await sim.listDiagnostics();
+        return current[0].state;
+      },
+      { timeout: 20000 },
+    ).then((state) => expect(state === "completed" || state === "failed").toBe(true));
+    const finalRows = await sim.listDiagnostics();
+    expect(finalRows[0].armSummaries.find((a) => a.arm === "B0")?.infrastructureErrors).toBe(1);
+    // meanScore honest: L arm measured value is 0.9 (not coerced), B0 has 0.55
+    expect(finalRows[0].armSummaries.find((a) => a.arm === "L")?.meanScore).toBe(0.9);
   });
 
   it("diagnostic parse: rejects malformed rows and wrong totalCells instead of silently rendering", async () => {

@@ -150,17 +150,22 @@ const server = createServer((req, res) => {
     // deterministic progress: one of the 6 cells completes per poll
     DIAGNOSTICS = DIAGNOSTICS.map((d) => {
       if (d.state !== "queued" && d.state !== "running") return d;
+      if ((d.error ?? "").includes("cancellation requested")) {
+        return { ...d, state: "cancelled", resumable: false, error: "cancellation requested by operator" };
+      }
       const completedCells = Math.min(6, d.completedCells + 1);
       const state = completedCells === 6 ? "completed" : "running";
       return {
         ...d,
         state,
+        resumable: !completed,
+        startedAt: d.startedAt ?? "2026-09-06T12:00:30Z",
         completedCells,
         updatedAt: "2026-09-06T12:01:00Z",
         armSummaries: completed
           ? [
-              { arm: "B0", completed: 3, successes: 2, meanScore: 0.55, totalTokens: 4200, wallDurationSeconds: 240 },
-              { arm: "L", completed: 3, successes: 3, meanScore: 0.9, totalTokens: 5100, wallDurationSeconds: 262 },
+              { arm: "B0", completed: 3, successes: 2, meanScore: 0.55, totalTokens: 4200, wallDurationSeconds: 240, infrastructureErrors: 1 },
+              { arm: "L", completed: 3, successes: 3, meanScore: 0.9, totalTokens: 5100, wallDurationSeconds: 262, infrastructureErrors: 0 },
             ]
           : d.armSummaries,
       };
@@ -174,6 +179,16 @@ const server = createServer((req, res) => {
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       const input = JSON.parse(body || "{}");
+      // idempotent: relaunching the same frozen candidate/base RESUMES the
+      // same diagnostic (no new job)
+      const existing = DIAGNOSTICS.find(
+        (d) => d.candidateId === String(input.candidateId ?? "") && d.baseBundleHash === String(input.baseBundleHash ?? ""),
+      );
+      if (existing) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ diagnosticId: existing.diagnosticId, state: existing.state }));
+        return;
+      }
       const diag = {
         diagnosticId: `diag_acc010_${String(DIAGNOSTICS.length + 1).padStart(3, "0")}`,
         candidateId: String(input.candidateId ?? "cand_acc010_validated"),
@@ -182,11 +197,12 @@ const server = createServer((req, res) => {
         state: "queued",
         completedCells: 0,
         totalCells: 6,
-        startedAt: "2026-09-06T12:00:00Z",
+        startedAt: null,
         updatedAt: "2026-09-06T12:00:00Z",
         armSummaries: [],
         error: null,
         promotionEligible: false,
+        resumable: true,
       };
       DIAGNOSTICS = [diag, ...DIAGNOSTICS];
       res.writeHead(200, { "content-type": "application/json" });
