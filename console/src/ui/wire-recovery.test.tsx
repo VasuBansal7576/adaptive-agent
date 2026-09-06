@@ -79,6 +79,16 @@ beforeEach(() => {
   FakeEventSource.dropOnConnections = 0;
   FakeEventSource.connectionCount = 0;
   vi.stubGlobal("EventSource", FakeEventSource as unknown as typeof EventSource);
+  // isolate network: transports in these tests must never reach a real host
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/session")) return new Response("{}", { status: 200 });
+      if (u.includes("/runs/")) return new Response(JSON.stringify({ status: "running", lastEventSequence: 2 }), { status: 200 });
+      return new Response("{}", { status: 200 });
+    }),
+  );
 });
 afterEach(() => {
   vi.unstubAllGlobals();
