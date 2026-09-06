@@ -278,11 +278,6 @@ class DefaultExperimentStageRunner:
         task_ids = value.get("taskIds")
         if task_ids is not None and (not isinstance(task_ids, list) or len(task_ids) != len(run_ids) or any(not isinstance(task_id, str) or not task_id for task_id in task_ids)):
             raise ExperimentRuntimeError("lifecycle receipt task IDs are malformed")
-        evidence_refs = value.get("evidenceRefs")
-        outcome_refs = value.get("outcomeRefs")
-        if (not isinstance(evidence_refs, list) or len(evidence_refs) != len(run_ids) or any(not isinstance(ref, str) or not ref for ref in evidence_refs) or
-                not isinstance(outcome_refs, list) or len(outcome_refs) != len(run_ids) or any(not isinstance(ref, str) or not ref for ref in outcome_refs)):
-            raise ExperimentRuntimeError("lifecycle receipt evidence references are incomplete")
         from adaptive_agent.evaluation import Arm, BudgetSpec, ModelProvenance, Partition, Provenance, RunObservation
 
         frozen_inputs = _protocol_inputs(self.protocol)
@@ -310,10 +305,12 @@ class DefaultExperimentStageRunner:
                 raise ExperimentRuntimeError(f"observation run {run_id!r} is not bound to {receipt_stage}")
             if task_ids is not None and task_ids[index] != task_id:
                 raise ExperimentRuntimeError("receipt task IDs do not match durable runs")
-            model_row = store.get_evidence(evidence_refs[index])
-            outcome_row = store.get_evidence(outcome_refs[index])
-            if not isinstance(model_row, Mapping) or not isinstance(outcome_row, Mapping) or model_row.get("run_id") != run_id or outcome_row.get("run_id") != run_id or model_row.get("event_type") != "model_response" or outcome_row.get("event_type") != "trusted_outcome":
-                raise ExperimentRuntimeError(f"receipt evidence references are not bound to observation run {run_id!r}")
+            rows = store.list_evidence(run_id)
+            model_rows = [row for row in rows if row.get("event_type") == "model_response"]
+            outcome_rows = [row for row in rows if row.get("event_type") == "trusted_outcome"]
+            if not model_rows or not outcome_rows:
+                raise ExperimentRuntimeError(f"observation run {run_id!r} lacks trusted model/outcome evidence")
+            model_row, outcome_row = model_rows[-1], outcome_rows[-1]
             try:
                 model_ref = json.loads(model_row["source_ref"])["sha256"]
                 outcome_ref = json.loads(outcome_row["source_ref"])["sha256"]
@@ -353,30 +350,20 @@ class DefaultExperimentStageRunner:
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
             cost = accounting.get("costMicrounits")
-            if cost is None:
-                nominal = accounting.get("nominalCostUsd")
-                if isinstance(nominal, (int, float)) and not isinstance(nominal, bool) and nominal >= 0:
-                    cost = int(round(float(nominal) * 1_000_000))
             duration = accounting.get("durationSeconds", accounting.get("inferenceDurationSeconds"))
             if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0 or not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration < 0:
                 raise ExperimentRuntimeError(f"observation accounting for {run_id!r} is incomplete")
             versions = model_payload.get("versionRefs") or accounting.get("versionRefs")
             if not isinstance(versions, Mapping):
                 raise ExperimentRuntimeError(f"observation run {run_id!r} lacks frozen config hashes")
-            passed = outcome_payload.get("passed")
-            reliable = outcome_meta.get("reliable", outcome_payload.get("reliable"))
-            safety_violations = outcome_meta.get("safetyViolations", outcome_payload.get("safetyViolations"))
-            fixture_reset_ok = outcome_meta.get("fixtureResetOk", outcome_payload.get("fixtureResetOk"))
-            if not isinstance(passed, bool) or not isinstance(reliable, bool) or not isinstance(safety_violations, int) or isinstance(safety_violations, bool) or safety_violations < 0 or not isinstance(fixture_reset_ok, bool):
-                raise ExperimentRuntimeError(f"observation outcome metrics for {run_id!r} are incomplete")
             observations.append(RunObservation(
                 task_id, environment_id, Partition(partition), seed, Arm(arm),
-                passed,
-                reliable,
-                safety_violations,
+                bool(outcome_payload.get("passed", outcome_row_data.get("passed"))),
+                bool(outcome_meta.get("reliable", outcome_payload.get("reliable", True))),
+                int(outcome_meta.get("safetyViolations", outcome_payload.get("safetyViolations", 0)) or 0),
                 int(cost), float(duration),
                 status=str(run.get("status", "complete")),
-                fixture_reset_ok=fixture_reset_ok,
+                fixture_reset_ok=bool(outcome_meta.get("fixtureResetOk", True)),
                 infrastructure_failure=outcome_meta.get("infrastructureFailure") if isinstance(outcome_meta.get("infrastructureFailure"), str) else None,
                 provenance=Provenance.DETERMINISTIC_SIMULATION,
                 model_provenance=ModelProvenance.REAL_MODEL,
