@@ -917,12 +917,15 @@ class DurableRuntime:
         """Call the trusted evaluator with durable execution evidence when supported."""
         if self.evaluator is None:
             return None
+        durable_evidence = self._durable_evaluator_evidence(run_id)
         kwargs: dict[str, Any] = {
             "goal": goal,
             "model_output": model_output,
             "environment": dict(environment),
             "run_id": run_id,
-            "evidence": self._durable_evaluator_evidence(run_id),
+            "evidence": durable_evidence,
+            "model_responses": [item for item in durable_evidence if item.get("eventType") == "model_response"],
+            "kernel_events": [item for item in durable_evidence if item.get("eventType") == "kernel"],
         }
         try:
             parameters = inspect.signature(self.evaluator).parameters
