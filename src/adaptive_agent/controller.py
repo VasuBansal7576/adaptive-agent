@@ -747,7 +747,11 @@ class Controller:
         if event_type == "run_failed":
             error = payload.get("error")
             return {"summary": "Runtime failure recorded", "detail": str(error)} if isinstance(error, str) and error else {"summary": "Runtime failure recorded"}
-        if event_type in {"outcome_recorded", "trusted_outcome"}:
+        if event_type == "outcome_recorded":
+            fields = {key: payload[key] for key in ("passed", "score", "reason") if key in payload}
+            detail = json.dumps(fields, sort_keys=True, separators=(",", ":")) if fields else ""
+            return {"summary": "Trusted outcome check recorded", **({"detail": detail} if detail else {})}
+        if event_type == "trusted_outcome":
             # Trusted evaluator details stay out of the operator projection.
             # This also protects legacy rows written before the canonical
             # trusted-outcome seam applied its allowlist.
