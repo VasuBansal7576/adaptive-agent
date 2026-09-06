@@ -19,6 +19,17 @@ from typing import Any
 MODEL_TOKENS = 20_000
 WALL_SECONDS = 90
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SHARED_ROOT_QA_DATA = Path("/private/tmp/adaptive-agent-browser-api")
+
+
+def _reject_shared_qa_path(*values: str | os.PathLike[str] | None) -> None:
+    """Keep evaluator stores away from the shared browser/QA database."""
+    forbidden = SHARED_ROOT_QA_DATA.resolve()
+    resolved = [Path(value).expanduser().resolve() for value in values if value is not None]
+    if any(path == forbidden or forbidden in path.parents for path in resolved):
+        raise RuntimeError(f"shared root QA data directory is forbidden: {forbidden}")
+    if len(resolved) == 2 and resolved[0] == resolved[1]:
+        raise RuntimeError("source and target evaluator stores must be isolated")
 
 
 def _bundle_by_hash(store: Any, content_hash: str) -> Any:
@@ -125,6 +136,7 @@ def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | No
     from adaptive_agent.evaluation import Arm, BudgetSpec, EvaluationProtocol
 
     target = Path(data_dir)
+    _reject_shared_qa_path(target, source_data_dir)
     if initialize and target.exists() and any(target.iterdir()):
         raise RuntimeError(f"data directory must be a new empty directory: {data_dir}")
     if source_data_dir and source_run_id:
