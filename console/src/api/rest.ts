@@ -1,4 +1,4 @@
-import type { RunEvent, RunRecord, SkillVersionSummary, CandidateDiff, EnvironmentPackageSummary, RunOptions, TaskOption } from "./types";
+import type { RunEvent, RunRecord, SkillVersionSummary, CandidateDiff, EnvironmentPackageSummary, RunOptions, TaskOption, EvaluationJob, EvaluationReportProjection } from "./types";
 import type {
   ConsoleTransport,
   CreateRunInput,
@@ -70,6 +70,117 @@ export class ApiError extends Error {
     const corr = this.correlationId ? ` (correlation ${this.correlationId})` : "";
     return `${this.code}: ${this.message}${corr}`;
   }
+}
+
+const EVAL_STATES = ["queued", "running", "valid", "invalid", "cancelled", "completed", "decided"];
+
+function parseReport(value: unknown, field: string): EvaluationReportProjection {
+  const r = (value ?? {}) as Record<string, unknown>;
+  const str = (key: string): string | undefined => (typeof r[key] === "string" ? (r[key] as string) : undefined);
+  const bool = (key: string): boolean | undefined => (typeof r[key] === "boolean" ? (r[key] as boolean) : undefined);
+  const numOrNull = (key: string): number | null | undefined =>
+    typeof r[key] === "number" ? (r[key] as number) : r[key] === null ? null : undefined;
+  const armSummaries: Record<string, EvaluationReportProjection["armSummaries"][string]> = {};
+  if (r.armSummaries && typeof r.armSummaries === "object" && !Array.isArray(r.armSummaries)) {
+    for (const [arm, raw] of Object.entries(r.armSummaries as Record<string, unknown>)) {
+      const a = (raw ?? {}) as Record<string, unknown>;
+      const n = (key: string): number => (typeof a[key] === "number" ? (a[key] as number) : 0);
+      armSummaries[arm] = {
+        accuracy: n("accuracy"),
+        reliability: n("reliability"),
+        meanCostMicrounits: n("meanCostMicrounits"),
+        medianLatencySeconds: n("medianLatencySeconds"),
+        p95LatencySeconds: n("p95LatencySeconds"),
+        safetyViolations: n("safetyViolations"),
+        count: n("count"),
+      };
+    }
+  } else {
+    throw new SchemaError(`${field}.armSummaries`);
+  }
+  const report: EvaluationReportProjection = {
+    comparison: str("comparison") ?? "unknown",
+    validityStatus: str("validityStatus") ?? "unknown",
+    promotionEligible: bool("promotionEligible") ?? false,
+    armSummaries,
+  };
+  if (r.candidateHash !== undefined) report.candidateHash = str("candidateHash");
+  if (r.baseHash !== undefined) report.baseHash = str("baseHash");
+  if (r.protocolHash !== undefined) report.protocolHash = str("protocolHash");
+  if (Array.isArray(r.confidenceIntervals)) {
+    report.confidenceIntervals = (r.confidenceIntervals as Record<string, unknown>[]).map((ci, i) => ({
+      metric: typeof ci.metric === "string" ? ci.metric : `metric-${i}`,
+      point: typeof ci.point === "number" ? ci.point : 0,
+      lower95: typeof ci.lower95 === "number" ? ci.lower95 : 0,
+      upper95: typeof ci.upper95 === "number" ? ci.upper95 : 0,
+      draws: typeof ci.draws === "number" ? ci.draws : undefined,
+      analysisSeed: typeof ci.analysisSeed === "number" ? ci.analysisSeed : undefined,
+    }));
+  }
+  const safetyPassed = bool("safetyPassed");
+  if (safetyPassed !== undefined) report.safetyPassed = safetyPassed;
+  if (r.missingPairs !== undefined && typeof r.missingPairs === "number") report.missingPairs = r.missingPairs;
+  const metricCellsComplete = bool("metricCellsComplete");
+  if (metricCellsComplete !== undefined) report.metricCellsComplete = metricCellsComplete;
+  const safetyCellsComplete = bool("safetyCellsComplete");
+  if (safetyCellsComplete !== undefined) report.safetyCellsComplete = safetyCellsComplete;
+  const modelProvenanceComplete = bool("modelProvenanceComplete");
+  if (modelProvenanceComplete !== undefined) report.modelProvenanceComplete = modelProvenanceComplete;
+  if (Array.isArray(r.infrastructureFailures)) {
+    report.infrastructureFailures = (r.infrastructureFailures as unknown[]).map((f, i) =>
+      typeof f === "string" ? f : `failure-${i}`,
+    );
+  }
+  if (r.analysisSeed !== undefined && typeof r.analysisSeed === "number") report.analysisSeed = r.analysisSeed;
+  report.nominalCostUsd = numOrNull("nominalCostUsd");
+  report.actualInputTokens = numOrNull("actualInputTokens");
+  report.actualOutputTokens = numOrNull("actualOutputTokens");
+  report.wallDurationSeconds = numOrNull("wallDurationSeconds");
+  if (r.billingBasis !== undefined && typeof r.billingBasis === "string") report.billingBasis = r.billingBasis;
+  return report;
+}
+
+function arr2evals(value: unknown): EvaluationJob[] {
+  if (!Array.isArray(value)) throw new SchemaError("evaluations");
+  return value.map((item, i) => {
+    const o = (item ?? {}) as Record<string, unknown>;
+    const evaluationId = typeof o.evaluationId === "string" ? o.evaluationId : `unknown-${i}`;
+    const candidateId = typeof o.candidateId === "string" && o.candidateId ? o.candidateId : null;
+    const rawState = typeof o.state === "string" ? o.state : "";
+    // legacy/malformed rows (missing candidateId, unrecognized states) are
+    // preserved explicitly UNVERIFIED — trusted:true from an unverifiable row
+    // is NEVER normalized into performance evidence
+    const verified = candidateId !== null && EVAL_STATES.includes(rawState);
+    const job: EvaluationJob = {
+      evaluationId,
+      candidateId,
+      state: verified ? (rawState as EvaluationJob["state"]) : "unverified",
+      verified,
+    };
+    if (typeof o.trusted === "boolean") job.trusted = o.trusted;
+    if (typeof o.reason === "string") job.reason = o.reason;
+    if (o.validity === "invalid" || o.promotionEligible === false) {
+      job.reason = job.reason ?? `legacy record (validity: ${String(o.validity ?? "unknown")})`;
+    }
+    if (o.error && typeof o.error === "object" && !Array.isArray(o.error)) {
+      const err = o.error as Record<string, unknown>;
+      if (typeof err.message === "string") job.reason = err.message;
+    }
+    // canonical trusted report projection (96a84d3/8fcb18a): rendered as actual
+    // evaluation details, never fabricated; unbound legacy rows stay unverified
+    if (o.report !== undefined) {
+      if (!verified) {
+        job.reason = job.reason ?? "report present but row is not canonically bound — unverified";
+      } else {
+        try {
+          job.report = parseReport(o.report, `evaluations[${i}].report`);
+        } catch (error) {
+          job.reason = `report projection incomplete: ${(error as Error).message}`;
+        }
+      }
+    }
+    return job;
+  });
 }
 
 /** Friendly operator-facing text; raw JSON/HTML error bodies never reach the UI. */
@@ -324,14 +435,28 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       return created;
     },
 
+    launchEvaluation: async (input: { candidateId: string; baseBundleHash: string }) => {
+      // protocolHash/partitionRef are control-plane-owned; the backend derives
+      // or rejects until the contract relaxation lands (coordinated with 2)
+      const action = (await json("/evaluations", {
+        method: "POST",
+        body: JSON.stringify({ candidateId: input.candidateId, baseBundleHash: input.baseBundleHash }),
+      })) as Record<string, unknown>;
+      const evaluationId = typeof action.evaluationId === "string" ? action.evaluationId : "";
+      const state = typeof action.state === "string" ? action.state : "queued";
+      if (!evaluationId) throw new SchemaError("evaluation.evaluationId");
+      return { evaluationId, state };
+    },
+
+    listEvaluations: () =>
+      validated(json("/evaluations"), (value) =>
+        arr2evals(value),
+      ),
+
     launchLearningCycle: async (input: LearningCycleInput) => {
       const action = (await json("/learning/launch", {
         method: "POST",
-        body: JSON.stringify({
-          runId: input.runId,
-          predictedEffect: input.predictedEffect,
-          evidenceIds: input.evidenceIds,
-        }),
+        body: JSON.stringify({ runId: input.runId }),
       })) as Record<string, unknown>;
       const actionId = typeof action.actionId === "string" ? action.actionId : "";
       const status = typeof action.status === "string" ? action.status : "staged";

@@ -144,12 +144,13 @@ describe("live wire contract", () => {
       (_url) => ({ body: { status: "ready" } }), // bootstrap
       (_url) => ({ body: { authenticated: true } }), // session
       (_url, init) => {
-        expect(String(init?.body)).toContain('"runId":"run_live_1"');
+        const body = JSON.parse(String(init?.body));
+        expect(body).toEqual({ runId: "run_live_1" }); // runId-only request
         return { body: { actionId: "learn_1", status: "staged" } };
       },
     ]);
     const transport = createRestTransport();
-    const result = await transport.launchLearningCycle({ runId: "run_live_1", predictedEffect: "p", evidenceIds: ["e1"] });
+    const result = await transport.launchLearningCycle({ runId: "run_live_1" });
     expect(result.actionId).toBe("learn_1");
     expect(calls.some((c) => c.url.endsWith("/learning/launch"))).toBe(true);
   });

@@ -94,6 +94,15 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
   // close when the selection or transport changes; reconnectNonce forces a
   // manual stream reopen (stale banner) while preserving the cursor
   const lastRecordRefresh = useRef(0);
+  const refreshCandidates = useCallback(async () => {
+    try {
+      const candidates = await transport.listCandidates();
+      dispatch({ type: "candidatesRefreshed", candidates });
+    } catch {
+      /* load/stale paths surface connection issues */
+    }
+  }, [transport]);
+
   const refreshRunRecords = useCallback(async () => {
     // throttle background record refreshes
     if (Date.now() - lastRecordRefresh.current < 2000) return;
@@ -347,6 +356,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               runs={state.runs}
               loading={state.loading}
               onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
+              onRefreshCandidates={() => void refreshCandidates()}
             />
           )}
         </div>

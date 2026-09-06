@@ -80,7 +80,7 @@ describe("createRun, learning cycle, and registration", () => {
     const dialog = await screen.findByRole("dialog", { name: "Create run" });
     // Luna profile preselected via /run-options; token budget prefilled from budgetDefaults
     expect(within(dialog).getByLabelText("Model")).toHaveValue("Luna");
-    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000));
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000));
     // goal is focused for immediate typing
     await waitFor(() => expect(within(dialog).getByLabelText("Goal")).toHaveFocus(), { timeout: 3000 });
     fireEvent.change(within(dialog).getByLabelText("Goal"), { target: { value: "Sim end-to-end goal" } });
@@ -100,17 +100,18 @@ describe("createRun, learning cycle, and registration", () => {
     expect(await within(dialog).findByText(/Token budget must be a positive number/)).toBeInTheDocument();
   });
 
-  it("runs a learning cycle that stages an evidence-linked proposal", async () => {
+  it("runs a learning cycle from a completed run without operator-supplied predictions", async () => {
     const user = userEvent.setup();
     render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
     await user.click(await screen.findByRole("tab", { name: "Candidates" }));
     await user.click(await screen.findByRole("button", { name: "Run learning cycle" }));
     const dialog = await screen.findByRole("dialog", { name: "Run learning cycle" });
-    await user.selectOptions(within(dialog).getByLabelText("Run (development attempt)"), "run-sim-1001");
-    await user.type(within(dialog).getByLabelText("Predicted effect"), "fewer stale updates (prediction, not a score)");
-    await user.type(within(dialog).getByLabelText("Evidence IDs (comma-separated)"), "ev-sim-31");
+    await user.selectOptions(within(dialog).getByLabelText("Completed development run"), "run-sim-1004");
     await user.click(within(dialog).getByRole("button", { name: "Stage learning cycle" }));
     expect(await screen.findByText(/Learning cycle staged: action learn-sim-\d+ \(staged\)/)).toBeInTheDocument();
+    // no predicted-effect or evidence-id inputs exist in the flow
+    expect(within(dialog).queryByLabelText(/Predicted effect/)).not.toBeInTheDocument();
+    expect(within(dialog).queryByLabelText(/Evidence IDs/)).not.toBeInTheDocument();
   });
 
   it("registers a complete environment manifest", async () => {

@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { createSimulationTransport } from "../api/simulation";
 import type { ConsoleTransport } from "../api/transport";
+// eslint-disable-next-line @typescript-eslint/no-var-requires
 
 beforeEach(() => {
   vi.stubGlobal("EventSource", undefined);
@@ -77,12 +78,117 @@ describe("qa regressions: createRun recovery and honesty", () => {
     // wait for the run-options response to land (Model label flips to "Luna"),
     // then edit the token budget so no late prefill can race the edit
     await waitFor(() => expect(within(dialog).getByLabelText("Model")).toHaveValue("Luna"), { timeout: 3000 });
-    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000));
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000));
     fireEvent.change(within(dialog).getByLabelText("Token budget"), { target: { value: "7777" } });
     await user.type(within(dialog).getByLabelText("Goal"), "budget application probe");
     await user.click(within(dialog).getByRole("button", { name: "Create run" }));
     await waitFor(() => expect(sent.length).toBe(1));
     expect(sent[0].budget?.modelTokens).toBe(7777);
+  });
+
+  it("preserves legacy evaluation rows as UNVERIFIED, never trusted evidence (QA run eval_d123…)", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const transport: ConsoleTransport = {
+      ...sim,
+      // exact legacy QA shape: no candidateId, unknown state, trusted:true
+      listEvaluations: async () =>
+        [
+          { evaluationId: "eval_d1238417af2044118f4982816655d34d", promotionEligible: false, state: "completed", trusted: true, validity: "valid" },
+        ] as never,
+    };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    expect(await screen.findByText(/legacy evaluation record\(s\) preserved as UNVERIFIED/)).toBeInTheDocument();
+    expect(await screen.findByText(/state "completed"/)).toBeInTheDocument();
+    // trusted flag from an unverifiable row is never rendered as evidence
+    expect(screen.getByText(/trusted flag present \(unverified\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/\(trusted\)/)).not.toBeInTheDocument();
+  });
+
+  it("uses learningEligible for the learning source, including trusted failed attempts", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const runs = await sim.listRuns();
+    const eligibleFailed = { ...runs[2], status: "failed" as const, learningEligible: true };
+    const ineligibleSucceeded = { ...runs[3], status: "succeeded" as const, learningEligible: false };
+    const transport: ConsoleTransport = {
+      ...sim,
+      listRuns: async () => [eligibleFailed, ineligibleSucceeded],
+    };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    await user.click(await screen.findByRole("button", { name: "Run learning cycle" }));
+    const dialog = await screen.findByRole("dialog", { name: "Run learning cycle" });
+    const select = within(dialog).getByLabelText("Completed development run");
+    const options = within(select).getAllByRole("option").map((o) => o.textContent ?? "");
+    expect(options.some((t) => t.includes(eligibleFailed.runId))).toBe(true); // trusted failed dev attempt eligible
+    expect(options.some((t) => t.includes(ineligibleSucceeded.runId))).toBe(false); // server excluded
+  });
+
+  it("moves focus to the run detail panel when a run is selected (768 master-detail)", async () => {
+    const user = userEvent.setup();
+    render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
+    await screen.findAllByRole("button", { name: /run-sim-1002/ });
+    await user.click(screen.getAllByRole("button", { name: /run-sim-1002/ })[0]);
+    // the detail region receives focus so keyboard users land in the new context
+    await waitFor(() =>
+      expect((document.activeElement as HTMLElement | null)?.getAttribute("aria-label")).toBe("Run details"),
+    );
+  });
+
+  it("launches evaluation from a validated candidate and surfaces backend errors", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const launched: Array<{ candidateId: string }> = [];
+    const transport: ConsoleTransport = {
+      ...sim,
+      launchEvaluation: async (input) => {
+        launched.push(input);
+        return { evaluationId: "eval-sim-900", state: "queued" };
+      },
+    };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    await user.click((await screen.findAllByRole("button", { name: "Launch evaluation" }))[0]);
+    expect(await screen.findByText(/Evaluation eval-sim-900 queued/)).toBeInTheDocument();
+    expect(launched[0].candidateId).toBe("cand-sim-204");
+  });
+
+  it("valid cards state proposal validation, never a performance claim", async () => {
+    render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
+    await userEvent.setup().click(await screen.findByRole("tab", { name: "Candidates" }));
+    expect(await screen.findByText(/Proposal validation passed — this is not a performance result/)).toBeInTheDocument();
+  });
+
+  it("opens the learning-cycle dialog from the empty-candidates state (regression)", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const transport: ConsoleTransport = { ...sim, listCandidates: async () => [] };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    // the empty state previously returned before mounting the modal, so the
+    // button did nothing
+    await user.click(await screen.findByRole("button", { name: "Run learning cycle" }));
+    expect(await screen.findByRole("dialog", { name: "Run learning cycle" })).toBeInTheDocument();
+  });
+
+  it("distinguishes contract errors from the empty state", async () => {
+    const { SchemaError, parseCandidates } = await import("../api/validate");
+    expect(() => parseCandidates([{ candidateId: "c" }])).toThrow(SchemaError); // missing projection
+    expect(() =>
+      parseCandidates([
+        {
+          candidateId: "c",
+          state: "validated",
+          predictedEffect: "p",
+          baseBundleHash: "h",
+          editOperations: [],
+          changedArtifactHashes: [],
+          supportingEvidenceIds: [],
+        },
+      ]),
+    ).not.toThrow();
   });
 
   it("resets the token budget to the advertised default after success, never a hardcoded literal", async () => {
@@ -91,8 +197,8 @@ describe("qa regressions: createRun recovery and honesty", () => {
     await screen.findAllByRole("button", { name: /run-sim-1001/ });
     await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
     let dialog = await screen.findByRole("dialog", { name: "Create run" });
-    // server-advertised default (sim /run-options: 4000 in the fixture; live is 20000)
-    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000), { timeout: 3000 });
+    // server-advertised default (fixture mirrors the authoritative 20,000 default)
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000), { timeout: 3000 });
     await user.type(within(dialog).getByLabelText("Goal"), "advertised reset probe");
     await user.click(within(dialog).getByRole("button", { name: "Create run" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
@@ -100,7 +206,7 @@ describe("qa regressions: createRun recovery and honesty", () => {
     // proving the reset path follows the server value rather than a literal
     await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
     dialog = await screen.findByRole("dialog", { name: "Create run" });
-    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000), { timeout: 3000 });
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000), { timeout: 3000 });
   });
 
   it("restricts mode choices to the selected environment's declared modes", async () => {

@@ -88,7 +88,6 @@ async function main() {
   // no hashes are computed from id strings in the client
   const runOptions = await json("/run-options");
   const modelRef = runOptions?.modelProfiles?.[0]?.ref;
-  const budgetRef = runOptions?.budgetRef ?? runOptions?.budgetDefaults?.budgetRef;
   if (!modelRef?.sha256) throw new Error("/run-options did not provide an authoritative model ref");
   console.log(`run-options ok: profile ${modelRef.id} (budget ${runOptions.budgetDefaults?.modelTokens} tokens / ${runOptions.budgetDefaults?.toolCalls} calls / ${runOptions.budgetDefaults?.wallTimeSeconds}s)`);
   const body = {
@@ -97,7 +96,7 @@ async function main() {
       : { goal: "console smoke: verify create/launch/events/cancel", environmentId },
     modelProfileRef: modelRef,
     // server-advertised trusted budget ref (verbatim when present)
-    ...(budgetRef ? { budgetRef } : {}),
+    ...(runOptions.budgetDefaults?.budgetRef ? { budgetRef: runOptions.budgetDefaults.budgetRef } : {}),
     // validated budget object; the backend hashes and stores it
     budget: {
       modelTokens: runOptions.budgetDefaults?.modelTokens ?? 4000,
@@ -159,23 +158,13 @@ async function main() {
   const res = await fetch(`${base}/runs/${run.runId}/events?cursor=0`, {
     headers: cookie ? { cookie } : {},
   });
-  let reader = res.body.getReader();
+  const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   // launch runs as a background task; allow bounded latency before events flow
   const deadline = Date.now() + 25000;
   while (seen.length < 2 && Date.now() < deadline) {
-    const remaining = Math.max(1, deadline - Date.now());
-    let timeoutId;
-    const read = await Promise.race([
-      reader.read(),
-      new Promise((resolve) => {
-        timeoutId = setTimeout(() => resolve(null), remaining);
-      }),
-    ]);
-    clearTimeout(timeoutId);
-    if (read === null) break;
-    const { done, value } = read;
+    const { done, value } = await reader.read();
     if (done) {
       // the stream closes when the run is terminal; reopen from the cursor
       if (seen.length > 0) break;
@@ -215,23 +204,8 @@ async function main() {
     if (seen[k].sequence <= seen[k - 1].sequence) throw new Error("non-monotonic sequence numbers");
   }
   const lastSeq = Math.max(...seen.map((e) => e.sequence));
-  // A live stream may remain open while the runtime is still finishing. Keep
-  // the duplicate check bounded so the smoke command never hangs on an idle
-  // post-cursor connection.
-  const duplicateController = new AbortController();
-  const duplicateTimeout = setTimeout(() => duplicateController.abort(), 2000);
-  let dupText = "";
-  try {
-    const dupRes = await fetch(`${base}/runs/${run.runId}/events?cursor=${lastSeq}`, {
-      headers: cookie ? { cookie } : {},
-      signal: duplicateController.signal,
-    });
-    dupText = await dupRes.text();
-  } catch {
-    // timeout or a terminal stream close is acceptable for this probe
-  } finally {
-    clearTimeout(duplicateTimeout);
-  }
+  const dupRes = await fetch(`${base}/runs/${run.runId}/events?cursor=${lastSeq}`, { headers: cookie ? { cookie } : {} });
+  const dupText = await dupRes.text().catch(() => "");
   const dupCount = (dupText.match(/^data:/gm) || []).length;
   if (dupCount > 0) {
     // a terminal run legitimately closes with no new frames; any frame after
