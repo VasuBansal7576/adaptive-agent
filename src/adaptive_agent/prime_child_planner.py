@@ -36,7 +36,19 @@ class SharedLedgerModelClient:
             raise SecurityViolation("parent model deadline expired")
         if self.budget.remaining_model_tokens == 0:
             raise SecurityViolation("shared model token budget exhausted")
-        raw = self.client.invoke(**kwargs)
+        # Test/deployment clients may expose the minimal planner interface and
+        # omit optional deadline/cancellation fields.  Preserve those fields
+        # for capable clients while avoiding a signature mismatch at this
+        # trusted adapter boundary.
+        try:
+            parameters = inspect.signature(self.client.invoke).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        forwarded = kwargs if accepts_kwargs or not parameters else {
+            key: value for key, value in kwargs.items() if key in parameters
+        }
+        raw = self.client.invoke(**forwarded)
         if not isinstance(raw, Mapping):
             raise AdapterError("parent model response must be an object")
         usage = raw.get("usage")
