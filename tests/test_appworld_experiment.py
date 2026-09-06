@@ -106,3 +106,10 @@ def test_cli_runs_and_resumes_real_runtime_panels(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="SOURCE_REVISION"):
         run_experiment(bad)
     assert _Model.calls == calls
+    state_path = tmp_path / "run" / "appworld-experiment-state.json"
+    state = json.loads(state_path.read_text())
+    state["trainingStatus"] = "failed"
+    state_path.write_text(json.dumps(state))
+    with pytest.raises(RuntimeError, match="budget-expanding retry"):
+        run_experiment(resume)
+    assert _Model.calls == calls
