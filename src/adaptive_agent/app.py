@@ -810,10 +810,7 @@ class DurableRuntime:
         }
         accounting_ref = self.controller.store.put_artifact(accounting)
         payload["accountingRef"] = accounting_ref.model_dump(mode="json", by_alias=True)
-        recorder = getattr(self.controller, "record_model_response", None)
-        if callable(recorder):
-            return recorder(run_id, payload)
-        return self.controller.append_event(run_id, "model_response", payload, "system", "operator")
+        return self.controller.record_model_response(run_id, payload)
 
     def _claim_run(self, run_id: str) -> tuple[bool, Any | None]:
         """Claim a queued run through whichever canonical seam is present.
