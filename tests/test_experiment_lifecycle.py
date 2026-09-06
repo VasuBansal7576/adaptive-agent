@@ -126,16 +126,17 @@ def test_nested_subcall_admission_retains_failed_usage_once(tmp_path: Path):
         subcalls += 1
         admission = context["admitSubcall"]("child-0", estimated_input_tokens=3, estimated_output_tokens=2, estimated_tool_calls=1, estimated_cost_microunits=5)
         context["recordSubcall"](admission["admissionId"], result={"usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}, "toolCalls": 1, "wallSeconds": 0.01, "costMicrounits": 5}, error="child infrastructure failure")
-        return original(cell, context)
+        return {**original(cell, context), "usage": {"inputTokens": 4, "outputTokens": 3, "totalTokens": 7}, "costMicrounits": 7, "chargedSubcallIds": [admission["admissionId"]], "residualUsage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "residualCostMicrounits": 2}
 
     stages[0] = LifecycleStage("bootstrap", ("bootstrap-0",), with_subcall)
-    limits = {"attempts": 8, "inputTokens": 16, "outputTokens": 16, "toolCalls": 16, "wallMicros": 8_000_000, "costMicrounits": 16}
+    limits = {"attempts": 9, "inputTokens": 16, "outputTokens": 16, "toolCalls": 16, "wallMicros": 8_000_000, "costMicrounits": 16}
     first = job.run_experiment("subcalls", tuple(stages), limits=limits)
     second = job.run_experiment("subcalls", tuple(stages), limits=limits)
     assert first.status == second.status == "complete"
     assert subcalls == 1
     assert job.lifecycle_accounting("subcalls")["subcalls"] == 1
     assert job.lifecycle_accounting("subcalls")["inputTokens"] == 11
+    assert job.lifecycle_accounting("subcalls")["costMicrounits"] == 14
 
 
 def test_malformed_nested_subcall_accounting_is_not_charged(tmp_path: Path):

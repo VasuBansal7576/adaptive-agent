@@ -141,7 +141,8 @@ class EvaluationJob:
             if budget is None:
                 conn.rollback()
                 raise EvaluationError("lifecycle budget is not initialized")
-            if budget["blocked"] or budget["attempts"] >= budget["max_attempts"] or budget["input_tokens"] >= budget["max_input_tokens"] or budget["output_tokens"] >= budget["max_output_tokens"] or budget["tool_calls"] >= budget["max_tool_calls"] or budget["wall_micros"] >= budget["max_wall_micros"] or budget["cost_microunits"] >= budget["max_cost_microunits"]:
+            subcall_count = conn.execute("SELECT COUNT(*) AS count FROM evaluation_lifecycle_subcalls WHERE job_id = ?", (job_id,)).fetchone()["count"]
+            if budget["blocked"] or budget["attempts"] + subcall_count >= budget["max_attempts"] or budget["input_tokens"] >= budget["max_input_tokens"] or budget["output_tokens"] >= budget["max_output_tokens"] or budget["tool_calls"] >= budget["max_tool_calls"] or budget["wall_micros"] >= budget["max_wall_micros"] or budget["cost_microunits"] >= budget["max_cost_microunits"]:
                 conn.execute("UPDATE evaluation_lifecycle_budget SET blocked = 1, updated_at = datetime('now') WHERE job_id = ?", (job_id,))
                 conn.commit()
                 raise EvaluationError("lifecycle launch budget exhausted")
@@ -194,8 +195,29 @@ class EvaluationJob:
         input_tokens = usage.get("inputTokens", 0) if usage else 0
         output_tokens = usage.get("outputTokens", 0) if usage else 0
         tool_calls = payload.get("toolCalls", 0)
-        wall_micros = int(float(payload.get("wallSeconds", 0) or 0) * 1_000_000)
+        wall_seconds = payload.get("wallSeconds", 0)
         cost_value = payload.get("costMicrounits", 0)
+        charged_ids = payload.get("chargedSubcallIds", ())
+        if charged_ids:
+            if not isinstance(charged_ids, (list, tuple)) or not all(isinstance(value, str) and value for value in charged_ids):
+                raise EvaluationError("charged subcall IDs are malformed")
+            with self.store.connect() as conn:
+                rows = conn.execute("SELECT admission_id, status FROM evaluation_lifecycle_subcalls WHERE admission_id IN (%s)" % ",".join("?" for _ in charged_ids), tuple(charged_ids)).fetchall()
+            if len(rows) != len(set(charged_ids)) or any(row["status"] not in {"complete", "failed"} for row in rows):
+                raise EvaluationError("charged subcall IDs are not durably finalized")
+            residual = payload.get("residualUsage")
+            if not isinstance(residual, Mapping) or any(not isinstance(residual.get(key), int) or isinstance(residual.get(key), bool) or residual[key] < 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or residual["totalTokens"] != residual["inputTokens"] + residual["outputTokens"]:
+                raise EvaluationError("residual lifecycle accounting is malformed")
+            input_tokens, output_tokens = residual["inputTokens"], residual["outputTokens"]
+            tool_calls = payload.get("residualToolCalls", 0)
+            wall_seconds = payload.get("residualWallSeconds", 0)
+            cost_value = payload.get("residualCostMicrounits", 0)
+        unknown_cost = cost_value is None and payload.get("economicCostStatus") == "unknown"
+        if unknown_cost:
+            cost_value = 0
+        if not isinstance(tool_calls, int) or isinstance(tool_calls, bool) or tool_calls < 0 or isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float)) or not math.isfinite(wall_seconds) or wall_seconds < 0 or isinstance(cost_value, bool) or not isinstance(cost_value, (int, float)) or not math.isfinite(cost_value) or cost_value < 0:
+            raise EvaluationError("lifecycle accounting is malformed")
+        wall_micros = int(float(wall_seconds or 0) * 1_000_000)
         cost = int(cost_value) if isinstance(cost_value, (int, float)) and not isinstance(cost_value, bool) else 0
         with self.store.connect() as conn:
             conn.execute("UPDATE evaluation_lifecycle_attempts SET status = ?, result_json = ?, error = ?, updated_at = datetime('now') WHERE job_id = ? AND stage = ? AND cell_key = ? AND attempt = ?", (status, json.dumps(payload, sort_keys=True, default=str), error, job_id, stage, cell_key, attempt))
@@ -237,22 +259,23 @@ class EvaluationJob:
                     persisted = json.loads(existing["result_json"] or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     persisted = {}
-                return {"admissionId": existing["admission_id"], "status": existing["status"], "result": persisted if isinstance(persisted, dict) else {}, "error": existing["error"], "reused": True}
+                return {"admissionId": existing["admission_id"], "status": existing["status"], "result": persisted if isinstance(persisted, dict) else {}, "error": existing["error"], "reused": True, "dispatchAllowed": False}
             budget = conn.execute("SELECT * FROM evaluation_lifecycle_budget WHERE job_id = ?", (job_id,)).fetchone()
             if budget is None:
                 conn.rollback()
                 raise EvaluationError("lifecycle budget is not initialized")
-            reserved = conn.execute("SELECT COALESCE(SUM(estimated_input_tokens), 0) AS input, COALESCE(SUM(estimated_output_tokens), 0) AS output, COALESCE(SUM(estimated_tool_calls), 0) AS tools, COALESCE(SUM(estimated_wall_micros), 0) AS wall, COALESCE(SUM(estimated_cost_microunits), 0) AS cost FROM evaluation_lifecycle_subcalls WHERE job_id = ? AND status = 'reserved'", (job_id,)).fetchone()
+            reserved = conn.execute("SELECT COALESCE(SUM(estimated_input_tokens), 0) AS input, COALESCE(SUM(estimated_output_tokens), 0) AS output, COALESCE(SUM(estimated_tool_calls), 0) AS tools, COALESCE(SUM(estimated_wall_micros), 0) AS wall, COALESCE(SUM(estimated_cost_microunits), 0) AS cost, COUNT(*) AS count FROM evaluation_lifecycle_subcalls WHERE job_id = ? AND status = 'reserved'", (job_id,)).fetchone()
+            subcall_count = conn.execute("SELECT COUNT(*) AS count FROM evaluation_lifecycle_subcalls WHERE job_id = ?", (job_id,)).fetchone()["count"]
             estimates = (estimated_input_tokens, estimated_output_tokens, estimated_tool_calls, int(estimated_wall_seconds * 1_000_000), estimated_cost_microunits)
             totals = (budget["input_tokens"] + reserved["input"] + estimates[0], budget["output_tokens"] + reserved["output"] + estimates[1], budget["tool_calls"] + reserved["tools"] + estimates[2], budget["wall_micros"] + reserved["wall"] + estimates[3], budget["cost_microunits"] + reserved["cost"] + estimates[4])
             caps = (budget["max_input_tokens"], budget["max_output_tokens"], budget["max_tool_calls"], budget["max_wall_micros"], budget["max_cost_microunits"])
-            if budget["blocked"] or any(total > cap for total, cap in zip(totals, caps)):
+            if budget["blocked"] or budget["attempts"] + subcall_count >= budget["max_attempts"] or any(total > cap for total, cap in zip(totals, caps)):
                 conn.execute("UPDATE evaluation_lifecycle_budget SET blocked = 1, updated_at = datetime('now') WHERE job_id = ?", (job_id,))
                 conn.commit()
                 raise EvaluationError("lifecycle subcall budget exhausted")
             conn.execute("INSERT INTO evaluation_lifecycle_subcalls(admission_id, job_id, stage, cell_key, subcall_key, status, estimated_input_tokens, estimated_output_tokens, estimated_tool_calls, estimated_wall_micros, estimated_cost_microunits, updated_at) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, datetime('now'))", (admission_id, job_id, stage, cell_key, subcall_key, *estimates))
             conn.commit()
-        return {"admissionId": admission_id, "status": "reserved", "reused": False}
+        return {"admissionId": admission_id, "status": "reserved", "reused": False, "dispatchAllowed": True}
 
     def record_lifecycle_subcall(self, admission_id: str, *, result: Mapping[str, Any] | None = None, error: str | None = None) -> dict[str, Any]:
         """Persist nested-call receipt exactly once, including failed usage."""
@@ -269,11 +292,11 @@ class EvaluationJob:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     persisted = {}
                 conn.commit()
-                return {"admissionId": admission_id, "status": row["status"], "result": persisted if isinstance(persisted, dict) else {}, "error": row["error"], "reused": True}
+                return {"admissionId": admission_id, "status": row["status"], "result": persisted if isinstance(persisted, dict) else {}, "error": row["error"], "reused": True, "dispatchAllowed": False}
             if result is None and error:
                 conn.execute("UPDATE evaluation_lifecycle_subcalls SET status = 'failed', error = ?, updated_at = datetime('now') WHERE admission_id = ?", (error, admission_id))
                 conn.commit()
-                return {"admissionId": admission_id, "status": "failed", "result": {}, "error": error, "reused": False}
+                return {"admissionId": admission_id, "status": "failed", "result": {}, "error": error, "reused": False, "dispatchAllowed": False}
             usage = payload.get("usage")
             malformed = not isinstance(usage, Mapping) or any(not isinstance(usage.get(key), int) or isinstance(usage.get(key), bool) or usage[key] < 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]
             cost = payload.get("costMicrounits")
@@ -283,6 +306,7 @@ class EvaluationJob:
             malformed = malformed or not isinstance(tool_calls, int) or isinstance(tool_calls, bool) or tool_calls < 0 or isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float)) or not math.isfinite(wall_seconds) or wall_seconds < 0 or (cost is None and not unknown_cost) or (cost is not None and (isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0))
             if malformed:
                 conn.execute("UPDATE evaluation_lifecycle_subcalls SET status = 'failed', error = ?, updated_at = datetime('now') WHERE admission_id = ?", (error or "malformed subcall accounting", admission_id))
+                conn.execute("UPDATE evaluation_lifecycle_budget SET blocked = 1, updated_at = datetime('now') WHERE job_id = ?", (row["job_id"],))
                 conn.commit()
                 raise EvaluationError("lifecycle subcall accounting is malformed")
             status = "failed" if error else "complete"
@@ -290,7 +314,7 @@ class EvaluationJob:
             conn.execute("UPDATE evaluation_lifecycle_subcalls SET status = ?, result_json = ?, error = ?, updated_at = datetime('now') WHERE admission_id = ?", (status, json.dumps(payload, sort_keys=True, default=str), error, admission_id))
             conn.execute("UPDATE evaluation_lifecycle_budget SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, tool_calls = tool_calls + ?, wall_micros = wall_micros + ?, cost_microunits = cost_microunits + ?, blocked = CASE WHEN ? THEN 1 ELSE blocked END, updated_at = datetime('now') WHERE job_id = ?", (usage["inputTokens"], usage["outputTokens"], tool_calls, int(float(wall_seconds or 0) * 1_000_000), cost_value, unknown_cost, row["job_id"]))
             conn.commit()
-        return {"admissionId": admission_id, "status": status, "reused": False}
+        return {"admissionId": admission_id, "status": status, "reused": False, "dispatchAllowed": False}
 
     def run_experiment(self, job_id: str, stages: Sequence[LifecycleStage], *, limits: Mapping[str, int] | None = None, context: Mapping[str, Any] | None = None) -> EvaluationJobResult:
         """Run the complete ordered lifecycle with durable per-cell resume.
