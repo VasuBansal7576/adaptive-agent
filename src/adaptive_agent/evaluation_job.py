@@ -513,7 +513,7 @@ class EvaluationJob:
                     validation_report = self._experiment_report(stages, state, stage_name="validation")
                     reports["validation"] = validation_report
                     self._save(job_id, "experiment", "running", report=validation_report, reports=reports, runtime_accounting=self.lifecycle_accounting(job_id))
-                    self._apply_validation_gate(validation_report, state)
+                    self._apply_validation_gate(validation_report, state, job_id)
             accounting = self.lifecycle_accounting(job_id)
             reports = self._experiment_reports(stages, state)
             expected_reports = {stage.name for stage in stages if stage.report_required}
@@ -545,7 +545,7 @@ class EvaluationJob:
             reports[stage.name] = self._experiment_report(stages, state, stage_name=stage.name)
         return reports
 
-    def _apply_validation_gate(self, report: EvaluationReport, state: Mapping[str, Any]) -> None:
+    def _apply_validation_gate(self, report: EvaluationReport, state: Mapping[str, Any], job_id: str) -> None:
         learning_results = state.get("results", {}).get("learning", {}) if isinstance(state.get("results"), Mapping) else {}
         candidate_id = None
         if isinstance(learning_results, Mapping):
@@ -572,7 +572,7 @@ class EvaluationJob:
             if active_hash != report.candidate_hash or len(promoted) != 1:
                 raise EvaluationError("promoted candidate does not match the durable validation decision")
             return
-        self.controller.candidates.promote(candidate_id, report.to_dict())
+        self.controller.candidates.promote(candidate_id, {**report.to_dict(), "reportId": f"{job_id}:validation"})
 
     def _experiment_report(self, stages: Sequence[LifecycleStage], state: Mapping[str, Any], *, stage_name: str | None = None) -> EvaluationReport:
         """Build a strict report from durable validation/final lifecycle receipts."""
@@ -786,7 +786,7 @@ class EvaluationJob:
             )
             if summary.complete and report.validity_status == "valid" and report.promotion_eligible and candidate_id is not None:
                 report.require_promotion_evidence(self.protocol, self.packages)
-                decision = self.controller.candidates.promote(candidate_id, report.to_dict())
+                decision = self.controller.candidates.promote(candidate_id, {**report.to_dict(), "reportId": f"{job_id}:{comparison}"})
                 self._save(job_id, comparison, "decided", report, runtime_accounting=accounting)
                 return EvaluationJobResult(job_id, comparison, "decided", report, decision, runtime_accounting=accounting)
             status = "complete" if report.validity_status == "valid" else "incomplete"

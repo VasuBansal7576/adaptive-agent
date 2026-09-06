@@ -187,11 +187,11 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     published_before_restart = api.get("/evaluations")
     assert published_before_restart.status_code == 200
     published_before = {
-        item["comparison"]: item
+        item["evaluationId"]: item
         for item in published_before_restart.json()
-        if item.get("comparison") in {"validation", "final"}
+        if item.get("evaluationId") in {"full-production-synthetic:validation", "full-production-synthetic:final"}
     }
-    assert set(published_before) == {"validation", "final"}
+    assert set(published_before) == {"full-production-synthetic:validation", "full-production-synthetic:final"}
     assert all(item["trusted"] is True and item["state"] == "valid" for item in published_before.values())
 
     with runtime.controller.store.connect() as conn:
@@ -215,11 +215,11 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     published_after_restart = restarted_api.get("/evaluations")
     assert published_after_restart.status_code == 200
     published_after = {
-        item["comparison"]: item
+        item["evaluationId"]: item
         for item in published_after_restart.json()
-        if item.get("comparison") in {"validation", "final"}
+        if item.get("evaluationId") in {"full-production-synthetic:validation", "full-production-synthetic:final"}
     }
-    assert set(published_after) == {"validation", "final"}
+    assert set(published_after) == {"full-production-synthetic:validation", "full-production-synthetic:final"}
     assert all(item["trusted"] is True and item["state"] == "valid" for item in published_after.values())
     assert {item["protocolHash"] for item in published_after.values()} == {item["protocolHash"] for item in published_before.values()}
     restarted_job = restarted.build_evaluation_job(protocol, {Arm.B0: active})
