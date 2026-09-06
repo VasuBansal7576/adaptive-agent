@@ -629,7 +629,7 @@ class DurableRuntime:
         if expected_bundle_hash and bundle_hash != expected_bundle_hash:
             raise LearningRuntimeError("evaluation bundle hash does not match supplied bundle")
         configured_arm_bundles = getattr(frozen_config, "arm_bundles", None)
-        expected_mapping = configured_arm_bundles if isinstance(configured_arm_bundles, Mapping) else self._evaluation_arm_bundles
+        expected_mapping = configured_arm_bundles if isinstance(configured_arm_bundles, Mapping) and configured_arm_bundles else self._evaluation_arm_bundles
         expected_arm_bundle = expected_mapping.get(arm_value)
         if expected_arm_bundle is not None and expected_arm_bundle != bundle_hash:
             raise LearningRuntimeError("evaluation arm bundle does not match the frozen arm mapping")
@@ -658,7 +658,7 @@ class DurableRuntime:
         if row:
             persisted = {key: value for key, value in row.items() if key != "run_id"}
             run_payload = json.loads(row.get("run_json", "{}"))
-            arm_bundles = dict(configured_arm_bundles) if isinstance(configured_arm_bundles, Mapping) else (dict(self._evaluation_arm_bundles) if self._evaluation_arm_bundles else {arm_value: bundle_hash})
+            arm_bundles = dict(configured_arm_bundles) if isinstance(configured_arm_bundles, Mapping) and configured_arm_bundles else (dict(self._evaluation_arm_bundles) if self._evaluation_arm_bundles else {arm_value: bundle_hash})
             arm_bundles.setdefault(arm_value, bundle_hash)
             run_payload.update({"arm": arm_value, "seed": seed, "bundleHash": bundle_hash, "armBundles": arm_bundles})
             persisted["run_json"] = json.dumps(run_payload, sort_keys=True)

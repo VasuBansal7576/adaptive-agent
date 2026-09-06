@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from adaptive_agent.app import create_runtime_app
 from adaptive_agent.models import CandidateProposal, SkillBundle
+from adaptive_agent.evaluation import Arm, BudgetSpec, ModelProvenance, Partition, Provenance, RunObservation
 
 
 def _candidate(runtime, candidate_id: str, base_hash: str) -> str:
@@ -112,3 +114,22 @@ def test_diagnostic_cancel_marks_queued_cells_and_does_not_promote(tmp_path: Pat
     worker.join(timeout=5)
     assert runtime.diagnostics.get(diagnostic["diagnosticId"])["state"] == "cancelled"
     assert runtime.controller.store.list_promotions() == []
+
+
+def test_diagnostic_uses_aggregate_final_accounting_over_last_turn_usage(tmp_path: Path):
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    active = runtime.controller.get_active_bundle()
+    assert active is not None
+    candidate_hash = _candidate(runtime, "cand_accounting", active.content_hash)
+    accounting = runtime.controller.store.put_artifact({
+        "aggregateUsage": {"inputTokens": 21923, "outputTokens": 3539, "totalTokens": 25462},
+        "usage": {"inputTokens": 8556, "outputTokens": 419, "totalTokens": 8975},
+    })
+    seed_observation = RunObservation("placeholder", "finance", Partition.DEVELOPMENT, 17, Arm.B0, True, True, 0, 0, 0.1, model_provenance=ModelProvenance.REAL_MODEL, provenance=Provenance.DETERMINISTIC_SIMULATION, budget=BudgetSpec(), accounting_ref=accounting.sha256)
+    runtime.verify_evaluation_observation = lambda *_args: True
+    runtime.diagnostics.executor = lambda task, config, _bundle: replace(seed_observation, task_id=task.task_id, environment_id=task.environment_ref.id, arm=config.arm, seed=config.seed, bundle_hash=config.bundle_hash)
+    diagnostic = runtime.diagnostics.create("cand_accounting", active.content_hash)
+    result = runtime.diagnostics.run(diagnostic["diagnosticId"])
+    assert result["state"] == "completed"
+    assert all(item["totalTokens"] == 25462 * 3 for item in result["armSummaries"])
