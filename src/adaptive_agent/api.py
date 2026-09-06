@@ -222,6 +222,11 @@ class EvaluationLaunchRequest(ApiModel):
     partition_ref: JsonObject | None = Field(default=None, alias="partitionRef")
 
 
+class DiagnosticLaunchRequest(ApiModel):
+    candidate_id: str = Field(alias="candidateId", min_length=1)
+    base_bundle_hash: str = Field(alias="baseBundleHash", min_length=1)
+
+
 class CandidateDecisionRequest(ApiModel):
     evaluation_id: str = Field(alias="evaluationId", min_length=1)
     decision: str
@@ -1129,6 +1134,34 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
             return runtime.list_evaluations()
         with plane._lock:
             return [dict(evaluation) for evaluation in plane.evaluations.values()]
+
+    @app.post("/diagnostics/launch", status_code=202)
+    def launch_diagnostic(payload: DiagnosticLaunchRequest, background: BackgroundTasks) -> JsonObject:
+        if runtime is None or not hasattr(runtime, "diagnostics"):
+            raise HTTPException(status_code=503, detail="development diagnostics are not configured")
+        try:
+            diagnostic = runtime.diagnostics.create(payload.candidate_id, payload.base_bundle_hash)
+            background.add_task(runtime.diagnostics.run, diagnostic["diagnosticId"])
+            return diagnostic
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/diagnostics")
+    def diagnostics() -> list[JsonObject]:
+        if runtime is None or not hasattr(runtime, "diagnostics"):
+            raise HTTPException(status_code=503, detail="development diagnostics are not configured")
+        return runtime.diagnostics.list()
+
+    @app.post("/diagnostics/{diagnostic_id}/cancel")
+    def cancel_diagnostic(diagnostic_id: str) -> JsonObject:
+        if runtime is None or not hasattr(runtime, "diagnostics"):
+            raise HTTPException(status_code=503, detail="development diagnostics are not configured")
+        try:
+            return runtime.diagnostics.cancel(diagnostic_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/candidates/{candidate_id}/decision")
     def candidate_decision(candidate_id: str, payload: CandidateDecisionRequest) -> JsonObject:
