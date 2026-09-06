@@ -45,7 +45,9 @@ The `require_runtime=False` option is reserved for control-plane unit mode and i
 Default probe results include self-contained evidence receipts with payload and content hash, and do not expose the hidden answer.
 The focused safety, core, and lifecycle test report was 39 passed with no services or paid calls.
 Actual Docker-backed EVAL-005 passed its two runtime cases, `child_failure_recovery_and_cap` and `shared_model_cost_token_cap`, using the deterministic probe model rather than a paid model call.
-The isolated Controller probes passed 7 EVAL-004 obligations and 8 EVAL-005 obligations on fresh temporary Stores and data directories.
+The current session-4 Controller probe at `83d2e01` passed EVAL-004 8/8 and EVAL-005 8/8 on an isolated temporary Store and data directory.
+It closes `promotion_crash_reopen_atomic`, `child_failure_propagated`, and `event_reconnect_resume`: reopening preserves the active pointer, evaluating state, and promotion count; a failed child remains linked by `parentRunId` with both rows and the failed step persisted; and terminal SSE resume yields the exact remaining event tail.
+This probe evidence did not change the cost ledger, EVAL-003, or evaluator lifecycle, and used no services or paid calls.
 The latest session-5 console tip is `ae482da`, following `29afe35`, with 61/61 tests, TypeScript, and build clean; its latest report did not include live smoke.
 These results do not establish a product-wide run, heldout performance, or final evaluation success.
 
