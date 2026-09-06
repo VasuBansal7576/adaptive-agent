@@ -50,6 +50,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
   });
   const [activeTab, setActiveTab] = useState<TabId>("runs");
   const [streamNonce, setStreamNonce] = useState(0);
+  const [learningRequest, setLearningRequest] = useState<{ runId: string } | null>(null);
   const closeStreamRef = useRef<(() => void) | null>(null);
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
@@ -246,8 +247,15 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     if (next !== null) {
       event.preventDefault();
       tabRefs.current[next]?.focus();
-      setActiveTab(TABS[next].id);
+      selectTab(TABS[next].id);
     }
+  };
+
+  const selectTab = (id: TabId) => {
+    setActiveTab(id);
+    // narrow viewports scroll the tab row horizontally: keep the active tab visible
+    const index = TABS.findIndex((t) => t.id === id);
+    requestAnimationFrame(() => tabRefs.current[index]?.scrollIntoView({ block: "nearest", inline: "nearest" }));
   };
 
   const switchTransport = () => {
@@ -351,7 +359,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               aria-controls={`panel-${tab.id}`}
               tabIndex={activeTab === tab.id ? 0 : -1}
               onKeyDown={(e) => onTabKeyDown(e, index)}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => selectTab(tab.id)}
               className={`whitespace-nowrap border-b-2 px-4 py-2 text-sm font-medium transition-colors ${
                 activeTab === tab.id
                   ? "border-sky-500 text-sky-300"
@@ -386,6 +394,10 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               onSelectRun={(runId) => dispatch({ type: "selectRun", runId })}
               onCancel={(run) => void cancelRun(run.runId)}
               onCreateRun={createRun}
+              onLearnFromRun={(runId) => {
+                setLearningRequest({ runId });
+                setActiveTab("candidates");
+              }}
               onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
               onReconnect={() => void manualReconnect()}
             />
@@ -400,6 +412,8 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
               onRefreshCandidates={() => void refreshCandidates()}
               onRefreshRuns={() => void refreshRunRecords(true)}
+              learningRequest={learningRequest}
+              onLearningRequestConsumed={() => setLearningRequest(null)}
             />
           )}
         </div>

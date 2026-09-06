@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ConsoleTransport, CreateRunInput } from "../api/transport";
 import { newIdempotencyKey } from "../api/transport";
 import { describeToolError } from "../api/errors";
+import { sourceLabelFor } from "../api/sourceLabels";
 import type { ApprovalRequest, EnvironmentPackageSummary, RunEvent, RunOptions, RunRecord, TaskOption } from "../api/types";
 import type { ConnectionState } from "../state/consoleStore";
 import { StatusBadge } from "../components/StatusBadge";
@@ -30,6 +31,7 @@ export function RunView({
   onCreateRun,
   onActionError,
   onReconnect,
+  onLearnFromRun,
 }: {
   transport: ConsoleTransport;
   runs: RunRecord[];
@@ -44,6 +46,7 @@ export function RunView({
   onCreateRun: (input: CreateRunInput) => Promise<boolean>;
   onActionError: (message: string, correlationId?: string | null) => void;
   onReconnect: () => void;
+  onLearnFromRun: (runId: string) => void;
 }) {
   const selected = runs.find((r) => r.runId === selectedRunId) ?? null;
   const [approval, setApproval] = useState<{ request: ApprovalRequest } | null>(null);
@@ -156,8 +159,10 @@ export function RunView({
           <div className="space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-700 bg-slate-900/60 p-4">
               <div className="min-w-0 flex-1">
-                <h3 className="break-all font-mono text-sm text-slate-100">{selected.runId}</h3>
-                <p className="mt-0.5 text-[13px] text-slate-400 [overflow-wrap:anywhere]">{selected.goal}</p>
+                <h3 className="text-sm font-semibold text-slate-100 [overflow-wrap:anywhere]">{selected.goal}</h3>
+                <p className="mt-0.5 font-mono text-[11px] text-slate-500">
+                  <span className="break-all">{selected.runId}</span> · {selected.environmentId} · mode {selected.executionMode ?? "interactive"}
+                </p>
                 <p className="mt-1 text-xs text-slate-500 [overflow-wrap:anywhere]">
                   bundle {selected.skillBundleRef.id} v{selected.skillBundleRef.version} · env {selected.environmentRef.id} v{selected.environmentRef.version}
                 </p>
@@ -175,6 +180,8 @@ export function RunView({
                 ) : null}
               </div>
             </div>
+
+            <WorkflowStrip selected={selected} onLearnFromRun={onLearnFromRun} />
 
             {connection === "stale" && (
               <Banner tone="warn" title="Event stream stale — reconnecting from the last acknowledged cursor" role="alert">
@@ -619,7 +626,8 @@ function NewRunDialog({
             {/* free-form goals are not accepted by the durable runtime yet */}
             {fieldErrors.taskId && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.taskId}</p>}
             <p id="newrun-task-hint" className="mt-1 text-[11px] text-slate-500">
-              Select a registered task — this environment accepts registered task goals only.
+              Select a registered task — this environment accepts registered task goals only.{" "}
+              {sourceLabelFor(environmentId).provenance}
             </p>
           </div>
         )}
@@ -745,5 +753,74 @@ function ApprovalDialog({
         </div>
       </div>
     </Modal>
+  );
+}
+
+
+/** Honest four-stage workflow guidance using ONLY actual records: the run
+ *  stage reflects the selected run's server status; the learn stage exposes
+ *  the action when the server declares learningEligible; later stages point
+ *  to the Candidates tab where evaluation gates activation. No stage is ever
+ *  marked complete without server data. */
+/** Exhaustive, plain status phrasing for the workflow strip. */
+const RUN_STATUS_PHRASE: Record<RunRecord["status"], string> = {
+  queued: "is queued",
+  running: "is in progress",
+  awaiting_approval: "is awaiting approval",
+  succeeded: "completed",
+  failed: "failed",
+  cancelled: "was cancelled",
+  timed_out: "timed out",
+};
+
+function WorkflowStrip({
+  selected,
+  onLearnFromRun,
+}: {
+  selected: RunRecord;
+  onLearnFromRun: (runId: string) => void;
+}) {
+  const stages: Array<{ label: string; caption: React.ReactNode }> = [
+    {
+      label: "1. Execute goal",
+      caption: (
+        <>
+          Run {RUN_STATUS_PHRASE[selected.status] ?? `in progress (${selected.status})`}
+          {selected.outcomeRef ? " with a recorded outcome." : "."} {sourceLabelFor(selected.environmentId).provenance}
+        </>
+      ),
+    },
+    {
+      label: "2. Learn from verified attempt",
+      caption: selected.learningEligible ? (
+        <>
+          This run is eligible for learning.{" "}
+          <button
+            type="button"
+            onClick={() => onLearnFromRun(selected.runId)}
+            className="rounded-md border border-sky-700 px-2.5 py-1 text-[11px] font-medium text-sky-300 hover:bg-sky-950/60"
+          >
+            Learn from this run
+          </button>
+        </>
+      ) : (
+        <>Becomes eligible after a verified outcome.</>
+      ),
+    },
+    { label: "3. Evaluate candidate", caption: <>Staged candidates are compared against the base by the trusted evaluator in the Candidates tab.</> },
+    { label: "4. Activate only if gate passes", caption: <>A candidate activates only when the trusted gate passes.</> },
+  ];
+  return (
+    <nav aria-label="Adaptive workflow" className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
+      <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Adaptive workflow</h4>
+      <ol className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {stages.map((stage) => (
+          <li key={stage.label} className="rounded-lg bg-slate-800/60 p-3">
+            <p className="text-[12px] font-semibold text-slate-200">{stage.label}</p>
+            <p className="mt-1 text-[11px] leading-relaxed text-slate-400 [overflow-wrap:anywhere]">{stage.caption}</p>
+          </li>
+        ))}
+      </ol>
+    </nav>
   );
 }

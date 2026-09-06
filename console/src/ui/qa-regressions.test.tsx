@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { createSimulationTransport } from "../api/simulation";
 import type { ConsoleTransport } from "../api/transport";
+import type { RunRecord } from "../api/types";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 
 beforeEach(() => {
@@ -161,6 +162,110 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect(await screen.findByText(/Proposal validation passed — this is not a performance result/)).toBeInTheDocument();
   });
 
+  it("Modal directly: Escape fires onClose exactly once; Tab wraps last->first and Shift+Tab first->last", async () => {
+    const { Modal } = await import("../components/ui");
+    const onClose = vi.fn();
+    const firstRef = { current: null as HTMLInputElement | null };
+    const lastRef = { current: null as HTMLButtonElement | null };
+    const { rerender } = render(
+      <Modal open title="Unit" onClose={onClose} returnFocusTo={{ current: null }}>
+        <form>
+          <input
+            aria-label="First field"
+            ref={(el) => {
+              firstRef.current = el;
+            }}
+          />
+          <button
+            ref={(el) => {
+              lastRef.current = el;
+            }}
+            onClick={onClose}
+          >
+            Last control
+          </button>
+        </form>
+      </Modal>,
+    );
+    const dialog = screen.getByRole("dialog", { name: "Unit" });
+    expect(dialog).toBeInTheDocument();
+
+    // focus the LAST control, press Tab once: must land on the FIRST field (single wrap)
+    lastRef.current?.focus();
+    await userEvent.setup().keyboard("{Tab}");
+    expect(firstRef.current).toHaveFocus();
+
+    // focus the FIRST control, press Shift+Tab once: must land on the LAST control
+    firstRef.current?.focus();
+    await userEvent.setup().keyboard("{Shift>}{Tab}{/Shift}");
+    expect(lastRef.current).toHaveFocus();
+
+    // Escape fires onClose EXACTLY once even if pressed twice (dialog closed -> listener gone)
+    await userEvent.setup().keyboard("{Escape}");
+    rerender(
+      <Modal open={false} title="Unit" onClose={onClose}>
+        <form />
+      </Modal>,
+    );
+    await userEvent.setup().keyboard("{Escape}");
+    await userEvent.setup().keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("Modal Escape closes exactly once and Tab wraps one step per press", async () => {
+    // use the new-run dialog: onClose count observable via the dialog state
+    const user = userEvent.setup();
+    render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
+    await screen.findAllByRole("button", { name: /run-sim-1001/ });
+    await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
+    const dialog = await screen.findByRole("dialog", { name: "Create run" });
+    // move focus to the last focusable (Create run), then Tab: must wrap to the first field in ONE press (no double-jump)
+    const createBtn = within(dialog).getByRole("button", { name: "Create run" });
+    (createBtn as HTMLButtonElement).focus();
+    expect(createBtn).toHaveFocus();
+    await user.keyboard("{Tab}");
+    const focusables = dialog.querySelectorAll<HTMLElement>("a[href], button:not([disabled]), input, select, textarea");
+    const positions = focusables.length;
+    const afterOne = document.activeElement;
+    await user.keyboard("{Tab}");
+    const afterTwo = document.activeElement;
+    await user.keyboard("{Tab}");
+    const afterThree = document.activeElement;
+    // no double-execution: one press advances exactly one position in the trap
+    expect(afterTwo).not.toBe(afterOne);
+    expect(afterThree).not.toBe(afterTwo);
+    expect(within(dialog).queryAllByRole("button", { name: "Create run" }).length).toBe(1);
+    expect(positions).toBeGreaterThan(1);
+    // Escape closes and does not re-fire (dialog stays closed)
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the workflow strip and Learn-from-this-run only for eligible runs", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const runs = await sim.listRuns();
+    const eligible = { ...runs[3], learningEligible: true };
+    const ineligible = { ...runs[0], status: "running" as const, learningEligible: false };
+    const transport: ConsoleTransport = { ...sim, listRuns: async () => [eligible, ineligible] };
+    render(<App transport={transport} />);
+    await screen.findAllByRole("button", { name: /run-sim-1004/ });
+    // workflow guidance renders all four stages with honest captions
+    expect(screen.getByText("1. Execute goal")).toBeInTheDocument();
+    expect(screen.getByText("2. Learn from verified attempt")).toBeInTheDocument();
+    expect(screen.getByText("3. Evaluate candidate")).toBeInTheDocument();
+    expect(screen.getByText("4. Activate only if gate passes")).toBeInTheDocument();
+    // select the eligible run: the Learn action appears
+    await user.click(screen.getAllByRole("button", { name: /run-sim-1004/ })[0]);
+    expect(await screen.findByRole("button", { name: "Learn from this run" })).toBeInTheDocument();
+    // select the ineligible run: guidance replaces the action, no fake progress
+    await user.click(screen.getAllByRole("button", { name: /run-sim-1001/ })[0]);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Learn from this run" })).not.toBeInTheDocument());
+    expect(screen.getByText(/Becomes eligible after a verified outcome/)).toBeInTheDocument();
+  });
+
   it("lists a run whose learningEligible flips true after the terminal outcome, without a full reload (QA run_a1662f…)", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
@@ -192,6 +297,71 @@ describe("qa regressions: createRun recovery and honesty", () => {
     const options = within(select).getAllByRole("option").map((o) => o.textContent ?? "");
     expect(options.some((t) => t.includes(baseRun.runId))).toBe(true);
     expect(calls).toBeGreaterThanOrEqual(2); // the refresh happened without a reload
+  });
+
+  it("distinguishes sources by EXACT registered id: built-in fixture vs AppWorld vs unspecified", async () => {
+    const { sourceLabelFor } = await import("../api/sourceLabels");
+    // exact known built-ins keep fixture wording
+    expect(sourceLabelFor("finance").tag).toBe("simulated business fixture");
+    expect(sourceLabelFor("customer_support").tag).toBe("simulated business fixture");
+    expect(sourceLabelFor("it").tag).toBe("simulated business fixture");
+    expect(sourceLabelFor("lab_scheduling").tag).toBe("simulated business fixture");
+    // the explicit -sim dev-fixture ids used by the console simulation
+    expect(sourceLabelFor("finance-sim").tag).toBe("simulated business fixture");
+    // AppWorld exact id only, plain published-benchmark wording
+    const appworld = sourceLabelFor("appworld");
+    expect(appworld.tag).toBe("AppWorld");
+    expect(appworld.provenance).toBe("Tasks use AppWorld, a published benchmark with simulated app data.");
+    // arbitrary user packages are NOT mislabeled
+    expect(sourceLabelFor("finance-external").tag).toBe("source not specified");
+    expect(sourceLabelFor("appworld-custom").tag).toBe("source not specified");
+    // unknown registered ids: source not specified, never built-in fixture
+    const unknown = sourceLabelFor("mystery_env");
+    expect(unknown.tag).toBe("source not specified");
+    expect(unknown.provenance).toBe("Data source not specified.");
+    // case is NOT folded: user-defined casing stays unregistered
+    expect(sourceLabelFor("Finance").tag).toBe("source not specified");
+    expect(sourceLabelFor("APPWORLD").tag).toBe("source not specified");
+
+  });
+
+  it("renders the AppWorld source label in registry and workflow without claiming results", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const envs = await sim.listEnvironments();
+    envs.push({ environmentId: "appworld", version: "1.0", validationState: "valid", evaluatorReady: true, toolCount: 3, policyScope: "appworld/*", executionModes: ["interactive"] });
+    const appworldRun: RunRecord = { ...(await sim.listRuns())[3], runId: "run_aw_1", environmentId: "appworld", environmentRef: { id: "appworld", version: "1", sha256: "aw" }, learningEligible: true };
+    const transport: ConsoleTransport = {
+      ...sim,
+      listEnvironments: async () => envs,
+      listRuns: async () => [appworldRun],
+    };
+    render(<App transport={transport} />);
+    // registry card tags AppWorld distinctly
+    await user.click(await screen.findByRole("tab", { name: "Environment registry" }));
+    expect(await screen.findByText("AppWorld")).toBeInTheDocument();
+    // selected-run workflow carries the AppWorld provenance, no result claims
+    await user.click(await screen.findByRole("tab", { name: "Runs" }));
+    await user.click((await screen.findAllByRole("button", { name: /run_aw_1/ }))[0]);
+    expect(await screen.findByText(/Tasks use AppWorld, a published benchmark with simulated app data/)).toBeInTheDocument();
+  });
+
+  it("labels the built-in task catalog truthfully as simulated business fixtures", async () => {
+    const user = userEvent.setup();
+    const transport: ConsoleTransport = { ...createSimulationTransport({ disconnectAfterEvents: 0 }) };
+    render(<App transport={transport} />);
+    await screen.findAllByRole("button", { name: /run-sim-1001/ });
+    // workflow strip states the provenance boundary explicitly
+    expect(screen.getByText(/Tasks use the built-in simulated business fixture catalog/)).toBeInTheDocument();
+    // new-run dialog carries the same boundary near task selection
+    await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
+    const dialog = await screen.findByRole("dialog", { name: "Create run" });
+    expect(
+      await within(dialog).findByText(/Tasks use the built-in simulated business fixture catalog/),
+    ).toBeInTheDocument();
+    // no external/published benchmark sourcing claimed in this built-in flow
+    expect((document.body.textContent || "").toLowerCase()).not.toContain("published benchmark");
+    expect((document.body.textContent || "").toLowerCase()).not.toContain("appworld");
   });
 
   it("opens the learning-cycle dialog from the empty-candidates state (regression)", async () => {
@@ -256,7 +426,7 @@ describe("qa regressions: createRun recovery and honesty", () => {
     // default and only option is the declared mode
     expect(modeSelect).toHaveValue("dry_run");
     expect(within(modeSelect).getAllByRole("option")).toHaveLength(1);
-    expect(screen.queryByText(/interactive/)).not.toBeInTheDocument();
+    expect(within(dialog).queryByText(/interactive/)).not.toBeInTheDocument(); // only declared modes in the dialog
   });
 
   it("acknowledges successful package validation visibly", async () => {

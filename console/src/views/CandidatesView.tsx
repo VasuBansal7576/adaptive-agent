@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import type { ConsoleTransport, LearningCycleInput } from "../api/transport";
 import type { CandidateDiff, EvaluationJob, EvaluationReportProjection, RunRecord } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
@@ -12,6 +12,8 @@ export function CandidatesView({
   onActionError,
   onRefreshCandidates,
   onRefreshRuns,
+  learningRequest,
+  onLearningRequestConsumed,
 }: {
   transport: ConsoleTransport;
   candidates: CandidateDiff[];
@@ -21,6 +23,9 @@ export function CandidatesView({
   onRefreshCandidates: () => void;
   /** refresh authoritative run records (eligibility) without a reload */
   onRefreshRuns: () => void;
+  /** carried selection from "Learn from this run": opens the dialog preselected */
+  learningRequest: { runId: string } | null;
+  onLearningRequestConsumed: () => void;
 }) {
   const [rollbackTarget, setRollbackTarget] = useState<CandidateDiff | null>(null);
   const [reason, setReason] = useState("");
@@ -28,7 +33,18 @@ export function CandidatesView({
   const [cycleOpen, setCycleOpen] = useState(false);
   const [cycleBusy, setCycleBusy] = useState(false);
   const [cycleRunId, setCycleRunId] = useState("");
+  // "Learn from this run" carries the selected run into this dialog
+  useEffect(() => {
+    if (learningRequest) {
+      onRefreshRuns();
+      setCycleRunId(learningRequest.runId);
+      setCycleOpen(true);
+      onLearningRequestConsumed();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [learningRequest]);
   const [notice, setNotice] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
+  const learningButtonRef = useRef<HTMLButtonElement>(null);
   const [evalJobs, setEvalJobs] = useState<EvaluationJob[] | null>(null);
   const [evalJobsError, setEvalJobsError] = useState<string | null>(null);
 
@@ -121,7 +137,7 @@ export function CandidatesView({
         </p>
       </div>
 
-      <LearningCycleButton busy={cycleBusy} onRun={() => { onRefreshRuns(); setCycleOpen(true); }} />
+      <LearningCycleButton busy={cycleBusy} buttonRef={learningButtonRef} onRun={() => { onRefreshRuns(); setCycleOpen(true); }} />
 
       {loading && <LoadingState label="Loading candidates…" />}
 
@@ -293,6 +309,8 @@ export function CandidatesView({
         onClose={() => setCycleOpen(false)}
         runs={eligibleRuns}
         busy={cycleBusy}
+        preselectedRunId={cycleRunId}
+        returnFocusTo={learningButtonRef}
         onSubmit={(input) => void runCycle(input)}
       />
 
@@ -355,10 +373,11 @@ function renderEditOperations(cand: CandidateDiff): string {
     .join("\n\n");
 }
 
-function LearningCycleButton({ busy, onRun }: { busy: boolean; onRun: () => void }) {
+function LearningCycleButton({ busy, onRun, buttonRef }: { busy: boolean; onRun: () => void; buttonRef: React.MutableRefObject<HTMLButtonElement | null> }) {
   return (
     <div>
       <button
+        ref={buttonRef}
         type="button"
         onClick={onRun}
         disabled={busy}
@@ -376,17 +395,26 @@ function LearningCycleModal({
   onClose,
   runs,
   busy,
+  preselectedRunId,
+  returnFocusTo,
   onSubmit,
 }: {
   open: boolean;
   onClose: () => void;
   runs: RunRecord[];
   busy: boolean;
+  /** run carried in from "Learn from this run" (or a previous dialog session) */
+  preselectedRunId?: string;
+  returnFocusTo?: RefObject<HTMLButtonElement | null>;
   onSubmit: (input: LearningCycleInput) => void;
 }) {
-  const [runId, setRunId] = useState("");
+  const [runId, setRunId] = useState(preselectedRunId ?? "");
+  // keep the carried selection in sync when the dialog opens
+  useEffect(() => {
+    if (open && preselectedRunId) setRunId(preselectedRunId);
+  }, [open, preselectedRunId]);
   return (
-    <Modal open={open} title="Run learning cycle" onClose={onClose}>
+    <Modal open={open} title="Run learning cycle" onClose={onClose} returnFocusTo={returnFocusTo}>
       <form
         onSubmit={(e) => {
           e.preventDefault();

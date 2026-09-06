@@ -14,8 +14,11 @@ Read [MILESTONES.md](MILESTONES.md) for implementation evidence and delivery gat
 ## Current status
 
 The public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent).
-The verified root-committed `main` checkpoint is `2a54cf9`, which preserves evaluator privacy in stored outcomes.
+The verified root-committed `main` checkpoint is `61e700b`, which includes the integrated backend and console evidence.
 The public repository and its `main` branch were verified at this checkpoint.
+
+Current verification records 123 focused backend checks passed, 71 console tests passed, clean TypeScript and production-build checks, and a real local API browser pass at 375, 768, and 1440 pixel widths with no overflow or page errors.
+These are scripted integration and browser checks, not a performance measurement.
 
 Retained root evidence at `a882641` records the full synthetic 1,080-case run, restart coverage, and two authenticated reports passing in 48.25 seconds.
 The combined production bytes at `2a54cf9` reproduced that same full synthetic pass.
@@ -31,7 +34,8 @@ A real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC and failed
 It produced no learning result, validation result, final metrics, or measured improvement.
 M4 is therefore not complete.
 
-Current active work is split across the required EVAL-003 binding, final gate, transfer/adaptation reporting, and default budgets in session 6; fresh reads and enum-error effects in session 7; and the failed-attempt ledger in session 2.
+The AppWorld work remains in worker 2, where the full runtime integration still has a serialization failure and is not accepted or merged.
+Multi-run learning in worker 4 is still awaiting its fix and commit.
 
 The accepted Luna-through-ChatGPT subscription path does not expose an API-key or provider switch.
 The trusted parent accounts actual model usage and rejects after aggregate token exhaustion.

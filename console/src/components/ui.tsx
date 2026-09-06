@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode, type RefObject } from "react";
 
 export function Banner({
   tone,
@@ -53,26 +53,37 @@ export function Modal({
   title,
   onClose,
   children,
+  returnFocusTo,
 }: {
   open: boolean;
   title: string;
   onClose: () => void;
   children: ReactNode;
+  /** explicit focus-return target when the invoking control unmounts
+   *  (defaults to the element focused at open) */
+  returnFocusTo?: RefObject<HTMLElement | null>;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const restoreRef = useRef<HTMLElement | null>(null);
+  // stable onClose: the effect subscribes once per open; a changing onClose
+  // identity must not tear down listeners or steal focus mid-render
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const returnFocusToRef = useRef(returnFocusTo);
+  returnFocusToRef.current = returnFocusTo;
 
   useEffect(() => {
     if (!open) return;
     restoreRef.current = document.activeElement as HTMLElement | null;
     const panel = panelRef.current;
     // initial focus prefers the first text field (DOM order) over buttons
+    // initial focus prefers the first text field (DOM order) over buttons
     panel?.querySelector<HTMLElement>("textarea, input, select, button, [tabindex]")?.focus();
 
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (event.key !== "Tab" || !panel) return;
@@ -90,12 +101,23 @@ export function Modal({
         first.focus();
       }
     };
+    // ONE document-level listener: keydowns inside the focused dialog bubble
+    // here. A second (panel) listener would run the Tab wrap and Escape
+    // handling twice. The stable onCloseRef keeps the subscription per open.
     document.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("keydown", onKey);
-      restoreRef.current?.focus();
+      // restore focus: prefer the explicit return-focus target when provided
+      // and still connected, then the element captured at open
+      const explicit = returnFocusToRef.current?.current;
+      if (explicit && explicit.isConnected) {
+        explicit.focus();
+        return;
+      }
+      const restore = restoreRef.current;
+      if (restore?.isConnected) restore.focus();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
   return (

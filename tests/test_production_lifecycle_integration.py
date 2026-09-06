@@ -207,6 +207,18 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
         assert learning_receipt["sourceRunIds"]
         assert learning_receipt.get("reusedCandidate") is not True
 
+    for report in (result.reports or {}).values():
+        payload = report.to_dict()
+        assert payload["auxiliarySummaries"]["transfer"]["queryCount"] == 3
+        assert payload["auxiliarySummaries"]["adaptation"]["queryCount"] == 3
+        assert payload["auxiliaryOverhead"]["transfer"]["supportAndLearningIncluded"] is True
+        assert payload["auxiliaryOverhead"]["adaptation"]["support"]["totalTokens"] > 0
+        assert payload["auxiliaryOverhead"]["adaptation"]["learning"]["totalTokens"] > 0
+        assert payload["auxiliaryExposure"]["transfer"]["sourceRunIds"]
+        assert payload["auxiliaryExposure"]["transfer"]["taskIds"]
+        assert payload["auxiliaryExposure"]["adaptation"]["taskIds"]
+        assert payload["auxiliaryLimitations"]
+
     first_calls = task_model.turn
     restarted_app = create_runtime_app(data_dir=tmp_path, model_runner=task_model, learning_model_client=learning_model, evaluator=trusted_evaluator)
     restarted = restarted_app.state.durable_runtime

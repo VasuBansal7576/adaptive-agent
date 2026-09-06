@@ -231,3 +231,126 @@ def test_rich_broker_projection_keeps_diagnostics_without_secrets(tmp_path: Path
     assert "apiKey" not in content and "sk-secret-value" not in content
     assert "expectedAnswer" not in content and "hidden-answer" not in content
     assert "hunter2" not in content
+
+
+def _register_dev_run(store, registry, env_id: str, run_id: str, *, status: str, passed: bool, evidence_ids: list[str]):
+    """Persist a real completed development run with trusted evidence."""
+    import hashlib
+    import json
+    from datetime import datetime, timezone
+
+    from adaptive_agent.models import ArtifactRef, EnvironmentManifest, RunRecord, RunStatus, TaskInput, ToolSchema, sha256_json
+    from adaptive_agent.retrieval import content_hash
+
+    doc_ref = store.put_artifact(f"Public documentation for {env_id}.")
+    manifest = EnvironmentManifest(
+        environmentId=env_id,
+        version="1",
+        docs=[doc_ref],
+        toolSchemas=[ToolSchema(name="read", version="1", inputSchema={"type": "object"}, outputSchema={"type": "object"}, effect="read")],
+        policyRef=ArtifactRef(id="policy", version="1", sha256="1" * 64),
+        evaluatorRef=ArtifactRef(id="evaluator", version="1", sha256="2" * 64),
+        resetRef=ArtifactRef(id="reset", version="1", sha256="3" * 64),
+    )
+    if store.get_environment(env_id) is None:
+        store.register_environment(env_id, "1", store.put_artifact(manifest.model_dump(mode="json", by_alias=True)))
+    task_id = f"task-{run_id}"
+    task = TaskInput(taskId=task_id, environmentRef=ArtifactRef(id=env_id, version="1", sha256="4" * 64), goal=f"goal for {env_id}", partition="development")
+    task_ref = store.put_artifact(task.model_dump(mode="json", by_alias=True))
+    store.register_task(task_id, env_id, "1", task_ref.model_dump_json(), "development", f"goal for {env_id}")
+    record = RunRecord(
+        taskRef=task_ref,
+        environmentRef=ArtifactRef(id=env_id, version="1", sha256="4" * 64),
+        policyRef=ArtifactRef(id="policy", version="1", sha256="1" * 64),
+        modelProfileRef=ArtifactRef(id="model", version="1", sha256="5" * 64),
+        skillBundleRef=ArtifactRef(id="bundle", version="1", sha256="6" * 64),
+        budgetRef=ArtifactRef(id="budget", version="1", sha256="7" * 64),
+        runId=run_id,
+        status=RunStatus(status),
+    )
+    store.save_run(run_id, {"parent_run_id": None, "task_id": task_id, "environment_id": env_id, "bundle_id": "base", "status": status, "idempotency_key": f"idem-{run_id}", "last_event_sequence": 1, "created_at": datetime.now(timezone.utc).isoformat(), "run_json": record.model_dump_json(by_alias=True)})
+    doc_content = f"Public documentation for {env_id}."
+    store.save_learning_record(f"learning-doc-{env_id}", env_id, run_id, json.dumps({"kind": "public_doc", "sourceId": doc_ref.id, "content": doc_content, "contentHash": content_hash(doc_content), "environmentId": env_id, "visibility": "public"}, sort_keys=True, separators=(",", ":")))
+    for index, evidence_id in enumerate(evidence_ids):
+        content = f"broker observed development evidence {evidence_id}"
+        ref = store.put_artifact(content)
+        store.append_evidence(evidence_id, {"run_id": run_id, "sequence": index + 1, "event_type": "tool_result", "content_hash": sha256_json(content), "source_ref": ref.model_dump_json(), "trust_class": "broker", "visibility": "learner", "redacted": 1})
+        store.save_learning_record(f"learning-evidence-{evidence_id}", env_id, run_id, json.dumps({"kind": "live_evidence", "sourceId": evidence_id, "content": content, "contentHash": content_hash(content), "sourceContentHash": sha256_json(content), "environmentId": env_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": True, "outcomePassed": passed}, sort_keys=True, separators=(",", ":")))
+    store.save_outcome(f"out-{run_id}", {"run_id": run_id, "passed": 1 if passed else 0, "score": 1.0, "metadata_json": "{}", "checked_at": datetime.now(timezone.utc).isoformat()})
+    return list(evidence_ids)
+
+
+class _ScriptedLearningClient:
+    """Deterministic model client that cites the requested evidence id."""
+
+    def __init__(self, cited_source_id: str):
+        self.cited = cited_source_id
+        self.seen_evidence: list[str] = []
+
+    def invoke(self, *, goal, environment, messages, remaining_deadline=None, cancel=None, token_cap=None):
+        import json
+
+        evidence = environment["learningContext"]["developmentEvidence"]
+        self.seen_evidence = [item["sourceId"] for item in evidence]
+        assert self.cited in self.seen_evidence, f"cited source {self.cited} never entered learner context"
+        procedure = "Reuse the observed development procedure."
+        payload = {
+            "predictedEffect": "transfer observed procedure",
+            "editOperations": [{"path": "skills/multi-run/procedure", "operation": "add", "value": procedure}],
+            "supportingEvidenceIds": [self.cited],
+            "proposerVersion": "runtime-test",
+            "skill": {"procedure": procedure},
+        }
+        return {"provider": "openai-codex", "model": "test-luna", "responseId": "resp-multi", "text": json.dumps(payload), "usage": {"totalTokens": 12}}
+
+
+def test_launch_learning_multi_run_cites_second_run_and_preserves_coverage(tmp_path: Path):
+    """Actual DurableRuntime.launch_learning with real durable runs, the real
+    retriever/validator/candidate sink, and a scripted model client."""
+    pytest.importorskip("fastapi")
+    from types import SimpleNamespace
+
+    from adaptive_agent.app import DurableRuntime
+    from adaptive_agent.controller import Controller
+    from adaptive_agent.environment import EnvironmentRegistry
+    from adaptive_agent.store import Store
+
+    store = Store(tmp_path)
+    registry = EnvironmentRegistry(store)
+    run_a = "run-dev-a"
+    run_b = "run-dev-b"
+    # >8 evidence records on the primary run plus a later selected failure in
+    # a second environment: per-run bounding must keep the failed run's record.
+    ids_a = _register_dev_run(store, registry, "env-a", run_a, status="succeeded", passed=True, evidence_ids=[f"ev-a{i}" for i in range(10)])
+    ids_b = _register_dev_run(store, registry, "env-b", run_b, status="failed", passed=False, evidence_ids=["ev-b0"])
+    controller = Controller(store, registry)
+    base = SkillBundle(skills=[SkillVersion(skillId="existing", version="1", procedure="Keep the existing procedure.")])
+    controller.candidates.initialize_active_bundle(base)
+
+    runtime = DurableRuntime.__new__(DurableRuntime)
+    runtime.controller = controller
+    runtime.registry = registry
+    runtime.packages = {"env-a": object(), "env-b": object()}
+    runtime.model_runner = None
+    runtime.learning_model_client = _ScriptedLearningClient(cited_source_id=ids_b[0])
+    runtime._learning_runtime = None
+
+    result = runtime.launch_learning(SimpleNamespace(run_id=None, run_ids=[run_b, run_a]))
+
+    assert sorted(result["sourceRunIds"]) == sorted([run_a, run_b])
+    assert result["candidate"]["supportingEvidenceIds"] == [ids_b[0]]
+    # The failed second run's evidence reached the model context despite the
+    # primary run holding more than the per-kind window of evidence records.
+    assert ids_b[0] in runtime.learning_model_client.seen_evidence
+    assert all(ev_id in runtime.learning_model_client.seen_evidence for ev_id in ids_b)
+    # Primary coverage is bounded per run, not erased by the second run.
+    assert len([eid for eid in runtime.learning_model_client.seen_evidence if eid in ids_a]) <= 8
+    # Anything outside the declared set remains fail-closed.
+    store.append_evidence("ev-foreign", {"run_id": "run-foreign", "sequence": 1, "event_type": "tool_result", "content_hash": "x" * 64, "source_ref": "{}", "trust_class": "broker", "visibility": "learner", "redacted": 1})
+    foreign = _ScriptedLearningClient.__new__(_ScriptedLearningClient)
+    foreign.cited = "broker:ev-foreign"
+    foreign.seen_evidence = []
+    runtime.learning_model_client = foreign
+    runtime._learning_runtime = None
+    with pytest.raises(Exception):
+        runtime.launch_learning(SimpleNamespace(run_id=None, run_ids=[run_a, run_b]))

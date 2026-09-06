@@ -23,8 +23,11 @@ No additional workers are spawned during this documentation task.
 
 ## Current root checkpoint
 
-As of 2026-09-06, the verified public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent), and the clean root-committed `main` checkpoint is `2a54cf9`.
-This checkpoint includes the controller privacy fix; the prior backup remains retained.
+As of 2026-09-06, the verified public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent), and the clean root-committed `main` checkpoint is `61e700b`.
+This checkpoint includes the integrated backend and console evidence; the prior backup remains retained.
+
+Current verification records 123 focused backend checks passed, 71 console tests passed, clean TypeScript and production-build checks, and a real local API browser pass at 375, 768, and 1440 pixel widths with no overflow or page errors.
+These are scripted integration and browser checks, not a performance measurement.
 
 Retained root evidence at `a882641` records the full synthetic 1,080-case run, restart coverage, and two authenticated reports passing in 48.25 seconds.
 The combined production bytes at `2a54cf9` reproduced that same full synthetic pass.
@@ -36,7 +39,8 @@ The real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC and fail
 It produced no learning result, validation result, final metrics, or measured improvement.
 M4 is not complete and must not be represented as passed.
 
-Independent fixes remain active in parallel: session 6 owns public tool-enum and error-contract defects, session 2 owns failed-attempt accounting and trusted negative outcomes, and session 7 owns provider-write effect fidelity.
+The AppWorld work remains in worker 2, where the full runtime integration still has a serialization failure and is not accepted or merged.
+Multi-run learning in worker 4 is still awaiting its fix and commit.
 
 The strict provider output-token cap remains an accepted but unmet criterion.
 The SDK nominal cost is a proxy, and economic billing is unknown.
@@ -112,7 +116,7 @@ The backend tip contains the requested session-2 ancestry through `83d7e87`, `21
 The console tip contains the requested session-5 lineage through `29afe35` and `ae482da`.
 Dirty worker overlays and uncommitted lock files were excluded from that assembly.
 
-The current public `main` checkpoint is `2a54cf9`, as recorded above, and includes the controller privacy fix.
+That historical assembly's public `main` checkpoint was `2a54cf9` and included the controller privacy fix.
 
 Post-assembly verification must use newly allocated temporary Store and data paths and must preserve the reported 171 backend tests and 61/61 console result as prior evidence rather than replaying paid or shared-data smoke.
 Cost accounting, the B0/L/A ablation, and the final report remain incomplete.

@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import json
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -35,6 +36,20 @@ class EvaluationJobTests(unittest.TestCase):
                 job.run("job-missing", "validation", base_hash="base", candidate_hash="candidate")
             self.assertIsNone(job.readback("job-missing"))
 
+    def test_auxiliary_evidence_reports_distinct_query_support_and_learning_usage(self):
+        job = object.__new__(EvaluationJob)
+        job.store = SimpleNamespace(get_artifact=lambda ref: {"usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5}} if ref == "query-acct" else {"usage": {"inputTokens": 7, "outputTokens": 11, "totalTokens": 18}})
+        query = SimpleNamespace(run_id="query-run", task_id="query-task", accounting_ref="query-acct", cost_microunits=13, latency_seconds=1.0, passed=True, reliable=True, safety_violations=0)
+        support = SimpleNamespace(run_id="support-run", task_id="support-task", accounting_ref="support-acct", cost_microunits=17, latency_seconds=2.0, passed=True, reliable=True, safety_violations=0)
+        stages = (SimpleNamespace(name="transfer", cells=("leave-out:finance",)), SimpleNamespace(name="adaptation", cells=()))
+        state = {"results": {"transfer": {"leave-out:finance": {"queryRunIds": ["query-run"], "supportRunIds": ["support-run"], "trainingSourceRunIds": ["learning-source"], "queryTaskIds": [], "learningReceipt": {"usage": {"inputTokens": 19, "outputTokens": 23, "totalTokens": 42,}, "costMicrounits": 29}}}}}
+        evidence = job._auxiliary_evidence(stages, state, lambda *_args, **_kwargs: (query, support))
+        self.assertEqual(evidence["exposure"]["transfer"]["taskIds"], ["query-task", "support-task"])
+        self.assertEqual(evidence["exposure"]["transfer"]["sourceRunIds"], ["learning-source", "support-run"])
+        self.assertEqual(evidence["overhead"]["transfer"]["query"]["totalTokens"], 5)
+        self.assertEqual(evidence["overhead"]["transfer"]["support"]["totalTokens"], 18)
+        self.assertEqual(evidence["overhead"]["transfer"]["learning"]["totalTokens"], 42)
+        self.assertEqual(evidence["overhead"]["transfer"]["support"]["costMicrounits"], 17)
     def test_incomplete_driver_result_is_persisted_without_second_model_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             job = self._job(directory)

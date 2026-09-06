@@ -39,9 +39,12 @@ def test_controller_eval_003_does_not_write_controller_store(tmp_path):
 
     result = controller.execute_probe("EVAL-003")
 
-    assert result["passed"] is False
+    assert result["passed"] is True
     assert result["provider"]["runtimeRequired"] is True
-    assert result["provider"]["runtime"]["executed"] is False
+    assert result["provider"]["runtime"]["executed"] is True
+    assert result["provider"]["runtime"]["actualDocker"] is True
+    assert all(item["passed"] is True for item in result["provider"]["runtime"]["cases"].values())
+    assert result["evidence"] and result["evidenceReceipts"]
     assert store.list_environments() == []
     assert list((tmp_path / "controller").glob("**/*"))
 

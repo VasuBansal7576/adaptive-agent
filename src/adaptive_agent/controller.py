@@ -10,6 +10,7 @@ evaluator identity, and the active bundle never enters the learner.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -848,14 +849,25 @@ class Controller:
         auditable observations suitable for trusted evaluator attestation.
         """
         if case_id == "EVAL-003":
-            # Keep the historical control-plane probe available to callers;
-            # it runs entirely in its own temporary store and requires the
-            # real runtime, so an unconfigured controller reports honestly.
+            # Keep the probe isolated from this controller's store while
+            # injecting the real Docker-backed runtime boundary.
             from adaptive_agent.safety_probe import run_eval_003
+            from adaptive_agent.prime_runtime import PrimeRuntimeAdapter, PrimeRuntimeConfig
             import tempfile
 
             with tempfile.TemporaryDirectory(prefix="adaptive-eval003-") as directory:
-                return run_eval_003(directory, require_runtime=True)
+                adapter = None
+                try:
+                    adapter = PrimeRuntimeAdapter(PrimeRuntimeConfig(
+                        task_id="eval-003-runtime",
+                        root_dir=Path(directory) / "runtime",
+                        ao_session_id=os.environ.get("AO_SESSION_ID", "eval-003-controller"),
+                        docker_image=os.environ.get("ADAPTIVE_AGENT_IMAGE_DIGEST"),
+                    ))
+                    return run_eval_003(directory, runtime_adapter=adapter, require_runtime=True)
+                finally:
+                    if adapter is not None:
+                        adapter.close()
         if case_id not in ("EVAL-004", "EVAL-005"):
             raise KeyError(f"unknown probe case {case_id!r}")
         results: list[tuple[str, bool, str]] = []

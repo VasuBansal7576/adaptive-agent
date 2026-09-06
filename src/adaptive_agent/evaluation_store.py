@@ -82,7 +82,29 @@ class ControllerSafetyProbeAdapter:
     def eval_005(self):
         return self._run("EVAL-005")
 
+    def eval_003(self):
+        """Run the real Prime/runtime safety probe at the controller boundary."""
+        raw = self.executor.execute_probe("EVAL-003")
+        if not isinstance(raw, dict) and callable(getattr(raw, "to_dict", None)):
+            raw = raw.to_dict()
+        if not isinstance(raw, dict) or raw.get("caseId") != "EVAL-003":
+            raise ValueError("controller EVAL-003 probe returned a malformed case")
+        detail = raw.get("detail")
+        cases = detail.get("cases") if isinstance(detail, dict) else None
+        evidence = raw.get("evidence")
+        if not isinstance(cases, list) or not cases or not all(isinstance(item, dict) for item in cases):
+            raise ValueError("controller EVAL-003 probe returned incomplete case evidence")
+        if not isinstance(evidence, list) or not evidence or not all(isinstance(item, str) and item for item in evidence):
+            raise ValueError("controller EVAL-003 probe returned incomplete evidence references")
+        return SafetyProbeResult(
+            bool(raw.get("passed")) if isinstance(raw.get("passed"), bool) else False,
+            tuple(cases),
+            tuple(evidence),
+            ("Prime runtime safety obligations executed through Controller",),
+        )
+
     def register(self, registry: Any) -> None:
+        registry.register_safety_probe("EVAL-003", self.eval_003)
         registry.register_safety_probe("EVAL-004", self.eval_004)
         registry.register_safety_probe("EVAL-005", self.eval_005)
 
@@ -167,6 +189,34 @@ class SQLiteRunEvidenceStore:
             return False
         if not all(isinstance(value, dict) for value in (response, accounting, outcome)):
             return False
+        response_accounting_ref = response.get("accountingRef")
+        if isinstance(response_accounting_ref, dict):
+            response_accounting_ref = response_accounting_ref.get("sha256")
+        if response_accounting_ref is not None and (not isinstance(response_accounting_ref, str) or not response_accounting_ref):
+            return False
+        bound_final_ref = run_payload.get("finalAccountingRef")
+        if bound_final_ref is not None:
+            if not isinstance(bound_final_ref, str) or bound_final_ref != observation.accounting_ref or not isinstance(response_accounting_ref, str):
+                return False
+        elif response_accounting_ref is not None and response_accounting_ref != observation.accounting_ref:
+            return False
+        if isinstance(response_accounting_ref, str) and response_accounting_ref != observation.accounting_ref:
+            try:
+                original_accounting = self.store.get_artifact(response_accounting_ref)
+            except KeyError:
+                return False
+            if not isinstance(original_accounting, dict):
+                return False
+            # The terminal receipt may extend only terminal execution fields.
+            # Usage, cost, identity, and canonical version pins remain bound to
+            # the authenticated model receipt and cannot be rewritten in a
+            # replay or by a tampered run binding.
+            mutable_terminal_fields = {"durationSeconds", "inferenceDurationSeconds", "toolCalls"}
+            if any(
+                key not in mutable_terminal_fields and accounting.get(key) != original_accounting.get(key)
+                for key in set(accounting) | set(original_accounting)
+            ):
+                return False
         receipts = accounting.get("receipts")
         aggregate_usage = accounting.get("aggregateUsage")
         if receipts is not None:
