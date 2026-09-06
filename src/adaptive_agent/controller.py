@@ -186,6 +186,16 @@ class Controller:
         self.append_event(run_id, "run_cancelled", {}, "operator", "operator")
         return self.get_run(run_id)
 
+    def claim_run(self, run_id: str) -> tuple[bool, RunRecord | None]:
+        """Claim queued execution exactly once before side-effect setup."""
+        claimed = self.store.claim_run(run_id)
+        if claimed is None:
+            return False, None
+        run = self.get_run(run_id)
+        if claimed:
+            self.append_event(run_id, "run_started", {"runId": run_id}, "system", "operator")
+        return claimed, run
+
     # ------------------------------------------------------------------ steps
     def begin_step(self, run_id: str, kind: StepKind | str, input_refs: list[ArtifactRef] | None = None) -> StepRecord:
         kind = StepKind(kind)
@@ -307,13 +317,20 @@ class Controller:
         provider: ToolProvider,
         driver: RunDriver,
         evaluate: Callable[[], Outcome] | None = None,
+        claimed: bool = False,
     ) -> RunRecord:
         """Run lifecycle wrapper: running -> driver -> evaluator-derived terminal state.
 
         The driver sees only a DriverContext; provider errors surface as
         OUTCOME_UNKNOWN evidence, never a crash of the control plane.
         """
-        self._set_run_status(run_id, RunStatus.running)
+        if not claimed:
+            acquired, current = self.claim_run(run_id)
+            if not acquired:
+                return current
+        current = self.get_run(run_id)
+        if current is None or current.status != RunStatus.running:
+            return current
         ctx = DriverContext(self, run_id, env_id, provider)
         try:
             driver.act(ctx)

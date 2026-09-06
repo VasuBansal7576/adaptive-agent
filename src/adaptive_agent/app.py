@@ -18,10 +18,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from adaptive_agent.api import ControlPlane, ModelRunner, OutcomeEvaluator, create_app, _ref, IdempotencyConflict
+from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
 from adaptive_agent.broker import Capability, ToolBroker, ToolProvider
 from adaptive_agent.controller import Controller
 from adaptive_agent.environment import EnvironmentRegistry
-from adaptive_agent.evaluation import build_environment_packages
+from adaptive_agent.evaluation import build_environment_packages, sha256_json
 from adaptive_agent.planner import PrimeCliModelClient, LunaPlanner, PlannerResult, PlannerLimits
 from adaptive_agent.prime_runtime import Capability as PrimeCapability, CapabilityBroker, PrimeRuntimeAdapter, PrimeRuntimeConfig
 from adaptive_agent.models import ArtifactRef, EnvironmentManifest as DurableManifest, TaskInput as DurableTask, ToolSchema as DurableTool, RunStatus, ToolRequest, Outcome as DurableOutcome
@@ -186,6 +187,53 @@ class DurableRuntime:
             rows = conn.execute("SELECT run_id FROM runs ORDER BY created_at").fetchall()
         return [run for row in rows if (run := self.get_run(row[0])) is not None]
 
+    def _record_model_response(self, run_id: str, package: Any, evidence: Mapping[str, Any]) -> Any:
+        """Persist the parent-owned model envelope with run-scoped accounting pins."""
+        stored = self.controller.store.get_run(run_id)
+        run = self.controller.get_run(run_id)
+        if stored is None or run is None:
+            raise KeyError("run not found")
+        response_id = evidence.get("responseId") or evidence.get("response_id")
+        if not isinstance(response_id, str) or not response_id.strip():
+            raise ValueError("model response evidence requires responseId")
+        usage = evidence.get("usage")
+        if not isinstance(usage, Mapping) or not usage:
+            raise ValueError("model response evidence requires usage")
+        version_refs = {
+            "policy": run.policy_ref.sha256,
+            "schema": sha256_json(package.manifest.tool_schemas),
+            "planner": run.skill_bundle_ref.sha256,
+            "budget": run.budget_ref.sha256,
+            "image": os.environ.get("ADAPTIVE_AGENT_IMAGE_DIGEST", "image-unpinned"),
+        }
+        image_digest = version_refs["image"]
+        payload = {
+            **dict(evidence),
+            "runId": run_id,
+            "taskId": stored["task_id"],
+            "environmentId": stored["environment_id"],
+            "responseId": response_id,
+            "modelProfile": evidence.get("model"),
+            "budgetRef": run.budget_ref.model_dump(mode="json", by_alias=True),
+            "imageDigest": image_digest,
+            "corePlannerHash": run.skill_bundle_ref.sha256,
+            "versionRefs": version_refs,
+            "planner": {"responseId": response_id, "modelProfile": evidence.get("model"), "corePlannerHash": run.skill_bundle_ref.sha256, "versionRefs": version_refs},
+        }
+        accounting = {
+            "responseId": response_id,
+            "runId": run_id,
+            "taskId": stored["task_id"],
+            "environmentId": stored["environment_id"],
+            "usage": dict(usage),
+            "versionRefs": version_refs,
+            "costMicrounits": 0,
+            "durationSeconds": 0.0,
+        }
+        accounting_ref = self.controller.store.put_artifact(accounting)
+        payload["accountingRef"] = accounting_ref.model_dump(mode="json", by_alias=True)
+        return self.controller.append_event(run_id, "model_response", payload, "system", "operator")
+
     def launch(self, run_id: str) -> None:
         stored = self.controller.store.get_run(run_id)
         if not stored:
@@ -194,6 +242,11 @@ class DurableRuntime:
         package = self.packages.get(stored["environment_id"])
         if not task or not package:
             raise KeyError("development task not found")
+        claimed, current = self.controller.claim_run(run_id)
+        if current is None:
+            raise KeyError("run not found")
+        if not claimed:
+            return
         cancel = self._cancel_events.setdefault(run_id, threading.Event())
         provider: _FixtureProvider
         if self.model_runner is not None:
@@ -205,11 +258,11 @@ class DurableRuntime:
                 def act(self, _ctx: Any) -> None:
                     nonlocal invocation
                     invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
-                    runtime.controller.append_event(run_id, "model_response", {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)}, "system", "operator")
+                    runtime._record_model_response(run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)})
             def evaluate() -> DurableOutcome:
                 outcome = dict(self.evaluator(goal=task.goal, model_output=invocation.text, environment=self._planner_environment(package, run_id))) if self.evaluator is not None and invocation is not None else {"passed": False}
                 return DurableOutcome(runId=run_id, passed=bool(outcome.get("passed") is True), metadata=outcome)
-            self.controller.execute_run(run_id, package.environment_id, provider, DirectDriver(), evaluate=evaluate)
+            self.controller.execute_run(run_id, package.environment_id, provider, DirectDriver(), evaluate=evaluate, claimed=True)
             self._cancel_events.pop(run_id, None)
             return
         prime: PrimeRuntimeAdapter | None = None
@@ -260,14 +313,14 @@ class DurableRuntime:
 
             def record_model_observation(self, evidence: Mapping[str, Any], *, trusted_parent: bool = False) -> Any:
                 result = prime.record_model_observation(evidence, trusted_parent=trusted_parent)
-                self._controller.append_event(run_id, "model_response", dict(evidence), "system", "operator")
+                runtime._record_model_response(run_id, package, evidence)
                 return result
         class Driver:
             def __init__(self, controller: Controller) -> None:
                 self._controller = controller
                 self.result: PlannerResult | None = None
             def act(self, ctx: Any) -> None:
-                max_tokens = int(budget_data.get("modelTokens", 4000)) if isinstance(budget_data, Mapping) else 4000
+                max_tokens = int(budget_data.get("modelTokens", DEFAULT_MODEL_TOKENS)) if isinstance(budget_data, Mapping) else DEFAULT_MODEL_TOKENS
                 wall_seconds = float(budget_data.get("wallTimeSeconds", 90)) if isinstance(budget_data, Mapping) else 90.0
                 if max_tokens <= 0:
                     self.result = PlannerResult("budget_exhausted", None, 0, 0, 0, (), ())
@@ -285,7 +338,7 @@ class DurableRuntime:
             fixture = package.evaluate(task.task_id, provider.session)
             return DurableOutcome(runId=run_id, passed=fixture.passed, score=1.0 if fixture.passed else 0.0, metadata={"reason": fixture.reason, "evaluatorVersion": fixture.evaluator_version, "plannerStatus": result.status})
         try:
-            self.controller.execute_run(run_id, package.environment_id, provider, driver, evaluate=evaluate)
+            self.controller.execute_run(run_id, package.environment_id, provider, driver, evaluate=evaluate, claimed=True)
         finally:
             if prime is not None:
                 prime.close(remove_workspace=True)
@@ -392,8 +445,8 @@ def create_runtime_app(
         kwargs["model_runner"] = model_runner
     if evaluator is not None:
         kwargs["evaluator"] = evaluator
-    model_profile = {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "tier": "medium", "maxTokens": 4000}
-    budget_profile = {"modelTokens": 4000, "toolCalls": 32, "childRuns": 0, "wallTimeSeconds": 90, "costMicrounits": 100000, "currency": "USD"}
+    model_profile = {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "tier": "medium", "maxTokens": DEFAULT_MODEL_TOKENS}
+    budget_profile = {"modelTokens": DEFAULT_MODEL_TOKENS, "toolCalls": 32, "childRuns": 0, "wallTimeSeconds": 90, "costMicrounits": 100000, "currency": "USD"}
     model_ref = _ref("model-profile", "1", model_profile)
     budget_ref = _ref("budget-default", "1", budget_profile)
     kwargs["seed_test_references"] = False

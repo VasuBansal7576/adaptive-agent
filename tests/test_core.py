@@ -7,6 +7,7 @@ claims real learning.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -361,6 +362,45 @@ class TestControllerSeam:
         assert any(e["event"] == "tool_result" for e in evs)
         ctl.record_outcome(run.run_id, passed=True, score=1.0)
         assert store.get_outcome_by_run_id(run.run_id)["passed"] == 1
+
+    def test_execute_run_claims_once_under_concurrent_and_retry_launches(self, store, registry, broker, provider):
+        from adaptive_agent.models import Budget, ModelProfile, RunRequest
+
+        ctl = self._ctl(store, registry, broker)
+        task = self._task(registry, store)
+        req = RunRequest(
+            taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
+            modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
+            budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
+            idempotencyKey="idem-claim",
+        )
+        run = ctl.create_run(req, task)
+        started, release = threading.Event(), threading.Event()
+        calls = 0
+        lock = threading.Lock()
+
+        class D:
+            def act(self, _ctx):
+                nonlocal calls
+                with lock:
+                    calls += 1
+                started.set()
+                release.wait(timeout=2)
+
+        first = threading.Thread(target=ctl.execute_run, args=(run.run_id, ENV, provider, D()))
+        first.start()
+        assert started.wait(timeout=1)
+        second = threading.Thread(target=ctl.execute_run, args=(run.run_id, ENV, provider, D()))
+        second.start()
+        second.join(timeout=1)
+        assert calls == 1
+        release.set()
+        first.join(timeout=2)
+        assert calls == 1
+        assert ctl.get_run(run.run_id).status is RunStatus.succeeded
+
+        ctl.execute_run(run.run_id, ENV, provider, D())
+        assert calls == 1
 
 
 class TestCandidateLifecycle:

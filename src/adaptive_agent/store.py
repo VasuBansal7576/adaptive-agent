@@ -269,6 +269,33 @@ class Store:
             row = conn.execute("SELECT * FROM runs WHERE idempotency_key = ?", (key,)).fetchone()
             return dict(row) if row else None
 
+    def claim_run(self, run_id: str) -> bool | None:
+        """Atomically claim a queued run for one executor.
+
+        ``None`` means the run does not exist, ``True`` means this caller
+        changed queued to running, and ``False`` means another caller already
+        claimed it or it is terminal.  The serialized RunRecord is updated in
+        the same transaction as the status column so a restart cannot observe
+        a partially claimed run.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status, run_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            if row["status"] != "queued":
+                conn.rollback()
+                return False
+            payload = json.loads(row["run_json"])
+            payload["status"] = "running"
+            changed = conn.execute("UPDATE runs SET status = ?, run_json = ? WHERE run_id = ? AND status = 'queued'", ("running", json.dumps(payload, sort_keys=True), run_id)).rowcount == 1
+            if changed:
+                conn.commit()
+            else:
+                conn.rollback()
+            return changed
+
     def update_run_status(
         self,
         run_id: str,

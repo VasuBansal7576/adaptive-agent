@@ -23,6 +23,8 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Res
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
+
 
 JsonObject = dict[str, Any]
 
@@ -540,6 +542,49 @@ class ControlPlane:
                 self.runs[run_id]["lastEventSequence"] = sequence
             return event
 
+    def _emit_evidence(self, run_id: str, evidence_type: str, summary: str, payload: Mapping[str, Any]) -> JsonObject:
+        """Emit structured evidence while retaining the SSE summary/detail shape."""
+        event = self._emit(run_id, "evidence", summary, json.dumps(dict(payload), sort_keys=True))
+        event["evidenceType"] = evidence_type
+        event["evidence"] = dict(payload)
+        return event
+
+    @staticmethod
+    def _model_response_evidence(run: JsonObject, invocation: ModelInvocation, environment: JsonObject) -> JsonObject:
+        response_id = invocation.response_id
+        version_refs = {
+            "policy": run["policyRef"]["sha256"],
+            "budget": run["budgetRef"]["sha256"],
+            "planner": run["skillBundleRef"]["sha256"],
+            "image": environment.get("imageDigest", "image-unpinned"),
+        }
+        planner = {"responseId": response_id, "modelProfile": invocation.model, "corePlannerHash": run["skillBundleRef"]["sha256"], "versionRefs": version_refs}
+        accounting = {
+            "responseId": response_id,
+            "runId": run["runId"],
+            "taskId": run["taskRef"]["id"],
+            "environmentId": run["environmentId"],
+            "usage": dict(invocation.usage),
+            "versionRefs": version_refs,
+        }
+        return {
+            "runId": run["runId"],
+            "taskId": run["taskRef"]["id"],
+            "environmentId": run["environmentId"],
+            "provider": invocation.provider,
+            "model": invocation.model,
+            "modelProfile": invocation.model,
+            "responseId": response_id,
+            "usage": dict(invocation.usage),
+            "budgetRef": run["budgetRef"],
+            "imageDigest": version_refs["image"],
+            "corePlannerHash": run["skillBundleRef"]["sha256"],
+            "versionRefs": version_refs,
+            "planner": planner,
+            "accountingRef": _ref(f"accounting_{run['runId']}_{response_id}", "1", accounting),
+            "accounting": accounting,
+        }
+
     def launch(self, run_id: str) -> None:
         with self._lock:
             run = self.runs.get(run_id)
@@ -564,8 +609,8 @@ class ControlPlane:
             with self._lock:
                 if run["status"] == "cancelled":
                     return
-            provenance = {"provider": invocation.provider, "model": invocation.model, "responseId": response_id, "usage": dict(invocation.usage)}
-            self._emit(run_id, "evidence", "Authenticated model response received.", json.dumps(provenance, sort_keys=True))
+            provenance = self._model_response_evidence(run, invocation, env["manifest"])
+            self._emit_evidence(run_id, "model_response", "Authenticated model response received.", provenance)
             outcome = dict(self.evaluator(goal=run["goal"], model_output=invocation.text, environment=env["manifest"]))
             with self._lock:
                 if run["status"] == "cancelled":
@@ -691,7 +736,7 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
         return {
             "modelProfiles": [{"ref": model, "label": "Luna", "provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna"}],
             "budgetDefaults": {
-                "modelTokens": 4000,
+                "modelTokens": DEFAULT_MODEL_TOKENS,
                 "toolCalls": 32,
                 "childRuns": 0,
                 "wallTimeSeconds": 90,
@@ -827,12 +872,17 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
     @app.post("/runs/{run_id}/launch", status_code=202)
     def launch_run(run_id: str, background: BackgroundTasks) -> JsonObject:
         if runtime is not None:
-            if runtime.get_run(run_id) is None:
+            current = runtime.get_run(run_id)
+            if current is None:
                 raise HTTPException(status_code=404, detail="run not found")
+            if current.get("status") != "queued":
+                return {"runId": run_id, "status": current.get("status", "unknown")}
             background.add_task(runtime.launch, run_id)
             return {"runId": run_id, "status": "accepted"}
         if run_id not in plane.runs:
             raise HTTPException(status_code=404, detail="run not found")
+        if plane.runs[run_id].get("status") != "queued":
+            return {"runId": run_id, "status": plane.runs[run_id].get("status", "unknown")}
         background.add_task(plane.launch, run_id)
         return {"runId": run_id, "status": "accepted"}
 

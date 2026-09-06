@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from threading import Event
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
+
 
 MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "openai-codex/gpt-5.6-luna"
@@ -67,7 +69,7 @@ class KernelExecutor(Protocol):
 class PlannerLimits:
     max_turns: int = 8
     max_wall_seconds: float = 900.0
-    max_model_tokens: int = 4_000
+    max_model_tokens: int = DEFAULT_MODEL_TOKENS
     max_code_chars: int = 32_768
     max_context_chars: int = 32_768
     max_output_chars: int = 16_384

@@ -3,8 +3,10 @@ from threading import Event, Thread
 import pytest
 
 from adaptive_agent.api import CandidateProposalRequest, ControlPlane, EvaluationRequest, create_app, make_authenticated_model_runner
+from adaptive_agent.app import create_runtime_app
 from adaptive_agent.evaluation import Arm, EvaluationProtocol, EvaluationRunner, ModelProvenance, Partition, RunObservation, build_environment_packages
 from adaptive_agent.planner import make_luna_model_runner
+from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
 
 
 def manifest():
@@ -55,6 +57,104 @@ def test_register_create_and_live_lifecycle():
     events = api.get(f"/runs/{run['runId']}/events").text
     assert "Authenticated model response received" in events
     assert "Run succeeded" in events
+    evidence = api.get(f"/runs/{run['runId']}/evidence").json()
+    model_event = next(event for event in evidence if event.get("evidenceType") == "model_response")
+    model_evidence = model_event["evidence"]
+    assert model_evidence["runId"] == run["runId"]
+    assert model_evidence["environmentId"] == "neutral"
+    assert model_evidence["responseId"] == "resp-test-1"
+    assert model_evidence["planner"]["corePlannerHash"] == run["skillBundleRef"]["sha256"]
+    assert model_evidence["imageDigest"] == "image-unpinned"
+
+
+def test_model_token_default_is_shared_and_practical():
+    api = client()
+    assert api.get("/run-options").json()["budgetDefaults"]["modelTokens"] == DEFAULT_MODEL_TOKENS == 20_000
+
+
+def test_durable_launch_retry_does_not_reinvoke_model(tmp_path):
+    calls = 0
+
+    class RuntimeInvocation:
+        text = "done"
+        provider = "openai-codex"
+        model = "openai-codex/gpt-5.6-luna"
+        response_id = "durable-response"
+        usage = {"inputTokens": 1, "outputTokens": 1}
+
+    def runtime_runner(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return RuntimeInvocation()
+
+    app = create_runtime_app(model_runner=runtime_runner, evaluator=lambda **_kwargs: {"passed": True}, data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").status_code == 200
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "durable-retry"}).json()
+    assert api.post(f"/runs/{run['runId']}/launch").status_code == 202
+    retry = api.post(f"/runs/{run['runId']}/launch")
+    assert retry.status_code == 202
+    assert retry.json() == {"runId": run["runId"], "status": "succeeded"}
+    assert calls == 1
+    assert api.get(f"/runs/{run['runId']}").json()["status"] == "succeeded"
+
+
+def test_durable_cancelled_run_cannot_be_reopened(tmp_path):
+    calls = 0
+
+    class RuntimeInvocation:
+        text = "done"
+        provider = "openai-codex"
+        model = "openai-codex/gpt-5.6-luna"
+        response_id = "cancelled-response"
+        usage = {"inputTokens": 1, "outputTokens": 1}
+
+    def runtime_runner(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return RuntimeInvocation()
+
+    app = create_runtime_app(model_runner=runtime_runner, evaluator=lambda **_kwargs: {"passed": True}, data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "durable-cancel"}).json()
+    assert api.post(f"/runs/{run['runId']}/cancel").json()["status"] == "cancelled"
+    retry = api.post(f"/runs/{run['runId']}/launch")
+    assert retry.json() == {"runId": run["runId"], "status": "cancelled"}
+    assert calls == 0
+
+
+def test_durable_restart_does_not_reopen_claimed_run(tmp_path):
+    first_app = create_runtime_app(data_dir=tmp_path)
+    first_api = TestClient(first_app, base_url="http://127.0.0.1")
+    first_api.get("/session/bootstrap")
+    task = first_api.get("/environments/finance/tasks").json()[0]
+    run = first_api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "durable-restart"}).json()
+    claimed, _ = first_app.state.controller.claim_run(run["runId"])
+    assert claimed is True
+
+    calls = 0
+
+    class RuntimeInvocation:
+        text = "done"
+        provider = "openai-codex"
+        model = "openai-codex/gpt-5.6-luna"
+        response_id = "restart-response"
+        usage = {"inputTokens": 1, "outputTokens": 1}
+
+    def runtime_runner(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return RuntimeInvocation()
+
+    restarted_app = create_runtime_app(model_runner=runtime_runner, evaluator=lambda **_kwargs: {"passed": True}, data_dir=tmp_path)
+    restarted_api = TestClient(restarted_app, base_url="http://127.0.0.1")
+    restarted_api.get("/session/bootstrap")
+    retry = restarted_api.post(f"/runs/{run['runId']}/launch")
+    assert retry.json() == {"runId": run["runId"], "status": "running"}
+    assert calls == 0
 
 
 def test_idempotency_replays_and_conflicts():

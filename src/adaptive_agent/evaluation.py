@@ -20,6 +20,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import StrEnum
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
+from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
+
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject = dict[str, JsonValue]
@@ -264,7 +266,7 @@ class TaskInput:
 
 @dataclass(frozen=True)
 class BudgetSpec:
-    model_tokens: int = 4_000
+    model_tokens: int = DEFAULT_MODEL_TOKENS
     tool_calls: int = 32
     child_runs: int = 0
     wall_time_seconds: int = 90
