@@ -232,7 +232,7 @@ class LearningRuntime:
                 task_id=run_row["task_id"] if isinstance(run_row, Mapping) else "",
                 outcome_passed=outcome_passed,
             )
-        except LearningProjectionError:
+        except (LearningProjectionError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             # If the raw broker source was compacted, continue with a
             # previously persisted and validated projection.  Without one,
             # the unified evidence seam below reports the missing dependency.
