@@ -3,11 +3,63 @@ import unittest
 from pathlib import Path
 
 from adaptive_agent.benchmark import ResumableEvaluationDriver
-from adaptive_agent.evaluation import EvaluationError, EvaluationProtocol, ModelProvenance, Partition, RunObservation, build_environment_packages
+from adaptive_agent.evaluation import Arm, EvaluationError, EvaluationProtocol, ModelProvenance, Partition, RunObservation, build_environment_packages
+from adaptive_agent.evaluation_store import SQLiteAllocationStore
 from adaptive_agent.store import Store
 
 
 class BenchmarkDriverTests(unittest.TestCase):
+    def test_live_owner_cannot_be_stolen_by_another_driver(self):
+        packages = build_environment_packages()
+        protocol = EvaluationProtocol()
+        protocol.freeze(packages)
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            driver_a = ResumableEvaluationDriver(store, protocol, packages, lambda *_: None, object())
+            driver_b = ResumableEvaluationDriver(store, protocol, packages, lambda *_: None, object())
+            task = packages["finance"].tasks_for_partition(Partition.DEVELOPMENT)[0]
+            self.assertTrue(driver_a._claim("live-owner", task, Arm.B0, 0))
+            self.assertFalse(driver_b._claim("live-owner", task, Arm.B0, 0))
+
+    def test_allocation_gap_recovers_original_panel_and_persists_plan(self):
+        packages = build_environment_packages()
+        protocol = EvaluationProtocol()
+        protocol.freeze(packages)
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            class TrustedSmokeEvidence:
+                durable = True
+                def verify(self, observation, frozen, package):
+                    return True
+            def execute(task, frozen_config, bundle):
+                if task.partition is Partition.DEVELOPMENT:
+                    return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+                raise RuntimeError("validation unavailable")
+            smoke = ResumableEvaluationDriver(store, protocol, packages, execute, object(), evidence_store=TrustedSmokeEvidence())
+            smoke.run("gap", Partition.DEVELOPMENT)
+            base = SQLiteAllocationStore(store)
+            class CrashAfterAllocation:
+                def __init__(self):
+                    self.crashed = False
+                def reserve_next(self, *args):
+                    index = base.reserve_next(*args)
+                    if not self.crashed:
+                        self.crashed = True
+                        raise KeyboardInterrupt("crash after allocation")
+                    return index
+                def get(self, allocation_id):
+                    return base.get(allocation_id)
+            crashing = ResumableEvaluationDriver(store, protocol, packages, execute, object(), allocation_store=CrashAfterAllocation(), evidence_store=TrustedSmokeEvidence())
+            with self.assertRaises(KeyboardInterrupt):
+                crashing.run("gap", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
+            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, object(), evidence_store=TrustedSmokeEvidence())
+            result = resumed.run("gap", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
+            self.assertTrue(result.failed)
+            with store.connect() as conn:
+                plan = conn.execute("SELECT panel_json FROM benchmark_plans WHERE benchmark_id = 'gap' AND partition = 'validation'").fetchone()
+            self.assertIsNotNone(plan)
+            self.assertEqual(len(__import__("json").loads(plan["panel_json"])), 60)
+
     def test_failed_runtime_is_persisted_and_panel_resumes_without_reselection(self):
         packages = build_environment_packages()
         protocol = EvaluationProtocol()
