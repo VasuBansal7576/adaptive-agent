@@ -167,6 +167,13 @@ class Store:
                     metadata_json TEXT NOT NULL,
                     checked_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS learning_records (
+                    record_id TEXT PRIMARY KEY,
+                    environment_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             conn.commit()
@@ -515,8 +522,38 @@ class Store:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def list_learning_records(self, *, environment_id: str, run_id: str) -> list[dict[str, Any]]:
-        """Return the narrow, provenance-checked projection exposed to learning."""
+    def save_learning_record(self, record_id: str, environment_id: str, run_id: str, record_json: str) -> None:
+        """Persist one immutable learner projection for restart-safe learning."""
+        if not all(isinstance(value, str) and value for value in (record_id, environment_id, run_id, record_json)):
+            raise ValueError("learning record fields must be non-empty strings")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO learning_records (record_id, environment_id, run_id, record_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (record_id, environment_id, run_id, record_json, _utcnow()),
+            )
+            conn.commit()
+
+    def list_learning_records(self, environment_id: str | None = None, run_id: str | None = None) -> list[dict[str, Any]]:
+        """Read the narrow, persisted projection exposed to learning."""
+        with self._connect() as conn:
+            query = "SELECT * FROM learning_records WHERE 1=1"
+            params: list[Any] = []
+            if environment_id is not None:
+                query += " AND environment_id = ?"
+                params.append(environment_id)
+            if run_id is not None:
+                query += " AND run_id = ?"
+                params.append(run_id)
+            query += " ORDER BY created_at, record_id"
+            rows = conn.execute(query, params).fetchall()
+        if rows:
+            return [dict(row) for row in rows]
+
+        # Older stores predate the materialized projection. Reconstruct it
+        # only when no persisted rows exist, preserving the existing safety
+        # checks and allowing those stores to migrate on the next launch.
+        if environment_id is None or run_id is None:
+            return []
         records: list[dict[str, Any]] = []
         environment = self.get_environment(environment_id)
         if environment:
