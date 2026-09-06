@@ -793,7 +793,17 @@ class Store:
         query += " ORDER BY created_at"
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-            return [dict(r) for r in rows]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            row = dict(r)
+            try:
+                decoded = json.loads(row.get("record_json") or "{}")
+                if isinstance(decoded, dict):
+                    row.update(decoded)  # record fields queryable alongside record_json
+            except (TypeError, json.JSONDecodeError):
+                pass
+            out.append(row)
+        return out
 
     # ------------------------------------------------------------------ generic helpers
     def _insert_json(self, table: str, id_col: str, obj_id: str, data: dict[str, Any]) -> None:

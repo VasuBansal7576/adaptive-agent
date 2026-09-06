@@ -474,8 +474,15 @@ class TestControllerSeam:
         store.save_learning_record("lr-1", ENV, "run-a", '{"skill":"s1"}')
         store.save_learning_record("lr-2", ENV, "run-b", '{"skill":"s2"}')
         store.save_learning_record("lr-3", "other-env", "run-a", '{"skill":"s3"}')
-        assert [r["record_id"] for r in store.list_learning_records(ENV)] == ["lr-1", "lr-2"]
+        rows = store.list_learning_records(ENV)
+        assert [r["record_id"] for r in rows] == ["lr-1", "lr-2"]
         assert [r["record_id"] for r in store.list_learning_records(ENV, "run-b")] == ["lr-2"]
+        # record_json fields are decoded into the row so restart-reuse paths
+        # can query kind/sourceId/trustClass directly.
+        assert rows[0]["skill"] == "s1"
+        store.save_learning_record("lr-4", ENV, "run-c", json.dumps({"kind": "live_evidence", "sourceId": "broker:ev-1", "trustedOutcome": True}))
+        reused = [r for r in store.list_learning_records(ENV) if r.get("kind") == "live_evidence"]
+        assert reused and reused[0]["sourceId"] == "broker:ev-1" and reused[0]["trustedOutcome"] is True
         assert store.list_learning_records(run_id="run-a") == [
             r for r in store.list_learning_records() if r["run_id"] == "run-a"
         ]
