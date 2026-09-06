@@ -162,6 +162,34 @@ describe("run-options and registered tasks in the new-run dialog", () => {
     expect(within(within(dialog).getByLabelText("Mode")).getAllByRole("option")).toHaveLength(1);
   });
 
+  it("parses the REAL durable candidate projection (hashes + edit operations)", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const realShape = [
+      {
+        candidateId: "cand_405ac49df3c845f8be97490490a41350",
+        baseBundleHash: "2647d69d89ff03689c5427b675472699ec144d842a58a726ca5d8b59074f74cc",
+        candidateBundleHash: "60d7e19903203cdc430847fc2fae6224539c038bd78a4894db4f6de583f63ced",
+        editOperations: [
+          '{"operation":"add","path":"skills/reconcile-invoice-payment/procedure","value":"For an invoice-payment reconciliation task, read the named invoice and payment records first."}',
+        ],
+        changedArtifactHashes: ["5a92230eab60bf54c2a832424ce9ac7c3e8fc6c53fe52e6153c0cf9dc0ec1f29"],
+        supportingEvidenceIds: ["broker:ev_2efcf195b4ab49519a4970c604d043bf"],
+        predictedEffect: "Improve reconciliation by reading both records first.",
+        proposerVersion: "1",
+        state: "evaluating",
+      },
+    ];
+    const transport: ConsoleTransport = { ...sim, listCandidates: async () => realShape as never };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    expect(await screen.findByText("cand_405ac49df3c845f8be97490490a41350")).toBeInTheDocument();
+    expect(await screen.findByText("Evaluating")).toBeInTheDocument();
+    expect(await screen.findByText(/2647d69d89ff0368/)).toBeInTheDocument();
+    expect(await screen.findByText(/broker:ev_2efcf195/)).toBeInTheDocument();
+    expect(await screen.findByText(/read the named invoice and payment records first/)).toBeInTheDocument();
+  });
+
   it("accepts the top-level budgetRef from /run-options (01f2462 shape)", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });

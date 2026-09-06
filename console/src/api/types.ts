@@ -103,11 +103,19 @@ export type SkillVersionSummary = {
 
 export type CandidateDiff = {
   candidateId: string;
-  baseBundleRef: ArtifactRef;
-  candidateBundleRef: ArtifactRef;
+  /** plane projection: artifact refs + unified diff */
+  baseBundleRef?: ArtifactRef;
+  candidateBundleRef?: ArtifactRef;
+  /** durable projection: authoritative hashes + edit operations */
+  baseBundleHash?: string;
+  candidateBundleHash?: string;
+  editOperations?: string[];
+  changedArtifactHashes?: string[];
+  supportingEvidenceIds?: string[];
+  proposerVersion?: string;
   state: "draft" | "validated" | "evaluating" | "promoted" | "rejected" | "quarantined" | "superseded" | "rolled_back";
-  /** unified diff text; rendered as escaped preformatted text */
-  diff: string;
+  /** plane projection: unified diff text; rendered as escaped preformatted text */
+  diff?: string;
   predictedEffect: string;
   /** present only when a trusted evaluation exists; never conflated with prediction */
   measured?: {

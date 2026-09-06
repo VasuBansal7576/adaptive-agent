@@ -327,11 +327,7 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
     launchLearningCycle: async (input: LearningCycleInput) => {
       const action = (await json("/learning/launch", {
         method: "POST",
-        body: JSON.stringify({
-          runId: input.runId,
-          predictedEffect: input.predictedEffect,
-          evidenceIds: input.evidenceIds,
-        }),
+        body: JSON.stringify({ runId: input.runId }),
       })) as Record<string, unknown>;
       const actionId = typeof action.actionId === "string" ? action.actionId : "";
       const status = typeof action.status === "string" ? action.status : "staged";

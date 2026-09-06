@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { createSimulationTransport } from "../api/simulation";
 import type { ConsoleTransport } from "../api/transport";
+// eslint-disable-next-line @typescript-eslint/no-var-requires
 
 beforeEach(() => {
   vi.stubGlobal("EventSource", undefined);
@@ -83,6 +84,36 @@ describe("qa regressions: createRun recovery and honesty", () => {
     await user.click(within(dialog).getByRole("button", { name: "Create run" }));
     await waitFor(() => expect(sent.length).toBe(1));
     expect(sent[0].budget?.modelTokens).toBe(7777);
+  });
+
+  it("opens the learning-cycle dialog from the empty-candidates state (regression)", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const transport: ConsoleTransport = { ...sim, listCandidates: async () => [] };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    // the empty state previously returned before mounting the modal, so the
+    // button did nothing
+    await user.click(await screen.findByRole("button", { name: "Run learning cycle" }));
+    expect(await screen.findByRole("dialog", { name: "Run learning cycle" })).toBeInTheDocument();
+  });
+
+  it("distinguishes contract errors from the empty state", async () => {
+    const { SchemaError, parseCandidates } = await import("../api/validate");
+    expect(() => parseCandidates([{ candidateId: "c" }])).toThrow(SchemaError); // missing projection
+    expect(() =>
+      parseCandidates([
+        {
+          candidateId: "c",
+          state: "validated",
+          predictedEffect: "p",
+          baseBundleHash: "h",
+          editOperations: [],
+          changedArtifactHashes: [],
+          supportingEvidenceIds: [],
+        },
+      ]),
+    ).not.toThrow();
   });
 
   it("resets the token budget to the advertised default after success, never a hardcoded literal", async () => {

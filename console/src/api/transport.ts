@@ -76,10 +76,11 @@ export type CreateRunInput = {
   executionMode: "dry_run" | "interactive" | "batch" | "replay";
 };
 
+/** runId-only request: the durable learning pipeline generates the proposal
+ *  and evidence from the run's development attempts; the operator never
+ *  supplies predicted effects or evidence ids (the runtime ignores them). */
 export type LearningCycleInput = {
   runId: string;
-  predictedEffect: string;
-  evidenceIds: string[];
 };
 
 /**

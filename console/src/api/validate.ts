@@ -305,32 +305,54 @@ export function parseSkills(value: unknown): SkillVersionSummary[] {
 const CANDIDATE_STATES = ["draft", "validated", "evaluating", "promoted", "rejected", "quarantined", "superseded", "rolled_back"] as const;
 const GATE_DECISIONS = ["promoted", "rejected", "quarantined"] as const;
 
+/**
+ * Both candidate projections are accepted and validated:
+ * - plane: {baseBundleRef, candidateBundleRef, diff, ...}
+ * - durable: {baseBundleHash, candidateBundleHash, editOperations,
+ *   changedArtifactHashes, supportingEvidenceIds, proposerVersion, ...}
+ * Unknown/missing required fields raise SchemaError instead of silently
+ * hiding real candidates behind an empty state.
+ */
 export function parseCandidates(value: unknown): CandidateDiff[] {
   return arr(value, "candidates").map((item, i) => {
     const o = obj(item, `candidates[${i}]`);
-    const cand: CandidateDiff = {
-      candidateId: str(o.candidateId, `candidates[${i}].candidateId`),
-      baseBundleRef: parseArtifactRef(o.baseBundleRef, `candidates[${i}].baseBundleRef`),
-      candidateBundleRef: parseArtifactRef(o.candidateBundleRef, `candidates[${i}].candidateBundleRef`),
-      state: oneOf(o.state, CANDIDATE_STATES, `candidates[${i}].state`),
-      diff: str(o.diff, `candidates[${i}].diff`),
-      predictedEffect: str(o.predictedEffect, `candidates[${i}].predictedEffect`),
-    };
+    const field = `candidates[${i}]`;
+    const candidateId = str(o.candidateId, `${field}.candidateId`);
+    const state = oneOf(o.state, CANDIDATE_STATES, `${field}.state`);
+    const predictedEffect = str(o.predictedEffect ?? "", `${field}.predictedEffect`);
+    const cand: CandidateDiff = { candidateId, state, predictedEffect };
+    if (o.baseBundleRef !== undefined) {
+      cand.baseBundleRef = parseArtifactRef(o.baseBundleRef, `${field}.baseBundleRef`);
+      cand.candidateBundleRef = parseArtifactRef(o.candidateBundleRef, `${field}.candidateBundleRef`);
+      cand.diff = str(o.diff, `${field}.diff`);
+    } else if (typeof o.baseBundleHash === "string") {
+      // durable projection
+      cand.baseBundleHash = str(o.baseBundleHash, `${field}.baseBundleHash`);
+      if (o.candidateBundleHash !== undefined && o.candidateBundleHash !== null) {
+        cand.candidateBundleHash = str(o.candidateBundleHash, `${field}.candidateBundleHash`);
+      }
+      cand.editOperations = arr(o.editOperations, `${field}.editOperations`).map((op, j) => str(op, `${field}.editOperations[${j}]`));
+      cand.changedArtifactHashes = arr(o.changedArtifactHashes, `${field}.changedArtifactHashes`).map((h) => str(h, `${field}.changedArtifactHashes[]`));
+      cand.supportingEvidenceIds = arr(o.supportingEvidenceIds, `${field}.supportingEvidenceIds`).map((e) => str(e, `${field}.supportingEvidenceIds[]`));
+      if (o.proposerVersion !== undefined) cand.proposerVersion = str(o.proposerVersion, `${field}.proposerVersion`);
+    } else {
+      throw new SchemaError(`${field}.projection`);
+    }
     if (o.measured !== undefined) {
-      const m = obj(o.measured, `candidates[${i}].measured`);
+      const m = obj(o.measured, `${field}.measured`);
       cand.measured = {
-        accuracyGainPp: num(m.accuracyGainPp, `candidates[${i}].measured.accuracyGainPp`),
-        reliabilityDelta: num(m.reliabilityDelta, `candidates[${i}].measured.reliabilityDelta`),
-        costRatio: num(m.costRatio, `candidates[${i}].measured.costRatio`),
-        p95LatencyRatio: num(m.p95LatencyRatio, `candidates[${i}].measured.p95LatencyRatio`),
-        gateDecision: oneOf(m.gateDecision, GATE_DECISIONS, `candidates[${i}].measured.gateDecision`),
-        gateReasons: arr(m.gateReasons, `candidates[${i}].measured.gateReasons`).map((r) => str(r, "gateReasons[]")),
-        evaluationRef: parseArtifactRef(m.evaluationRef, `candidates[${i}].measured.evaluationRef`),
+        accuracyGainPp: num(m.accuracyGainPp, `${field}.measured.accuracyGainPp`),
+        reliabilityDelta: num(m.reliabilityDelta, `${field}.measured.reliabilityDelta`),
+        costRatio: num(m.costRatio, `${field}.measured.costRatio`),
+        p95LatencyRatio: num(m.p95LatencyRatio, `${field}.measured.p95LatencyRatio`),
+        gateDecision: oneOf(m.gateDecision, GATE_DECISIONS, `${field}.measured.gateDecision`),
+        gateReasons: arr(m.gateReasons, `${field}.measured.gateReasons`).map((r) => str(r, "gateReasons[]")),
+        evaluationRef: parseArtifactRef(m.evaluationRef, `${field}.measured.evaluationRef`),
       };
     }
     if (o.audit !== undefined) {
-      cand.audit = arr(o.audit, `candidates[${i}].audit`).map((entry, j) => {
-        const a = obj(entry, `candidates[${i}].audit[${j}]`);
+      cand.audit = arr(o.audit, `${field}.audit`).map((entry, j) => {
+        const a = obj(entry, `${field}.audit[${j}]`);
         return {
           rollbackId: str(a.rollbackId, "rollbackId"),
           fromRef: parseArtifactRef(a.fromRef, "fromRef"),

@@ -49,6 +49,7 @@ export type ConsoleAction =
   | { type: "runAdded"; run: RunRecord }
   | { type: "environmentAdded"; environment: EnvironmentPackageSummary }
   | { type: "candidateAdded"; candidate: CandidateDiff }
+  | { type: "candidatesRefreshed"; candidates: CandidateDiff[] }
   | { type: "actionError"; message: string; correlationId?: string | null; mayHaveCommitted?: boolean }
   | { type: "actionErrorCleared" };
 
@@ -171,6 +172,8 @@ export function reducer(state: ConsoleState, action: ConsoleAction): ConsoleStat
         candidates: [action.candidate, ...state.candidates.filter((c) => c.candidateId !== action.candidate.candidateId)],
         actionError: null,
       };
+    case "candidatesRefreshed":
+      return { ...state, candidates: action.candidates };
     case "actionError":
       return {
         ...state,

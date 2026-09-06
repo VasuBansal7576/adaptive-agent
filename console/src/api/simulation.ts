@@ -369,6 +369,8 @@ export function createSimulationTransport(options?: {
     },
 
     async launchLearningCycle(input: LearningCycleInput) {
+      // fixture: the durable pipeline generates proposal + evidence from the
+      // completed development run
       const actionId = `learn-sim-${(learningActionCount += 1).toString().padStart(3, "0")}`;
       return { actionId, runId: input.runId, status: "staged" as const };
     },
