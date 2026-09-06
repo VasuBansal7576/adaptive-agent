@@ -264,7 +264,7 @@ class TaskInput:
 
 @dataclass(frozen=True)
 class BudgetSpec:
-    model_tokens: int = 4_000
+    model_tokens: int = 20_000
     tool_calls: int = 32
     child_runs: int = 0
     wall_time_seconds: int = 90
@@ -977,9 +977,12 @@ class EvaluationProtocol:
         return (len(self.known_environments) + 1) * self.tasks_per_environment * len(self.seeds) * 3
 
     def workload(self, candidate_count: int = 1, *, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0) -> WorkloadPlan:
-        if candidate_count < 0:
-            raise EvaluationError("candidate_count cannot be negative")
-        return WorkloadPlan(candidate_count, self.validation_run_count, self.final_run_count, training_runs if training_runs is not None else len(self.known_environments) * self.tasks_per_environment, transfer_runs, safety_runs, retries)
+        training = training_runs if training_runs is not None else len(self.known_environments) * self.tasks_per_environment
+        if not 0 <= candidate_count <= self.validation_candidate_limit:
+            raise EvaluationError(f"candidate_count must be between 0 and {self.validation_candidate_limit}")
+        if min(training, transfer_runs, safety_runs, retries) < 0:
+            raise EvaluationError("workload counts cannot be negative")
+        return WorkloadPlan(candidate_count, self.validation_run_count, self.final_run_count, training, transfer_runs, safety_runs, retries)
 
     def freeze(self, packages: Mapping[str, EnvironmentPackage]) -> "FrozenProtocol":
         if self._frozen is not None:
@@ -1193,6 +1196,11 @@ class EvaluationReport:
     safety_case_results: Mapping[str, bool] = field(default_factory=dict)
     safety_probe_outputs: Mapping[str, JsonObject] = field(default_factory=dict)
     attestation_ledger: TrustedAttestationLedger | None = field(default=None, repr=False, compare=False)
+    actual_input_tokens: int = 0
+    actual_output_tokens: int = 0
+    nominal_cost_usd: float | None = None
+    wall_duration_seconds: float = 0.0
+    billing_basis: str = "SDK nominal usage cost; subscription billing not measured"
 
     @property
     def promotion_eligible(self) -> bool:
@@ -1217,7 +1225,7 @@ class EvaluationReport:
         return self
 
     def to_dict(self) -> JsonObject:
-        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "safetyProbeOutputs": _jsonable(self.safety_probe_outputs), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit)}
+        return {"comparison": self.comparison, "validityStatus": self.validity_status, "promotionEligible": self.promotion_eligible, "candidateHash": self.candidate_hash, "baseHash": self.base_hash, "protocolHash": self.protocol_hash, "partitionHashes": dict(self.partition_hashes), "armSummaries": {key: value.to_dict() for key, value in self.arm_summaries.items()}, "confidenceIntervals": [value.to_dict() for value in self.confidence_intervals], "safetyPassed": self.safety_passed, "safetyCaseResults": dict(self.safety_case_results), "safetyProbeOutputs": _jsonable(self.safety_probe_outputs), "missingPairs": self.missing_pairs, "partitionLeak": self.partition_leak, "invalidFixtureResets": self.invalid_fixture_resets, "infrastructureFailures": list(self.infrastructure_failures), "evaluatorRefs": list(self.evaluator_refs), "environmentCells": _jsonable(self.environment_cells), "metricCellsComplete": self.metric_cells_complete, "safetyCellsComplete": self.safety_cells_complete, "modelProvenanceComplete": self.model_provenance_complete, "attestation": self.attestation, "exposure": [_jsonable(value) for value in self.exposure], "workload": self.workload.to_dict(), "analysisSeed": self.analysis_seed, "ablationAudit": _jsonable(self.ablation_audit), "actualInputTokens": self.actual_input_tokens, "actualOutputTokens": self.actual_output_tokens, "nominalCostUsd": self.nominal_cost_usd, "wallDurationSeconds": self.wall_duration_seconds, "billingBasis": self.billing_basis}
 
 
 Executor = Callable[[Arm, EnvironmentPackage, TaskInput, int], RunObservation]

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import importlib
-from dataclasses import dataclass
+import json
+import time
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from adaptive_agent.benchmark import FrozenExecutionConfig, ResumableEvaluationDriver, TrustedTaskExecutor
@@ -36,6 +38,7 @@ class EvaluationJobResult:
     report: EvaluationReport | dict[str, Any] | None
     decision: object | None = None
     error: str | None = None
+    runtime_accounting: dict[str, Any] | None = None
 
 
 class EvaluationJob:
@@ -51,6 +54,7 @@ class EvaluationJob:
         execute: TrustedTaskExecutor,
         *,
         total_budget_microunits: int | None = None,
+        max_total_attempts: int | None = None,
     ) -> None:
         self.store = store
         self.controller = controller
@@ -59,35 +63,48 @@ class EvaluationJob:
         self.arm_bundles = dict(arm_bundles)
         self.execute = execute
         self.total_budget_microunits = total_budget_microunits
+        if max_total_attempts is not None and max_total_attempts < 0:
+            raise EvaluationError("max_total_attempts cannot be negative")
+        self.max_total_attempts = max_total_attempts
         with store.connect() as conn:
             conn.execute(
-                "CREATE TABLE IF NOT EXISTS evaluation_jobs (job_id TEXT PRIMARY KEY, comparison TEXT NOT NULL, status TEXT NOT NULL, report_ref TEXT, error TEXT, updated_at TEXT NOT NULL)"
+                "CREATE TABLE IF NOT EXISTS evaluation_jobs (job_id TEXT PRIMARY KEY, comparison TEXT NOT NULL, status TEXT NOT NULL, report_ref TEXT, error TEXT, runtime_accounting_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL)"
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(evaluation_jobs)")}
+            if "runtime_accounting_json" not in columns:
+                conn.execute("ALTER TABLE evaluation_jobs ADD COLUMN runtime_accounting_json TEXT NOT NULL DEFAULT '{}'")
             conn.commit()
 
-    def _preflight(self, comparison: str) -> None:
+    def planned_workload(self, candidate_count: int = 1, *, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0):
+        return self.protocol.workload(candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)
+
+    def _preflight(self, comparison: str, workload) -> None:
         if comparison not in {"validation", "final"}:
             raise EvaluationError("comparison must be validation or final")
         required = (Arm.B0, Arm.L) if comparison == "validation" else (Arm.B0, Arm.L, Arm.A)
         missing = [arm.value for arm in required if arm not in self.arm_bundles and arm.value not in self.arm_bundles]
         if missing:
             raise EvaluationError(f"missing expected arm bundles before evaluation: {', '.join(missing)}")
-        expected = self.protocol.validation_run_count if comparison == "validation" else self.protocol.final_run_count
+        if workload.validation_per_candidate != self.protocol.validation_run_count or workload.final_runs != self.protocol.final_run_count:
+            raise EvaluationError("workload panel counts do not match the frozen protocol")
+        if self.max_total_attempts is not None and workload.total_attempted_runs > self.max_total_attempts:
+            raise EvaluationError("overall evaluation workload exhausted")
         if self.total_budget_microunits is not None:
             if self.total_budget_microunits < 0:
                 raise EvaluationError("total budget cannot be negative")
-            required_cost = expected * self.protocol.run_budget.cost_microunits
+            required_cost = workload.total_attempted_runs * self.protocol.run_budget.cost_microunits
             if required_cost > self.total_budget_microunits:
                 raise EvaluationError("evaluation budget cannot cover the immutable panel")
 
-    def _save(self, job_id: str, comparison: str, status: str, report: EvaluationReport | None = None, error: str | None = None) -> None:
+    def _save(self, job_id: str, comparison: str, status: str, report: EvaluationReport | None = None, error: str | None = None, runtime_accounting: Mapping[str, Any] | None = None) -> None:
         report_ref = None
         if report is not None:
             report_ref = self.store.put_artifact(report.to_dict()).sha256
+        accounting_json = json.dumps(dict(runtime_accounting or {}), sort_keys=True)
         with self.store.connect() as conn:
             conn.execute(
-                "INSERT INTO evaluation_jobs(job_id, comparison, status, report_ref, error, updated_at) VALUES (?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(job_id) DO UPDATE SET comparison=excluded.comparison, status=excluded.status, report_ref=excluded.report_ref, error=excluded.error, updated_at=excluded.updated_at",
-                (job_id, comparison, status, report_ref, error),
+                "INSERT INTO evaluation_jobs(job_id, comparison, status, report_ref, error, runtime_accounting_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(job_id) DO UPDATE SET comparison=excluded.comparison, status=excluded.status, report_ref=excluded.report_ref, error=excluded.error, runtime_accounting_json=excluded.runtime_accounting_json, updated_at=excluded.updated_at",
+                (job_id, comparison, status, report_ref, error, accounting_json),
             )
             conn.commit()
 
@@ -101,10 +118,12 @@ class EvaluationJob:
             payload = self.store.get_artifact(row["report_ref"])
             if isinstance(payload, dict):
                 report = payload  # serialized readback is intentionally opaque
-        return EvaluationJobResult(job_id, row["comparison"], row["status"], report, error=row["error"])
+        accounting = json.loads(row["runtime_accounting_json"] or "{}") if "runtime_accounting_json" in row.keys() else {}
+        return EvaluationJobResult(job_id, row["comparison"], row["status"], report, error=row["error"], runtime_accounting=accounting)
 
-    def run(self, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None) -> EvaluationJobResult:
-        self._preflight(comparison)
+    def run(self, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None, candidate_count: int = 1, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0) -> EvaluationJobResult:
+        workload = self.planned_workload(candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)
+        self._preflight(comparison, workload)
         if comparison == "final" and ablation is None:
             raise EvaluationError("final evaluation requires pinned ablation input")
         frozen = self.protocol.start_candidate_generation()
@@ -119,6 +138,8 @@ class EvaluationJob:
             arm_bundles=self.arm_bundles,
         )
         report: EvaluationReport | None = None
+        observations: tuple[RunObservation, ...] = ()
+        started = time.monotonic()
         try:
             summary = driver.run(job_id, Partition.VALIDATION if comparison == "validation" else Partition.FINAL, base_hash=base_hash, candidate_hash=candidate_hash)
             observations = tuple(item.observation for item in summary.statuses if item.observation is not None)
@@ -131,16 +152,56 @@ class EvaluationJob:
                 expected_partitions=frozen.partition_hashes,
                 ablation_audit=None if comparison == "validation" else __import__("adaptive_agent.evaluation", fromlist=["audit_ablation"]).audit_ablation(ablation) if ablation is not None else None,
             )
+            accounting = self._runtime_accounting(observations, time.monotonic() - started)
+            report = replace(
+                report,
+                actual_input_tokens=accounting["inputTokens"],
+                actual_output_tokens=accounting["outputTokens"],
+                nominal_cost_usd=accounting["nominalCostUsd"],
+                wall_duration_seconds=accounting["wallDurationSeconds"],
+                billing_basis=accounting["billingBasis"],
+            )
             if summary.complete and report.validity_status == "valid" and report.promotion_eligible and candidate_id is not None:
                 report.require_promotion_evidence(self.protocol, self.packages)
                 decision = self.controller.candidates.promote(candidate_id, report)
-                self._save(job_id, comparison, "decided", report)
-                return EvaluationJobResult(job_id, comparison, "decided", report, decision)
-            self._save(job_id, comparison, "complete" if report.validity_status == "valid" else "incomplete", report)
-            return EvaluationJobResult(job_id, comparison, "complete" if report.validity_status == "valid" else "incomplete", report)
+                self._save(job_id, comparison, "decided", report, runtime_accounting=accounting)
+                return EvaluationJobResult(job_id, comparison, "decided", report, decision, runtime_accounting=accounting)
+            status = "complete" if report.validity_status == "valid" else "incomplete"
+            self._save(job_id, comparison, status, report, runtime_accounting=accounting)
+            return EvaluationJobResult(job_id, comparison, status, report, runtime_accounting=accounting)
         except Exception as exc:
-            self._save(job_id, comparison, "failed", report=report, error=str(exc))
-            return EvaluationJobResult(job_id, comparison, "failed", report, error=str(exc))
+            accounting = self._runtime_accounting(observations, time.monotonic() - started)
+            self._save(job_id, comparison, "failed", report=report, error=str(exc), runtime_accounting=accounting)
+            return EvaluationJobResult(job_id, comparison, "failed", report, error=str(exc), runtime_accounting=accounting)
+
+    def _runtime_accounting(self, observations: tuple[RunObservation, ...], wall_seconds: float) -> dict[str, Any]:
+        input_tokens = output_tokens = 0
+        nominal_cost = 0.0
+        nominal_seen = False
+        for observation in observations:
+            if not observation.accounting_ref:
+                continue
+            accounting = self.store.get_artifact(observation.accounting_ref)
+            usage = accounting.get("usage", {}) if isinstance(accounting, dict) else {}
+            input_tokens += int(usage.get("inputTokens", 0) or 0)
+            output_tokens += int(usage.get("outputTokens", 0) or 0)
+            evidence = self.store.get_evidence(observation.evidence_ref) if observation.evidence_ref else None
+            if not evidence:
+                continue
+            try:
+                source = json.loads(evidence["source_ref"])
+                response = self.store.get_artifact(source["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                response = None
+            if isinstance(response, dict):
+                value = response.get("nominalCostUsd")
+                usage_cost = response.get("usage", {}).get("cost", {}) if isinstance(response.get("usage"), dict) else {}
+                if value is None and isinstance(usage_cost, dict):
+                    value = usage_cost.get("total")
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    nominal_cost += float(value)
+                    nominal_seen = True
+        return {"inputTokens": input_tokens, "outputTokens": output_tokens, "totalTokens": input_tokens + output_tokens, "nominalCostUsd": nominal_cost if nominal_seen else None, "wallDurationSeconds": wall_seconds, "billingBasis": "SDK nominal usage cost; subscription billing is separate and unmeasured"}
 
     def run_development_smoke(self, job_id: str):
         """Run the one-task trusted development receipt used by held-out gates."""
@@ -156,13 +217,13 @@ class EvaluationJob:
         return driver.run_development_smoke(job_id)
 
 
-def build_evaluation_job(store: Store, controller: Controller, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], arm_bundles: Mapping[Arm | str, object], execute: TrustedTaskExecutor, *, total_budget_microunits: int | None = None) -> EvaluationJob:
+def build_evaluation_job(store: Store, controller: Controller, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], arm_bundles: Mapping[Arm | str, object], execute: TrustedTaskExecutor, *, total_budget_microunits: int | None = None, max_total_attempts: int | None = None) -> EvaluationJob:
     """Concrete factory binding the trusted executor to the production job."""
-    return EvaluationJob(store, controller, protocol, packages, arm_bundles, execute, total_budget_microunits=total_budget_microunits)
+    return EvaluationJob(store, controller, protocol, packages, arm_bundles, execute, total_budget_microunits=total_budget_microunits, max_total_attempts=max_total_attempts)
 
 
-def run_evaluation_job(job: EvaluationJob, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None) -> EvaluationJobResult:
-    return job.run(job_id, comparison, base_hash=base_hash, candidate_hash=candidate_hash, candidate_id=candidate_id, ablation=ablation)
+def run_evaluation_job(job: EvaluationJob, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None, candidate_count: int = 1, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0) -> EvaluationJobResult:
+    return job.run(job_id, comparison, base_hash=base_hash, candidate_hash=candidate_hash, candidate_id=candidate_id, ablation=ablation, candidate_count=candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)
 
 
 def main(argv: list[str] | None = None) -> int:
