@@ -23,6 +23,8 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_SENSITIVE_KEY = re.compile(r"(?i)(?:hidden|expected|evaluator|answer[_ -]?key|approval|secret|credential|api[_-]?key|token|password|authorization)")
+
 _SECRET_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
@@ -37,7 +39,11 @@ def sanitize_for_learner(value: Any) -> Any:
             value = pattern.sub("[REDACTED]", value)
         return value
     if isinstance(value, dict):
-        return {key: sanitize_for_learner(item) for key, item in value.items()}
+        return {
+            key: sanitize_for_learner(item)
+            for key, item in value.items()
+            if not _SENSITIVE_KEY.search(str(key))
+        }
     if isinstance(value, (list, tuple)):
         return [sanitize_for_learner(item) for item in value]
     return value
