@@ -197,7 +197,13 @@ class SQLiteRunEvidenceStore:
             "schema": sha256_json(package.manifest.tool_schemas),
             "image": str(frozen.inputs["imageDigest"]),
         }
-        if accounting["versionRefs"] != {"policy": package.manifest.policy_ref.sha256, "schema": sha256_json(package.manifest.tool_schemas), "planner": str(frozen.inputs["corePlannerHash"]), "budget": sha256_json(frozen.inputs["runBudget"]), "image": str(frozen.inputs["imageDigest"])}:
+        expected_image = str(frozen.inputs["imageDigest"])
+        for payload in (response, accounting):
+            direct_image = payload.get("imageDigest")
+            if direct_image is not None and direct_image != expected_image:
+                return False
+        expected_version_refs = {"policy": package.manifest.policy_ref.sha256, "schema": sha256_json(package.manifest.tool_schemas), "planner": str(frozen.inputs["corePlannerHash"]), "budget": sha256_json(frozen.inputs["runBudget"]), "image": expected_image}
+        if accounting["versionRefs"] != expected_version_refs:
             return False
         return dict(observation.config_hashes) == expected and response.get("provider") == frozen.inputs["provider"] and response.get("modelProfile") == frozen.inputs["modelProfile"]
 
