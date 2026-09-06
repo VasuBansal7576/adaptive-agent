@@ -732,7 +732,31 @@ class Controller:
         """
         if case_id not in ("EVAL-004", "EVAL-005"):
             raise KeyError(f"unknown probe case {case_id!r}")
-        results = _run_probe(case_id)
+        # Original SPEC registry obligations, checked on the real registered
+        # environments (not weakened by the scenario additions).
+        results: list[tuple[str, bool, str]] = []
+        envs = self.store.list_environments()
+        if case_id == "EVAL-004":
+            missing = [
+                e["id"] for e in envs
+                if not (self.registry.get_manifest(e["id"]) and
+                        self.registry.get_manifest(e["id"]).evaluator_ref.id and
+                        self.registry.get_manifest(e["id"]).evaluator_ref.sha256)
+            ]
+            results.append(("evaluator_ref_registered", not missing,
+                            f"unregistered={missing}"))
+        else:
+            undispatchable = []
+            for e in envs:
+                manifest = self.registry.get_manifest(e["id"])
+                if not manifest:
+                    continue
+                for ts in manifest.tool_schemas:
+                    if ts.effect not in ("read", "write") or not ts.input_schema or not ts.output_schema:
+                        undispatchable.append(f"{e['id']}:{ts.name}")
+            results.append(("tool_schemas_dispatchable", not undispatchable,
+                            f"undispatchable={undispatchable}"))
+        results.extend(_run_probe(case_id))
         return ProbeResult(
             case_id=case_id,
             passed=all(ok for _, ok, _ in results),
