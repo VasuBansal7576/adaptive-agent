@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import os
 import re
 import time
 from collections.abc import Mapping
@@ -494,7 +495,18 @@ class Controller:
         )
         if status == "exists":
             return RunRecord.model_validate_json(row["run_json"])
-        self.append_event(run.run_id, "run_created", {"run_id": run.run_id}, "system", "learner")
+        image_digest = (
+            os.environ.get("ADAPTIVE_AGENT_IMAGE_DIGEST", "").strip()
+            or skill_bundle.execution_config.image_digest
+            or "image-unpinned"
+        )
+        self.append_event(
+            run.run_id,
+            "run_created",
+            {"run_id": run.run_id, "imageDigest": image_digest},
+            "system",
+            "learner",
+        )
         return run
 
     def get_run(self, run_id: str) -> RunRecord | None:

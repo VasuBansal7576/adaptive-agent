@@ -122,6 +122,7 @@ class ExecutionConfig(BaseModel):
     step_limit: int = 100
     child_count_limit: int = 2
     child_depth_limit: int = 1
+    image_digest: str = Field("", alias="imageDigest")
 
 
 class ToolRequest(BaseModel):

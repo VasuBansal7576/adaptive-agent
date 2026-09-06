@@ -350,6 +350,10 @@ class TestControllerSeam:
         assert ctl.get_run(r1.run_id).status.value == "queued"
         evs = ctl.events(r1.run_id)
         assert evs and evs[0]["event"] == "run_created" and evs[0]["id"] == 1
+        # Frozen image identity is pinned on the run receipt (or 'image-unpinned').
+        created = store.get_evidence(evs[0]["data"]["evidence_id"])
+        payload = store.get_artifact(ArtifactRef.model_validate_json(created["source_ref"]))
+        assert payload["imageDigest"] == "image-unpinned"
 
     def test_execute_run_dispatches_through_broker(self, store, registry, broker, provider):
         from adaptive_agent.models import Budget, ModelProfile, RunRequest
