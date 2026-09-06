@@ -709,8 +709,11 @@ class DurableRuntime:
                 request.approval_token = self.controller.broker.issue_approval(package.environment_id, run_id, capability.tool, dict(arguments), request.idempotency_key)
             result = self.controller.dispatch_tool(package.environment_id, request, durable_capability, provider, budget_remaining=budget_remaining, dry_run=run is not None and run.execution_mode == "dry_run")
             partition = self.controller.store.get_task(stored["task_id"]).get("partition") if stored and self.controller.store.get_task(stored["task_id"]) else None
-            visibility = "learner" if partition == "development" else "operator"
-            self.controller.append_event(run_id, "tool_result", result.model_dump(mode="json", by_alias=True), "broker", visibility)
+            self.controller.append_broker_result(
+                run_id,
+                result.model_dump(mode="json", by_alias=True),
+                development=partition == "development",
+            )
             # Every broker attempt consumes the shared run call budget,
             # including failed/retried calls whose receipts remain auditable.
             budget_remaining["tool_calls"] = max(0, budget_remaining["tool_calls"] - 1)

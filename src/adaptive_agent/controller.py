@@ -261,6 +261,20 @@ class Controller:
         )
         return ev
 
+    def append_broker_result(self, run_id: str, payload: dict[str, Any], *, development: bool = False) -> EvidenceRecord:
+        """Record broker fidelity and a bounded learner projection.
+
+        The operator row retains the complete broker response. DEVELOPMENT
+        runs additionally receive a learner-visible row containing only the
+        non-sensitive result envelope; fixture output and evaluator material
+        never cross this boundary.
+        """
+        operator_event = self.append_event(run_id, "tool_result", payload, "broker", "operator")
+        if development:
+            safe = {key: payload[key] for key in ("callId", "status", "effect", "toolVersion") if key in payload}
+            self.append_event(run_id, "tool_result", safe, "broker", "learner")
+        return operator_event
+
     def events(self, run_id: str, after_sequence: int = 0) -> list[dict[str, Any]]:
         """Ordered SSE-ready event payloads: [{id, event, data}]."""
         rows = [r for r in self.store.list_evidence(run_id) if r["sequence"] > after_sequence]
