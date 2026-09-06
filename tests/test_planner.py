@@ -311,8 +311,8 @@ def test_system_prompt_documents_exact_discovery_contract_for_tool_calls():
     assert "exact current-run capability ids" in prompt
     assert "exact id from environment.capabilities or discovery" in prompt
     assert "only for grant inspection or recovery" in prompt
-    assert "Never invent, construct, copy, reuse stale or foreign-run ids" in prompt
-    assert "aliases or suffix matching" in prompt
+    assert "Never invent capability IDs or reuse stale or foreign-run IDs." in prompt
+    assert "Do not rely on aliases or suffix matching" in prompt
 
 
 def test_system_prompt_deduplicates_overlapping_skills_by_full_value():
