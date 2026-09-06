@@ -127,12 +127,23 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
 
   const createRun = async (input: Parameters<ConsoleTransport["createRun"]>[0]) => {
     try {
+      // transport-level createRun includes the launch step so runs never stay queued
       const run = await transport.createRun(input);
       dispatch({ type: "runAdded", run });
-      // explicit launch step (POST /runs/{id}/launch)
-      await transport.launchRun(run.runId);
+      return true;
     } catch (error) {
-      failAction(error);
+      const message = error instanceof Error ? error.message : "Unknown create failure";
+      const correlationId = (error as { correlationId?: string } | null)?.correlationId ?? null;
+      // honest uncertainty: the POST may have been accepted before the failure
+      dispatch({
+        type: "actionError",
+        message: `Run creation did not complete: ${message}`,
+        correlationId,
+        mayHaveCommitted: true,
+      });
+      // refresh the list so a run the API accepted becomes visible
+      void load();
+      return false;
     }
   };
 
@@ -214,6 +225,9 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
             <Banner tone="bad" title="Action failed" role="alert">
               {state.actionError.message}
               {state.actionError.correlationId ? ` — correlation ${state.actionError.correlationId}` : ""}
+              {state.actionError.mayHaveCommitted
+                ? " The API may have accepted this change before the failure; any form choices are preserved and the operation key is reused on retry."
+                : ""}
               <button
                 type="button"
                 onClick={() => dispatch({ type: "actionErrorCleared" })}
@@ -226,8 +240,9 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
         )}
         {state.loadError && (
           <div className="mb-4">
-            <Banner tone="bad" title="Console not connected" role="alert">
-              {state.loadError} — nothing was changed.{" "}
+            <Banner tone="bad" title="Console cannot refresh data" role="alert">
+              {state.loadError} — this is a display/refresh failure; changes already accepted by the API are not
+              undone.{" "}
               <button type="button" onClick={() => void retryConnection()} className="underline underline-offset-2">
                 Retry connection
               </button>
@@ -282,7 +297,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               environments={state.environments}
               onSelectRun={(runId) => dispatch({ type: "selectRun", runId })}
               onCancel={(run) => void cancelRun(run.runId)}
-              onCreateRun={(input) => void createRun(input)}
+              onCreateRun={createRun}
               onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
             />
           )}

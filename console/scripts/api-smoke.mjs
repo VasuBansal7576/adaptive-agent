@@ -66,16 +66,19 @@ async function main() {
     console.log(`registered smoke environment: ${environments[0].environmentId}`);
   }
 
-  // 4. create + launch a run (direct projection)
-  const manifest = environments[0]?.manifest;
-  const environmentId = environments[0]?.environmentId ?? manifest?.environmentId ?? "neutral";
+  // 4. create + launch a run (direct projection, authoritative trusted refs).
+  // The plane resolves (id, version, sha256) against its seeded trusted sets:
+  // "model-profile" and "budget-default", hashed over canonical JSON.
+  const { createHash } = await import("node:crypto");
+  const canonicalHash = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  const environmentId = environments[0]?.environmentId ?? "neutral";
   const run = await json("/runs", {
     method: "POST",
     body: JSON.stringify({
       goal: "console smoke: verify create/launch/events/cancel",
       environmentId,
-      modelProfileRef: { id: "openai-codex/gpt-5.6-luna", version: "1" },
-      budgetRef: { id: "budget-smoke", version: "1" },
+      modelProfileRef: { id: "model-profile", version: "1", sha256: canonicalHash("model-profile") },
+      budgetRef: { id: "budget-default", version: "1", sha256: canonicalHash("budget-default") },
       idempotencyKey: `smoke-${Date.now()}`,
       executionMode: "dry_run",
     }),
@@ -83,6 +86,22 @@ async function main() {
   if (!run.runId) throw new Error(`create run failed: ${JSON.stringify(run)}`);
   console.log(`run created: ${run.runId} (${run.executionMode})`);
   if (run.executionMode !== "dry_run") throw new Error(`executionMode not recorded: ${run.executionMode}`);
+
+  // 3b. authoritative refs: the stored run must carry complete sha256 refs so
+  // every subsequent list refresh passes boundary validation (QA regression)
+  const stored = await json(`/runs/${run.runId}`);
+  for (const ref of ["modelProfileRef", "budgetRef", "environmentRef", "policyRef", "taskRef", "skillBundleRef"]) {
+    const value = stored[ref];
+    if (!value || typeof value.sha256 !== "string" || value.sha256.length === 0) {
+      throw new Error(`stored ${ref} lacks sha256: ${JSON.stringify(value)}`);
+    }
+  }
+  const listed = await json("/runs");
+  const listedRun = listed.find((r) => r.runId === run.runId);
+  if (!listedRun || !listedRun.modelProfileRef?.sha256) {
+    throw new Error("listed run lacks modelProfileRef.sha256 (list refresh would fail)");
+  }
+  console.log("refs ok: stored and listed runs carry complete sha256 refs");
 
   await json(`/runs/${run.runId}/launch`, { method: "POST", body: "{}" });
 

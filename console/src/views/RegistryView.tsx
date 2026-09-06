@@ -236,6 +236,11 @@ export function RegistryView({
             >
               {submitState === "registering" ? "Registering…" : "Register environment"}
             </button>
+            {submitState === "ok" && (
+              <p role="status" className="text-xs font-medium text-emerald-400">
+                ✓ Package validated — all required manifest fields accepted. Use "Register environment" to create it.
+              </p>
+            )}
             {submitState === "rejected" && (
               <p role="alert" className="text-xs text-rose-400">
                 Validation failed — your input is preserved below for correction.

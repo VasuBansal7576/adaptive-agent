@@ -45,6 +45,8 @@ export type RunRecord = {
   /** console presentation fields supplied by the API projection */
   environmentId?: string;
   goal?: string;
+  /** declared modes the environment manifest supports (when projected) */
+  executionModes?: string[];
   budgetUsed?: { calls: number; callsCeiling: number; wallSeconds: number; wallCeiling: number };
 };
 
@@ -116,5 +118,7 @@ export type EnvironmentPackageSummary = {
   evaluatorReady: boolean;
   toolCount: number;
   policyScope: string;
+  /** declared execution modes projected from the manifest (optional) */
+  executionModes?: string[];
   missingFields?: string[];
 };

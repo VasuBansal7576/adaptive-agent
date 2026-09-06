@@ -6,7 +6,17 @@ import type {
   EnvironmentRegistration,
   LearningCycleInput,
 } from "./transport";
-import { validatePackageFields, formToStringPayload, formToRegistration } from "./transport";
+import { validatePackageFields, formToStringPayload, formToRegistration, sha256Hex, type CanonicalRef } from "./transport";
+
+/**
+ * Authoritative trusted-plane reference for the seeded entries. The control
+ * plane resolves (id, version, sha256) against its trusted-ref sets, so the
+ * console cannot invent profile or budget ids; it sends the seeded
+ * "model-profile"/"budget-default" refs with the canonical-JSON hash.
+ */
+export async function trustedRef(id: "model-profile" | "budget-default"): Promise<CanonicalRef> {
+  return { id, version: "1", sha256: await sha256Hex(JSON.stringify(id)) };
+}
 import {
   SchemaError,
   parseCandidates,
@@ -203,12 +213,19 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       }).then(() => undefined),
 
     async createRun(input: CreateRunInput) {
-      // direct projection accepted by the control API
+      // direct projection accepted by the control API. Profile/budget refs are
+      // AUTHORITATIVE trusted-plane references: the plane rejects unknown
+      // (id, version, sha256) tuples, and a ref without sha256 is malformed
+      // and would poison every subsequent list refresh (SchemaError). The
+      // seeded trusted entries are "model-profile" and "budget-default"; their
+      // sha256 is the hash of the canonical JSON encoding of the identifier.
+      const modelProfileRef = await trustedRef("model-profile");
+      const budgetRef = await trustedRef("budget-default");
       const body = {
         goal: input.goal,
         environmentId: input.environmentId,
-        modelProfileRef: { id: input.modelProfile, version: "1" },
-        budgetRef: { id: `budget-${input.idempotencyKey.slice(0, 8)}`, version: "1" },
+        modelProfileRef,
+        budgetRef,
         idempotencyKey: input.idempotencyKey,
         executionMode: input.executionMode,
       };
