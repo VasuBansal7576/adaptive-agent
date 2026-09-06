@@ -132,11 +132,22 @@ class DevelopmentDiagnosticManager:
         if row is None:
             raise KeyError("diagnostic not found")
         value = dict(row)
-        value["armSummaries"] = self._summaries(diagnostic_id)
+        value["armSummaries"] = self._summaries(diagnostic_id, value)
+        with self.store.connect() as conn:
+            completed = conn.execute(
+                "SELECT * FROM diagnostic_cells WHERE diagnostic_id = ? AND status = 'completed'",
+                (diagnostic_id,),
+            ).fetchall()
+        if not self._validate_plan(value) or any(
+            not self._validate_cached(cell, value) for cell in completed
+        ):
+            value["error"] = (
+                value.get("error")
+                or "persisted diagnostic evidence is unavailable or invalid"
+            )
         return value
 
-    @staticmethod
-    def _public(r: Mapping[str, Any]) -> dict[str, Any]:
+    def _public(self, r: Mapping[str, Any]) -> dict[str, Any]:
         return {
             "diagnosticId": r["diagnostic_id"],
             "candidateId": r["candidate_id"],
@@ -152,12 +163,36 @@ class DevelopmentDiagnosticManager:
             "error": r.get("error"),
             "promotionEligible": False,
             "purpose": "development_diagnostic",
+            "resumable": self._resumable(r),
         }
 
-    def _summaries(self, diagnostic_id: str) -> list[dict[str, Any]]:
+    def _resumable(self, record: Mapping[str, Any]) -> bool:
+        if record.get("state") not in {"queued", "running"}:
+            return False
+        lock = self._locks.setdefault(str(record["diagnostic_id"]), threading.Lock())
+        if not lock.acquire(False):
+            return False
+        path = Path(f"{self.store.db_path}.diagnostic.{record['diagnostic_id']}.lock")
+        handle = path.open("a+")
+        try:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return True
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+                lock.release()
+
+    def _summaries(
+        self, diagnostic_id: str, record: Mapping[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
         with self.store.connect() as conn:
             rows = conn.execute(
-                "SELECT arm,status,result_json FROM diagnostic_cells WHERE diagnostic_id = ? ORDER BY arm,cell_key",
+                "SELECT * FROM diagnostic_cells WHERE diagnostic_id = ? ORDER BY arm,cell_key",
                 (diagnostic_id,),
             ).fetchall()
         out = []
@@ -171,6 +206,8 @@ class DevelopmentDiagnosticManager:
                     infra += 1
                     continue
                 if row["status"] != "completed":
+                    continue
+                if record is not None and not self._validate_cached(row, record):
                     continue
                 completed += 1
                 try:
@@ -426,63 +463,129 @@ class DevelopmentDiagnosticManager:
             ):
                 return False
         serialized = row.get("observation_json")
-        if serialized:
-            try:
-                payload = json.loads(serialized)
-                payload["partition"] = Partition(payload["partition"])
-                payload["arm"] = Arm(payload["arm"])
-                payload["provenance"] = Provenance(
-                    payload.get("provenance", "deterministic_simulation")
-                )
-                payload["model_provenance"] = ModelProvenance(
-                    payload.get("model_provenance", "synthetic_model")
-                )
-                payload["budget"] = BudgetSpec(**payload["budget"])
-                observation = RunObservation(**payload)
-                verifier = getattr(self.runtime, "verify_evaluation_observation", None)
-                task = next(
-                    task for task in self.runtime.packages[str(row["environment_id"])].tasks_for_partition("development")
-                    if task.task_id == row["task_id"]
-                )
-                if not callable(verifier) or not verifier(
-                    observation,
-                    FrozenExecutionConfig(
-                        self._load_frozen(record),
-                        Arm(str(row["arm"])),
-                        int(row["seed"]),
-                        str(row["bundle_hash"]),
-                    ),
-                    task,
-                ):
-                    return False
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        if not serialized:
+            return False
+        try:
+            payload = json.loads(serialized)
+            payload["partition"] = Partition(payload["partition"])
+            payload["arm"] = Arm(payload["arm"])
+            payload["provenance"] = Provenance(
+                payload.get("provenance", "deterministic_simulation")
+            )
+            payload["model_provenance"] = ModelProvenance(
+                payload.get("model_provenance", "synthetic_model")
+            )
+            payload["budget"] = BudgetSpec(**payload["budget"])
+            observation = RunObservation(**payload)
+            verifier = getattr(self.runtime, "verify_evaluation_observation", None)
+            task = next(
+                task
+                for task in self.runtime.packages[
+                    str(row["environment_id"])
+                ].tasks_for_partition("development")
+                if task.task_id == row["task_id"]
+            )
+            config = FrozenExecutionConfig(
+                self._load_frozen(record),
+                Arm(str(row["arm"])),
+                int(row["seed"]),
+                str(row["bundle_hash"]),
+            )
+            if not callable(verifier) or not verifier(
+                observation,
+                config,
+                task,
+            ):
                 return False
+            if self._result_value(observation, task, config) != value:
+                return False
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, StopIteration):
+            return False
         return (
             isinstance(row.get("receipt_ref"), str)
             and sha256_json(value) == row["receipt_ref"]
         )
 
+    def _validate_plan(self, record: Mapping[str, Any]) -> bool:
+        try:
+            task_ids = json.loads(record.get("task_ids_json") or "")
+            frozen = self._load_frozen(record)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        environments = frozen.inputs.get("knownEnvironments")
+        if (
+            not isinstance(task_ids, dict)
+            or not isinstance(environments, list)
+            or len(environments) != 3
+        ):
+            return False
+        expected = {
+            (str(environment), arm)
+            for environment in environments
+            for arm in ("B0", "L")
+        }
+        with self.store.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM diagnostic_cells WHERE diagnostic_id = ?",
+                (record["diagnostic_id"],),
+            ).fetchall()
+        if (
+            len(rows) != 6
+            or {(str(row["environment_id"]), str(row["arm"])) for row in rows}
+            != expected
+        ):
+            return False
+        for row in rows:
+            if (
+                task_ids.get(str(row["environment_id"])) != row["task_id"]
+                or row["seed"] != record["seed"]
+                or row["protocol_hash"] != record["protocol_hash"]
+            ):
+                return False
+            expected_bundle = (
+                record["base_bundle_hash"]
+                if row["arm"] == "B0"
+                else record["candidate_bundle_hash"]
+            )
+            if row["bundle_hash"] != expected_bundle:
+                return False
+        return True
+
     def _result_value(
         self, observation: Any, task: Any, config: FrozenExecutionConfig
     ) -> dict[str, Any]:
-        accounting: Mapping[str, Any] = {}
-        if hasattr(observation, "accounting_ref"):
-            raw = self.store.get_artifact(observation.accounting_ref)
-            if isinstance(raw, Mapping):
-                accounting = raw
-        elif isinstance(observation, Mapping):
-            accounting = observation
+        if not isinstance(observation, RunObservation):
+            raise ValueError("runtime observation must be a trusted RunObservation")
+        if (
+            not isinstance(observation.accounting_ref, str)
+            or not observation.accounting_ref
+        ):
+            raise ValueError("runtime observation lacks final accounting reference")
+        raw = self.store.get_artifact(observation.accounting_ref)
+        if not isinstance(raw, Mapping):
+            raise ValueError("runtime observation accounting receipt is malformed")
+        accounting: Mapping[str, Any] = raw
         aggregate = accounting.get("aggregateUsage")
-        top_level = {k: accounting.get(k) for k in ("inputTokens", "outputTokens", "totalTokens")}
+        top_level = {
+            k: accounting.get(k) for k in ("inputTokens", "outputTokens", "totalTokens")
+        }
         usage = aggregate if isinstance(aggregate, Mapping) else top_level
-        if not isinstance(aggregate, Mapping) and not all(isinstance(v, int) for v in top_level.values()):
-            # Legacy injected executors expose usage directly.  Real runtime
-            # receipts use aggregateUsage, which always wins when present.
-            usage = accounting.get("usage", {})
-        canonical = {k: usage.get(k) for k in ("inputTokens", "outputTokens", "totalTokens")}
-        if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in canonical.values()):
+        if not isinstance(aggregate, Mapping) and not all(
+            isinstance(v, int) for v in top_level.values()
+        ):
+            usage = top_level
+        canonical = {
+            k: usage.get(k) for k in ("inputTokens", "outputTokens", "totalTokens")
+        }
+        if not all(
+            isinstance(v, int) and not isinstance(v, bool) and v >= 0
+            for v in canonical.values()
+        ):
             raise ValueError("evaluation accounting lacks canonical token counts")
-        if canonical["totalTokens"] != canonical["inputTokens"] + canonical["outputTokens"]:
+        if (
+            canonical["totalTokens"]
+            != canonical["inputTokens"] + canonical["outputTokens"]
+        ):
             raise ValueError("evaluation accounting totalTokens is inconsistent")
         passed = bool(
             getattr(
@@ -563,6 +666,17 @@ class DevelopmentDiagnosticManager:
                 if row is None:
                     raise KeyError("diagnostic not found")
                 record = dict(row)
+                if not self._validate_plan(record):
+                    conn.execute(
+                        "UPDATE diagnostics SET state='failed',error=?,updated_at=? WHERE diagnostic_id=?",
+                        (
+                            "diagnostic plan is incomplete or identity-mismatched",
+                            _now(),
+                            diagnostic_id,
+                        ),
+                    )
+                    conn.commit()
+                    return self.get(diagnostic_id)
                 if record["state"] in {"completed", "failed", "cancelled"}:
                     with self.store.connect() as verify_conn:
                         cached = verify_conn.execute(
@@ -605,6 +719,21 @@ class DevelopmentDiagnosticManager:
                     )
                     conn.commit()
                     return self.get(diagnostic_id)
+                cached = conn.execute(
+                    "SELECT * FROM diagnostic_cells WHERE diagnostic_id = ? AND status = 'completed'",
+                    (diagnostic_id,),
+                ).fetchall()
+                invalid_cells = [
+                    cell["cell_key"]
+                    for cell in cached
+                    if not self._validate_cached(cell, record)
+                ]
+                if invalid_cells:
+                    placeholders = ",".join("?" for _ in invalid_cells)
+                    conn.execute(
+                        f"UPDATE diagnostic_cells SET status='queued',result_json='{{}}',receipt_ref=NULL,failure_class=NULL,error=NULL,observation_json=NULL,updated_at=? WHERE diagnostic_id=? AND cell_key IN ({placeholders})",
+                        (_now(), diagnostic_id, *invalid_cells),
+                    )
                 conn.execute(
                     "UPDATE diagnostics SET state='running',owner_id=?,started_at=COALESCE(started_at,?),updated_at=? WHERE diagnostic_id=?",
                     (self._owner_id, _now(), _now(), diagnostic_id),
@@ -674,14 +803,17 @@ class DevelopmentDiagnosticManager:
                     observation = (
                         self.executor or self.runtime.execute_evaluation_task
                     )(task, config, bundles[config.arm.value])
-                    if isinstance(observation, RunObservation):
-                        verifier = getattr(self.runtime, "verify_evaluation_observation", None)
-                        if not callable(verifier) or not verifier(observation, config, task):
-                            raise ValueError(
-                                "runtime observation failed trusted evidence verification"
-                            )
-                    elif isinstance(observation, Mapping) and observation.get("accountingRef") is not None:
-                        raise ValueError("runtime observation must be a trusted RunObservation")
+                    verifier = getattr(
+                        self.runtime, "verify_evaluation_observation", None
+                    )
+                    if (
+                        not isinstance(observation, RunObservation)
+                        or not callable(verifier)
+                        or not verifier(observation, config, task)
+                    ):
+                        raise ValueError(
+                            "runtime observation failed trusted evidence verification"
+                        )
                     value = self._result_value(observation, task, config)
                     ref = self.store.put_artifact(value).sha256
                     serialized = (
