@@ -192,7 +192,20 @@ export const DISCONNECTED_MESSAGE = "API unavailable — the control API did not
  * run before any data request or SSE connection; failures surface as a clear
  * Disconnected state with a retry action, never an indefinite spinner.
  */
-export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
+/**
+ * API base selection:
+ * - Vite dev server: "/api" (same-origin proxy to 127.0.0.1:8000; the proxy
+ *   keeps the console origin so the loopback/same-origin access boundary and
+ *   the HttpOnly operator cookie work).
+ * - Production build: "" (direct same-origin routes — create_runtime_app
+ *   serves the console at / and the API at its own paths).
+ * An explicit baseUrl argument always wins (tests / alternative deployments).
+ */
+export function defaultApiBase(): string {
+  return import.meta.env.PROD ? "" : "/api";
+}
+
+export function createRestTransport(baseUrl: string = defaultApiBase()): ConsoleTransport {
   let sessionPromise: Promise<void> | null = null;
 
   const ensureSession = (): Promise<void> => {
