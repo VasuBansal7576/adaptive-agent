@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from typing import Any
 
 MODEL_TOKENS = 20_000
 WALL_SECONDS = 90
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _bundle_by_hash(store: Any, content_hash: str) -> Any:
@@ -72,6 +74,17 @@ def _docker_image_digest() -> str:
     raise RuntimeError("Docker image has no immutable digest")
 
 
+def _require_pin(name: str, value: str, *, image: bool = False) -> str:
+    if not isinstance(value, str) or not value or value in {"core-planner-unset", "image-unpinned"}:
+        raise RuntimeError(f"{name} is not pinned")
+    if image:
+        if "@sha256:" not in value and not SHA256.fullmatch(value.removeprefix("sha256:")):
+            raise RuntimeError(f"{name} is not an immutable Docker digest")
+    elif not SHA256.fullmatch(value):
+        raise RuntimeError(f"{name} is not a SHA-256 pin")
+    return value
+
+
 def _persist_or_verify_frozen(store: Any, frozen: Any, *, initialize: bool) -> None:
     payload = frozen.to_dict()
     existing = store.get_frozen_protocol(frozen.protocol_hash)
@@ -123,10 +136,13 @@ def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | No
     runtime = app.state.durable_runtime
     evaluation_module = __import__("adaptive_agent.evaluation", fromlist=["__file__"])
     analysis_hash = hashlib.sha256(Path(evaluation_module.__file__).read_bytes()).hexdigest()
+    core_pin = _require_pin("core planner hash", runtime.core_planner_hash)
+    image_pin = _require_pin("Docker image digest", image_digest, image=True)
+    analysis_pin = _require_pin("analysis code hash", analysis_hash)
     protocol = EvaluationProtocol(
-        core_planner_hash=runtime.core_planner_hash,
-        image_digest=image_digest,
-        analysis_code_hash=analysis_hash,
+        core_planner_hash=core_pin,
+        image_digest=image_pin,
+        analysis_code_hash=analysis_pin,
         run_budget=BudgetSpec(model_tokens=MODEL_TOKENS, wall_time_seconds=WALL_SECONDS),
         concurrency_limit=4,
     )
