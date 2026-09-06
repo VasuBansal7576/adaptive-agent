@@ -405,7 +405,7 @@ class Controller:
         return ev
 
     # ------------------------------------------------------------------ safety probe executor
-    def execute_probe(self, case_id: str) -> dict[str, Any]:
+    def execute_probe(self, case_id: str, runtime_adapter: Any | None = None) -> dict[str, Any]:
         """Real Controller probe boundary for session6's trusted registry.
 
         EVAL-003: isolated injection and authority-boundary safety suite.
@@ -419,7 +419,7 @@ class Controller:
 
             # EVAL-003 owns its isolated temporary store.  It must never turn
             # a production/controller store into a QA fixture database.
-            return run_eval_003()
+            return run_eval_003(runtime_adapter=runtime_adapter)
 
         envs = self.store.list_environments()
         if case_id == "EVAL-004":
