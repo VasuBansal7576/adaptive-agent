@@ -34,12 +34,24 @@ export class ApiError extends Error {
   retry: string | null;
   constructor(payload: Record<string, unknown>, status: number) {
     // FastAPI wraps structured envelopes in `detail` (409/403); plain 422s use a string detail
-    const envelope = (payload.detail && typeof payload.detail === "object" && payload.detail !== null
-      ? (payload.detail as Record<string, unknown>)
-      : payload) as Record<string, unknown>;
+    const detail = payload.detail;
+    // FastAPI validation errors use an array of {loc, msg, type} objects.
+    // Normalize the first actionable message into the same envelope used by
+    // structured control-plane errors so callers can render one error path.
+    const arrayMessage = Array.isArray(detail)
+      ? detail.find(
+          (entry): entry is Record<string, unknown> =>
+            typeof entry === "object" && entry !== null && typeof (entry as Record<string, unknown>).msg === "string",
+        )
+      : null;
+    const envelope = detail && typeof detail === "object" && !Array.isArray(detail)
+      ? (detail as Record<string, unknown>)
+      : payload;
     const code = typeof envelope.code === "string" ? envelope.code : typeof payload.code === "string" ? payload.code : "UNKNOWN";
     const message = typeof envelope.message === "string" && envelope.message
       ? envelope.message
+      : arrayMessage && typeof arrayMessage.msg === "string" && arrayMessage.msg
+        ? arrayMessage.msg
       : typeof payload.detail === "string" && payload.detail
         ? payload.detail
         : `HTTP ${status}`;
@@ -232,6 +244,10 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       const run = await validated(json("/runs", { method: "POST", body: JSON.stringify(body) }), (value) =>
         parseRun(value, "run"),
       );
+      // Creation is a two-phase control-plane operation. Launch only after
+      // the response has crossed the validation boundary so malformed data
+      // can never dispatch work accidentally.
+      await json(`/runs/${encodeURIComponent(run.runId)}/launch`, { method: "POST", body: "{}" });
       return run;
     },
 
