@@ -178,13 +178,30 @@ class EvaluationJob:
         input_tokens = output_tokens = 0
         nominal_cost = 0.0
         nominal_seen = False
+        economic_cost_microunits = 0.0
+        economic_cost_seen = False
+        economic_statuses: set[str] = set()
         for observation in observations:
             if not observation.accounting_ref:
                 continue
             accounting = self.store.get_artifact(observation.accounting_ref)
-            usage = accounting.get("usage", {}) if isinstance(accounting, dict) else {}
+            usage = {}
+            if isinstance(accounting, dict):
+                candidate_usage = accounting.get("aggregateUsage", accounting.get("usage", {}))
+                if isinstance(candidate_usage, dict):
+                    usage = candidate_usage
             input_tokens += int(usage.get("inputTokens", 0) or 0)
             output_tokens += int(usage.get("outputTokens", 0) or 0)
+            if isinstance(accounting, dict):
+                economic = accounting.get("economicCost")
+                if isinstance(economic, dict):
+                    status = economic.get("status")
+                    if isinstance(status, str):
+                        economic_statuses.add(status)
+                    value = economic.get("microunits")
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        economic_cost_microunits += float(value)
+                        economic_cost_seen = True
             evidence = self.store.get_evidence(observation.evidence_ref) if observation.evidence_ref else None
             if not evidence:
                 continue
@@ -201,7 +218,22 @@ class EvaluationJob:
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     nominal_cost += float(value)
                     nominal_seen = True
-        return {"inputTokens": input_tokens, "outputTokens": output_tokens, "totalTokens": input_tokens + output_tokens, "nominalCostUsd": nominal_cost if nominal_seen else None, "wallDurationSeconds": wall_seconds, "billingBasis": "SDK nominal usage cost; subscription billing is separate and unmeasured"}
+        if nominal_seen:
+            billing_basis = "SDK nominal usage cost; subscription billing is separate and unmeasured"
+        elif economic_statuses:
+            billing_basis = f"SDK economic cost status: {', '.join(sorted(economic_statuses))}; nominal USD cost unavailable"
+        else:
+            billing_basis = "SDK nominal usage cost unavailable; subscription billing is separate and unmeasured"
+        return {
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "totalTokens": input_tokens + output_tokens,
+            "nominalCostUsd": nominal_cost if nominal_seen else None,
+            "economicCostMicrounits": economic_cost_microunits if economic_cost_seen else None,
+            "economicCostStatuses": sorted(economic_statuses),
+            "wallDurationSeconds": wall_seconds,
+            "billingBasis": billing_basis,
+        }
 
     def run_development_smoke(self, job_id: str):
         """Run the one-task trusted development receipt used by held-out gates."""
