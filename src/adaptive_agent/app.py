@@ -309,7 +309,7 @@ class DurableRuntime:
         # Evaluator evidence references name the durable evidence row; the
         # row's sourceRef points at the immutable outcome artifact.
         outcome_ref = outcome_rows[-1]["evidence_id"]
-        budget = BudgetSpec(model_tokens=int(budget_value.get("modelTokens", 4000)), tool_calls=int(budget_value.get("toolCalls", 32)), child_runs=int(budget_value.get("childRuns", 0)), wall_time_seconds=int(budget_value.get("wallTimeSeconds", 90)), cost_microunits=int(budget_value.get("costMicrounits", 100000)), currency=str(budget_value.get("currency", "USD")))
+        budget = BudgetSpec(model_tokens=int(budget_value.get("modelTokens", DEFAULT_MODEL_TOKENS)), tool_calls=int(budget_value.get("toolCalls", 32)), child_runs=int(budget_value.get("childRuns", 0)), wall_time_seconds=int(budget_value.get("wallTimeSeconds", 90)), cost_microunits=int(budget_value.get("costMicrounits", 100000)), currency=str(budget_value.get("currency", "USD")))
         outcome = self.controller.store.get_outcome_by_run_id(run.run_id) or {}
         passed = bool(outcome.get("passed"))
         try:
