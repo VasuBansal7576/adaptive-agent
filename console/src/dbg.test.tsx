@@ -1,25 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { normalizeSseEvent } from "./api/validate";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { App } from "./App";
+import { createSimulationTransport } from "./api/simulation";
 
-describe("dbg wire", () => {
-  it("qa captured payload", () => {
-    const wire = {
-      id: 1,
-      event: "run_created",
-      data: {
-        evidence_id: "ev_370205e6caa74d32b05b04c2377deab0",
-        run_id: "run_873a94b0ce424e7699709663b461eb13",
-        sequence: 1,
-        event_type: "run_created",
-        content_hash: "9baec1f5358fbce8fa7d8a27fc4be5cb89d28857c67daf0b7ed83cdf8fe610b5",
-        source_ref: '{"id":"art_9baec1f5358fbce8","version":"1","sha256":"9baec1f5358fbce8fa7d8a27fc4be5cb89d28857c67daf0b7ed83cdf8fe610b5"}',
-        trust_class: "system",
-        visibility: "learner",
-        redacted: 1,
-      },
-    };
-    const e = normalizeSseEvent(wire, "sse");
-    console.log("PARSED:", JSON.stringify(e));
-    expect(e.sequence).toBe(1);
+describe("dbg escape", () => {
+  it("escape closes learning dialog", async () => {
+    const user = userEvent.setup();
+    render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
+    await screen.findAllByRole("button", { name: /run-sim-1004/ });
+    await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
+    const dialog = await screen.findByRole("dialog", { name: "Create run" });
+    let docEvents = 0;
+    document.addEventListener("keydown", () => { docEvents += 1; });
+    const active = document.activeElement?.tagName;
+    await user.keyboard("{Escape}");
+    if (docEvents === 0) throw new Error("UE-DEBUG " + JSON.stringify({ docEvents, active }));
+    const { fireEvent } = await import("@testing-library/react");
+    fireEvent.keyDown(document, { key: "Escape" });
+    await new Promise((r) => setTimeout(r, 100));
+    console.log("AFTER_SYNTHETIC:", screen.queryByRole("dialog") === null ? "closed" : "open");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument(), { timeout: 2000 });
+    expect(true).toBe(true);
   });
 });
