@@ -696,6 +696,53 @@ def test_failed_development_run_is_learning_eligible(tmp_path):
     assert public["learningEligible"] is True
 
 
+def test_trusted_outcome_is_operator_visible_but_excluded_from_learner_evidence(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post(
+        "/runs",
+        json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "trusted-outcome-visibility"},
+    ).json()
+    controller = app.state.controller
+    controller.record_model_response(
+        run["runId"],
+        {
+            "responseId": "visibility-response",
+            "runId": run["runId"],
+            "taskId": task["taskId"],
+            "environmentId": "finance",
+        },
+    )
+
+    evidence = controller.record_trusted_outcome(
+        run["runId"],
+        {
+            "responseId": "visibility-response",
+            "runId": run["runId"],
+            "taskId": task["taskId"],
+            "environmentId": "finance",
+            "passed": True,
+            "reliable": True,
+            "safetyViolations": 0,
+            "reason": "private evaluator details stay out of learner context",
+        },
+    )
+    controller._set_run_status(run["runId"], RunStatus.succeeded)
+
+    stored = app.state.durable_runtime.controller.store.get_evidence(evidence.evidence_id)
+    assert evidence.visibility == "operator"
+    assert stored is not None and stored["visibility"] == "operator"
+    operator_events = [event for event in controller.events(run["runId"]) if event["event"] == "trusted_outcome"]
+    assert len(operator_events) == 1
+    assert operator_events[0]["data"]["visibility"] == "operator"
+    learner_rows = app.state.durable_runtime.controller.store.list_learner_evidence(
+        environment_id="finance", run_id=run["runId"]
+    )
+    assert all(row["evidence_id"] != evidence.evidence_id for row in learner_rows)
+
+
 def test_evaluation_job_rejects_final_without_pinned_ablation(tmp_path):
     from adaptive_agent.evaluation import EvaluationError
     from adaptive_agent.evaluation_job import EvaluationJob

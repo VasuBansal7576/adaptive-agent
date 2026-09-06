@@ -931,7 +931,11 @@ class Controller:
         if not isinstance(fixture_reset_ok, bool):
             raise ValueError("outcome.fixtureResetOk must be a boolean")
         payload["fixtureResetOk"] = fixture_reset_ok
-        event = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "evaluator_only")
+        # Trusted evaluator evidence is operator-visible for audit and console
+        # projections.  The learner path remains excluded at the Store SQL
+        # boundary, which only returns redacted broker rows with learner
+        # visibility.
+        event = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "operator")
         self.record_outcome(run_id, bool(payload["passed"]), metadata=payload)
         return event
 
@@ -987,7 +991,7 @@ class Controller:
                 "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
                 "fixtureResetOk": bool(metadata.get("fixtureResetOk", True)),
             }
-            self.append_event(run_id, "trusted_outcome", trusted_payload, "evaluator", "evaluator_only")
+            self.append_event(run_id, "trusted_outcome", trusted_payload, "evaluator", "operator")
         return outcome
 
     def reconcile_run(self, run_id: str, provider: ToolProvider) -> list[str]:
