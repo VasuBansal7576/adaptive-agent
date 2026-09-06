@@ -73,6 +73,12 @@ export type RunEvent = {
   /** authoritative status transition derived from the validated event TYPE
    *  (never from display text); absent for non-lifecycle events */
   runStatus?: RunStatus;
+  /** the durable event type this row was projected from (e.g. run_failed,
+   *  outcome_recorded); used for honest failure classification */
+  lifecycleType?: string;
+  /** the API projected no status field for this event (e.g. bare status or
+   *  outcome rows): the authoritative RunRecord must be refreshed */
+  needsRecordRefresh?: boolean;
 };
 
 export type ApprovalRequest = {

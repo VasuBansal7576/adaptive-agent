@@ -90,6 +90,11 @@ export function RunView({
 
   const runEvents = selected ? events[selected.runId] ?? [] : [];
   const lastError = [...runEvents].reverse().find((e) => e.error);
+  // honest failure classification from validated event types: a recorded
+  // run_failed lifecycle event is a runtime failure; otherwise the outcome
+  // evidence decides — no text heuristics
+  const lastRuntimeFailure = [...runEvents].reverse().find((e) => e.lifecycleType === "run_failed");
+  const hasOutcomeEvidence = runEvents.some((e) => e.lifecycleType === "outcome_recorded");
 
   return (
     <section aria-labelledby="runs-heading" className="grid gap-6 lg:grid-cols-[minmax(280px,380px)_1fr]">
@@ -178,9 +183,22 @@ export function RunView({
             )}
 
             {selected.status === "failed" && !lastError?.error && (
-              <Banner tone="bad" title="Run failed">
-                The trusted outcome check did not pass. Inspect the evidence below; the active version is unchanged.
-              </Banner>
+              lastRuntimeFailure ? (
+                <Banner tone="bad" title="Runtime failure" role="alert">
+                  The run failed before or during execution (recorded run_failed evidence). The active version is
+                  unchanged; inspect the expanded event below for the recorded error.
+                </Banner>
+              ) : hasOutcomeEvidence ? (
+                <Banner tone="bad" title="Run failed" role="alert">
+                  The trusted outcome evidence recorded a failure. Inspect the expanded outcome event below; the
+                  active version is unchanged.
+                </Banner>
+              ) : (
+                <Banner tone="bad" title="Run failed" role="alert">
+                  The run reached a failed state. Inspect the event evidence below for the recorded cause; the
+                  active version is unchanged.
+                </Banner>
+              )
             )}
             {selected.status === "timed_out" && (
               <Banner tone="warn" title="Run timed out">

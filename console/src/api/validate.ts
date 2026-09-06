@@ -229,9 +229,13 @@ export function normalizeSseEvent(value: unknown, field: string): RunEvent {
     visibility: typeof data.visibility === "string" ? data.visibility : undefined,
     redacted: typeof data.redacted === "boolean" ? data.redacted : typeof data.redacted === "number" ? data.redacted === 1 : undefined,
   };
+  event.lifecycleType = eventType;
   // lifecycle status comes from the validated event type only
   const statusTransition = EVENT_TYPE_TO_STATUS[eventType];
   if (statusTransition) event.runStatus = statusTransition;
+  // bare status and outcome rows carry no status field server-side: the
+  // authoritative RunRecord must be refreshed to learn the real state
+  if (eventType === "status" || eventType === "outcome_recorded") event.needsRecordRefresh = true;
   return event;
 }
 

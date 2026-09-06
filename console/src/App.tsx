@@ -121,9 +121,12 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     const close = transport.openRunStream(runId, cursor, {
       onEvent: (event) => {
         dispatch({ type: "event", event });
-        // plane-shape status/approval events carry no validated status field:
-        // refresh the authoritative RunRecord instead of parsing display text
-        if (!event.runStatus && (event.kind === "status" || event.kind === "approval")) void refreshRunRecords();
+        // refresh the authoritative record when the event carries no validated
+        // status (bare status/outcome rows) or when plane-shape status/approval
+        // events arrive — never parse display text
+        if (event.needsRecordRefresh || (!event.runStatus && (event.kind === "status" || event.kind === "approval"))) {
+          void refreshRunRecords();
+        }
       },
       onState: (connection) => {
         if (connection !== "closed") dispatch({ type: "connection", state: connection });

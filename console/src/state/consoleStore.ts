@@ -69,19 +69,22 @@ export function applyEvent(state: ConsoleState, event: RunEvent): ConsoleState {
   }
   const events = state.events[event.runId] ?? [];
   const run = state.runs.find((r) => r.runId === event.runId);
+  const TERMINAL = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
   const runs = run
-    ? state.runs.map((r) =>
-        r.runId === event.runId
-          ? {
-              ...r,
-              lastEventSequence: Math.max(r.lastEventSequence, event.sequence),
-              // authoritative status transitions ONLY: from the validated
-              // lifecycle event type (event.runStatus) or from a refreshed
-              // RunRecord (runUpdated) — never from display text
-              status: event.runStatus ?? r.status,
-            }
-          : r,
-      )
+    ? state.runs.map((r) => {
+        let status = r.status;
+        // lifecycle transitions apply only forward: a terminal record (loaded
+        // authoritatively or already reached in sequence order) must never be
+        // downgraded by an OLDER replayed event
+        if (event.runStatus && !TERMINAL.has(status)) {
+          status = event.runStatus;
+        }
+        return {
+          ...r,
+          lastEventSequence: Math.max(r.lastEventSequence, event.sequence),
+          status,
+        };
+      })
     : state.runs;
   return {
     ...state,
