@@ -108,10 +108,12 @@ class ChildPlannerTests(unittest.TestCase):
         ledger = SharedBudget(30, 1000, 4, 1, 5)
         budget = ChildPlannerBudget(ledger)
         client = FakeClient(usage=7)
-        proxy = LunaChildPlanner(client, budget=budget).parent_model_client()
+        observations = []
+        proxy = LunaChildPlanner(client, budget=budget).parent_model_client(observations.append)
         with self.assertRaises(SecurityViolation):
             proxy.invoke(goal="parent", environment={}, messages=[], remaining_deadline=5)
         self.assertEqual(client.calls, 1)
+        self.assertEqual(observations[0]["responseId"], "child-response-1")
         self.assertEqual(ledger.model_tokens_used, 7)
         with self.assertRaises(SecurityViolation):
             proxy.invoke(goal="parent", environment={}, messages=[], remaining_deadline=5)
