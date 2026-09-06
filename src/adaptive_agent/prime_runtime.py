@@ -12,6 +12,7 @@ import ast
 import base64
 import binascii
 import hashlib
+import math
 import json
 import os
 import queue
@@ -165,6 +166,79 @@ class ModelObservation:
 
 
 @dataclass(frozen=True)
+class ParsedModelUsage:
+    """Validated provider receipt used by both parent and child accounting."""
+
+    tokens: int
+    cost_microunits: int | None
+    currency: str | None
+
+
+def _usage_int_field(usage: Mapping[str, Any], label: str, aliases: tuple[str, ...]) -> int | None:
+    values: list[int] = []
+    for key in aliases:
+        if key not in usage:
+            continue
+        value = usage[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise AdapterError(f"model usage field {key!r} must be a non-negative integer")
+        values.append(value)
+    if values and any(value != values[0] for value in values[1:]):
+        raise AdapterError(f"model usage has contradictory {label} fields")
+    return values[0] if values else None
+
+
+def parse_model_usage(usage: Mapping[str, Any], *, require_cost: bool = False, expected_currency: str = "USD") -> ParsedModelUsage:
+    """Normalize token and nominal-cost receipts without dropping input usage."""
+    if not isinstance(usage, Mapping) or not usage:
+        raise AdapterError("model usage must be a non-empty object")
+    total = _usage_int_field(usage, "total", ("totalTokens", "total_tokens"))
+    input_tokens = _usage_int_field(usage, "input", ("input", "inputTokens", "input_tokens"))
+    output_tokens = _usage_int_field(usage, "output", ("output", "outputTokens", "output_tokens"))
+    if input_tokens is not None:
+        if output_tokens is None:
+            raise AdapterError("model usage input tokens require output tokens")
+        tokens = input_tokens + output_tokens
+        if total is not None and total != tokens:
+            raise AdapterError("model usage total contradicts input plus output")
+    elif output_tokens is not None:
+        if total is not None and total != output_tokens:
+            raise AdapterError("model usage total contradicts output-only usage")
+        tokens = output_tokens
+    elif total is not None:
+        tokens = total
+    else:
+        raise AdapterError("model usage must include total or input/output token accounting")
+
+    cost_microunits = _usage_int_field(usage, "costMicrounits", ("costMicrounits", "cost_microunits"))
+    cost = usage.get("cost")
+    if cost is not None and not isinstance(cost, Mapping):
+        raise AdapterError("model usage cost must be an object")
+    sdk_total = cost.get("total") if isinstance(cost, Mapping) and "total" in cost else None
+    if sdk_total is not None:
+        if isinstance(sdk_total, bool) or not isinstance(sdk_total, (int, float)) or not math.isfinite(float(sdk_total)) or float(sdk_total) < 0:
+            raise AdapterError("model usage cost.total must be finite and non-negative")
+        sdk_microunits = int(round(float(sdk_total) * 1_000_000))
+        if cost_microunits is not None and cost_microunits != sdk_microunits:
+            raise AdapterError("model usage cost contradicts costMicrounits")
+        cost_microunits = sdk_microunits
+    currencies: list[str] = []
+    for value in (usage.get("currency"), cost.get("currency") if isinstance(cost, Mapping) else None):
+        if value is not None:
+            if not isinstance(value, str) or not value.strip():
+                raise AdapterError("model usage currency must be a non-empty string")
+            currencies.append(value.strip().upper())
+    if currencies and any(value != currencies[0] for value in currencies[1:]):
+        raise AdapterError("model usage has contradictory currencies")
+    currency = currencies[0] if currencies else (expected_currency.upper() if cost_microunits is not None else None)
+    if currency is not None and expected_currency and currency != expected_currency.upper():
+        raise AdapterError("model usage currency does not match configured currency")
+    if require_cost and cost_microunits is None:
+        raise AdapterError("model usage cost is required by the configured cost guard")
+    return ParsedModelUsage(tokens, cost_microunits, currency)
+
+
+@dataclass(frozen=True)
 class ChildPlanRequest:
     """Trusted-parent input to the child planner; it contains no credentials."""
 
@@ -196,6 +270,8 @@ class SharedBudget:
     max_artifact_count: int
     max_child_runs: int = 0
     max_model_tokens: int | None = None
+    max_model_cost_microunits: int | None = None
+    model_cost_currency: str = "USD"
     started_at: float = field(default_factory=time.monotonic)
     cancel_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -204,6 +280,7 @@ class SharedBudget:
     artifact_refs: dict[tuple[str, str, str], ArtifactRef] = field(default_factory=dict)
     child_runs_used: int = 0
     model_tokens_used: int = 0
+    model_cost_microunits_used: int = 0
 
     def remaining_seconds(self) -> float:
         return max(0.0, self.max_wall_seconds - (time.monotonic() - self.started_at))
@@ -214,15 +291,25 @@ class SharedBudget:
                 raise SecurityViolation("shared child budget is exhausted or cancelled")
             self.child_runs_used += 1
 
-    def record_model_usage(self, tokens: int) -> None:
+    def record_model_usage(self, tokens: int, cost_microunits: int | None = None, currency: str | None = None) -> None:
         if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
             raise AdapterError("model token usage must be a non-negative integer")
+        if cost_microunits is not None and (not isinstance(cost_microunits, int) or isinstance(cost_microunits, bool) or cost_microunits < 0):
+            raise AdapterError("model nominal cost must be a non-negative integer")
+        if self.max_model_cost_microunits is not None and cost_microunits is None:
+            raise AdapterError("model nominal cost is required by the configured cost guard")
+        if currency is not None and currency.upper() != self.model_cost_currency.upper():
+            raise AdapterError("model usage currency does not match configured currency")
         with self.lock:
-            # A completed provider receipt is recorded in full before the
+            # A completed provider receipt is recorded in full before either
             # ledger rejects further dispatch. Never lose over-cap usage.
             self.model_tokens_used += tokens
-            if self.max_model_tokens is not None and self.model_tokens_used > self.max_model_tokens:
-                raise SecurityViolation("shared model token budget exhausted")
+            if cost_microunits is not None:
+                self.model_cost_microunits_used += cost_microunits
+            token_exhausted = self.max_model_tokens is not None and self.model_tokens_used > self.max_model_tokens
+            cost_exhausted = self.max_model_cost_microunits is not None and self.model_cost_microunits_used > self.max_model_cost_microunits
+            if token_exhausted or cost_exhausted:
+                raise SecurityViolation("shared model budget exhausted")
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -248,8 +335,22 @@ class ChildPlannerBudget:
             return None
         return max(0, self.ledger.max_model_tokens - self.ledger.model_tokens_used)
 
-    def record_model_usage(self, tokens: int) -> None:
-        self.ledger.record_model_usage(tokens)
+    @property
+    def remaining_model_cost_microunits(self) -> int | None:
+        if self.ledger.max_model_cost_microunits is None:
+            return None
+        return max(0, self.ledger.max_model_cost_microunits - self.ledger.model_cost_microunits_used)
+
+    @property
+    def max_model_cost_microunits(self) -> int | None:
+        return self.ledger.max_model_cost_microunits
+
+    @property
+    def model_cost_currency(self) -> str:
+        return self.ledger.model_cost_currency
+
+    def record_model_usage(self, tokens: int, cost_microunits: int | None = None, currency: str | None = None) -> None:
+        self.ledger.record_model_usage(tokens, cost_microunits, currency)
 
 
 ChildPlanner = Callable[[ChildPlanRequest], ChildPlan | Mapping[str, Any] | str]
@@ -275,6 +376,8 @@ class PrimeRuntimeConfig:
     max_artifact_count: int = 128
     max_total_wall_seconds: float = 300.0
     max_model_tokens: int | None = None
+    max_model_cost_microunits: int | None = None
+    model_cost_currency: str = "USD"
     max_child_depth: int = 1
     child_runs: int = 0
     require_docker: bool = True
@@ -723,9 +826,13 @@ class PrimeRuntimeAdapter:
         self._depth = _depth
         if _depth > config.max_child_depth:
             raise AdapterError("child depth exceeds configured maximum")
+        if config.max_model_cost_microunits is not None and (config.max_model_cost_microunits < 0 or not config.model_cost_currency.strip()):
+            raise ValueError("model cost budget must be non-negative with a currency")
         self._budget = _shared_budget or SharedBudget(
             config.max_total_wall_seconds, config.max_total_artifact_bytes, config.max_artifact_count,
-            config.child_runs, config.max_model_tokens)
+            max_child_runs=config.child_runs, max_model_tokens=config.max_model_tokens,
+            max_model_cost_microunits=config.max_model_cost_microunits,
+            model_cost_currency=config.model_cost_currency)
         self._artifact_store_root = _artifact_store_root or (self.root / "artifacts")
         self.kernel: _KernelProcess | None = None
         self._lock = threading.RLock()
@@ -856,6 +963,8 @@ class PrimeRuntimeAdapter:
                 max_artifact_count=self.config.max_artifact_count,
                 max_total_wall_seconds=self.config.max_total_wall_seconds,
                 max_model_tokens=self.config.max_model_tokens,
+                max_model_cost_microunits=self.config.max_model_cost_microunits,
+                model_cost_currency=self.config.model_cost_currency,
                 max_child_depth=self.config.max_child_depth,
                 child_runs=0, require_docker=True, docker_image=self.config.docker_image,
                 ao_session_id=self.config.ao_session_id,

@@ -5,7 +5,7 @@ import inspect
 import json
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from .prime_runtime import AdapterError, ChildPlan, ChildPlanRequest, ChildPlannerBudget, SecurityViolation
+from .prime_runtime import AdapterError, ChildPlan, ChildPlanRequest, ChildPlannerBudget, SecurityViolation, parse_model_usage
 
 MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "openai-codex/gpt-5.6-luna"
@@ -34,8 +34,9 @@ class SharedLedgerModelClient:
         remaining = kwargs.get("remaining_deadline")
         if isinstance(remaining, (int, float)) and not isinstance(remaining, bool) and remaining <= 0:
             raise SecurityViolation("parent model deadline expired")
-        if self.budget.remaining_model_tokens == 0:
-            raise SecurityViolation("shared model token budget exhausted")
+        if (self.budget.remaining_model_tokens == 0
+                or self.budget.remaining_model_cost_microunits == 0):
+            raise SecurityViolation("shared model budget exhausted")
         # Test/deployment clients may expose the minimal planner interface and
         # omit optional deadline/cancellation fields.  Preserve those fields
         # for capable clients while avoiding a signature mismatch at this
@@ -61,7 +62,11 @@ class SharedLedgerModelClient:
             raise AdapterError("parent model response is not the pinned Luna subscription")
         if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
             raise AdapterError("parent model response lacks response id or usage accounting")
-        tokens = _usage_tokens(usage)
+        receipt = parse_model_usage(
+            usage,
+            require_cost=self.budget.max_model_cost_microunits is not None,
+            expected_currency=self.budget.model_cost_currency,
+        )
         if self.observation_sink is not None:
             self.observation_sink({
                 "provider": provider,
@@ -71,45 +76,13 @@ class SharedLedgerModelClient:
             })
         # Charge exactly once, immediately after the provider call. The
         # observation sink persists the response envelope before exhaustion.
-        self.budget.record_model_usage(tokens)
+        self.budget.record_model_usage(receipt.tokens, receipt.cost_microunits, receipt.currency)
         return raw
 
 
 def _usage_tokens(usage: Mapping[str, Any]) -> int:
-    """Normalize provider usage without silently dropping paid input tokens."""
-    if not isinstance(usage, Mapping) or not usage:
-        raise AdapterError("model usage must be a non-empty object")
-
-    def field(label: str, aliases: tuple[str, ...]) -> int | None:
-        values: list[int] = []
-        for key in aliases:
-            if key not in usage:
-                continue
-            value = usage[key]
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise AdapterError(f"model usage field {key!r} must be a non-negative integer")
-            values.append(value)
-        if values and any(value != values[0] for value in values[1:]):
-            raise AdapterError(f"model usage has contradictory {label} fields")
-        return values[0] if values else None
-
-    total = field("total", ("totalTokens", "total_tokens"))
-    input_tokens = field("input", ("input", "inputTokens", "input_tokens"))
-    output_tokens = field("output", ("output", "outputTokens", "output_tokens"))
-    if input_tokens is not None:
-        if output_tokens is None:
-            raise AdapterError("model usage input tokens require output tokens")
-        complete = input_tokens + output_tokens
-        if total is not None and total != complete:
-            raise AdapterError("model usage total contradicts input plus output")
-        return complete
-    if output_tokens is not None:
-        if total is not None and total != output_tokens:
-            raise AdapterError("model usage total contradicts output-only usage")
-        return output_tokens
-    if total is not None:
-        return total
-    raise AdapterError("model usage must include total or input/output token accounting")
+    """Compatibility shim for callers that only need normalized tokens."""
+    return parse_model_usage(usage).tokens
 
 
 def _text(raw: Mapping[str, Any]) -> str:
@@ -192,9 +165,13 @@ class LunaChildPlanner:
         """
         if self.budget is None:
             raise AdapterError("shared planner budget is required for parent accounting")
-        tokens = _usage_tokens(usage)
-        self.budget.record_model_usage(tokens)
-        return tokens
+        receipt = parse_model_usage(
+            usage,
+            require_cost=self.budget.max_model_cost_microunits is not None,
+            expected_currency=self.budget.model_cost_currency,
+        )
+        self.budget.record_model_usage(receipt.tokens, receipt.cost_microunits, receipt.currency)
+        return receipt.tokens
 
     def __call__(self, request: ChildPlanRequest) -> ChildPlan:
         if self.budget is not None and request.budget.ledger is not self.budget.ledger:
@@ -204,8 +181,9 @@ class LunaChildPlanner:
         remaining = min(request.remaining_seconds, request.budget.remaining_seconds)
         if remaining <= 0:
             raise SecurityViolation("child model planning deadline expired")
-        if request.budget.remaining_model_tokens == 0:
-            raise SecurityViolation("shared model token budget exhausted")
+        if (request.budget.remaining_model_tokens == 0
+                or request.budget.remaining_model_cost_microunits == 0):
+            raise SecurityViolation("shared model budget exhausted")
         try:
             structured_input = json.dumps(
                 {"prompt": request.prompt, "kwargs": dict(request.kwargs)},
@@ -254,7 +232,11 @@ class LunaChildPlanner:
             raise AdapterError("child model response is not the pinned Luna subscription")
         if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
             raise AdapterError("child model response lacks response id or usage")
-        tokens = _usage_tokens(usage)
+        receipt = parse_model_usage(
+            usage,
+            require_cost=request.budget.max_model_cost_microunits is not None,
+            expected_currency=request.budget.model_cost_currency,
+        )
         observation = {
             "provider": provider,
             "model": MODEL_NAME if model == "gpt-5.6-luna" else model,
@@ -267,7 +249,7 @@ class LunaChildPlanner:
             self.observation_sink(observation)
         # Record completed provider usage before enforcing the shared cap. An
         # over-cap receipt remains visible in the ledger and blocks later calls.
-        request.budget.record_model_usage(tokens)
+        request.budget.record_model_usage(receipt.tokens, receipt.cost_microunits, receipt.currency)
         if not text:
             raise AdapterError("child model response lacks text")
         return _bind_kwargs(_parse_plan(text, self.max_code_chars), request.kwargs)
