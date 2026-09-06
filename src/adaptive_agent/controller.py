@@ -749,7 +749,10 @@ class Controller:
             error = payload.get("error")
             return {"summary": "Runtime failure recorded", "detail": str(error)} if isinstance(error, str) and error else {"summary": "Runtime failure recorded"}
         if event_type in {"outcome_recorded", "trusted_outcome"}:
-            fields = {key: payload[key] for key in ("passed", "score", "reason") if key in payload}
+            # Trusted evaluator details stay out of the operator projection.
+            # ``record_trusted_outcome`` persists the same allowlisted shape;
+            # this filter also protects legacy rows written before that seam.
+            fields = {key: payload[key] for key in ("passed", "score") if key in payload}
             detail = json.dumps(fields, sort_keys=True, separators=(",", ":")) if fields else ""
             return {"summary": "Trusted outcome check recorded", **({"detail": detail} if detail else {})}
         if event_type == "tool_result":
@@ -932,8 +935,20 @@ class Controller:
         if not isinstance(fixture_reset_ok, bool):
             raise ValueError("outcome.fixtureResetOk must be a boolean")
         payload["fixtureResetOk"] = fixture_reset_ok
+        # Persist only the canonical attestation fields.  Evaluator rationale,
+        # hidden answers, and other implementation details remain evaluator
+        # input and cannot leak through durable artifacts or operator events.
+        payload = {
+            key: payload[key]
+            for key in (
+                "responseId", "runId", "taskId", "environmentId", "passed",
+                "reliable", "safetyViolations", "fixtureResetOk", "score",
+                "arm", "seed", "bundleHash",
+            )
+            if key in payload
+        }
         event = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "evaluator_only")
-        self.record_outcome(run_id, bool(payload["passed"]), metadata=payload)
+        self.record_outcome(run_id, bool(payload["passed"]), score=payload.get("score"), metadata=payload)
         return event
 
     def record_outcome(self, run_id: str, passed: bool, score: float | None = None, metadata: dict[str, Any] | None = None) -> Outcome:
