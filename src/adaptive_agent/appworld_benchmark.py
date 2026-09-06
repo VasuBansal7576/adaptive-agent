@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Protocol, Sequence
 
 from adaptive_agent.benchmark import FrozenExecutionConfig
-from adaptive_agent.evaluation import Arm, BudgetSpec, FrozenProtocol, ModelProvenance, Partition, RunObservation, canonical_json, clustered_paired_bootstrap, sha256_json
+from adaptive_agent.evaluation import AblationInput, Arm, BudgetSpec, FrozenProtocol, ModelProvenance, Partition, RunObservation, audit_ablation, canonical_json, clustered_paired_bootstrap, sha256_json
 
 APPWORLD_VERSION = "0.1.3.post1"
 DEFAULT_PUBLISHED_COUNT = 20
@@ -41,9 +42,40 @@ class DurableAppWorldAdapter:
     def __init__(self, runtime: Any, protocol: "AppWorldProtocol", bundle_hashes: Mapping[str, str] | None = None) -> None:
         self.runtime, self.protocol = runtime, protocol
         self.bundle_hashes = dict(bundle_hashes or {})
+        self._resolved_bundles: dict[str, Any] = {}
+        self._a_audit: Any | None = None
+
+    def preflight_bundles(self, bundle_hashes: Mapping[str, str]) -> None:
+        self._assert_runtime_pins()
+        if self.bundle_hashes and dict(self.bundle_hashes) != dict(bundle_hashes):
+            raise ValueError("AppWorld arm bundle mapping is immutable")
+        self.bundle_hashes = dict(bundle_hashes)
+        for arm in (Arm.B0, Arm.L, Arm.A):
+            self._resolved_bundles[arm.value] = self._bundle(self.bundle_hashes[arm.value])
+        a_bundle = self._resolved_bundles[Arm.A.value]
+        procedures = tuple(str(getattr(skill, "procedure", "")) for skill in getattr(a_bundle, "skills", ()))
+        self._a_audit = audit_ablation(AblationInput(a_bundle.content_hash, "", procedures))
+        if not self._a_audit.passed:
+            raise ValueError("AppWorld arm A memory-disabled audit failed")
+
+    def ablation_audit(self) -> Any:
+        if self._a_audit is None:
+            raise ValueError("AppWorld arm A audit was not preflighted")
+        return self._a_audit
+
+    def _assert_runtime_pins(self) -> None:
+        actual_image = getattr(self.runtime, "image_digest", None)
+        actual_provider = getattr(self.runtime, "provider", "openai-codex")
+        actual_revision = getattr(self.runtime, "source_revision", None) or os.environ.get("ADAPTIVE_AGENT_SOURCE_REVISION")
+        if actual_image != self.protocol.image_digest or not isinstance(actual_image, str) or not actual_image or actual_image == "image-unpinned":
+            raise ValueError("AppWorld runtime image digest does not match the frozen protocol")
+        if actual_provider != self.protocol.provider or actual_provider != "openai-codex":
+            raise ValueError("AppWorld runtime provider does not match the frozen protocol")
+        if actual_revision != self.protocol.source_revision or not isinstance(actual_revision, str) or not actual_revision:
+            raise ValueError("AppWorld runtime source revision does not match the frozen protocol")
 
     def _frozen(self) -> FrozenProtocol:
-        inputs = {"modelProfile": self.protocol.model_profile, "provider": "openai-codex", "corePlannerHash": self.protocol.core_planner_hash, "imageDigest": "image-unpinned", "runBudget": self.protocol.budget.to_dict()}
+        inputs = {"modelProfile": self.protocol.model_profile, "provider": self.protocol.provider, "corePlannerHash": self.protocol.core_planner_hash, "imageDigest": self.protocol.image_digest, "sourceRevision": self.protocol.source_revision, "runBudget": self.protocol.budget.to_dict()}
         return FrozenProtocol(self.protocol.protocol_hash, {}, {}, inputs)
 
     def _task(self, task: Any) -> Any:
@@ -88,8 +120,9 @@ class DurableAppWorldAdapter:
         return values
 
     def run_appworld_cell(self, *, package: AppWorldPackage, task: Any, arm: Arm, seed: int, bundle_hash: str, budget: BudgetSpec, run_id: str) -> AppWorldCellResult:
-        selected = self._bundle(bundle_hash)
-        self.bundle_hashes.setdefault(arm.value, bundle_hash)
+        selected = self._resolved_bundles.get(arm.value) or self._bundle(bundle_hash)
+        if self.bundle_hashes.get(arm.value) != bundle_hash:
+            raise ValueError("AppWorld arm bundle mapping changed after preflight")
         self.runtime._evaluation_arm_bundles = dict(self.bundle_hashes)
         observation = self.runtime.execute_evaluation_task(self._task(task), self._config(arm, seed, bundle_hash), selected)
         if not self.runtime.verify_evaluation_observation(observation, self._config(arm, seed, bundle_hash), self._task(task)):
@@ -106,7 +139,8 @@ class DurableAppWorldAdapter:
     def verify_appworld_cell(self, result: AppWorldCellResult, *, package: AppWorldPackage, task: Any, arm: Arm, seed: int, bundle_hash: str) -> bool:
         try:
             self._validate(result, task=task, arm=arm, seed=seed, bundle_hash=bundle_hash)
-            return self.runtime.verify_evaluation_observation(result.observation, self._config(arm, seed, bundle_hash), self._task(task)) and bool(self._usage(result.observation))
+            fresh_usage = self._usage(result.observation)
+            return self.runtime.verify_evaluation_observation(result.observation, self._config(arm, seed, bundle_hash), self._task(task)) and result.usage is not None and dict(result.usage) == dict(fresh_usage)
         except (KeyError, TypeError, ValueError):
             return False
 
@@ -128,6 +162,9 @@ class AppWorldProtocol:
     model_profile: str
     core_planner_hash: str
     dataset_content_hash: str
+    image_digest: str
+    provider: str
+    source_revision: str
     seeds: tuple[int, ...] = (0,)
     published_count: int = DEFAULT_PUBLISHED_COUNT
     sampling_seed: int = DEFAULT_SEED
@@ -139,8 +176,8 @@ class AppWorldProtocol:
     protocol_hash: str = ""
 
     @classmethod
-    def freeze(cls, package: AppWorldPackage, *, model_profile: str, core_planner_hash: str, official_split: str, dataset_content_hash: str | None = None, published_count: int = DEFAULT_PUBLISHED_COUNT, sampling_seed: int = DEFAULT_SEED, seeds: tuple[int, ...] = (0,), budget: BudgetSpec | None = None) -> "AppWorldProtocol":
-        if official_split not in ("dev", *FINAL_SPLITS) or not model_profile or not core_planner_hash or published_count < 1 or not seeds or any(isinstance(s, bool) or not isinstance(s, int) for s in seeds):
+    def freeze(cls, package: AppWorldPackage, *, model_profile: str, core_planner_hash: str, official_split: str, image_digest: str, provider: str = "openai-codex", source_revision: str, dataset_content_hash: str | None = None, published_count: int = DEFAULT_PUBLISHED_COUNT, sampling_seed: int = DEFAULT_SEED, seeds: tuple[int, ...] = (0,), budget: BudgetSpec | None = None) -> "AppWorldProtocol":
+        if official_split not in ("dev", *FINAL_SPLITS) or not model_profile or not core_planner_hash or not image_digest or image_digest == "image-unpinned" or provider != "openai-codex" or not source_revision or published_count < 1 or not seeds or any(isinstance(s, bool) or not isinstance(s, int) for s in seeds):
             raise ValueError("invalid AppWorld protocol pins")
         catalog = package.catalog
         content_hash = dataset_content_hash or catalog.dataset_hash()
@@ -155,11 +192,11 @@ class AppWorldProtocol:
         sampled = tuple(sorted(random.Random(sampling_seed).sample(final_ids, published_count)))
         split_by_id = tuple((task_id, split) for split, ids in split_ids.items() for task_id in ids if task_id in sampled)
         selected_budget = budget or BudgetSpec()
-        payload = {"source": "appworld", "version": APPWORLD_VERSION, "modelProfile": model_profile, "corePlannerHash": core_planner_hash, "datasetContentHash": content_hash, "officialSplit": official_split, "seeds": list(seeds), "publishedCount": published_count, "samplingSeed": sampling_seed, "budget": selected_budget.to_dict(), "officialSplitCounts": {k: len(v) for k, v in split_ids.items()}, "sampledTaskIds": list(sampled), "splitByTaskId": dict(split_by_id)}
-        return cls("appworld", model_profile, core_planner_hash, content_hash, tuple(seeds), published_count, sampling_seed, official_split, selected_budget, sampled, split_by_id, tuple((k, len(v)) for k, v in split_ids.items()), sha256_json(payload))
+        payload = {"source": "appworld", "version": APPWORLD_VERSION, "modelProfile": model_profile, "corePlannerHash": core_planner_hash, "datasetContentHash": content_hash, "imageDigest": image_digest, "provider": provider, "sourceRevision": source_revision, "officialSplit": official_split, "seeds": list(seeds), "publishedCount": published_count, "samplingSeed": sampling_seed, "budget": selected_budget.to_dict(), "officialSplitCounts": {k: len(v) for k, v in split_ids.items()}, "sampledTaskIds": list(sampled), "splitByTaskId": dict(split_by_id)}
+        return cls("appworld", model_profile, core_planner_hash, content_hash, image_digest, provider, source_revision, tuple(seeds), published_count, sampling_seed, official_split, selected_budget, sampled, split_by_id, tuple((k, len(v)) for k, v in split_ids.items()), sha256_json(payload))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"source": self.source, "version": APPWORLD_VERSION, "modelProfile": self.model_profile, "corePlannerHash": self.core_planner_hash, "datasetContentHash": self.dataset_content_hash, "officialSplit": self.official_split, "seeds": list(self.seeds), "publishedCount": self.published_count, "samplingSeed": self.sampling_seed, "budget": self.budget.to_dict(), "officialSplitCounts": dict(self.official_split_counts), "sampledTaskIds": list(self.sampled_task_ids), "splitByTaskId": dict(self.split_by_task_id), "protocolHash": self.protocol_hash, "scope": "published_subset" if self.published_count == DEFAULT_PUBLISHED_COUNT else "configured_subset"}
+        return {"source": self.source, "version": APPWORLD_VERSION, "modelProfile": self.model_profile, "corePlannerHash": self.core_planner_hash, "datasetContentHash": self.dataset_content_hash, "imageDigest": self.image_digest, "provider": self.provider, "sourceRevision": self.source_revision, "officialSplit": self.official_split, "seeds": list(self.seeds), "publishedCount": self.published_count, "samplingSeed": self.sampling_seed, "budget": self.budget.to_dict(), "officialSplitCounts": dict(self.official_split_counts), "sampledTaskIds": list(self.sampled_task_ids), "splitByTaskId": dict(self.split_by_task_id), "protocolHash": self.protocol_hash, "scope": "published_subset" if self.published_count == DEFAULT_PUBLISHED_COUNT else "configured_subset"}
 
 
 @dataclass(frozen=True)
@@ -171,8 +208,9 @@ class AppWorldReport:
     missing_pairs: int
     provenance_complete: bool
     limitations: tuple[str, ...]
+    ablation_audit: Mapping[str, Any] | None = None
     def to_dict(self) -> dict[str, Any]:
-        return {"benchmark": "appworld", "protocol": self.protocol.to_dict(), "armSummaries": dict(self.arm_summaries), "confidenceIntervals": list(self.confidence_intervals), "pairedTaskCount": self.paired_task_count, "missingPairs": self.missing_pairs, "provenanceComplete": self.provenance_complete, "limitations": list(self.limitations)}
+        return {"benchmark": "appworld", "protocol": self.protocol.to_dict(), "armSummaries": dict(self.arm_summaries), "confidenceIntervals": list(self.confidence_intervals), "pairedTaskCount": self.paired_task_count, "missingPairs": self.missing_pairs, "provenanceComplete": self.provenance_complete, "limitations": list(self.limitations), "ablationAudit": self.ablation_audit}
 
 
 class AppWorldBenchmarkRunner:
@@ -202,6 +240,10 @@ class AppWorldBenchmarkRunner:
             if row is None: conn.execute("INSERT INTO appworld_plans VALUES (?, ?)", (benchmark_id, encoded))
             elif row[0] != encoded: raise ValueError("benchmark is already bound to different protocol, dataset, or bundles")
             conn.commit()
+        preflight = getattr(self.runtime, "preflight_bundles", None)
+        if not callable(preflight):
+            raise ValueError("AppWorld runtime must preflight all arm bundles")
+        preflight(normalized)
         return normalized
 
     @staticmethod
@@ -268,7 +310,9 @@ class AppWorldBenchmarkRunner:
             summaries[arm.value] = {"accuracy": sum(r.observation.passed for r in selected) / len(selected) if selected else 0.0, "reliability": sum(r.observation.reliable for r in selected) / len(selected) if selected else 0.0, "inputTokens": sum(int(u.get("inputTokens", 0)) for u in usages) if len(usages) == len(selected) else None, "outputTokens": sum(int(u.get("outputTokens", 0)) for u in usages) if len(usages) == len(selected) else None, "costMicrounits": sum(r.observation.cost_microunits for r in selected), "latencySeconds": sum(r.observation.latency_seconds for r in selected), "count": len(selected)}
         base, candidate = [r for r in rows if r.arm == Arm.B0], [r for r in rows if r.arm == Arm.L]; keys = {(r.task_id, r.seed) for r in base} & {(r.task_id, r.seed) for r in candidate}; expected = len(self.protocol.sampled_task_ids) * len(self.protocol.seeds) * 3
         intervals = clustered_paired_bootstrap(base, candidate) if len(rows) == expected else ()
-        return AppWorldReport(self.protocol, summaries, tuple(x.to_dict() for x in intervals), len(keys), expected - len(rows), bool(rows) and len(rows) == expected and all(r.model_provenance is ModelProvenance.REAL_MODEL for r in rows), ("Published AppWorld subset; not the full benchmark.", "Only aggregate outcomes and measured usage are exported; task answers and traces remain private."))
+        audit = getattr(self.runtime, "ablation_audit", lambda: None)()
+        audit_value = audit.to_dict() if audit is not None and hasattr(audit, "to_dict") else (asdict(audit) if audit is not None else None)
+        return AppWorldReport(self.protocol, summaries, tuple(x.to_dict() for x in intervals), len(keys), expected - len(rows), bool(rows) and len(rows) == expected and all(r.model_provenance is ModelProvenance.REAL_MODEL for r in rows), ("Published AppWorld subset; not the full benchmark.", "Only aggregate outcomes and measured usage are exported; task answers and traces remain private."), audit_value)
 
 
 def create_appworld_benchmark_runner(runtime: Any, package: AppWorldPackage, protocol: AppWorldProtocol, bundles: Mapping[Arm | str, str], store_dir: str | Path | None = None) -> AppWorldBenchmarkRunner:
