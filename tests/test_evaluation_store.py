@@ -60,6 +60,36 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             row = RunObservation(task.task_id, "finance", Partition.VALIDATION, 17, Arm.L, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, response_id=response_id, accounting_ref=accounting_ref.sha256, evidence_ref="evidence-1", outcome_ref="outcome-1", config_hashes=expected, run_id=run_id)
             verifier = SQLiteRunEvidenceStore(store)
             self.assertTrue(verifier.verify(row, frozen, package))
+            nominal_accounting = store.put_artifact({
+                "responseId": response_id,
+                "runId": run_id,
+                "taskId": task.task_id,
+                "environmentId": "finance",
+                "usage": usage,
+                "costMicrounits": None,
+                "nominalCostUsd": 0.000001,
+                "nominalCostStatus": "complete",
+                "nominalCostCoverage": {"knownReceipts": 1, "totalReceipts": 1},
+                "economicCost": {"status": "unknown", "microunits": None},
+                "durationSeconds": 1.0,
+                "versionRefs": version_refs,
+            })
+            nominal_row = dataclasses.replace(row, accounting_ref=nominal_accounting.sha256, cost_microunits=1)
+            self.assertTrue(verifier.verify(nominal_row, frozen, package))
+            partial_accounting = store.put_artifact({
+                "responseId": response_id,
+                "runId": run_id,
+                "taskId": task.task_id,
+                "environmentId": "finance",
+                "usage": usage,
+                "costMicrounits": None,
+                "nominalCostUsd": 0.000001,
+                "nominalCostStatus": "partial",
+                "nominalCostCoverage": {"knownReceipts": 1, "totalReceipts": 2},
+                "durationSeconds": 1.0,
+                "versionRefs": version_refs,
+            })
+            self.assertFalse(verifier.verify(dataclasses.replace(nominal_row, accounting_ref=partial_accounting.sha256), frozen, package))
             with store.connect() as conn:
                 conn.execute("UPDATE evidence SET visibility = 'evaluator_only' WHERE evidence_id = ?", ("outcome-1",))
                 conn.commit()

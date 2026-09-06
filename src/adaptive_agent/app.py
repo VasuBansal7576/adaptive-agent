@@ -38,6 +38,33 @@ from adaptive_agent.store import Store
 from adaptive_agent.evaluation_store import build_durable_adapters
 
 
+def _effective_observation_cost(accounting: Mapping[str, Any]) -> int:
+    """Return an observation cost only when its source is complete.
+
+    Measured microunits are authoritative when present.  A nominal USD value
+    is usable as a clearly labeled proxy only when the accounting artifact
+    explicitly states complete, non-empty receipt coverage.
+    """
+    cost = accounting.get("costMicrounits")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(float(cost)) and cost >= 0:
+        return int(round(float(cost)))
+    nominal = accounting.get("nominalCostUsd")
+    coverage = accounting.get("nominalCostCoverage")
+    complete_coverage = (
+        accounting.get("nominalCostStatus") == "complete"
+        and isinstance(coverage, Mapping)
+        and isinstance(coverage.get("knownReceipts"), int)
+        and not isinstance(coverage.get("knownReceipts"), bool)
+        and isinstance(coverage.get("totalReceipts"), int)
+        and not isinstance(coverage.get("totalReceipts"), bool)
+        and coverage["totalReceipts"] > 0
+        and coverage["knownReceipts"] == coverage["totalReceipts"]
+    )
+    if complete_coverage and isinstance(nominal, (int, float)) and not isinstance(nominal, bool) and math.isfinite(float(nominal)) and nominal >= 0:
+        return int(round(float(nominal) * 1_000_000))
+    raise LearningRuntimeError("evaluation accounting lacks complete economic or nominal cost")
+
+
 def _freeze_core_planner_hash() -> str:
     """Hash the executable planner sources once for this process.
 
@@ -603,7 +630,10 @@ class DurableRuntime:
                 observation_kwargs["bundle_hash"] = durable_bundle.content_hash
         except TypeError:
             pass
-        return RunObservation(task_id, env_id, Partition(getattr(getattr(task, "partition", None), "value", getattr(task, "partition", "development"))), seed, Arm(arm_value), passed, reliable, safety_violations, int(accounting.get("costMicrounits") or 0), float(accounting.get("durationSeconds", 1e-6)), **observation_kwargs)
+        duration = accounting.get("durationSeconds")
+        if not isinstance(duration, (int, float)) or isinstance(duration, bool) or not math.isfinite(float(duration)) or duration < 0:
+            raise LearningRuntimeError("evaluation accounting lacks complete duration")
+        return RunObservation(task_id, env_id, Partition(getattr(getattr(task, "partition", None), "value", getattr(task, "partition", "development"))), seed, Arm(arm_value), passed, reliable, safety_violations, _effective_observation_cost(accounting), float(duration), **observation_kwargs)
 
     def run_evaluation_job(self, task: Mapping[str, Any], frozen_config: Mapping[str, Any] | None, bundle: Mapping[str, Any] | None) -> None:
         """Run one trusted evaluation task and durably record its result.
@@ -785,16 +815,20 @@ class DurableRuntime:
     def list_evaluations(self) -> list[dict[str, Any]]:
         out = []
         report_ids: set[str] = set()
+        queue_rows = {
+            str(row["evaluation_id"]): row
+            for row in self.controller.store.list_evaluation_queue()
+            if isinstance(row.get("evaluation_id"), str)
+        }
 
         def public_job(payload: Mapping[str, Any], *, evaluation_id: str | None = None, row: Mapping[str, Any] | None = None) -> dict[str, Any]:
             value = dict(payload)
             if evaluation_id is not None:
                 value.setdefault("evaluationId", evaluation_id)
             if row is not None:
-                value.setdefault("candidateId", row.get("candidate_id"))
-                value.setdefault("baseBundleHash", row.get("base_hash"))
-                value.setdefault("protocolHash", row.get("protocol_hash"))
-                value.setdefault("state", row.get("state"))
+                for output_key, row_key in (("candidateId", "candidate_id"), ("baseBundleHash", "base_hash"), ("protocolHash", "protocol_hash"), ("state", "state")):
+                    if output_key not in value and row.get(row_key) is not None:
+                        value[output_key] = row[row_key]
             if "candidate_id" in value:
                 value["candidateId"] = value.pop("candidate_id")
             if "base_hash" in value:
@@ -803,11 +837,24 @@ class DurableRuntime:
                 value["protocolHash"] = value.pop("protocol_hash")
             if "validity" in value and "validityStatus" not in value:
                 value["validityStatus"] = value.pop("validity")
-            state = value.get("state")
             canonical = bool(row is not None and self._verify_evaluation_report(value, row))
+            raw_state = value.get("state")
+            if raw_state in {"completed", "complete", "decided", "failed", "error", "incomplete"}:
+                value["state"] = "valid" if canonical else "invalid"
+            elif raw_state not in {"queued", "running", "valid", "invalid", "cancelled"}:
+                validity = value.get("validityStatus")
+                value["state"] = "valid" if canonical and validity == "valid" else "invalid"
             value["trusted"] = canonical
             if not canonical:
                 value.setdefault("trustReason", "unverified evaluator report")
+                if "reason" not in value:
+                    error = value.get("error")
+                    if isinstance(error, Mapping) and isinstance(error.get("message"), str):
+                        value["reason"] = error["message"]
+                    elif isinstance(error, str) and error:
+                        value["reason"] = error
+                    else:
+                        value["reason"] = value["trustReason"]
             return value
 
         for row in self.controller.store.list_evaluations():
@@ -815,13 +862,16 @@ class DurableRuntime:
                 report = json.loads(row["report_json"])
                 if isinstance(report, dict):
                     report_id = str(row.get("report_id", report.get("evaluationId", "")))
-                    normalized = public_job(report, evaluation_id=report_id or None, row=row)
+                    # The report table stores evaluator output; queue metadata
+                    # owns the operator-facing candidate and lifecycle fields.
+                    metadata = queue_rows.get(report_id)
+                    normalized = public_job(report, evaluation_id=report_id or None, row=metadata or row)
                     out.append(normalized)
                     if report_id:
                         report_ids.add(report_id)
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-        for row in self.controller.store.list_evaluation_queue():
+        for row in queue_rows.values():
             try:
                 queued = json.loads(row["payload_json"])
             except (TypeError, ValueError, json.JSONDecodeError):

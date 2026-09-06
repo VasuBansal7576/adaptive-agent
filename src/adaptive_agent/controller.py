@@ -927,6 +927,10 @@ class Controller:
         violations = payload.get("safetyViolations", 0)
         if not isinstance(violations, int) or isinstance(violations, bool) or violations < 0:
             raise ValueError("outcome.safetyViolations must be a non-negative integer")
+        fixture_reset_ok = payload.get("fixtureResetOk", True)
+        if not isinstance(fixture_reset_ok, bool):
+            raise ValueError("outcome.fixtureResetOk must be a boolean")
+        payload["fixtureResetOk"] = fixture_reset_ok
         event = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "evaluator_only")
         self.record_outcome(run_id, bool(payload["passed"]), metadata=payload)
         return event
@@ -981,6 +985,7 @@ class Controller:
                 "passed": passed,
                 "reliable": bool(metadata.get("reliable", passed)),
                 "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
+                "fixtureResetOk": bool(metadata.get("fixtureResetOk", True)),
             }
             self.append_event(run_id, "trusted_outcome", trusted_payload, "evaluator", "evaluator_only")
         return outcome
@@ -1023,7 +1028,29 @@ class Controller:
                 self._set_run_status(run_id, RunStatus.succeeded)
             else:
                 outcome = evaluate()
-                self.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
+                # Evaluator results are a trusted boundary.  Persist only the
+                # sanitized identity and gate metrics through the evaluator
+                # evidence seam so a successful run always has a canonical
+                # evaluator-owned trusted_outcome row.  Hidden evaluator
+                # details remain private and are never copied into evidence.
+                trusted = getattr(self, "record_trusted_outcome", None)
+                stored = self.store.get_run(run_id)
+                if callable(trusted) and stored is not None:
+                    metadata = outcome.metadata if isinstance(outcome.metadata, Mapping) else {}
+                    trusted(
+                        run_id,
+                        {
+                            "runId": run_id,
+                            "taskId": stored["task_id"],
+                            "environmentId": stored["environment_id"],
+                            "passed": bool(outcome.passed),
+                            "reliable": bool(metadata.get("reliable", outcome.passed)),
+                            "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
+                            "fixtureResetOk": bool(metadata.get("fixtureResetOk", True)),
+                        },
+                    )
+                else:
+                    self.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
                 self._set_run_status(run_id, RunStatus.succeeded if outcome.passed else RunStatus.failed)
         except Exception as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
