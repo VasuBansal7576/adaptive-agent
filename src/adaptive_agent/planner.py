@@ -171,11 +171,15 @@ class PrimeCliModelClient:
         coding_agent_dir: str | os.PathLike[str] | None = None,
         cwd: str | os.PathLike[str] = "/private/tmp",
         thinking: str = "medium",
+        max_output_chars: int = 65_536,
     ) -> None:
         self.executable = executable
         self.coding_agent_dir = os.fspath(coding_agent_dir) if coding_agent_dir is not None else None
         self.cwd = os.fspath(cwd)
         self.thinking = thinking
+        if max_output_chars < 1:
+            raise ValueError("max_output_chars must be positive")
+        self.max_output_chars = max_output_chars
 
     def invoke(
         self,
@@ -221,6 +225,7 @@ class PrimeCliModelClient:
         ]
         env = os.environ.copy()
         env["PRIME_AGENT_CODING_AGENT_DIR"] = coding_agent_dir
+        started = time.monotonic()
         try:
             process = subprocess.Popen(
                 command,
@@ -233,19 +238,26 @@ class PrimeCliModelClient:
         except OSError as exc:
             raise PlannerError(f"unable to launch Prime CLI: {exc}") from exc
 
-        started = time.monotonic()
         stdout = ""
         stderr = ""
+
+        def stop_process() -> None:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.communicate(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+
         try:
             while True:
                 if cancel is not None and cancel.is_set():
-                    process.terminate()
-                    process.communicate(timeout=1)
+                    stop_process()
                     raise PlannerCancelled("model call cancelled")
                 remaining = None if remaining_deadline is None else remaining_deadline - (time.monotonic() - started)
                 if remaining is not None and remaining <= 0:
-                    process.terminate()
-                    process.communicate(timeout=1)
+                    stop_process()
                     raise PlannerTimedOut("model call exceeded deadline")
                 try:
                     stdout, stderr = process.communicate(timeout=min(0.1, remaining) if remaining is not None else 0.1)
@@ -253,10 +265,10 @@ class PrimeCliModelClient:
                 except subprocess.TimeoutExpired:
                     continue
         except (PlannerCancelled, PlannerTimedOut):
-            if process.poll() is None:
-                process.kill()
-                process.communicate()
+            stop_process()
             raise
+        if len(stdout) > self.max_output_chars:
+            raise PlannerError("Prime CLI output exceeds the configured limit")
         if process.returncode != 0:
             detail = stderr.strip()[-2_000:]
             raise PlannerError(f"Prime CLI exited with status {process.returncode}: {detail}")

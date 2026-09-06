@@ -1,10 +1,11 @@
 from dataclasses import dataclass
 import stat
+import time
 from threading import Event
 
 import pytest
 
-from adaptive_agent.planner import LunaPlanner, PlannerError, PlannerLimits, PrimeCliModelClient, make_luna_model_runner
+from adaptive_agent.planner import LunaPlanner, PlannerError, PlannerLimits, PlannerTimedOut, PrimeCliModelClient, make_luna_model_runner
 
 
 @dataclass
@@ -139,6 +140,17 @@ def test_model_usage_is_recorded_before_token_cap_rejection():
     assert result.status == "budget_exhausted"
     assert result.model_tokens == 4
     assert len(sink.observations) == 1
+
+
+def test_prime_cli_client_terminates_when_deadline_expires(tmp_path):
+    executable = tmp_path / "prime-agent-slow"
+    executable.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(2)\n")
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    client = PrimeCliModelClient(executable=str(executable), coding_agent_dir=tmp_path)
+    started = time.monotonic()
+    with pytest.raises(PlannerTimedOut):
+        client.invoke(goal="goal", environment={}, messages=[], remaining_deadline=0.05)
+    assert time.monotonic() - started < 1
 
 
 def test_cancel_after_model_turn_prevents_finish_or_kernel_execution():
