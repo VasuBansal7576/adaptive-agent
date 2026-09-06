@@ -167,11 +167,15 @@ class ModelObservation:
 
 @dataclass(frozen=True)
 class ParsedModelUsage:
-    """Validated provider receipt used by both parent and child accounting."""
+    """Validated usage with nominal budget and economic billing kept separate."""
 
     tokens: int
+    # Ledger proxy: SDK usage.cost.total (or an explicit costMicrounits proxy).
     cost_microunits: int | None
     currency: str | None
+    nominal_cost_usd: float | None = None
+    # Only an explicitly supplied economicCost/economicCostMicrounits is measured.
+    economic_cost_microunits: int | None = None
 
 
 def _usage_int_field(usage: Mapping[str, Any], label: str, aliases: tuple[str, ...]) -> int | None:
@@ -189,7 +193,12 @@ def _usage_int_field(usage: Mapping[str, Any], label: str, aliases: tuple[str, .
 
 
 def parse_model_usage(usage: Mapping[str, Any], *, require_cost: bool = False, expected_currency: str = "USD") -> ParsedModelUsage:
-    """Normalize token and nominal-cost receipts without dropping input usage."""
+    """Normalize usage and expose SDK price only as a nominal budget proxy.
+
+    ``usage.cost.total`` is a provider-reported estimate on the subscription
+    path. It is safe for shared admission accounting, but does not prove a
+    billed economic charge. Explicit ``economicCost`` fields remain measured.
+    """
     if not isinstance(usage, Mapping) or not usage:
         raise AdapterError("model usage must be a non-empty object")
     total = _usage_int_field(usage, "total", ("totalTokens", "total_tokens"))
@@ -210,32 +219,64 @@ def parse_model_usage(usage: Mapping[str, Any], *, require_cost: bool = False, e
     else:
         raise AdapterError("model usage must include total or input/output token accounting")
 
-    cost_microunits = _usage_int_field(usage, "costMicrounits", ("costMicrounits", "cost_microunits"))
+    proxy_microunits = _usage_int_field(usage, "costMicrounits", ("costMicrounits", "cost_microunits"))
     cost = usage.get("cost")
     if cost is not None and not isinstance(cost, Mapping):
         raise AdapterError("model usage cost must be an object")
     sdk_total = cost.get("total") if isinstance(cost, Mapping) and "total" in cost else None
+    nominal_cost_usd: float | None = None
     if sdk_total is not None:
         if isinstance(sdk_total, bool) or not isinstance(sdk_total, (int, float)) or not math.isfinite(float(sdk_total)) or float(sdk_total) < 0:
             raise AdapterError("model usage cost.total must be finite and non-negative")
-        sdk_microunits = int(round(float(sdk_total) * 1_000_000))
-        if cost_microunits is not None and cost_microunits != sdk_microunits:
+        nominal_cost_usd = float(sdk_total)
+        sdk_microunits = int(round(nominal_cost_usd * 1_000_000))
+        if proxy_microunits is not None and proxy_microunits != sdk_microunits:
             raise AdapterError("model usage cost contradicts costMicrounits")
-        cost_microunits = sdk_microunits
+        proxy_microunits = sdk_microunits
+
+    economic = usage.get("economicCost")
+    if economic is not None and not isinstance(economic, Mapping):
+        raise AdapterError("model usage economicCost must be an object")
+    economic_microunits = _usage_int_field(
+        usage, "economic cost", ("economicCostMicrounits", "economic_cost_microunits", "measuredCostMicrounits", "measured_cost_microunits")
+    )
+    nested_economic = economic.get("microunits") if isinstance(economic, Mapping) else None
+    if nested_economic is not None:
+        if not isinstance(nested_economic, int) or isinstance(nested_economic, bool) or nested_economic < 0:
+            raise AdapterError("model usage economicCost.microunits must be a non-negative integer")
+        if economic_microunits is not None and economic_microunits != nested_economic:
+            raise AdapterError("model usage economic cost fields contradict")
+        economic_microunits = nested_economic
+    economic_status = economic.get("status") if isinstance(economic, Mapping) else usage.get("economicCostStatus")
+    if economic_status is not None and economic_status not in {"unknown", "measured"}:
+        raise AdapterError("model usage economic cost status is invalid")
+    if economic_status == "measured" and economic_microunits is None:
+        raise AdapterError("measured economic cost requires microunits")
+    if economic_microunits is not None and economic_status not in {None, "measured"}:
+        raise AdapterError("economic cost microunits require measured status")
+    if economic_microunits is not None and proxy_microunits is None:
+        # A measured receipt is also a valid admission proxy when no SDK
+        # nominal price was supplied.
+        proxy_microunits = economic_microunits
+
     currencies: list[str] = []
-    for value in (usage.get("currency"), cost.get("currency") if isinstance(cost, Mapping) else None):
+    for value in (
+        usage.get("currency"),
+        cost.get("currency") if isinstance(cost, Mapping) else None,
+        economic.get("currency") if isinstance(economic, Mapping) else None,
+    ):
         if value is not None:
             if not isinstance(value, str) or not value.strip():
                 raise AdapterError("model usage currency must be a non-empty string")
             currencies.append(value.strip().upper())
     if currencies and any(value != currencies[0] for value in currencies[1:]):
         raise AdapterError("model usage has contradictory currencies")
-    currency = currencies[0] if currencies else (expected_currency.upper() if cost_microunits is not None else None)
+    currency = currencies[0] if currencies else (expected_currency.upper() if proxy_microunits is not None else None)
     if currency is not None and expected_currency and currency != expected_currency.upper():
         raise AdapterError("model usage currency does not match configured currency")
-    if require_cost and cost_microunits is None:
+    if require_cost and proxy_microunits is None:
         raise AdapterError("model usage cost is required by the configured cost guard")
-    return ParsedModelUsage(tokens, cost_microunits, currency)
+    return ParsedModelUsage(tokens, proxy_microunits, currency, nominal_cost_usd, economic_microunits)
 
 
 @dataclass(frozen=True)
