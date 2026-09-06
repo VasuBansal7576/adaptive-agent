@@ -955,8 +955,10 @@ def test_durable_event_projection_exposes_safe_failure_summary_and_hides_evaluat
     assert '"totalTokens":6' in model["data"]["detail"]
     outcome = next(event for event in events if event["event"] == "outcome_recorded")
     assert outcome["data"]["summary"] == "Trusted outcome check recorded"
-    assert '"reason":"objective state not matched"' in outcome["data"]["detail"]
+    assert outcome["data"]["detail"] == '{"passed":false,"score":0.0}'
+    assert '"reason"' not in outcome["data"]["detail"]
     assert all(event["data"].get("visibility") != "evaluator_only" for event in events)
+    assert "objective state not matched" not in response.text
     assert "hidden evaluator answer" not in response.text
 
 
