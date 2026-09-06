@@ -676,8 +676,8 @@ class DurableRuntime:
                 run_payload = decoded
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
-        arm = evidence.get("arm") or run_payload.get("arm") or "B0"
-        seed = evidence.get("seed", run_payload.get("seed", 0))
+        arm = evidence.get("arm") or run_payload.get("arm")
+        seed = evidence.get("seed", run_payload.get("seed"))
         bundle_hash = evidence.get("bundleHash") or run_payload.get("bundleHash") or run.skill_bundle_ref.sha256
         if not isinstance(bundle_hash, str) or not bundle_hash:
             raise ValueError("model response evidence requires bundleHash")
