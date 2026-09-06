@@ -147,6 +147,15 @@ def test_benchmark_write_uses_authorized_batch_mode(monkeypatch, tmp_path):
             return None
 
     monkeypatch.setattr(app_module, "PrimeRuntimeAdapter", FakePrime)
+    fixture_providers = []
+    fixture_provider = app_module._FixtureProvider
+
+    class RecordingFixtureProvider(fixture_provider):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            fixture_providers.append(self)
+
+    monkeypatch.setattr(app_module, "_FixtureProvider", RecordingFixtureProvider)
     seen = {}
     app = create_runtime_app(
         learning_model_client=PlannerClient(),
@@ -169,6 +178,8 @@ def test_benchmark_write_uses_authorized_batch_mode(monkeypatch, tmp_path):
     assert run_id is not None
     assert runtime.get_run(run_id)["status"] == "succeeded"
     assert runtime.get_run(run_id)["executionMode"] == "batch"
+    assert fixture_providers[0].session.state["invoice_status"] == "paid"
+    assert fixture_providers[0].session.state["payment_applied_to"] == "INV-DEV-000"
     assert seen["model_responses"]
     assert seen["kernel_events"]
     tool_events = [row for row in runtime.controller.store.list_evidence(run_id) if row["event_type"] == "tool_result"]
