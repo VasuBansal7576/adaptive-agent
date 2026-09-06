@@ -867,18 +867,43 @@ class Store:
         if not task or task.get("partition") != "development":
             raise PermissionError("tool-call projection is development-partition only")
 
+        # Restrict the projection to tools and input fields declared by the
+        # environment manifest. Missing or malformed manifests fail closed.
+        schema_keys: dict[str, set[str]] | None = {}
+        environment = self.get_environment(run["environment_id"])
+        if environment:
+            try:
+                manifest_ref = json.loads(environment["manifest_ref"])
+                manifest = self.get_artifact(manifest_ref["sha256"])
+                for schema in manifest.get("toolSchemas", []):
+                    if isinstance(schema, dict) and isinstance(schema.get("name"), str):
+                        properties = (schema.get("inputSchema") or {}).get("properties") or {}
+                        schema_keys[schema["name"]] = set(properties)
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, AttributeError):
+                schema_keys = None
+        if not schema_keys:
+            return []
+
+        def valid_source(event: dict[str, Any]) -> dict[str, Any] | None:
+            if event["event_type"] != "tool_result" or event["trust_class"] != "broker":
+                return None
+            if event["visibility"] not in {"learner", "operator"}:
+                return None
+            try:
+                source_ref = json.loads(event["source_ref"])
+                payload = self.get_artifact(source_ref["sha256"])
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                return None
+            if event.get("content_hash") != source_ref["sha256"]:
+                return None
+            return payload if isinstance(payload, dict) else None
+
         with self._connect() as conn:
             calls = [dict(row) for row in conn.execute("SELECT * FROM tool_calls WHERE run_id = ? ORDER BY rowid", (run_id,)).fetchall()]
         evidence_by_call: dict[str, dict[str, Any]] = {}
         for event in self.list_evidence(run_id):
-            if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker" or event.get("visibility") not in {"learner", "operator"}:
-                continue
-            try:
-                ref = json.loads(event["source_ref"])
-                payload = self.get_artifact(ref["sha256"])
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(payload, dict) and isinstance(payload.get("callId"), str):
+            payload = valid_source(event)
+            if payload is not None and isinstance(payload.get("callId"), str):
                 evidence_by_call[payload["callId"]] = event
 
         out: list[dict[str, Any]] = []
@@ -907,12 +932,15 @@ class Store:
             else:
                 output = None
                 effect = call.get("effect")
+            allowed = schema_keys.get(call["tool"])
+            if allowed is None:
+                continue
             event = evidence_by_call.get(call["call_id"], {})
             if event:
                 matched.add(call["call_id"])
             out.append({
                 "callId": call["call_id"], "evidenceId": event.get("evidence_id"), "tool": call["tool"],
-                "input": sanitize_for_learner(arguments), "result": sanitize_for_learner(output), "status": status,
+                "input": sanitize_for_learner({key: arguments[key] for key in arguments if key in allowed}), "result": sanitize_for_learner(output), "status": status,
                 "errorCode": error_code, "retry": retry, "version": version, "effect": effect,
                 "idempotencyKey": call["idempotency_key"], "argumentsSha256": sha256_json(arguments),
                 "resultSha256": result_hash, "evidenceContentHash": event.get("content_hash"),
@@ -927,23 +955,33 @@ class Store:
             # fallback; prepared calls above can still derive a safe row from
             # their persisted result while retaining the operator evidence
             # solely for provenance.
-            if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker" or event.get("visibility") != "learner":
+            if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker" or event.get("visibility") != "operator":
                 continue
-            try:
-                ref = json.loads(event["source_ref"])
-                payload = self.get_artifact(ref["sha256"])
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                payload = None
-            if payload is not None and not isinstance(payload, dict):
-                continue
-            payload = payload or {}
+            payload = valid_source(event)
+            if payload is None:
+                # Preserve a minimal bound row only when the source artifact
+                # cannot be resolved. A resolved hash mismatch is tampering.
+                try:
+                    source_ref = json.loads(event["source_ref"])
+                    self.get_artifact(source_ref["sha256"])
+                except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                    payload = {}
+                else:
+                    continue
             call_id = payload.get("callId")
             if isinstance(call_id, str) and call_id in matched:
                 continue
+            tool = payload.get("tool")
+            allowed = schema_keys.get(tool) if isinstance(tool, str) else None
+            if payload and not isinstance(tool, str):
+                continue
+            if tool is not None and allowed is None:
+                continue
+            raw_input = payload.get("input")
             error = payload.get("error")
             out.append({
-                "callId": call_id, "evidenceId": event.get("evidence_id"), "tool": payload.get("tool"),
-                "input": None, "result": sanitize_for_learner(payload.get("output")), "status": payload.get("status"),
+                "callId": call_id, "evidenceId": event.get("evidence_id"), "tool": tool,
+                "input": sanitize_for_learner({key: raw_input[key] for key in raw_input if allowed is not None and key in allowed}) if isinstance(raw_input, dict) else None, "result": sanitize_for_learner(payload.get("output")), "status": payload.get("status"),
                 "errorCode": error.get("code") if isinstance(error, dict) else None,
                 "retry": error.get("retry") if isinstance(error, dict) else None,
                 "version": payload.get("toolVersion"), "effect": payload.get("effect"),
