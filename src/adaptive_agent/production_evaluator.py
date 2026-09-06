@@ -320,7 +320,8 @@ def _lifecycle_stages(runtime: Any, protocol: Any, declared_retries: int) -> tup
         return callback(cell_key=cell_key, context={**dict(context), "declaredRetries": declared_retries, "sealedEnvironment": protocol.sealed_environment})
 
     def recover(receipt: Mapping[str, Any], *, stage: str, cell_key: str) -> Sequence[Any]:
-        runner = getattr(runtime, "experiment_stage_runner", None)
+        get_runner = getattr(runtime, "_get_or_create_experiment_stage_runner", None)
+        runner = get_runner() if callable(get_runner) else getattr(runtime, "experiment_stage_runner", None)
         recovery = getattr(runner, "recover_evaluation_observations", None)
         if not callable(recovery):
             recovery = getattr(runner, "recover_observations", None)

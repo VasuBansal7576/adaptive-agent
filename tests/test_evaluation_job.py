@@ -61,7 +61,11 @@ class EvaluationJobTests(unittest.TestCase):
                     candidate_hash="candidate-hash",
                     base_hash="base-hash",
                     protocol_hash="protocol-hash",
-                    partition_hashes={f"finance:{phase}": f"{phase}-partition"},
+                    partition_hashes={
+                        f"customer_support:{phase}": f"customer-support-{phase}-partition",
+                        f"finance:{phase}": f"finance-{phase}-partition",
+                        f"it:{phase}": f"it-{phase}-partition",
+                    },
                     arm_summaries={},
                     confidence_intervals=(),
                     safety_passed=True,
@@ -82,6 +86,10 @@ class EvaluationJobTests(unittest.TestCase):
             self.assertEqual({row["report_id"] for row in rows}, {"lifecycle:validation", "lifecycle:final"})
             self.assertEqual(len(rows), 2)
             self.assertEqual({json.loads(row["partition_ref"])["id"] for row in rows}, {"validation", "final"})
+            self.assertEqual(
+                {json.loads(row["partition_ref"])["sha256"] for row in rows},
+                {"finance-validation-partition", "finance-final-partition"},
+            )
 
 
 if __name__ == "__main__":

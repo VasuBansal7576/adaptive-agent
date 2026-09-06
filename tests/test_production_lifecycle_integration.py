@@ -148,7 +148,15 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     counts = {stage.name: len(stage.cells) for stage in stages}
     assert counts["validation"] == 360 and counts["final"] == 720
     plan = _lifecycle_execution_plan(counts, 0)
-    limits = {"attempts": max(plan["totalAdmissions"], 1_000_000), "inputTokens": 1_000_000_000_000, "outputTokens": 1_000_000_000_000, "toolCalls": 1_000_000_000_000, "wallMicros": 1_000_000_000_000, "costMicrounits": 1_000_000_000_000}
+    actual_attempts = plan["totalAdmissions"]
+    limits = {
+        "attempts": actual_attempts,
+        "inputTokens": actual_attempts * protocol.run_budget.model_tokens,
+        "outputTokens": actual_attempts * protocol.run_budget.model_tokens,
+        "toolCalls": actual_attempts * protocol.run_budget.tool_calls,
+        "wallMicros": actual_attempts * protocol.run_budget.wall_time_seconds * 1_000_000,
+        "costMicrounits": actual_attempts * protocol.run_budget.cost_microunits,
+    }
     job = runtime.build_evaluation_job(protocol, {Arm.B0: active})
     result = job.run_experiment("full-production-synthetic", stages, limits=limits)
     assert result.status == "complete", result.error
@@ -172,6 +180,20 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     assert len(promotions_before_restart) == 1 and promotions_before_restart[0]["decision"] == "promoted"
     assert task_model.turn > 0 and learning_model.calls == 7
 
+    from fastapi.testclient import TestClient
+
+    api = TestClient(app)
+    assert api.get("/session/bootstrap").status_code == 200
+    published_before_restart = api.get("/evaluations")
+    assert published_before_restart.status_code == 200
+    published_before = {
+        item["comparison"]: item
+        for item in published_before_restart.json()
+        if item.get("comparison") in {"validation", "final"}
+    }
+    assert set(published_before) == {"validation", "final"}
+    assert all(item["trusted"] is True and item["state"] == "valid" for item in published_before.values())
+
     with runtime.controller.store.connect() as conn:
         validation_receipts = conn.execute("SELECT COUNT(*) FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = 'validation' AND status = 'complete'", ("full-production-synthetic",)).fetchone()[0]
         final_receipts = conn.execute("SELECT COUNT(*) FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = 'final' AND status = 'complete'", ("full-production-synthetic",)).fetchone()[0]
@@ -188,6 +210,18 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     first_calls = task_model.turn
     restarted_app = create_runtime_app(data_dir=tmp_path, model_runner=task_model, learning_model_client=learning_model, evaluator=trusted_evaluator)
     restarted = restarted_app.state.durable_runtime
+    restarted_api = TestClient(restarted_app)
+    assert restarted_api.get("/session/bootstrap").status_code == 200
+    published_after_restart = restarted_api.get("/evaluations")
+    assert published_after_restart.status_code == 200
+    published_after = {
+        item["comparison"]: item
+        for item in published_after_restart.json()
+        if item.get("comparison") in {"validation", "final"}
+    }
+    assert set(published_after) == {"validation", "final"}
+    assert all(item["trusted"] is True and item["state"] == "valid" for item in published_after.values())
+    assert {item["protocolHash"] for item in published_after.values()} == {item["protocolHash"] for item in published_before.values()}
     restarted_job = restarted.build_evaluation_job(protocol, {Arm.B0: active})
     resumed = restarted_job.run_experiment("full-production-synthetic", _lifecycle_stages(restarted, protocol, 0), limits=limits)
     assert resumed.status == "complete", resumed.error

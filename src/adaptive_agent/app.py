@@ -189,6 +189,16 @@ class DurableRuntime:
         }
         self._reload_registered_environments()
 
+    def _get_or_create_experiment_stage_runner(self) -> Any:
+        """Return the runtime-owned runner, lazily restoring it after restart."""
+        callback = self.experiment_stage_runner
+        if callback is None and self._evaluation_protocol is not None:
+            from adaptive_agent.experiment_runtime import DefaultExperimentStageRunner
+
+            callback = DefaultExperimentStageRunner(self, self._evaluation_protocol)
+            self.experiment_stage_runner = callback
+        return callback
+
     def run_experiment_stage(self, *, cell_key: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
         """Run one lifecycle cell through the runtime-owned implementation.
 
@@ -196,12 +206,7 @@ class DurableRuntime:
         complete experiment lifecycle.  A missing binding fails closed instead
         of manufacturing a receipt from workload arithmetic.
         """
-        callback = self.experiment_stage_runner
-        if callback is None and self._evaluation_protocol is not None:
-            from adaptive_agent.experiment_runtime import DefaultExperimentStageRunner
-
-            callback = DefaultExperimentStageRunner(self, self._evaluation_protocol)
-            self.experiment_stage_runner = callback
+        callback = self._get_or_create_experiment_stage_runner()
         if not callable(callback):
             raise LearningRuntimeError("runtime does not have a trusted experiment stage runner")
         result = callback(cell_key=cell_key, context=dict(context))
@@ -750,10 +755,6 @@ class DurableRuntime:
         })
         thresholds = dict(protocol.thresholds)
         if self.controller.store.get_frozen_protocol(frozen.protocol_hash) is None:
-            validation_partitions = {
-                f"{name}:validation": frozen.partition_hashes[f"{name}:validation"]
-                for name in protocol.known_environments
-            }
             self.controller.candidates.freeze_protocol(
                 PromotionGate(
                     protocolHash=frozen.protocol_hash,
@@ -764,7 +765,7 @@ class DurableRuntime:
                 evaluator_id="|".join(evaluator_refs),
                 evaluator_refs=evaluator_refs,
                 fixture_hashes=dict(frozen.fixture_hashes),
-                partition_hashes=validation_partitions,
+                partition_hashes=dict(frozen.partition_hashes),
             )
         # CandidateManager consumes the evaluator's serialized report contract.
         # Bind its verifier to the same durable attestation ledger used by the
@@ -782,31 +783,38 @@ class DurableRuntime:
 
     def _verify_promotion_report(self, report: Mapping[str, Any]) -> bool:
         """Verify a candidate report against frozen inputs and the durable ledger."""
-        protocol = self._evaluation_protocol
-        if protocol is None or not isinstance(report, Mapping):
+        if not isinstance(report, Mapping):
             return False
         try:
-            frozen = protocol.start_candidate_generation()
-            environments = tuple(getattr(protocol, "known_environments", ()))
-            first_partition_hash = frozen.partition_hashes[f"{environments[0]}:validation"]
-        except (AttributeError, IndexError, KeyError, TypeError):
+            protocol_hash = report.get("protocolHash")
+            if not isinstance(protocol_hash, str) or not protocol_hash:
+                return False
+            frozen = self.controller.store.get_frozen_protocol(protocol_hash)
+            if frozen is None:
+                return False
+            partition_hashes = json.loads(frozen["partition_hashes_json"] or "{}")
+            validation_key = next(key for key in partition_hashes if key.endswith(":validation"))
+        except (AttributeError, IndexError, KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
             return False
         row = {
-            "protocol_hash": report.get("protocolHash"),
+            "protocol_hash": protocol_hash,
             "candidate_hash": report.get("candidateHash"),
             "base_hash": report.get("baseHash"),
-            "partition_ref": {"id": "validation", "sha256": first_partition_hash},
+            "partition_ref": {"id": "validation", "sha256": partition_hashes[validation_key]},
         }
         return self._verify_evaluation_report(report, row)
 
     def _verify_evaluation_report(self, report: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
         """Verify a serialized report against the durable evaluator ledger."""
-        protocol = self._evaluation_protocol
-        if protocol is None or not isinstance(report, Mapping):
+        if not isinstance(report, Mapping):
             return False
         try:
-            frozen = protocol.start_candidate_generation()
-            protocol_hash = frozen.protocol_hash
+            protocol_hash = row.get("protocol_hash")
+            if not isinstance(protocol_hash, str) or not protocol_hash:
+                return False
+            frozen = self.controller.store.get_frozen_protocol(protocol_hash)
+            if frozen is None:
+                return False
             if row.get("protocol_hash") != protocol_hash or report.get("protocolHash") != protocol_hash:
                 return False
             if report.get("candidateHash") != row.get("candidate_hash") or report.get("baseHash") != row.get("base_hash"):
@@ -819,16 +827,19 @@ class DurableRuntime:
             if not isinstance(partition_ref, Mapping) or partition_ref.get("id") not in {"validation", "final"}:
                 return False
             phase = str(partition_ref["id"])
-            environments = tuple(getattr(protocol, "known_environments", ()))
-            if phase == "final":
-                environments = (*environments, protocol.sealed_environment)
-            expected_partitions = {f"{name}:{phase}": frozen.partition_hashes[f"{name}:{phase}"] for name in environments}
+            frozen_partitions = json.loads(frozen["partition_hashes_json"] or "{}")
+            expected_partitions = {
+                key: value for key, value in frozen_partitions.items()
+                if isinstance(key, str) and key.endswith(f":{phase}")
+            }
+            if not expected_partitions:
+                return False
             if report.get("partitionHashes") != expected_partitions:
                 return False
-            first_partition = f"{environments[0]}:{phase}"
+            first_partition = next(iter(expected_partitions))
             if partition_ref.get("sha256") != expected_partitions[first_partition]:
                 return False
-            expected_refs = tuple(sorted({self.packages[name].manifest.evaluator_ref.id for name in environments if name in self.packages}))
+            expected_refs = tuple(sorted(json.loads(frozen["evaluator_refs_json"] or "[]")))
             refs = report.get("evaluatorRefs")
             if not isinstance(refs, (list, tuple)) or tuple(sorted(str(value) for value in refs)) != expected_refs:
                 return False
@@ -859,6 +870,7 @@ class DurableRuntime:
                 return False
             ledger = self.controller.evaluator_adapters[0]
             registry = TrustedEvaluatorRegistry(ledger)
+            environments = tuple(key.rsplit(":", 1)[0] for key in expected_partitions)
             for name in environments:
                 package = self.packages.get(name)
                 if package is None:

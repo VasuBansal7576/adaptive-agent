@@ -705,7 +705,9 @@ class EvaluationJob:
             partition_hashes = payload.get("partitionHashes")
             if not isinstance(partition_hashes, Mapping):
                 raise EvaluationError(f"{phase} report lacks partition hashes")
-            partition_key = next((key for key in sorted(partition_hashes) if key.endswith(f":{phase}")), None)
+            partition_key = f"{self.protocol.known_environments[0]}:{phase}"
+            if partition_key not in partition_hashes:
+                partition_key = None
             if partition_key is None:
                 raise EvaluationError(f"{phase} report lacks its frozen partition")
             report_id = f"{job_id}:{phase}"

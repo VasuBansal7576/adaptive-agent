@@ -4,7 +4,7 @@ import tempfile
 
 import pytest
 
-from adaptive_agent.production_evaluator import _lifecycle_execution_plan, _reject_shared_qa_path, _require_bound_real_receipt, build_job
+from adaptive_agent.production_evaluator import _lifecycle_execution_plan, _lifecycle_stages, _reject_shared_qa_path, _require_bound_real_receipt, build_job
 from adaptive_agent.store import Store
 
 
@@ -24,6 +24,28 @@ def test_lifecycle_execution_plan_accounts_for_nested_work_and_retries():
     counts = {"bootstrap": 1, "training": 60, "learning": 1, "transfer": 3, "adaptation": 3, "safety": 2, "validation": 360, "final": 720}
     plan = _lifecycle_execution_plan(counts, retries=1)
     assert plan == {"primaryCells": 1150, "primaryAttempts": 2300, "retryAttempts": 1150, "nestedSubcalls": 32, "totalAdmissions": 2332, "retriesPerCell": 1}
+
+
+def test_lifecycle_recovery_restores_lazy_stage_runner(tmp_path: Path):
+    from adaptive_agent.app import create_runtime_app
+    from adaptive_agent.evaluation import EvaluationProtocol
+
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    protocol = EvaluationProtocol(core_planner_hash=runtime.core_planner_hash, image_digest=runtime.image_digest)
+    protocol.freeze(runtime.packages)
+    runtime._evaluation_protocol = protocol
+    runtime.experiment_stage_runner = None
+
+    validation = next(stage for stage in _lifecycle_stages(runtime, protocol, 0) if stage.name == "validation")
+    assert validation.observation_recoverer is not None
+    with pytest.raises(RuntimeError, match="lifecycle receipt lacks durable observation run IDs"):
+        validation.observation_recoverer(
+            {"stage": "validation", "cellKey": "validation:0", "runIds": []},
+            stage="validation",
+            cell_key="validation:0",
+        )
+    assert runtime.experiment_stage_runner is not None
 
 
 def test_public_build_job_resume_restores_original_b0_after_promotion(tmp_path: Path, monkeypatch):
