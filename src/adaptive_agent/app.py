@@ -30,6 +30,7 @@ from adaptive_agent.learning import LearningService, PlannerLearningAdapter
 from adaptive_agent.learning_store import DurableLearningSourceAdapter, CandidateManagerLearningAdapter, LearningStoreError
 from adaptive_agent.learning_runtime import LearningRuntime, LearningRuntimeError
 from adaptive_agent.planner import PrimeCliModelClient, LunaPlanner, PlannerResult, PlannerLimits
+from adaptive_agent.prime_child_planner import LunaChildPlanner
 from adaptive_agent.prime_runtime import Capability as PrimeCapability, CapabilityBroker, PrimeRuntimeAdapter, PrimeRuntimeConfig
 from adaptive_agent.models import ArtifactRef, EnvironmentManifest as DurableManifest, TaskInput as DurableTask, ToolSchema as DurableTool, RunStatus, ToolRequest, Outcome as DurableOutcome, canonical_usage
 from adaptive_agent.store import Store
@@ -765,7 +766,7 @@ class DurableRuntime:
         if not isinstance(seed, int) or isinstance(seed, bool):
             raise ValueError("model response evidence requires an integer seed")
         arm_bundles = run_payload.get("armBundles")
-        if isinstance(arm_bundles, Mapping) and arm_bundles.get(arm) != bundle_hash:
+        if isinstance(arm_bundles, Mapping) and arm in arm_bundles and arm_bundles.get(arm) != bundle_hash:
             raise ValueError("model response bundleHash does not match the requested arm bundle")
         whole_run_duration = max(now - started, 1e-6)
         economic_status = evidence.get("economicCostStatus")
@@ -995,8 +996,11 @@ class DurableRuntime:
             budget_remaining["tool_calls"] = max(0, budget_remaining["tool_calls"] - 1)
             return result.model_dump(mode="json", by_alias=True)
         try:
+            max_tokens = int(budget_data.get("modelTokens", DEFAULT_MODEL_TOKENS)) if isinstance(budget_data, Mapping) else DEFAULT_MODEL_TOKENS
+            wall_seconds = float(budget_data.get("wallTimeSeconds", 90)) if isinstance(budget_data, Mapping) else 90.0
+            child_runs = int(budget_data.get("childRuns", 0)) if isinstance(budget_data, Mapping) else 0
             pinned_image = image_digest if isinstance(image_digest, str) and image_digest not in {"", "image-unpinned"} else None
-            prime = PrimeRuntimeAdapter(PrimeRuntimeConfig(task_id=run_id, model="openai-codex/gpt-5.6-luna", provider="openai-codex", max_model_tokens=int(budget_data.get("modelTokens", DEFAULT_MODEL_TOKENS)) if isinstance(budget_data, Mapping) else DEFAULT_MODEL_TOKENS, max_total_wall_seconds=float(budget_data.get("wallTimeSeconds", 90)) if isinstance(budget_data, Mapping) else 90.0, child_runs=int(budget_data.get("childRuns", 0)) if isinstance(budget_data, Mapping) else 0, max_child_depth=int(budget_data.get("childDepth", 1)) if isinstance(budget_data, Mapping) else 1, docker_image=pinned_image, ao_session_id=os.environ.get("AO_SESSION_ID")), broker=CapabilityBroker(run_id, authorizer=authorize))
+            prime = PrimeRuntimeAdapter(PrimeRuntimeConfig(task_id=run_id, model="openai-codex/gpt-5.6-luna", provider="openai-codex", max_model_tokens=max(1, max_tokens), max_total_wall_seconds=max(0.1, wall_seconds), child_runs=max(0, child_runs), max_child_depth=1, docker_image=pinned_image, ao_session_id=os.environ.get("AO_SESSION_ID")), broker=CapabilityBroker(run_id, authorizer=authorize))
             for tool in package.manifest.tool_schemas:
                 expires = (datetime.now(timezone.utc) + timedelta(seconds=90)).isoformat()
                 prime.broker.register(PrimeCapability(f"{run_id}:{tool.name}", tool.name, tool.version, tool.effect, "run", expires))
@@ -1015,31 +1019,30 @@ class DurableRuntime:
                 prime.close(remove_workspace=True)
             return
         runtime = self
-        from adaptive_agent.prime_child_planner import LunaChildPlanner
 
         # Parent and child model calls share the adapter's trusted ledger. The
         # child planner is attached only after the authenticated client exists,
         # and its receipts are routed through the same parent-owned evidence
         # path as the main planner.
-        child_planner = LunaChildPlanner(client, budget=prime.planner_budget)
+        def persist_child(evidence: Mapping[str, Any]) -> Any:
+            runtime._record_model_response(run_id, package, {**dict(evidence), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest})
+            return prime.record_model_observation(evidence, trusted_parent=True)
+
+        def persist_parent(evidence: Mapping[str, Any]) -> Any:
+            runtime._record_model_response(run_id, package, {**dict(evidence), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest})
+            return prime.record_model_observation(evidence, trusted_parent=True)
+
+        child_planner = LunaChildPlanner(client, budget=prime.planner_budget, observation_sink=persist_child)
         prime.child_planner = child_planner
 
-        def record_child_model_observation(evidence: Mapping[str, Any]) -> Any:
-            result = prime.record_model_observation(evidence, trusted_parent=True)
-            runtime._record_model_response(run_id, package, {**dict(evidence), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest})
-            return result
-
-        child_planner.observation_sink = record_child_model_observation
+        parent_client = child_planner.parent_model_client(observation_sink=persist_parent)
 
         class Sink:
             def __init__(self, controller: Controller) -> None:
                 self._controller = controller
 
             def record_model_observation(self, evidence: Mapping[str, Any], *, trusted_parent: bool = False) -> Any:
-                result = prime.record_model_observation(evidence, trusted_parent=trusted_parent)
-                runtime._record_model_response(run_id, package, {**dict(evidence), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest})
-                child_planner.record_parent_model_usage(evidence["usage"])
-                return result
+                return None
         class Driver:
             def __init__(self, controller: Controller) -> None:
                 self._controller = controller
@@ -1053,7 +1056,7 @@ class DurableRuntime:
                 if wall_seconds <= 0:
                     self.result = PlannerResult("timed_out", None, 0, 0, 0, (), ())
                     return
-                planner = LunaPlanner(client, prime, Sink(self._controller), limits=PlannerLimits(max_model_tokens=max(1, max_tokens), max_wall_seconds=max(0.1, wall_seconds)), emit=lambda event: self._controller.append_event(run_id, event.kind, {"summary": event.summary, "detail": event.detail}, "system", "operator"))
+                planner = LunaPlanner(parent_client, prime, Sink(self._controller), limits=PlannerLimits(max_model_tokens=max(1, max_tokens), max_wall_seconds=max(0.1, wall_seconds)), emit=lambda event: self._controller.append_event(run_id, event.kind, {"summary": event.summary, "detail": event.detail}, "system", "operator"))
                 self.result = planner.run(goal=task.goal, environment=runtime._planner_environment(package, run_id), active_skills=runtime._active_skills(run_id), cancel=cancel)
         driver = Driver(self.controller)
         def evaluate() -> DurableOutcome:
