@@ -9,9 +9,11 @@ candidate/store implementation.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 from dataclasses import dataclass
+from threading import Event
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .retrieval import AccessFilteredRetriever, Citation, RetrievalError, RetrievalResult, canonical_json
@@ -55,6 +57,46 @@ class ActiveBundleReader(Protocol):
     def __call__(self) -> str: ...
 
 
+PROPOSAL_CONTRACT: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["predictedEffect", "editOperations", "supportingEvidenceIds", "proposerVersion", "skill"],
+    "properties": {
+        "predictedEffect": {"type": "string", "minLength": 1, "maxLength": 500, "description": "A hypothesis only, never an outcome claim."},
+        "editOperations": {
+            "type": "array", "minItems": 1, "maxItems": 3,
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["path", "operation", "value"],
+                "properties": {
+                    "path": {"type": "string", "description": "Only skills/<generic-id>/{procedure,applicability,preconditions,failureHandling} or executionConfig/instructionVariant; no empty, '.', '..', absolute, or trusted-control paths."},
+                    "operation": {"enum": ["add", "replace", "remove"]},
+                    "value": {"description": "The exact value applied at path; remove requires null."},
+                },
+            },
+        },
+        "changedArtifactHashes": {"type": "array", "maxItems": 1, "description": "Optional caller-independent assertion; the service recomputes the hash from exact persisted patch bytes."},
+        "supportingEvidenceIds": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "Verified DEVELOPMENT evidence IDs only."}},
+        "proposerVersion": {"type": "string", "minLength": 1},
+        "skill": {
+            "type": "object", "additionalProperties": False, "required": ["procedure"],
+            "properties": {
+                "procedure": {"type": "string", "minLength": 1, "description": "Generic learned procedure; may include legitimate broker/API orchestration."},
+                "applicability": {"type": "object"},
+                "preconditions": {"type": "array", "items": {"type": "string"}},
+                "failureHandling": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "executionConfigPatch": {"type": "object", "additionalProperties": False, "properties": {"instructionVariant": {"type": "string"}}},
+    },
+    "description": "Every supplied skill/config field must equal the value of exactly one edit operation. The service applies and hashes this single canonical patch; predictedEffect and feedback never establish truth.",
+}
+
+
+def proposal_contract_json() -> str:
+    return json.dumps(PROPOSAL_CONTRACT, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
 def _sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode()).hexdigest()
 
@@ -63,6 +105,14 @@ def _require_hash(value: Any, label: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
         raise LearningError(f"{label} must be a SHA-256 digest")
     return value
+
+
+def _usage_tokens(usage: Mapping[str, Any]) -> int | None:
+    for key in ("totalTokens", "total_tokens", "outputTokens", "output_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
 
 
 def sanitize_feedback(feedback: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -107,20 +157,27 @@ class PlannerLearningAdapter:
         self.client = client
         self.evidence_sink = evidence_sink
 
-    def __call__(self, *, goal: str, environment: dict[str, Any], emit: Callable[[str, str, str | None], None]) -> ModelInvocation:
+    def __call__(self, *, goal: str, environment: dict[str, Any], emit: Callable[[str, str, str | None], None], remaining_deadline: float | None = None, cancel: Event | None = None, token_cap: int | None = None) -> ModelInvocation:
         messages = [
             {
                 "role": "system",
                 "content": (
                     "Propose one generic bounded learning patch from verified development evidence. "
-                    "Return only the JSON proposal schema requested by the caller. "
+                    "Return exactly one JSON object matching the PROPOSAL_CONTRACT included in the user message. "
                     "Predicted effects are hypotheses, not outcomes. Only patch the bounded skill/config paths; "
                     "do not emit fixture IDs, hidden evaluator material, or authority-bearing fields."
                 ),
             },
-            {"role": "user", "content": json.dumps({"goal": goal, "environment": environment}, sort_keys=True, ensure_ascii=False)},
+            {"role": "user", "content": json.dumps({"goal": goal, "environment": environment, "PROPOSAL_CONTRACT": PROPOSAL_CONTRACT}, sort_keys=True, ensure_ascii=False)},
         ]
-        raw = self.client.invoke(goal=goal, environment=environment, messages=messages)
+        invoke = self.client.invoke
+        parameters = inspect.signature(invoke).parameters
+        accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+        invoke_kwargs: dict[str, Any] = {"goal": goal, "environment": environment, "messages": messages}
+        for name, value in (("remaining_deadline", remaining_deadline), ("cancel", cancel), ("token_cap", token_cap)):
+            if accepts_kwargs or name in parameters:
+                invoke_kwargs[name] = value
+        raw = invoke(**invoke_kwargs)
         if not isinstance(raw, Mapping):
             raise LearningError("planner client returned a non-object response")
         provider, model = raw.get("provider"), raw.get("model")
@@ -267,7 +324,13 @@ class LearningService:
         self.candidate_sink = candidate_sink
         self.active_bundle_hash = active_bundle_hash
 
-    def propose(self, *, run_id: str, environment_id: str, goal: str, base_bundle_hash: str | None = None, environment: Mapping[str, Any] | None = None, feedback: Mapping[str, Any] | None = None, allowed_skill_ids: set[str] | None = None, emit: Callable[[str, str, str | None], None] | None = None) -> LearningProposal:
+    def propose(self, *, run_id: str, environment_id: str, goal: str, base_bundle_hash: str | None = None, environment: Mapping[str, Any] | None = None, feedback: Mapping[str, Any] | None = None, allowed_skill_ids: set[str] | None = None, emit: Callable[[str, str, str | None], None] | None = None, remaining_deadline: float | None = None, cancel: Event | None = None, token_cap: int | None = None) -> LearningProposal:
+        if cancel is not None and cancel.is_set():
+            raise LearningError("learning proposal cancelled before model invocation")
+        if remaining_deadline is not None and remaining_deadline <= 0:
+            raise LearningError("learning proposal deadline expired before model invocation")
+        if token_cap is not None and token_cap <= 0:
+            raise LearningError("learning proposal token cap must be positive")
         active = _require_hash(self.active_bundle_hash(), "active bundle hash")
         if base_bundle_hash is not None and base_bundle_hash != active:
             raise LearningError("candidate base is not the pinned active bundle")
@@ -278,12 +341,26 @@ class LearningService:
         safe_environment["learningContext"] = result.prompt_payload()
         safe_environment["sanitizedFeedback"] = sanitize_feedback(feedback)
         safe_environment["baseBundleHash"] = active
-        invocation = self.model_runner(goal=goal, environment=safe_environment, emit=emit or (lambda *_: None))
+        safe_environment["proposalContract"] = PROPOSAL_CONTRACT
+        safe_environment["proposalLimits"] = {"maxChangedArtifacts": 3, "maxChangedLogicalLines": _MAX_CHANGED_LINES, "maxPatchBytes": _MAX_PATCH_BYTES}
+        runner = self.model_runner
+        runner_kwargs: dict[str, Any] = {"goal": goal, "environment": safe_environment, "emit": emit or (lambda *_: None)}
+        parameters = inspect.signature(runner).parameters
+        accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+        for name, value in (("remaining_deadline", remaining_deadline), ("cancel", cancel), ("token_cap", token_cap)):
+            if accepts_kwargs or name in parameters:
+                runner_kwargs[name] = value
+        invocation = runner(**runner_kwargs)
+        if cancel is not None and cancel.is_set():
+            raise LearningError("learning proposal cancelled after model invocation")
         if not all(isinstance(getattr(invocation, attr, None), str) and getattr(invocation, attr).strip() for attr in ("provider", "model", "response_id", "text")):
             raise LearningError("authenticated model invocation provenance is incomplete")
         usage = getattr(invocation, "usage", None)
         if not isinstance(usage, Mapping) or not usage:
             raise LearningError("authenticated model usage is missing")
+        used_tokens = _usage_tokens(usage)
+        if token_cap is not None and used_tokens is not None and used_tokens > token_cap:
+            raise LearningError("learning proposal exceeded the model token cap")
         parsed = _parse_model_json(invocation.text)
         operations = _canonical_operations(parsed["editOperations"])
         skill = _validate_skill(parsed["skill"])
