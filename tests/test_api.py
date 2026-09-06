@@ -410,6 +410,16 @@ def test_benchmark_write_uses_authorized_batch_mode(monkeypatch, tmp_path):
             self.turn = 0
 
         def invoke(self, *, goal, environment, messages, **kwargs):
+            if "learningContext" in environment:
+                evidence = environment["learningContext"]["developmentEvidence"][0]["sourceId"]
+                proposal = {
+                    "predictedEffect": "Reuse verified tool results in a bounded workflow.",
+                    "editOperations": [{"path": "skills/portable-procedure/procedure", "operation": "add", "value": "Use verified tool results in a bounded workflow."}],
+                    "supportingEvidenceIds": [evidence],
+                    "proposerVersion": "test-proposer-1",
+                    "skill": {"procedure": "Use verified tool results in a bounded workflow."},
+                }
+                return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": "learning-response-1", "text": json.dumps(proposal), "usage": {"outputTokens": 3, "cost": {"total": 0}}}
             self.turn += 1
             capability_id = next(capability for capability in environment["capabilities"] if capability.endswith(":finance.invoice.apply_payment"))
             action = (
@@ -485,6 +495,12 @@ def test_benchmark_write_uses_authorized_batch_mode(monkeypatch, tmp_path):
     payload = runtime.controller.store.get_artifact(json.loads(tool_events[-1]["source_ref"])["sha256"])
     assert payload["status"] == "ok"
     assert payload["effect"] == "confirmed"
+    api = TestClient(app, base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").status_code == 200
+    learning = api.post("/learning/launch", json={"runId": run_id})
+    assert learning.status_code == 202, learning.text
+    assert learning.json()["runId"] == run_id
+    assert learning.json()["status"] == "staged"
 
 
 @pytest.mark.parametrize("zero_field", ["modelTokens", "costMicrounits"])
