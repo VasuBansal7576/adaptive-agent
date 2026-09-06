@@ -184,7 +184,7 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
         if current_cost is not None:
             cost += current_cost
             cost_seen = True
-        economic_unknown = economic_unknown or economic_status == "unknown"
+        economic_unknown = economic_unknown or economic_status == "unknown" or current_cost is None
     receipt: dict[str, Any] = {
         "stage": stage,
         "cellKey": cell_key,
@@ -199,12 +199,10 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
         "outcomeRefs": outcome_refs,
         "pins": dict(pins),
     }
-    if cost_seen:
+    if cost_seen and not economic_unknown:
         receipt["costMicrounits"] = cost
-    elif economic_unknown:
-        receipt["economicCostStatus"] = "unknown"
     else:
-        raise ExperimentRuntimeError("accounting has neither cost nor declared unknown economic cost")
+        receipt["economicCostStatus"] = "unknown"
     if extra:
         receipt.update(dict(extra))
     return receipt
@@ -222,6 +220,7 @@ class DefaultExperimentStageRunner:
         self.pins = _pins(runtime, protocol, self.inputs, self.base_hash)
         self._candidate_id: str | None = None
         self._candidate_hash: str | None = None
+        self._rotation_candidates: dict[str, tuple[str, str]] = {}
 
     def __call__(self, *, cell_key: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
         stage = _required_string(context.get("stage"), "lifecycle stage")
@@ -251,6 +250,12 @@ class DefaultExperimentStageRunner:
         known = tuple(getattr(self.protocol, "known_environments", ()))
         for environment_id in known:
             _package(self.runtime, environment_id)
+        provenance = getattr(self.runtime, "establish_clean_experiment", None)
+        if not callable(provenance):
+            raise ExperimentRuntimeError("runtime lacks clean experiment provenance seam")
+        clean = _mapping(provenance(self.protocol), "clean experiment provenance")
+        if clean.get("clean") is not True or not isinstance(clean.get("provenanceRef"), str) or not clean["provenanceRef"]:
+            raise ExperimentRuntimeError("experiment provenance is not clean")
         return {
             "stage": "bootstrap",
             "cellKey": cell_key,
@@ -270,6 +275,7 @@ class DefaultExperimentStageRunner:
             ],
             "exposedEnvironments": list(known),
             "sealedEnvironment": self.protocol.sealed_environment,
+            "provenanceRef": clean["provenanceRef"],
         }
 
     def _task_for_cell(self, cell_key: str, partition: str, environment_id: str | None = None, index: int = 0) -> Any:
@@ -287,6 +293,11 @@ class DefaultExperimentStageRunner:
             raise ExperimentRuntimeError("runtime execution returned an unbound observation")
         if getattr(observation, "response_id", None) is None:
             raise ExperimentRuntimeError("runtime execution lacks a trusted model response")
+        verifier = getattr(self.runtime, "verify_evaluation_observation", None)
+        if not callable(verifier):
+            raise ExperimentRuntimeError("runtime lacks strict evaluation evidence verifier")
+        if verifier(observation, config, task) is not True:
+            raise ExperimentRuntimeError("evaluation evidence failed the strict verifier")
         model_provenance = getattr(observation, "model_provenance", None)
         model_provenance = getattr(model_provenance, "value", model_provenance)
         if model_provenance != "real_model":
@@ -345,18 +356,72 @@ class DefaultExperimentStageRunner:
             raise ExperimentRuntimeError("candidate generation requires a completed development run")
         if self.runtime.controller.store.get_outcome_by_run_id(run_id) is None:
             raise ExperimentRuntimeError("candidate generation requires a trusted development outcome")
-        result = self.runtime.launch_learning(SimpleNamespace(run_id=run_id))
-        return self._learning_receipt(cell_key, run_id, result)
+        return self._candidate_from_run(run_id, cell_key, bind_primary=True, context=context)
 
-    def _learning_receipt(self, cell_key: str, run_id: str, result: Any) -> Mapping[str, Any]:
+    def _candidate_from_run(self, run_id: str, cell_key: str, *, bind_primary: bool, prior_learning_refs: set[str] | None = None, context: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        stored = self.runtime.controller.store.get_run(run_id)
+        if not isinstance(stored, Mapping) or stored.get("status") not in {"succeeded", "failed", "cancelled", "timed_out", "outcome_unknown"}:
+            raise ExperimentRuntimeError("candidate generation requires a completed run")
+        if self.runtime.controller.store.get_outcome_by_run_id(run_id) is None:
+            raise ExperimentRuntimeError("candidate generation requires a trusted outcome")
+        baseline_refs = prior_learning_refs if prior_learning_refs is not None else self._learning_observation_ids(run_id)
+        admission = self._admit_subcall(context, f"learning:{cell_key}:{run_id}")
+        if admission is not None and admission.get("reused") is True:
+            raise ExperimentRuntimeError("nested subcall checkpoint requires durable result recovery")
+        try:
+            result = self.runtime.launch_learning(SimpleNamespace(run_id=run_id))
+            receipt = self._learning_receipt(cell_key, run_id, result, bind_primary=bind_primary, prior_learning_refs=baseline_refs)
+        except Exception as exc:
+            self._record_subcall(admission, error=str(exc))
+            raise
+        self._record_subcall(admission, result=receipt)
+        return receipt
+
+    def _admit_subcall(self, context: Mapping[str, Any] | None, subcall_key: str) -> Mapping[str, Any] | None:
+        if not isinstance(context, Mapping):
+            return None
+        admit = context.get("admitSubcall")
+        if not callable(admit):
+            return None
+        budget = self.inputs.get("runBudget")
+        budget = budget if isinstance(budget, Mapping) else {}
+        admission = _mapping(admit(
+            subcall_key,
+            estimated_input_tokens=int(budget.get("modelTokens", 0) or 0),
+            estimated_output_tokens=int(budget.get("modelTokens", 0) or 0),
+            estimated_tool_calls=int(budget.get("toolCalls", 0) or 0),
+            estimated_wall_seconds=float(budget.get("wallTimeSeconds", 0) or 0),
+            estimated_cost_microunits=int(budget.get("costMicrounits", 0) or 0),
+        ), "nested subcall admission")
+        recorder = context.get("recordSubcall")
+        if callable(recorder):
+            return {**admission, "record": recorder}
+        return admission
+
+    @staticmethod
+    def _record_subcall(admission: Mapping[str, Any] | None, *, result: Mapping[str, Any] | None = None, error: str | None = None) -> None:
+        if admission is None:
+            return
+        if admission.get("reused") is True:
+            if admission.get("status") != "complete":
+                raise ExperimentRuntimeError("nested subcall admission is already in progress")
+            return
+        recorder = admission.get("record")
+        if callable(recorder):
+            recorder(admission.get("admissionId"), result=result, error=error)
+
+    def _learning_receipt(self, cell_key: str, run_id: str, result: Any, *, bind_primary: bool, prior_learning_refs: set[str] | None = None) -> Mapping[str, Any]:
         result = _mapping(result, "learning result")
         candidate = _mapping(result.get("candidate"), "learning candidate")
         candidate_id = _required_string(candidate.get("candidateId", candidate.get("candidate_id")), "candidate id")
         candidate_hash = _required_string(candidate.get("candidateBundleHash", candidate.get("candidate_bundle_hash")), "candidate bundle hash")
         if candidate.get("baseBundleHash", candidate.get("base_bundle_hash")) != self.base_hash:
             raise ExperimentRuntimeError("candidate is not based on the pinned development bundle")
-        self._candidate_id, self._candidate_hash = candidate_id, candidate_hash
-        learning_usage, learning_refs = self._learning_observation_usage(run_id)
+        if bind_primary:
+            self._candidate_id, self._candidate_hash = candidate_id, candidate_hash
+        else:
+            self._rotation_candidates[cell_key] = (candidate_id, candidate_hash)
+        learning_usage, learning_refs = self._learning_observation_usage(run_id, prior_refs=prior_learning_refs)
         return {
             "stage": "learning",
             "cellKey": cell_key,
@@ -383,21 +448,18 @@ class DefaultExperimentStageRunner:
         if not isinstance(run_ids, list) or not run_ids or not isinstance(run_ids[0], str):
             raise ExperimentRuntimeError("transfer source receipt lacks a durable run")
         run_id = run_ids[0]
-        stored = self.runtime.controller.store.get_run(run_id)
-        if not isinstance(stored, Mapping) or stored.get("status") not in {"succeeded", "failed", "cancelled", "timed_out", "outcome_unknown"}:
-            raise ExperimentRuntimeError("transfer candidate requires a completed development run")
-        if self.runtime.controller.store.get_outcome_by_run_id(run_id) is None:
-            raise ExperimentRuntimeError("transfer candidate requires a trusted development outcome")
-        result = self.runtime.launch_learning(SimpleNamespace(run_id=run_id))
-        receipt = self._learning_receipt(f"leave-out:{excluded}", run_id, result)
+        receipt = self._candidate_from_run(run_id, f"leave-out:{excluded}", bind_primary=False, context=context)
         return _load_bundle(self.runtime, receipt["candidateBundleHash"]), receipt
 
-    def _learning_observation_usage(self, run_id: str) -> tuple[dict[str, int], list[str]]:
+    def _learning_observation_usage(self, run_id: str, *, prior_refs: set[str] | None = None) -> tuple[dict[str, int], list[str]]:
         rows = self.runtime.controller.store.list_evidence(run_id)
         total = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
         refs: list[str] = []
         for row in rows:
             if row.get("event_type") != "learning_model_observation":
+                continue
+            evidence_id = row.get("evidence_id")
+            if prior_refs is not None and evidence_id in prior_refs:
                 continue
             source = row.get("source_ref")
             if not isinstance(source, str):
@@ -416,10 +478,20 @@ class DefaultExperimentStageRunner:
                 raise ExperimentRuntimeError("learning observation usage total is inconsistent")
             for key in total:
                 total[key] += fields[key]
-            refs.append(_required_string(row.get("evidence_id"), "learning observation evidence ref"))
+            refs.append(_required_string(evidence_id, "learning observation evidence ref"))
         if not refs:
             raise ExperimentRuntimeError("candidate generation lacks an authenticated learning observation")
         return total, refs
+
+    def _learning_observation_ids(self, run_id: str) -> set[str]:
+        rows = self.runtime.controller.store.list_evidence(run_id)
+        return {
+            evidence_id
+            for row in rows
+            if row.get("event_type") == "learning_model_observation"
+            for evidence_id in (row.get("evidence_id"),)
+            if isinstance(evidence_id, str) and evidence_id
+        }
 
     def _candidate(self, context: Mapping[str, Any]) -> Any:
         candidate_hash = self._candidate_hash
@@ -453,8 +525,9 @@ class DefaultExperimentStageRunner:
             cell_key,
             [observation],
             self.pins,
-            extra={"environmentId": environment_id, "partition": "validation", "resetBefore": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": [item["runIds"][0] for item in eligible], "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"]},
+            extra={"environmentId": environment_id, "partition": "validation", "resetBefore": True, "trainingExcludedEnvironment": environment_id, "trainingSourceRunIds": list(candidate_receipt["sourceRunIds"]), "candidateId": candidate_receipt["candidateId"], "candidateBundleHash": candidate_receipt["candidateBundleHash"], "learningReceipt": dict(candidate_receipt)},
         )
+        return self._merge_receipts(receipt, candidate_receipt)
 
     def _adaptation(self, cell_key: str, context: Mapping[str, Any], attempt: int) -> Mapping[str, Any]:
         match = _ADAPT.fullmatch(cell_key)
@@ -465,7 +538,14 @@ class DefaultExperimentStageRunner:
         support = self._task_for_cell(cell_key, "development", environment_id, 0)
         query = self._task_for_cell(cell_key, "validation", environment_id, 0)
         support_observation = self._execute(support, "L", int(self.protocol.seeds[0]), candidate, attempt)
-        query_observation = self._execute(query, "L", int(self.protocol.seeds[1]), candidate, attempt)
+        support_learning = self._candidate_from_run(
+            getattr(support_observation, "run_id"),
+            cell_key,
+            bind_primary=False,
+            context=context,
+        )
+        adapted_candidate = _load_bundle(self.runtime, support_learning["candidateBundleHash"])
+        query_observation = self._execute(query, "L", int(self.protocol.seeds[1]), adapted_candidate, attempt)
         receipt = _observation_receipt(
             self.runtime,
             "adaptation",
@@ -476,27 +556,63 @@ class DefaultExperimentStageRunner:
         )
         receipt["supportRunIds"] = [getattr(support_observation, "run_id")]
         receipt["queryRunIds"] = [getattr(query_observation, "run_id")]
-        return receipt
+        receipt["adaptedCandidateId"] = support_learning["candidateId"]
+        receipt["adaptedCandidateBundleHash"] = support_learning["candidateBundleHash"]
+        receipt["learningReceipt"] = dict(support_learning)
+        return self._merge_receipts(receipt, support_learning)
+
+    @staticmethod
+    def _merge_receipts(receipt: Mapping[str, Any], nested: Mapping[str, Any]) -> dict[str, Any]:
+        """Include authenticated nested-learning accounting exactly once."""
+        merged = dict(receipt)
+        outer_usage = _mapping(merged.get("usage"), "outer receipt usage")
+        nested_usage = _mapping(nested.get("usage"), "nested receipt usage")
+        merged["usage"] = {
+            key: int(outer_usage[key]) + int(nested_usage[key])
+            for key in ("inputTokens", "outputTokens", "totalTokens")
+        }
+        merged["toolCalls"] = int(merged.get("toolCalls", 0)) + int(nested.get("toolCalls", 0))
+        merged["wallSeconds"] = float(merged.get("wallSeconds", 0)) + float(nested.get("wallSeconds", 0))
+        outer_cost = merged.get("costMicrounits")
+        nested_cost = nested.get("costMicrounits")
+        if isinstance(outer_cost, (int, float)) and not isinstance(outer_cost, bool) and isinstance(nested_cost, (int, float)) and not isinstance(nested_cost, bool):
+            merged["costMicrounits"] = outer_cost + nested_cost
+            merged.pop("economicCostStatus", None)
+        else:
+            merged.pop("costMicrounits", None)
+            merged["economicCostStatus"] = "unknown"
+        merged["nestedRunIds"] = list(nested.get("runIds", []))
+        merged["nestedEvidenceRefs"] = list(nested.get("modelObservationRefs", []))
+        return merged
 
     def _safety(self, cell_key: str) -> Mapping[str, Any]:
         execute_probe = getattr(self.runtime.controller, "execute_probe", None)
         if not callable(execute_probe):
             raise ExperimentRuntimeError("controller has no registered safety probe executor")
+        started = time.monotonic()
         result = execute_probe(cell_key)
+        wall_seconds = max(time.monotonic() - started, 1e-9)
+        if not isinstance(result, Mapping):
+            converter = getattr(result, "model_dump", None) or getattr(result, "to_dict", None)
+            if callable(converter):
+                result = converter()
         result = _mapping(result, "safety probe result")
         if result.get("caseId") != cell_key or result.get("passed") is not True:
             raise ExperimentRuntimeError(f"registered safety probe {cell_key!r} did not pass")
+        raw_tool_calls = result.get("toolCalls")
+        tool_calls = raw_tool_calls if isinstance(raw_tool_calls, int) and not isinstance(raw_tool_calls, bool) and raw_tool_calls >= 0 else len(result.get("obligations", ()))
         return {
             "stage": "safety",
             "cellKey": cell_key,
             "status": "complete",
             "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0},
-            "toolCalls": 0,
-            "wallSeconds": 0,
+            "toolCalls": tool_calls,
+            "wallSeconds": wall_seconds,
             "costMicrounits": 0,
             "pins": dict(self.pins),
             "safetyCaseId": cell_key,
             "safetyEvidence": result.get("evidence", result.get("detail")),
+            "probeDurationSeconds": result.get("wallSeconds", wall_seconds),
         }
 
     def _panel_cell(self, stage: str, cell_key: str, context: Mapping[str, Any], attempt: int) -> Mapping[str, Any]:
@@ -532,8 +648,11 @@ class DefaultExperimentStageRunner:
                     if ablation is None:
                         ablation = bundles.get("ablation")
                     if ablation is not None:
-                        bundle = ablation
-                        ablation_hash = _bundle_hash(ablation)
+                        if isinstance(ablation, str):
+                            ablation_hash = ablation
+                        else:
+                            bundle = ablation
+                            ablation_hash = _bundle_hash(ablation)
             if not isinstance(ablation_hash, str):
                 raise ExperimentRuntimeError("final ablation bundle hash is not pinned")
             if bundle is None or _bundle_hash(bundle) != ablation_hash:
