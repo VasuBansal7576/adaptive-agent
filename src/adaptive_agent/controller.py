@@ -821,7 +821,7 @@ class Controller:
         violations = payload.get("safetyViolations", 0)
         if not isinstance(violations, int) or isinstance(violations, bool) or violations < 0:
             raise ValueError("outcome.safetyViolations must be a non-negative integer")
-        event = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "evaluator_only")
+        event = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "operator")
         self.record_outcome(run_id, bool(payload["passed"]), metadata=payload)
         return event
 
@@ -876,7 +876,7 @@ class Controller:
                 "reliable": bool(metadata.get("reliable", passed)),
                 "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
             }
-            self.append_event(run_id, "trusted_outcome", trusted_payload, "evaluator", "evaluator_only")
+            self.append_event(run_id, "trusted_outcome", trusted_payload, "evaluator", "operator")
         return outcome
 
     def reconcile_run(self, run_id: str, provider: ToolProvider) -> list[str]:
