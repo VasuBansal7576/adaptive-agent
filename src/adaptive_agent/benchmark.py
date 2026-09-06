@@ -81,7 +81,7 @@ class ResumableEvaluationDriver:
         self.allocation_store = allocation_store or SQLiteAllocationStore(store)
         self.evidence_store = evidence_store or SQLiteRunEvidenceStore(store)
         self.owner_id = secrets.token_urlsafe(12)
-        with store._connect() as conn:
+        with store.connect() as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS benchmark_task_runs (benchmark_id TEXT NOT NULL, task_id TEXT NOT NULL, environment_id TEXT NOT NULL, partition TEXT NOT NULL, arm TEXT NOT NULL, seed INTEGER NOT NULL, status TEXT NOT NULL, error TEXT, observation_json TEXT, owner_id TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(benchmark_id, task_id, arm, seed))")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(benchmark_task_runs)").fetchall()}
             if "owner_id" not in columns:
@@ -127,7 +127,7 @@ class ResumableEvaluationDriver:
         return BenchmarkSummary(benchmark_id, partition, tuple(statuses), expected_count)
 
     def _development_smoke_complete(self, benchmark_id: str) -> bool:
-        with self.store._connect() as conn:
+        with self.store.connect() as conn:
             rows = conn.execute("SELECT task_id, environment_id, arm, seed FROM benchmark_task_runs WHERE benchmark_id = ? AND partition = 'development' AND status = 'complete' AND observation_json IS NOT NULL", (benchmark_id,)).fetchall()
         for row in rows:
             status = self._load(benchmark_id, row["task_id"], Arm(row["arm"]), int(row["seed"]))
@@ -138,7 +138,7 @@ class ResumableEvaluationDriver:
     def _tasks_for_partition(self, benchmark_id: str, partition: Partition, base_hash: str, candidate_hash: str, frozen: FrozenProtocol) -> dict[str, tuple[TaskInput, ...]]:
         bundle_value = self.bundle.to_dict() if hasattr(self.bundle, "to_dict") else (self.bundle if isinstance(self.bundle, Mapping) else getattr(self.bundle, "bundle_id", self.bundle.__class__.__qualname__))
         plan_fingerprint = sha256_json({"protocol": frozen.protocol_hash, "partition": partition.value, "base": base_hash, "candidate": candidate_hash, "bundle": sha256_json(bundle_value)})
-        with self.store._connect() as conn:
+        with self.store.connect() as conn:
             plan = conn.execute("SELECT * FROM benchmark_plans WHERE benchmark_id = ? AND partition = ?", (benchmark_id, partition.value)).fetchone()
         if plan is not None:
             if plan["fingerprint"] != plan_fingerprint or plan["partition"] != partition.value:
@@ -157,19 +157,19 @@ class ResumableEvaluationDriver:
             names = self.protocol.known_environments if partition is not Partition.FINAL else (*self.protocol.known_environments, self.protocol.sealed_environment)
             tasks_by_env = {name: self.packages[name].tasks_for_partition(partition) for name in names}
         panel = [task.task_id for tasks in tasks_by_env.values() for task in tasks]
-        with self.store._connect() as conn:
+        with self.store.connect() as conn:
             conn.execute("INSERT INTO benchmark_plans(benchmark_id, partition, fingerprint, panel_json, created_at) VALUES (?, ?, ?, ?, datetime('now'))", (benchmark_id, partition.value, plan_fingerprint, json.dumps(panel, sort_keys=True)))
             conn.commit()
         return tasks_by_env
 
     def _claim(self, benchmark_id: str, task: TaskInput, arm: Arm, seed: int) -> bool:
-        with self.store._connect() as conn:
+        with self.store.connect() as conn:
             cursor = conn.execute("INSERT INTO benchmark_task_runs(benchmark_id, task_id, environment_id, partition, arm, seed, status, error, observation_json, owner_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, NULL, ?, datetime('now')) ON CONFLICT(benchmark_id, task_id, arm, seed) DO UPDATE SET status='running', error=NULL, owner_id=?, updated_at=datetime('now') WHERE benchmark_task_runs.status IN ('failed') OR (benchmark_task_runs.status = 'running' AND benchmark_task_runs.owner_id != ?)", (benchmark_id, task.task_id, task.environment_ref.id, task.partition.value, arm.value, seed, self.owner_id, self.owner_id, self.owner_id))
             conn.commit()
             return cursor.rowcount == 1
 
     def _load(self, benchmark_id: str, task_id: str, arm: Arm, seed: int) -> BenchmarkTaskStatus | None:
-        with self.store._connect() as conn:
+        with self.store.connect() as conn:
             row = conn.execute("SELECT * FROM benchmark_task_runs WHERE benchmark_id = ? AND task_id = ? AND arm = ? AND seed = ?", (benchmark_id, task_id, arm.value, seed)).fetchone()
         if not row:
             return None
@@ -186,7 +186,7 @@ class ResumableEvaluationDriver:
 
     def _save(self, benchmark_id: str, task: TaskInput, arm: Arm, seed: int, status: str, error: str | None, observation: RunObservation | None) -> None:
         observation_json = json.dumps(json.loads(canonical_json(observation)), sort_keys=True) if observation else None
-        with self.store._connect() as conn:
+        with self.store.connect() as conn:
             conn.execute("INSERT OR REPLACE INTO benchmark_task_runs(benchmark_id, task_id, environment_id, partition, arm, seed, status, error, observation_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))", (benchmark_id, task.task_id, task.environment_ref.id, task.partition.value, arm.value, seed, status, error, observation_json))
             conn.commit()
 
