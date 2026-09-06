@@ -39,7 +39,7 @@ class FrozenExecutionConfig:
     protocol: FrozenProtocol
     arm: Arm
     seed: int
-    bundle_hash: str | None = None
+    bundle_hash: str
 
 
 TrustedTaskExecutor = Callable[[TaskInput, FrozenExecutionConfig, object], RunObservation]
@@ -269,7 +269,7 @@ class ResumableEvaluationDriver:
         return bundle_hash
 
     @staticmethod
-    def _validate_observation(observation: RunObservation, task: TaskInput, environment_id: str, partition: Partition, seed: int, arm: Arm, bundle_hash: str | None) -> None:
+    def _validate_observation(observation: RunObservation, task: TaskInput, environment_id: str, partition: Partition, seed: int, arm: Arm, bundle_hash: str) -> None:
         if not isinstance(observation, RunObservation):
             raise EvaluationError("trusted executor must return RunObservation")
         if (observation.task_id, observation.environment_id, observation.partition, observation.seed, observation.arm) != (task.task_id, environment_id, partition, seed, arm):
