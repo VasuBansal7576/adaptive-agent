@@ -82,9 +82,12 @@ class _FixtureProvider(ToolProvider):
         return schema.version
 
     def __init__(self, package: Any, task: Any, run_id: str, seed: int = 0) -> None:
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise ValueError("fixture reset seed must be an integer")
         self.package = package
         self.session = package.reset(task.task_id, seed)
         self._run_id = run_id
+        self.seed = seed
 
 
 class _RegisteredPackage:
@@ -140,6 +143,7 @@ class DurableRuntime:
         self._run_last_receipt_at: dict[str, float] = {}
         self._run_receipts: dict[str, list[dict[str, Any]]] = {}
         self._approvals: dict[tuple[str, str], bool] = {}
+        self._evaluation_arm_bundles: dict[str, str] = {}
         # The canonical Controller seam owns lifecycle persistence.  Older
         # adapters exposed an atomic claim helper; keep a process-local guard
         # only for the canonical seam, which intentionally leaves claiming to
@@ -252,6 +256,10 @@ class DurableRuntime:
         if arm is None or not isinstance(seed, int):
             raise LearningRuntimeError("evaluation execution config lacks arm or seed")
         arm_value = getattr(arm, "value", str(arm))
+        if arm_value not in {"B0", "L", "A"}:
+            raise LearningRuntimeError(f"evaluation arm is invalid: {arm_value!r}")
+        if isinstance(seed, bool):
+            raise LearningRuntimeError("evaluation execution seed must be an integer")
         if isinstance(bundle, SkillBundle):
             durable_bundle = bundle
         elif isinstance(bundle, Mapping):
@@ -259,8 +267,14 @@ class DurableRuntime:
         else:
             durable_bundle = self.controller.get_active_bundle() or SkillBundle()
         expected_bundle_hash = getattr(frozen_config, "bundle_hash", None)
-        if expected_bundle_hash and durable_bundle.content_hash != expected_bundle_hash:
+        bundle_hash = getattr(durable_bundle, "content_hash", None)
+        if not isinstance(bundle_hash, str) or not bundle_hash:
+            raise LearningRuntimeError("evaluation arm bundle has no content hash")
+        if expected_bundle_hash and bundle_hash != expected_bundle_hash:
             raise LearningRuntimeError("evaluation bundle hash does not match supplied bundle")
+        expected_arm_bundle = self._evaluation_arm_bundles.get(arm_value)
+        if expected_arm_bundle is not None and expected_arm_bundle != bundle_hash:
+            raise LearningRuntimeError("evaluation arm bundle does not match the frozen arm mapping")
 
         version = str(getattr(getattr(task, "environment_ref", None), "version", "1"))
         environment_ref = ArtifactRef(id=env_id, version=version, sha256=sha256_json({"environmentId": env_id, "version": version}))
@@ -281,7 +295,7 @@ class DurableRuntime:
         if row:
             persisted = {key: value for key, value in row.items() if key != "run_id"}
             run_payload = json.loads(row.get("run_json", "{}"))
-            run_payload.update({"arm": arm_value, "seed": seed, "bundleHash": durable_bundle.content_hash})
+            run_payload.update({"arm": arm_value, "seed": seed, "bundleHash": bundle_hash})
             persisted["run_json"] = json.dumps(run_payload, sort_keys=True)
             self.controller.store.save_run(run.run_id, persisted)
 
@@ -382,6 +396,14 @@ class DurableRuntime:
             raise LearningRuntimeError("no active bundle is available for evaluation")
         selected = dict(arm_bundles or {})
         selected.setdefault("B0", active)
+        arm_hashes: dict[str, str] = {}
+        for key, value in selected.items():
+            arm_name = getattr(key, "value", str(key))
+            content_hash = getattr(value, "content_hash", None)
+            if not isinstance(content_hash, str) or not content_hash:
+                raise LearningRuntimeError(f"evaluation arm bundle {arm_name!r} has no content hash")
+            arm_hashes[arm_name] = content_hash
+        self._evaluation_arm_bundles = arm_hashes
         return ResumableEvaluationDriver(
             self.controller.store,
             protocol,
@@ -657,6 +679,15 @@ class DurableRuntime:
         arm = evidence.get("arm") or run_payload.get("arm") or "B0"
         seed = evidence.get("seed", run_payload.get("seed", 0))
         bundle_hash = evidence.get("bundleHash") or run_payload.get("bundleHash") or run.skill_bundle_ref.sha256
+        if not isinstance(bundle_hash, str) or not bundle_hash:
+            raise ValueError("model response evidence requires bundleHash")
+        if arm not in {"B0", "L", "A"}:
+            raise ValueError("model response evidence requires a valid arm")
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise ValueError("model response evidence requires an integer seed")
+        arm_bundles = run_payload.get("armBundles")
+        if isinstance(arm_bundles, Mapping) and arm_bundles.get(arm) != bundle_hash:
+            raise ValueError("model response bundleHash does not match the requested arm bundle")
         whole_run_duration = max(now - started, 1e-6)
         economic_status = evidence.get("economicCostStatus")
         if not isinstance(economic_status, str):

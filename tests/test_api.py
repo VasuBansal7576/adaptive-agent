@@ -1,9 +1,10 @@
 from fastapi.testclient import TestClient
 from threading import Event, Thread
+import json
 import pytest
 
 from adaptive_agent.api import CandidateProposalRequest, ControlPlane, EvaluationRequest, create_app, make_authenticated_model_runner
-from adaptive_agent.app import create_runtime_app
+from adaptive_agent.app import _FixtureProvider, create_runtime_app
 from adaptive_agent.evaluation import Arm, EvaluationProtocol, EvaluationRunner, ModelProvenance, Partition, RunObservation, build_environment_packages
 from adaptive_agent.planner import make_luna_model_runner
 from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
@@ -98,6 +99,57 @@ def test_durable_launch_retry_does_not_reinvoke_model(tmp_path):
     assert retry.json() == {"runId": run["runId"], "status": "succeeded"}
     assert calls == 1
     assert api.get(f"/runs/{run['runId']}").json()["status"] == "succeeded"
+
+
+def test_durable_model_accounting_payloads_keep_arm_seed_and_bundle_identity(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post(
+        "/runs",
+        json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "arm-seed-contract"},
+    ).json()
+    runtime = app.state.durable_runtime
+    store = runtime.controller.store
+    bundle_hash = runtime.controller.get_active_bundle().content_hash
+    stored = store.get_run(run["runId"])
+    assert stored is not None
+    run_payload = json.loads(stored["run_json"])
+    run_payload.update({"arm": "L", "seed": 23, "bundleHash": bundle_hash})
+    stored["run_json"] = json.dumps(run_payload, sort_keys=True)
+    store.save_run(run["runId"], {key: value for key, value in stored.items() if key != "run_id"})
+
+    runtime._record_model_response(
+        run["runId"],
+        runtime.packages["finance"],
+        {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": "arm-response", "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5}, "arm": "L", "seed": 23, "bundleHash": bundle_hash},
+    )
+    row = next(item for item in store.list_evidence(run["runId"]) if item["event_type"] == "model_response")
+    payload = store.get_artifact(json.loads(row["source_ref"])["sha256"])
+    accounting = store.get_artifact(payload["accountingRef"]["sha256"])
+    for artifact in (payload, accounting):
+        assert artifact["arm"] == "L"
+        assert artifact["seed"] == 23
+        assert artifact["bundleHash"] == bundle_hash
+
+
+def test_fixture_provider_reset_uses_executor_seed():
+    class Package:
+        def __init__(self):
+            self.reset_args = None
+
+        def reset(self, task_id, seed):
+            self.reset_args = (task_id, seed)
+            return object()
+
+    class Task:
+        task_id = "task-seed"
+
+    package = Package()
+    provider = _FixtureProvider(package, Task(), "run-seed", seed=29)
+    assert package.reset_args == ("task-seed", 29)
+    assert provider.seed == 29
 
 
 def test_durable_cancelled_run_cannot_be_reopened(tmp_path):
