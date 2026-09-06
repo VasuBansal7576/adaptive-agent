@@ -336,6 +336,8 @@ class DefaultExperimentStageRunner:
             if (
                 not isinstance(model_row, Mapping)
                 or not isinstance(outcome_row, Mapping)
+                or model_row.get("evidence_id") != evidence_refs[index]
+                or outcome_row.get("evidence_id") != outcome_refs[index]
                 or model_row.get("run_id") != run_id
                 or outcome_row.get("run_id") != run_id
                 or model_row.get("event_type") != "model_response"
