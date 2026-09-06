@@ -626,6 +626,11 @@ class TestControllerSeam:
         store2 = Store(workspace)
         assert store2.reserve_allocation("scope", "alloc-2", panels, 3) is None  # restart-safe
 
+        # Crash-after-allocation recovery: read the reserved panel back.
+        alloc = store2.get_allocation("alloc-2")
+        assert alloc["panel_index"] == 1 and alloc["task_ids"] == ["c", "d"]
+        assert store2.get_allocation("nope") is None
+
     def test_benchmark_task_run_owner_semantics(self, store: Store, workspace):
         # Single-owner claim with benchmark/arm/seed metadata.
         claimed, row = store.claim_benchmark_task_run(
