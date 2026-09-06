@@ -39,7 +39,7 @@ class BenchmarkDriverTests(unittest.TestCase):
                     1,
                     1.0,
                     model_provenance=ModelProvenance.REAL_MODEL,
-                    bundle_hash=frozen_config.bundle_hash,
+                    bundle_hash=selected_bundle.content_hash,
                 )
 
             first = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedEvidence(), owner_id="owner-a")
@@ -63,8 +63,8 @@ class BenchmarkDriverTests(unittest.TestCase):
         protocol.freeze(packages)
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory))
-            driver_a = ResumableEvaluationDriver(store, protocol, packages, lambda *_: None, object())
-            driver_b = ResumableEvaluationDriver(store, protocol, packages, lambda *_: None, object())
+            driver_a = ResumableEvaluationDriver(store, protocol, packages, lambda *_: None, SkillBundle(skills=[]))
+            driver_b = ResumableEvaluationDriver(store, protocol, packages, lambda *_: None, SkillBundle(skills=[]))
             task = packages["finance"].tasks_for_partition(Partition.DEVELOPMENT)[0]
             self.assertTrue(driver_a._claim("live-owner", task, Arm.B0, 0))
             self.assertFalse(driver_b._claim("live-owner", task, Arm.B0, 0))
@@ -75,15 +75,16 @@ class BenchmarkDriverTests(unittest.TestCase):
         protocol.freeze(packages)
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory))
+            bundle = SkillBundle(skills=[])
             class TrustedSmokeEvidence:
                 durable = True
                 def verify(self, observation, frozen, package):
                     return True
             def execute(task, frozen_config, bundle):
                 if task.partition is Partition.DEVELOPMENT:
-                    return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+                    return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, bundle_hash=bundle.content_hash)
                 raise RuntimeError("validation unavailable")
-            smoke = ResumableEvaluationDriver(store, protocol, packages, execute, object(), evidence_store=TrustedSmokeEvidence())
+            smoke = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle})
             smoke.run("gap", Partition.DEVELOPMENT)
             base = SQLiteAllocationStore(store)
             class CrashAfterAllocation:
@@ -97,10 +98,10 @@ class BenchmarkDriverTests(unittest.TestCase):
                     return index
                 def get(self, allocation_id):
                     return base.get(allocation_id)
-            crashing = ResumableEvaluationDriver(store, protocol, packages, execute, object(), allocation_store=CrashAfterAllocation(), evidence_store=TrustedSmokeEvidence())
+            crashing = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, allocation_store=CrashAfterAllocation(), evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle})
             with self.assertRaises(KeyboardInterrupt):
                 crashing.run("gap", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
-            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, object(), evidence_store=TrustedSmokeEvidence())
+            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle})
             result = resumed.run("gap", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
             self.assertTrue(result.failed)
             with store.connect() as conn:
@@ -114,24 +115,25 @@ class BenchmarkDriverTests(unittest.TestCase):
         protocol.freeze(packages)
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory))
+            bundle = SkillBundle(skills=[])
             calls = []
             def execute(task, frozen_config, bundle):
                 calls.append((task.task_id, frozen_config.arm, frozen_config.seed))
                 if task.partition is Partition.DEVELOPMENT:
-                    return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+                    return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, bundle_hash=bundle.content_hash)
                 raise RuntimeError("runtime unavailable")
             class TrustedSmokeEvidence:
                 durable = True
                 def verify(self, observation, frozen, package):
                     return True
-            driver = ResumableEvaluationDriver(store, protocol, packages, execute, object(), evidence_store=TrustedSmokeEvidence())
+            driver = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle})
             driver.run("bench-1", Partition.DEVELOPMENT)
             calls.clear()
             first = driver.run("bench-1", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
             self.assertTrue(first.failed)
             first_panel = {task_id for task_id, _, _ in calls}
             calls.clear()
-            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, object(), evidence_store=TrustedSmokeEvidence())
+            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle})
             second = resumed.run("bench-1", Partition.VALIDATION, base_hash="base", candidate_hash="candidate")
             self.assertTrue(second.failed)
             self.assertEqual(first_panel, {task_id for task_id, _, _ in calls})
@@ -142,8 +144,8 @@ class BenchmarkDriverTests(unittest.TestCase):
         protocol.freeze(packages)
         with tempfile.TemporaryDirectory() as directory:
             def execute(task, frozen_config, bundle):
-                return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.SYNTHETIC_MODEL)
-            driver = ResumableEvaluationDriver(Store(Path(directory)), protocol, packages, execute, object())
+                return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.SYNTHETIC_MODEL, bundle_hash=bundle.content_hash)
+            driver = ResumableEvaluationDriver(Store(Path(directory)), protocol, packages, execute, SkillBundle(skills=[]))
             result = driver.run("bench-2", Partition.DEVELOPMENT)
             self.assertTrue(result.failed)
             self.assertFalse(result.complete)
@@ -154,17 +156,18 @@ class BenchmarkDriverTests(unittest.TestCase):
         protocol.freeze(packages)
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory))
+            bundle = SkillBundle(skills=[])
             calls = []
             def crash(task, frozen_config, bundle):
                 calls.append(task.task_id)
                 if task.partition is Partition.DEVELOPMENT:
-                    return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+                    return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL, bundle_hash=bundle.content_hash)
                 raise KeyboardInterrupt("simulated process crash")
             class TrustedSmokeEvidence:
                 durable = True
                 def verify(self, observation, frozen, package):
                     return True
-            driver = ResumableEvaluationDriver(store, protocol, packages, crash, object(), evidence_store=TrustedSmokeEvidence())
+            driver = ResumableEvaluationDriver(store, protocol, packages, crash, bundle, evidence_store=TrustedSmokeEvidence(), arm_bundles={Arm.B0: bundle, Arm.L: bundle})
             driver.run("bench-crash", Partition.DEVELOPMENT)
             calls.clear()
             with self.assertRaises(KeyboardInterrupt):
@@ -181,10 +184,10 @@ class BenchmarkDriverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory))
             def execute(task, frozen_config, bundle):
-                return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.SYNTHETIC_MODEL)
-            first = ResumableEvaluationDriver(store, protocol, packages, execute, {"bundle": "one"})
+                return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.SYNTHETIC_MODEL, bundle_hash=bundle.content_hash)
+            first = ResumableEvaluationDriver(store, protocol, packages, execute, SkillBundle(skills=[]))
             first.run("fenced", Partition.DEVELOPMENT)
-            changed = ResumableEvaluationDriver(store, protocol, packages, execute, {"bundle": "two"})
+            changed = ResumableEvaluationDriver(store, protocol, packages, execute, SkillBundle(skills=[]))
             with self.assertRaisesRegex(EvaluationError, "different frozen inputs"):
                 changed.run("fenced", Partition.DEVELOPMENT)
 
