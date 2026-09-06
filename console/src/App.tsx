@@ -94,6 +94,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
   // close when the selection or transport changes; reconnectNonce forces a
   // manual stream reopen (stale banner) while preserving the cursor
   const lastRecordRefresh = useRef(0);
+  const acknowledgedRef = useRef(0);
   const refreshCandidates = useCallback(async () => {
     try {
       const candidates = await transport.listCandidates();
@@ -103,9 +104,10 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     }
   }, [transport]);
 
-  const refreshRunRecords = useCallback(async () => {
-    // throttle background record refreshes
-    if (Date.now() - lastRecordRefresh.current < 2000) return;
+  const refreshRunRecords = useCallback(async (force = false) => {
+    // throttle background record refreshes; forced refreshes (tab open, user
+    // intent) always run
+    if (!force && Date.now() - lastRecordRefresh.current < 2000) return;
     lastRecordRefresh.current = Date.now();
     try {
       const runs = await transport.listRuns();
@@ -127,24 +129,64 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     const runId = state.selectedRunId;
     const cursor = state.cursors[runId] ?? 0;
     dispatch({ type: "connection", state: "connecting" });
+    // acknowledged cursor + burst-deduped refresh schedulers, local to this stream
+    acknowledgedRef.current = cursor;
+    const pendingRefresh = { timer: null as ReturnType<typeof setTimeout> | null };
+    const pendingTerminal = { timer: null as ReturnType<typeof setTimeout> | null };
+    const scheduleRecordRefresh = () => {
+      if (pendingRefresh.timer) return;
+      pendingRefresh.timer = setTimeout(() => {
+        pendingRefresh.timer = null;
+        void refreshRunRecords(true);
+      }, 300);
+    };
+    const scheduleTerminalRefresh = () => {
+      if (pendingTerminal.timer) return;
+      pendingTerminal.timer = setTimeout(() => {
+        pendingTerminal.timer = null;
+        void refreshRunRecords(true);
+      }, 1200);
+    };
     const close = transport.openRunStream(runId, cursor, {
       onEvent: (event) => {
+        // acknowledged cursor local to THIS stream: updated per event so gap
+        // detection never reads a stale closure and never forces per-event
+        // authoritative GETs
+        const gapSkipped = event.sequence > acknowledgedRef.current + 1;
+        acknowledgedRef.current = Math.max(acknowledgedRef.current, event.sequence);
         dispatch({ type: "event", event });
         // refresh the authoritative record when the event carries no validated
         // status (bare status/outcome rows) or when plane-shape status/approval
-        // events arrive — never parse display text
-        if (event.needsRecordRefresh || (!event.runStatus && (event.kind === "status" || event.kind === "approval"))) {
-          void refreshRunRecords();
+        // events arrive — never parse display text. Bursts (gaps, bare rows)
+        // dedupe into one scheduled refresh.
+        if (gapSkipped || event.needsRecordRefresh || (!event.runStatus && (event.kind === "status" || event.kind === "approval"))) {
+          scheduleRecordRefresh();
+        }
+        // a terminal lifecycle event schedules ONE delayed authoritative
+        // refresh (the private outcome commits server-side around this
+        // transition). Normal terminal EOF closes the stream — no manual close
+        // here so later evidence always drains first; timers dedupe across
+        // replayed historical terminal events.
+        const TERMINAL_STATES = ["succeeded", "failed", "cancelled", "timed_out"];
+        if (event.runStatus && TERMINAL_STATES.includes(event.runStatus)) {
+          scheduleTerminalRefresh();
         }
       },
       onState: (connection) => {
-        if (connection !== "closed") dispatch({ type: "connection", state: connection });
+        // record every state the transport reports, including a genuine
+        // terminal closed (EOF after a terminal run); teardown cleanup no
+        // longer emits closed, so nothing is mislabeled
+        dispatch({ type: "connection", state: connection });
       },
     });
     closeStreamRef.current = close;
     return close;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.selectedRunId, transport, state.loading, streamNonce]);
+
+  useEffect(() => {
+    if (activeTab === "candidates") void refreshRunRecords(true);
+  }, [activeTab, refreshRunRecords]);
 
   const manualReconnect = async () => {
     try {
@@ -357,14 +399,12 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               loading={state.loading}
               onActionError={(message, correlationId) => dispatch({ type: "actionError", message, correlationId })}
               onRefreshCandidates={() => void refreshCandidates()}
+              onRefreshRuns={() => void refreshRunRecords(true)}
             />
           )}
         </div>
       </main>
 
-      <footer className="border-t border-slate-800 py-4 text-center text-xs text-slate-600">
-        Operator actions are audited. The learner never receives the operator token. Evidence renders as escaped text.
-      </footer>
     </div>
   );
 }

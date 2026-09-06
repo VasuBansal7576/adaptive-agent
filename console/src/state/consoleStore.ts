@@ -63,11 +63,12 @@ export type ConsoleAction =
  */
 export function applyEvent(state: ConsoleState, event: RunEvent): ConsoleState {
   const cursor = state.cursors[event.runId] ?? 0;
-  if (event.sequence <= cursor) return state; // duplicate
-  if (event.sequence > cursor + 1) {
-    // gap: treat as stale, expect transport to reconnect from cursor
-    return { ...state, connection: "stale" };
-  }
+  if (event.sequence <= cursor) return state; // duplicate suppression
+  // Sequence gaps are EXPECTED in the durable projection: evaluator_only rows
+  // are filtered server-side, so visible sequences legitimately skip. A gapped
+  // event is still a VISIBLE event — apply it normally (status + evidence) and
+  // advance the acknowledged cursor past the hidden rows. Nothing is dropped
+  // or fabricated; authoritative recovery uses the record refresh path.
   const events = state.events[event.runId] ?? [];
   const run = state.runs.find((r) => r.runId === event.runId);
   const TERMINAL = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
@@ -141,13 +142,25 @@ export function reducer(state: ConsoleState, action: ConsoleAction): ConsoleStat
     case "runUpdated":
       return { ...state, runs: state.runs.map((r) => (r.runId === action.run.runId ? action.run : r)) };
     case "runsRefreshed":
-      // authoritative record refresh (e.g., after plane-shape status events or
-      // stream close): merge server-side status into existing runs
+      // authoritative record refresh (e.g., after plane-shape status events,
+      // stream close, or eligibility flips): merge the server projection into
+      // existing runs — the server is authoritative for status, outcome, and
+      // learningEligible (set after the private trusted outcome commits)
       return {
         ...state,
         runs: state.runs.map((r) => {
           const fresh = action.runs.find((f) => f.runId === r.runId);
-          return fresh ? { ...r, status: fresh.status, lastEventSequence: Math.max(r.lastEventSequence, fresh.lastEventSequence), budgetUsed: fresh.budgetUsed ?? r.budgetUsed } : r;
+          return fresh
+            ? {
+                ...r,
+                status: fresh.status,
+                lastEventSequence: Math.max(r.lastEventSequence, fresh.lastEventSequence),
+                budgetUsed: fresh.budgetUsed ?? r.budgetUsed,
+                learningEligible: fresh.learningEligible,
+                outcomeRef: fresh.outcomeRef ?? r.outcomeRef,
+                executionMode: fresh.executionMode ?? r.executionMode,
+              }
+            : r;
         }),
       };
     case "runAdded":

@@ -4,7 +4,7 @@ import tempfile
 
 import pytest
 
-from adaptive_agent.production_evaluator import _lifecycle_execution_plan, _reject_shared_qa_path, _require_bound_real_receipt
+from adaptive_agent.production_evaluator import _lifecycle_execution_plan, _reject_shared_qa_path, _require_bound_real_receipt, build_job
 from adaptive_agent.store import Store
 
 
@@ -24,6 +24,33 @@ def test_lifecycle_execution_plan_accounts_for_nested_work_and_retries():
     counts = {"bootstrap": 1, "training": 60, "learning": 1, "transfer": 3, "adaptation": 3, "safety": 2, "validation": 360, "final": 720}
     plan = _lifecycle_execution_plan(counts, retries=1)
     assert plan == {"primaryCells": 1150, "primaryAttempts": 2300, "retryAttempts": 1150, "nestedSubcalls": 32, "totalAdmissions": 2332, "retriesPerCell": 1}
+
+
+def test_public_build_job_resume_restores_original_b0_after_promotion(tmp_path: Path, monkeypatch):
+    from adaptive_agent.evaluation import Arm
+    from adaptive_agent.experiment_runtime import DefaultExperimentStageRunner
+    from adaptive_agent.models import SkillBundle, SkillVersion
+    import adaptive_agent.production_evaluator as production_evaluator
+
+    image = "sha256:" + "1" * 64
+    monkeypatch.setattr(production_evaluator, "_docker_image_digest", lambda: image)
+    first_app, _, first_job = build_job(str(tmp_path), None, None, None, initialize=True, force_job=True, job_id="restart-job")
+    runtime = first_app.state.durable_runtime
+    original = first_job.arm_bundles[Arm.B0]
+    original_hash = original.content_hash
+
+    promoted = SkillBundle(parent=original.bundle_id, skills=[SkillVersion(skillId="promoted-skill", version="1", procedure="new procedure")])
+    promoted.content_hash = runtime.controller.candidates.recompute_bundle_hash(promoted)
+    runtime.controller.store.save_bundle(promoted.bundle_id, promoted.parent, promoted.content_hash, promoted.model_dump_json(by_alias=True), False)
+    runtime.controller.store.set_active_bundle(promoted.content_hash)
+
+    resumed_app, resumed_protocol, resumed_job = build_job(str(tmp_path), None, None, None, initialize=False, force_job=True, job_id="restart-job")
+    resumed_runtime = resumed_app.state.durable_runtime
+    resumed_b0 = resumed_job.arm_bundles[Arm.B0]
+
+    assert resumed_runtime.controller.get_active_bundle().content_hash == promoted.content_hash
+    assert resumed_b0.content_hash == original_hash
+    assert DefaultExperimentStageRunner(resumed_runtime, resumed_protocol).base_hash == original_hash
 
 
 def test_bound_private_outcome_requires_trusted_canonical_identity():

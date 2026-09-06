@@ -10,6 +10,7 @@ runtime's trusted learning entry point.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -194,7 +195,20 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
             cost += current_cost
             cost_seen = True
         economic_unknown = economic_unknown or economic_status == "unknown" or current_cost is None
-        if current_nominal is not None:
+        accounting_value = runtime.controller.store.get_artifact(getattr(observation, "accounting_ref", ""))
+        nominal_coverage = accounting_value.get("nominalCostCoverage") if isinstance(accounting_value, Mapping) else None
+        nominal_complete = (
+            isinstance(accounting_value, Mapping)
+            and accounting_value.get("nominalCostStatus") == "complete"
+            and isinstance(nominal_coverage, Mapping)
+            and isinstance(nominal_coverage.get("knownReceipts"), int)
+            and not isinstance(nominal_coverage.get("knownReceipts"), bool)
+            and isinstance(nominal_coverage.get("totalReceipts"), int)
+            and not isinstance(nominal_coverage.get("totalReceipts"), bool)
+            and nominal_coverage["totalReceipts"] > 0
+            and nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"]
+        )
+        if current_nominal is not None and nominal_complete:
             nominal += current_nominal
             nominal_seen = True
         else:
@@ -234,7 +248,8 @@ class DefaultExperimentStageRunner:
         self.protocol = protocol
         self.frozen_protocol = protocol.start_candidate_generation()
         self.inputs = _frozen_inputs(self.frozen_protocol)
-        self.base_bundle = _active_bundle(runtime)
+        bound_base_hash = getattr(runtime, "_evaluation_base_bundle_hash", None)
+        self.base_bundle = _load_bundle(runtime, bound_base_hash) if isinstance(bound_base_hash, str) and bound_base_hash else _active_bundle(runtime)
         self.base_hash = _bundle_hash(self.base_bundle)
         self.pins = _pins(runtime, protocol, self.inputs, self.base_hash)
         self._candidate_id: str | None = None
@@ -278,6 +293,18 @@ class DefaultExperimentStageRunner:
         task_ids = value.get("taskIds")
         if task_ids is not None and (not isinstance(task_ids, list) or len(task_ids) != len(run_ids) or any(not isinstance(task_id, str) or not task_id for task_id in task_ids)):
             raise ExperimentRuntimeError("lifecycle receipt task IDs are malformed")
+        evidence_refs = value.get("evidenceRefs")
+        outcome_refs = value.get("outcomeRefs")
+        if (
+            not isinstance(evidence_refs, list)
+            or len(evidence_refs) != len(run_ids)
+            or any(not isinstance(ref, str) or not ref for ref in evidence_refs)
+            or not isinstance(outcome_refs, list)
+            or len(outcome_refs) != len(run_ids)
+            or any(not isinstance(ref, str) or not ref for ref in outcome_refs)
+        ):
+            raise ExperimentRuntimeError("lifecycle receipt evidence references are incomplete")
+        receipt_proxy = value.get("costBasis") == "nominal_budget_proxy" and value.get("billingStatus") == "unknown"
         from adaptive_agent.evaluation import Arm, BudgetSpec, ModelProvenance, Partition, Provenance, RunObservation, sha256_json
 
         frozen_inputs = _protocol_inputs(self.protocol)
@@ -305,12 +332,19 @@ class DefaultExperimentStageRunner:
                 raise ExperimentRuntimeError(f"observation run {run_id!r} is not bound to {receipt_stage}")
             if task_ids is not None and task_ids[index] != task_id:
                 raise ExperimentRuntimeError("receipt task IDs do not match durable runs")
-            rows = store.list_evidence(run_id)
-            model_rows = [row for row in rows if row.get("event_type") == "model_response"]
-            outcome_rows = [row for row in rows if row.get("event_type") == "trusted_outcome"]
-            if not model_rows or not outcome_rows:
-                raise ExperimentRuntimeError(f"observation run {run_id!r} lacks trusted model/outcome evidence")
-            model_row, outcome_row = model_rows[-1], outcome_rows[-1]
+            model_row = store.get_evidence(evidence_refs[index])
+            outcome_row = store.get_evidence(outcome_refs[index])
+            if (
+                not isinstance(model_row, Mapping)
+                or not isinstance(outcome_row, Mapping)
+                or model_row.get("evidence_id") != evidence_refs[index]
+                or outcome_row.get("evidence_id") != outcome_refs[index]
+                or model_row.get("run_id") != run_id
+                or outcome_row.get("run_id") != run_id
+                or model_row.get("event_type") != "model_response"
+                or outcome_row.get("event_type") != "trusted_outcome"
+            ):
+                raise ExperimentRuntimeError(f"receipt evidence references are not bound to observation run {run_id!r}")
             try:
                 model_ref = json.loads(model_row["source_ref"])["sha256"]
                 outcome_ref = json.loads(outcome_row["source_ref"])["sha256"]
@@ -349,23 +383,58 @@ class DefaultExperimentStageRunner:
                     outcome_meta = {**persisted_meta, **outcome_meta}
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
+            passed = outcome_payload.get("passed")
+            reliable = outcome_meta.get("reliable", outcome_payload.get("reliable"))
+            safety_violations = outcome_meta.get("safetyViolations", outcome_payload.get("safetyViolations"))
+            fixture_reset_ok = outcome_meta.get("fixtureResetOk", outcome_payload.get("fixtureResetOk"))
+            if (
+                not isinstance(passed, bool)
+                or not isinstance(reliable, bool)
+                or not isinstance(safety_violations, int)
+                or isinstance(safety_violations, bool)
+                or safety_violations < 0
+                or not isinstance(fixture_reset_ok, bool)
+            ):
+                raise ExperimentRuntimeError(f"observation outcome metrics for {run_id!r} are incomplete")
             cost = accounting.get("costMicrounits")
+            if cost is None:
+                nominal = accounting.get("nominalCostUsd")
+                coverage = accounting.get("nominalCostCoverage")
+                complete_coverage = (
+                    accounting.get("nominalCostStatus") == "complete"
+                    and isinstance(coverage, Mapping)
+                    and isinstance(coverage.get("knownReceipts"), int)
+                    and not isinstance(coverage.get("knownReceipts"), bool)
+                    and isinstance(coverage.get("totalReceipts"), int)
+                    and not isinstance(coverage.get("totalReceipts"), bool)
+                    and coverage["totalReceipts"] > 0
+                    and coverage["knownReceipts"] == coverage["totalReceipts"]
+                )
+                nominal_valid = isinstance(nominal, (int, float)) and not isinstance(nominal, bool) and math.isfinite(float(nominal)) and nominal >= 0
+                coverage_disclosed = "nominalCostStatus" in accounting or "nominalCostCoverage" in accounting
+                if nominal_valid and (complete_coverage or (receipt_proxy and not coverage_disclosed)):
+                    cost = int(round(float(nominal) * 1_000_000))
             duration = accounting.get("durationSeconds", accounting.get("inferenceDurationSeconds"))
-            if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0 or not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration < 0:
+            if not isinstance(cost, (int, float)) or isinstance(cost, bool) or not math.isfinite(float(cost)) or cost < 0 or not isinstance(duration, (int, float)) or isinstance(duration, bool) or not math.isfinite(float(duration)) or duration < 0:
                 raise ExperimentRuntimeError(f"observation accounting for {run_id!r} is incomplete")
             versions = model_payload.get("versionRefs") or accounting.get("versionRefs")
             if not isinstance(versions, Mapping):
                 raise ExperimentRuntimeError(f"observation run {run_id!r} lacks frozen config hashes")
             package = _package(self.runtime, environment_id)
+            infrastructure_failure = outcome_meta.get("infrastructureFailure")
+            if not isinstance(infrastructure_failure, str):
+                infrastructure_failure = None
+            durable_status = str(run.get("status", "complete"))
+            observation_status = "complete" if durable_status in {"succeeded", "failed"} and infrastructure_failure is None else durable_status
             observations.append(RunObservation(
                 task_id, environment_id, Partition(partition), seed, Arm(arm),
-                bool(outcome_payload.get("passed", outcome_row_data.get("passed"))),
-                bool(outcome_meta.get("reliable", outcome_payload.get("reliable", True))),
-                int(outcome_meta.get("safetyViolations", outcome_payload.get("safetyViolations", 0)) or 0),
+                passed,
+                reliable,
+                safety_violations,
                 int(cost), float(duration),
-                status="complete" if run.get("status") == "succeeded" else str(run.get("status", "complete")),
-                fixture_reset_ok=bool(outcome_meta.get("fixtureResetOk", True)),
-                infrastructure_failure=outcome_meta.get("infrastructureFailure") if isinstance(outcome_meta.get("infrastructureFailure"), str) else None,
+                status=observation_status,
+                fixture_reset_ok=fixture_reset_ok,
+                infrastructure_failure=infrastructure_failure,
                 provenance=Provenance.DETERMINISTIC_SIMULATION,
                 model_provenance=ModelProvenance.REAL_MODEL,
                 model_profile=str(model_payload.get("modelProfile", frozen_inputs["modelProfile"])),
@@ -859,28 +928,13 @@ class DefaultExperimentStageRunner:
             cell_key,
             "support",
         )
-        # Adaptation evaluates the already promoted candidate against a fresh
-        # support/query pair. Candidate generation is a separate lifecycle
-        # operation and must not be re-run from a task receipt that has no
-        # authenticated learner observation.
-        candidate_hash = _required_string(self._candidate_hash, "candidate bundle hash")
-        candidate_id = _required_string(self._candidate_id, "candidate id")
-        adapted_candidate = _load_bundle(self.runtime, candidate_hash)
-        support_learning = {
-            "stage": "learning",
-            "cellKey": cell_key,
-            "status": "complete",
-            "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0},
-            "toolCalls": 0,
-            "wallSeconds": 0.0,
-            "costMicrounits": 0,
-            "candidateId": candidate_id,
-            "candidateBundleHash": candidate_hash,
-            "sourceRunIds": [getattr(support_observation, "run_id")],
-            "nestedAdmissions": [],
-            "nestedCheckpoints": [],
-            "reusedCandidate": True,
-        }
+        support_learning = self._candidate_from_run(
+            getattr(support_observation, "run_id"),
+            cell_key,
+            bind_primary=False,
+            context=context,
+        )
+        adapted_candidate = _load_bundle(self.runtime, support_learning["candidateBundleHash"])
         query_observation, query_receipt = self._execute_stage_subcall(
             query,
             "L",
@@ -910,9 +964,10 @@ class DefaultExperimentStageRunner:
             support_learning,
             charged_subcall_ids=[
                 support_receipt["nestedAdmissionId"],
+                *support_learning.get("nestedAdmissions", []),
                 query_receipt["nestedAdmissionId"],
             ],
-            charged_subcall_receipts=[support_receipt, query_receipt],
+            charged_subcall_receipts=[support_receipt, support_learning, query_receipt],
         )
 
     @staticmethod

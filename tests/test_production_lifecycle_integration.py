@@ -24,12 +24,13 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     class TaskModel:
         def __init__(self):
             self.turn = 0
-            self.turns_by_goal = {}
+            self.turns_by_run = {}
 
         def invoke(self, *, goal, environment, messages, **kwargs):
             self.turn += 1
-            turn = self.turns_by_goal.get(goal, 0) + 1
-            self.turns_by_goal[goal] = turn
+            run_key = environment["capabilities"][0]
+            turn = self.turns_by_run.get(run_key, 0) + 1
+            self.turns_by_run[run_key] = turn
             identifiers = re.findall(r"[A-Z]{3}-[A-Z]+-\d{3}", goal)
             schemas = {schema["name"]: schema for schema in environment["toolSchemas"]}
             goal_words = set(re.findall(r"[a-z]+", goal.lower()))
@@ -114,7 +115,14 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
 
     task_model = TaskModel()
     learning_model = LearningModel()
-    app = create_runtime_app(data_dir=tmp_path, model_runner=task_model, learning_model_client=learning_model, evaluator=lambda **_: {"passed": True, "reliable": True, "safetyViolations": 0, "fixtureResetOk": True})
+
+    def trusted_evaluator(*, model_responses, **_kwargs):
+        payload = model_responses[-1]["payload"]
+        development = "-development-" in payload["taskId"]
+        passed = development or payload["arm"] == "L"
+        return {"passed": passed, "reliable": True, "safetyViolations": 0, "fixtureResetOk": True}
+
+    app = create_runtime_app(data_dir=tmp_path, model_runner=task_model, learning_model_client=learning_model, evaluator=trusted_evaluator)
     runtime = app.state.durable_runtime
     from adaptive_agent.evaluation import EvaluationProtocol
 
@@ -133,38 +141,61 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     assert result.reports is not None and set(result.reports) == {"validation", "final"}
     assert result.reports["validation"].validity_status == "valid"
     assert result.reports["final"].validity_status == "valid"
+    assert result.reports["validation"].arm_summaries["B0"].accuracy == 0.0
+    assert result.reports["validation"].arm_summaries["L"].accuracy == 1.0
+    assert result.reports["final"].arm_summaries["B0"].accuracy == 0.0
+    assert result.reports["final"].arm_summaries["L"].accuracy == 1.0
+    assert result.reports["final"].arm_summaries["A"].accuracy == 0.0
     assert result.reports["final"].ablation_audit is not None and result.reports["final"].ablation_audit.passed
     learned_hash = result.reports["validation"].candidate_hash
     learned = runtime.controller.store.get_bundle_by_hash(learned_hash)
     assert learned is not None
-    a_hash = result.runtime_accounting  # retain a durable accounting assertion below
     assert runtime.controller.store.get_bundle_by_hash(result.reports["final"].candidate_hash) is not None
-    assert task_model.turn > 0 and learning_model.calls == 1
+    assert runtime.controller.get_active_bundle().content_hash == learned_hash
+    ablation_hash = runtime._evaluation_arm_bundles["A"]
+    assert len({active.content_hash, learned_hash, ablation_hash}) == 3
+    promotions_before_restart = runtime.controller.store.list_promotions()
+    assert len(promotions_before_restart) == 1 and promotions_before_restart[0]["decision"] == "promoted"
+    assert task_model.turn > 0 and learning_model.calls == 7
+
+    with runtime.controller.store.connect() as conn:
+        validation_receipts = conn.execute("SELECT COUNT(*) FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = 'validation' AND status = 'complete'", ("full-production-synthetic",)).fetchone()[0]
+        final_receipts = conn.execute("SELECT COUNT(*) FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = 'final' AND status = 'complete'", ("full-production-synthetic",)).fetchone()[0]
+        transfer_and_adaptation = conn.execute("SELECT stage, result_json FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage IN ('transfer', 'adaptation') AND status = 'complete' ORDER BY stage, cell_key", ("full-production-synthetic",)).fetchall()
+    assert (validation_receipts, final_receipts) == (360, 720)
+    assert len(transfer_and_adaptation) == 6
+    for row in transfer_and_adaptation:
+        stage_receipt = json.loads(row["result_json"])
+        learning_receipt = stage_receipt["learningReceipt"]
+        assert learning_receipt["modelObservationRefs"]
+        assert learning_receipt["sourceRunIds"]
+        assert learning_receipt.get("reusedCandidate") is not True
 
     first_calls = task_model.turn
-    restarted_app = create_runtime_app(data_dir=tmp_path, model_runner=task_model, learning_model_client=learning_model, evaluator=lambda **_: {"passed": True, "reliable": True, "safetyViolations": 0, "fixtureResetOk": True})
+    restarted_app = create_runtime_app(data_dir=tmp_path, model_runner=task_model, learning_model_client=learning_model, evaluator=trusted_evaluator)
     restarted = restarted_app.state.durable_runtime
-    restarted_job = restarted.build_evaluation_job(protocol, {Arm.B0: restarted.controller.get_active_bundle()})
+    restarted_job = restarted.build_evaluation_job(protocol, {Arm.B0: active})
     resumed = restarted_job.run_experiment("full-production-synthetic", _lifecycle_stages(restarted, protocol, 0), limits=limits)
-    assert resumed.status == "complete"
+    assert resumed.status == "complete", resumed.error
     assert task_model.turn == first_calls
-    assert learning_model.calls == 1
+    assert learning_model.calls == 7
+    assert restarted.controller.store.list_promotions() == promotions_before_restart
 
     final_state = resumed.reports["final"] if resumed.reports else None
     assert final_state is not None and final_state.validity_status == "valid"
-    a_rows = restarted.controller.store.connect()
-    with a_rows as conn:
+    with restarted.controller.store.connect() as conn:
         bundles = conn.execute("SELECT bundle_id, content_hash, bundle_json FROM skill_bundles").fetchall()
     assert len({row[1] for row in bundles}) >= 3
     assert learned["content_hash"] == learned_hash
 
     # Removing one durable model evidence row makes recovery fail closed and
     # cannot be converted into a complete lifecycle result.
-    with a_rows as conn:
+    with restarted.controller.store.connect() as conn:
         row = conn.execute("SELECT result_json FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = 'validation' LIMIT 1", ("full-production-synthetic",)).fetchone()
         receipt = json.loads(row[0])
         evidence_id = receipt["evidenceRefs"][0]
         conn.execute("DELETE FROM evidence WHERE evidence_id = ?", (evidence_id,))
         conn.commit()
-    with pytest.raises(Exception):
-        restarted_job.run_experiment("full-production-synthetic", _lifecycle_stages(restarted, protocol, 0), limits=limits, context={"resume": True})
+    invalid_resume = restarted_job.run_experiment("full-production-synthetic", _lifecycle_stages(restarted, protocol, 0), limits=limits, context={"resume": True})
+    assert invalid_resume.status == "failed"
+    assert "evidence" in (invalid_resume.error or "").lower()

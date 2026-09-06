@@ -233,6 +233,29 @@ class EvaluationTests(unittest.TestCase):
         invalid.require_promotion_evidence(protocol, packages)
     self.assertTrue(frozen.protocol_hash)
 
+  def test_completed_wrong_answers_are_valid_metric_observations(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    runner = EvaluationRunner(protocol, packages, safety_cases={"EVAL-004": True, "EVAL-005": True})
+    rows = []
+    for name in protocol.known_environments:
+        for task in packages[name].tasks_for_partition(Partition.VALIDATION)[:protocol.tasks_per_environment]:
+            for seed in protocol.seeds:
+                rows.append(dataclasses.replace(_observation(name, task, seed, Arm.B0, False), model_provenance=ModelProvenance.REAL_MODEL))
+                rows.append(dataclasses.replace(_observation(name, task, seed, Arm.L, True), model_provenance=ModelProvenance.REAL_MODEL))
+
+    report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=rows)
+
+    self.assertEqual(report.validity_status, "valid")
+    self.assertEqual(report.arm_summaries[Arm.B0.value].accuracy, 0.0)
+    self.assertEqual(report.arm_summaries[Arm.L.value].accuracy, 1.0)
+
+    interrupted = dataclasses.replace(rows[0], status="failed", infrastructure_failure="provider_timeout")
+    invalid = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=[interrupted, *rows[1:]])
+    self.assertEqual(invalid.validity_status, "invalid")
+    self.assertIn("provider_timeout", invalid.infrastructure_failures)
+
   def test_invalid_duplicate_or_leaked_pair_is_not_a_valid_report(self):
     packages = build_environment_packages()
     protocol = EvaluationProtocol()

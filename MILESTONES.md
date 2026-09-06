@@ -21,6 +21,24 @@ After M2 fixes the contracts, environment fixtures and console work can proceed 
 The evaluator owner must remain independent of learner-controlled code and protect validation and final test contents.
 No additional workers are spawned during this documentation task.
 
+## Current root checkpoint
+
+As of 2026-09-06, the current local `main` is `7c65f5b`.
+This checkpoint records one root-verified real path through the production UI, the authenticated Luna subscription, the Docker runtime, a broker write, and the trusted evaluator.
+The run used the clean Store and data directory `/private/tmp/adaptive-agent-main-20260906` and produced run `run_a1662f700a9a400b9e0f80b87a52f76e`.
+
+The run produced learning candidate `cand_a095170f9c6d4f58943deb7539270de0` from three broker references and 7,206 learning tokens.
+Candidate proposal validation passed.
+No heldout panel or performance result follows from that validation.
+Session 6 is fixing the full lifecycle 360/720 regression.
+
+The strict provider output-token cap remains an accepted but unmet criterion.
+The SDK nominal cost is a proxy, and economic billing is unknown.
+No publication or submission is authorized.
+
+This checkpoint updates the current status only.
+The historical evidence ledger, QA-data hold, delivery gates, and requirement traceability below remain preserved.
+
 ## Implementation and integration snapshot
 
 The following snapshot was read from the current worktrees on 2026-09-06.
@@ -47,6 +65,7 @@ The following records are the fresh root-verified evidence for this checkpoint, 
 
 | Evidence | Classification | What it establishes | What it does not establish |
 | --- | --- | --- | --- |
+| Root-verified production UI to authenticated Luna, Docker, broker write, and trusted evaluator on `/private/tmp/adaptive-agent-main-20260906`; run `run_a1662f700a9a400b9e0f80b87a52f76e`; candidate `cand_a095170f9c6d4f58943deb7539270de0` | Current real product evidence | A clean Store and data path completed the real execution chain, and candidate proposal validation used three broker references and 7,206 learning tokens | Heldout panels, a performance result, a completed candidate comparison, or a promotion decision |
 | Session-2 current probe and integration lineage at `f3785f0` with a reviewed dirty overlay; 171 backend tests passed | Current integration evidence | The current control-plane and evaluator-launch integration is test-covered at the reported checkpoint | A committed merge, real provider product run, heldout evaluation, or final performance result |
 | Actual Docker-backed EVAL-003 from the current session-2 lineage: 7 obligations passed on isolated temporary Store and data paths | Current boundary evidence | The seven obligations crossed the actual Docker runtime boundary while using an isolated fixture and no paid model call | General model safety, product acceptance, or sealed evaluator performance |
 | EVAL-003 safety hardening at `3261afc` atop `f423fac`; focused safety, core, and lifecycle tests 39 passed | Current safety evidence | Attacker-controlled public-document output, forged approval attempts, no-provider-write behavior, Docker-provenance requirements, fail-closed controller execution, and self-contained payload/content-hash receipts | A full pass without an injected Docker-backed Prime adapter, heldout evaluation, or paid-provider result |
@@ -117,7 +136,7 @@ The historical evidence entries above remain preserved as reports, but any entry
 
 The current gate status is deliberately conservative.
 M0 and M1 are complete as documentation and local integration milestones.
-M2 has substantial implementation and narrow real-run evidence, but remains unmet until the actual neutral goal-to-model-to-tool-to-trusted-evaluator path and required boundary checks are retained together.
+M2 now has a root-verified production UI to authenticated model, Docker, broker, and trusted-evaluator path, but remains unmet until the required candidate comparison, gate decision, and boundary evidence are retained together.
 M3 has core learning, storage, broker, candidate, and benchmark components, but the complete three-pack lifecycle and all required acceptance scenarios are not verified as one integrated product.
 M4 is unmet because there is no clean sealed four-environment B0/L/A evaluation, measured cross-domain result, or final resource-budget evidence.
 M5 and M6 have not started, and there are no public repository, social-demo, deployment, or submission claims.

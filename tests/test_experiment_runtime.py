@@ -256,6 +256,109 @@ def test_partial_known_cost_remains_unknown():
     assert "costMicrounits" not in partial_receipt
 
 
+def test_observation_cost_requires_complete_nominal_coverage():
+    from adaptive_agent.app import LearningRuntimeError, _effective_observation_cost
+
+    assert _effective_observation_cost({"costMicrounits": 17, "nominalCostUsd": 0.000021}) == 17
+    complete = {"nominalCostUsd": 0.000021, "nominalCostStatus": "complete", "nominalCostCoverage": {"knownReceipts": 1, "totalReceipts": 1}}
+    assert _effective_observation_cost(complete) == 21
+    with pytest.raises(LearningRuntimeError, match="complete economic or nominal cost"):
+        _effective_observation_cost({"nominalCostUsd": 0.000021, "nominalCostStatus": "partial", "nominalCostCoverage": {"knownReceipts": 1, "totalReceipts": 2}})
+
+
+def test_recovery_uses_receipt_refs_and_nominal_proxy():
+    import json
+    from adaptive_agent.evaluation import build_environment_packages
+
+    class RecoveryStore:
+        def __init__(self):
+            self.artifacts = {
+                "model-art": {"responseId": "response", "arm": "L", "seed": 17, "bundleHash": "base", "versionRefs": {"planner": "core"}, "accountingRef": "acct"},
+                "outcome-art": {"passed": True, "reliable": True, "safetyViolations": 0, "fixtureResetOk": True},
+                "acct": {"nominalCostUsd": 0.000012, "durationSeconds": 1.0},
+            }
+            self.rows = {
+                "model-ref": {"evidence_id": "model-ref", "run_id": "run", "event_type": "model_response", "source_ref": json.dumps({"sha256": "model-art"})},
+                "outcome-ref": {"evidence_id": "outcome-ref", "run_id": "run", "event_type": "trusted_outcome", "source_ref": json.dumps({"sha256": "outcome-art"})},
+            }
+
+        def get_run(self, run_id):
+            return {"task_id": "task", "environment_id": "known-a", "status": "succeeded", "run_json": json.dumps({"arm": "L", "seed": 17, "bundleHash": "base"})} if run_id == "run" else None
+
+        def get_task(self, task_id):
+            return {"partition": "validation"} if task_id == "task" else None
+
+        def get_evidence(self, evidence_id):
+            return self.rows.get(evidence_id)
+
+        def get_artifact(self, ref):
+            return self.artifacts[ref]
+
+        def get_outcome_by_run_id(self, _run_id):
+            return {}
+
+    store = RecoveryStore()
+    runtime = SimpleNamespace(controller=SimpleNamespace(store=store, get_active_bundle=lambda: Bundle("base")), core_planner_hash="core", image_digest="image", packages={"known-a": build_environment_packages()["finance"]})
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    receipt = {"stage": "validation", "cellKey": "validation:0", "runIds": ["run"], "evidenceRefs": ["model-ref"], "outcomeRefs": ["outcome-ref"], "costBasis": "nominal_budget_proxy", "billingStatus": "unknown"}
+
+    observations = runner.recover_evaluation_observations(receipt)
+    assert observations[0].cost_microunits == 12
+    with pytest.raises(ExperimentRuntimeError, match="evidence references"):
+        runner.recover_evaluation_observations({**receipt, "evidenceRefs": ["missing"]})
+
+
+def test_recovery_treats_audited_wrong_answer_as_complete_but_not_infrastructure_failure():
+    import json
+    from adaptive_agent.evaluation import build_environment_packages
+
+    class RecoveryStore:
+        def __init__(self):
+            self.infrastructure_failure = None
+            self.artifacts = {
+                "model-art": {"responseId": "response", "arm": "B0", "seed": 17, "bundleHash": "base", "versionRefs": {"planner": "core"}, "accountingRef": "acct"},
+                "outcome-art": {"passed": False, "reliable": True, "safetyViolations": 0, "fixtureResetOk": True},
+                "acct": {"costMicrounits": 12, "durationSeconds": 1.0},
+            }
+            self.rows = {
+                "model-ref": {"evidence_id": "model-ref", "run_id": "run", "event_type": "model_response", "source_ref": json.dumps({"sha256": "model-art"})},
+                "outcome-ref": {"evidence_id": "outcome-ref", "run_id": "run", "event_type": "trusted_outcome", "source_ref": json.dumps({"sha256": "outcome-art"})},
+            }
+
+        def get_run(self, run_id):
+            return {"task_id": "task", "environment_id": "known-a", "status": "failed", "run_json": json.dumps({"arm": "B0", "seed": 17, "bundleHash": "base"})} if run_id == "run" else None
+
+        def get_task(self, task_id):
+            return {"partition": "validation"} if task_id == "task" else None
+
+        def get_evidence(self, evidence_id):
+            return self.rows.get(evidence_id)
+
+        def get_artifact(self, ref):
+            return self.artifacts[ref]
+
+        def get_outcome_by_run_id(self, _run_id):
+            metadata = {"reliable": True, "safetyViolations": 0, "fixtureResetOk": True}
+            if self.infrastructure_failure is not None:
+                metadata["infrastructureFailure"] = self.infrastructure_failure
+            return {"metadata_json": json.dumps(metadata)}
+
+    store = RecoveryStore()
+    runtime = SimpleNamespace(controller=SimpleNamespace(store=store, get_active_bundle=lambda: Bundle("base")), core_planner_hash="core", image_digest="image", packages={"known-a": build_environment_packages()["finance"]})
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    receipt = {"stage": "validation", "cellKey": "validation:0", "runIds": ["run"], "evidenceRefs": ["model-ref"], "outcomeRefs": ["outcome-ref"]}
+
+    audited_failure = runner.recover_evaluation_observations(receipt)[0]
+    assert audited_failure.passed is False
+    assert audited_failure.status == "complete"
+    assert audited_failure.infrastructure_failure is None
+
+    store.infrastructure_failure = "provider_timeout"
+    infrastructure_failure = runner.recover_evaluation_observations(receipt)[0]
+    assert infrastructure_failure.status == "failed"
+    assert infrastructure_failure.infrastructure_failure == "provider_timeout"
+
+
 def test_learning_receipt_preserves_nominal_proxy_and_wall_time(monkeypatch):
     runtime = Runtime()
     runner = DefaultExperimentStageRunner(runtime, Protocol())

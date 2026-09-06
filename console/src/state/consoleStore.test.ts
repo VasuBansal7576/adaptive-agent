@@ -37,11 +37,25 @@ describe("event cursor semantics", () => {
     expect(replayedAgain.events["r1"]).toHaveLength(2);
   });
 
-  it("marks the connection stale on a sequence gap instead of applying", () => {
-    const s1 = applyEvent(state, ev(3));
-    expect(s1.cursors["r1"]).toBeUndefined();
-    expect(s1.connection).toBe("stale");
-    expect(s1.events["r1"]).toBeUndefined();
+  it("applies the first VISIBLE event after hidden evaluator rows (gap retains the event)", () => {
+    // hidden evaluator_only rows create legitimate gaps: the gapped event is
+    // still visible evidence — it is applied normally (cursor advances past
+    // the hidden rows, evidence retained, status updated), nothing dropped
+    const visible: RunEvent = { ...ev(3), runStatus: "running" };
+    const s1 = applyEvent(state, visible);
+    expect(s1.cursors["r1"]).toBe(3);
+    expect(s1.events["r1"]).toHaveLength(1);
+    expect(s1.events["r1"]?.[0].summary).toBe(visible.summary);
+    expect(s1.runs[0].status).toBe("running");
+    expect(s1.connection).toBe(initialConsoleState.connection);
+  });
+
+  it("retains BOTH visible events across a private gap (sequence 1 then 3)", () => {
+    const s1 = applyEvent(state, ev(1));
+    const s2 = applyEvent(s1, { ...ev(3), runStatus: "running" });
+    expect(s2.cursors["r1"]).toBe(3);
+    expect(s2.events["r1"]).toHaveLength(2);
+    expect(s2.events["r1"]?.map((e) => e.sequence)).toEqual([1, 3]);
   });
 
   it("status changes ONLY via validated lifecycle transitions or record refresh", () => {

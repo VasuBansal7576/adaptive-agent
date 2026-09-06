@@ -160,14 +160,37 @@ def _require_pin(name: str, value: str, *, image: bool = False) -> str:
 
 def _persist_or_verify_frozen(store: Any, frozen: Any, *, initialize: bool) -> None:
     payload = frozen.to_dict()
-    existing = store.get_frozen_protocol(frozen.protocol_hash)
-    if initialize:
-        if existing is not None:
-            raise RuntimeError("initialization refuses an existing frozen protocol")
-        store.save_frozen_protocol(frozen.protocol_hash, json.dumps(payload, sort_keys=True), "production-evaluator")
-        return
-    if existing is None or json.loads(existing.get("gate_json", "{}")) != payload:
-        raise RuntimeError("resume frozen protocol pins do not match")
+    encoded = json.dumps(payload, sort_keys=True)
+    with store.connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS evaluation_protocol_bindings (protocol_hash TEXT PRIMARY KEY, protocol_json TEXT NOT NULL)")
+        existing = conn.execute("SELECT protocol_json FROM evaluation_protocol_bindings WHERE protocol_hash = ?", (frozen.protocol_hash,)).fetchone()
+        if initialize:
+            if existing is not None:
+                raise RuntimeError("initialization refuses an existing frozen protocol")
+            conn.execute("INSERT INTO evaluation_protocol_bindings(protocol_hash, protocol_json) VALUES (?, ?)", (frozen.protocol_hash, encoded))
+            conn.commit()
+            return
+        if existing is None or existing["protocol_json"] != encoded:
+            raise RuntimeError("resume frozen protocol pins do not match")
+
+
+def _persist_or_restore_base_bundle(store: Any, job_id: str, active: Any, *, initialize: bool) -> Any:
+    """Freeze B0 by job so resume cannot silently use a promoted active bundle."""
+    active_hash = getattr(active, "content_hash", None)
+    if not isinstance(active_hash, str) or not active_hash:
+        raise RuntimeError("durable runtime has no hashable active base bundle")
+    with store.connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS evaluation_job_bases (job_id TEXT PRIMARY KEY, base_bundle_hash TEXT NOT NULL)")
+        row = conn.execute("SELECT base_bundle_hash FROM evaluation_job_bases WHERE job_id = ?", (job_id,)).fetchone()
+        if initialize:
+            if row is not None:
+                raise RuntimeError("initialization refuses an existing job base binding")
+            conn.execute("INSERT INTO evaluation_job_bases(job_id, base_bundle_hash) VALUES (?, ?)", (job_id, active_hash))
+            conn.commit()
+            return active
+        if row is None:
+            raise RuntimeError("resume job has no persisted base bundle binding")
+        return _bundle_by_hash(store, str(row["base_bundle_hash"]))
 
 
 def _persist_or_verify_workload(store: Any, job_id: str, workload: dict[str, Any], *, initialize: bool) -> None:
@@ -188,7 +211,7 @@ def _persist_or_verify_workload(store: Any, job_id: str, workload: dict[str, Any
             raise RuntimeError("job workload is already frozen with different counts")
 
 
-def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | None, source_run_id: str | None, *, a_hash: str | None = None, initialize: bool = False, force_job: bool = False) -> tuple[Any, Any, Any]:
+def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | None, source_run_id: str | None, *, a_hash: str | None = None, initialize: bool = False, force_job: bool = False, job_id: str | None = None) -> tuple[Any, Any, Any]:
     """Build an evaluator job around the integrated durable runtime.
 
     The import is deliberately local: an evaluator process must resolve the
@@ -227,7 +250,8 @@ def build_job(data_dir: str, source_data_dir: str | None, candidate_id: str | No
     active = runtime.controller.get_active_bundle()
     if active is None:
         raise RuntimeError("durable runtime has no active base bundle")
-    bundles: dict[Any, Any] = {Arm.B0: active}
+    base = _persist_or_restore_base_bundle(runtime.controller.store, job_id, active, initialize=initialize) if job_id is not None else active
+    bundles: dict[Any, Any] = {Arm.B0: base}
     if candidate_id is not None:
         learned = _candidate_bundle(runtime.controller.store, candidate_id)
         bundles[Arm.L] = learned
@@ -370,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.comparison not in {"smoke", "experiment"} and (not args.candidate_id or not args.source_data_dir or not args.source_run_id):
         parser.error("held-out evaluation requires candidate/source store/source run bindings")
-    app, protocol, job = build_job(args.data_dir, args.source_data_dir, args.candidate_id, args.source_run_id, a_hash=args.a_hash, initialize=args.initialize, force_job=args.comparison == "experiment")
+    app, protocol, job = build_job(args.data_dir, args.source_data_dir, args.candidate_id, args.source_run_id, a_hash=args.a_hash, initialize=args.initialize, force_job=args.comparison == "experiment", job_id=args.job)
     workload = _workload(protocol, args.candidate_count, args.training_runs, args.transfer_runs, args.safety_runs, args.retries)
     print(json.dumps({"job": args.job, "comparison": args.comparison, "workload": workload}, sort_keys=True))
     if workload["transferRuns"] < 1:

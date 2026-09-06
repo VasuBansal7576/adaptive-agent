@@ -238,6 +238,21 @@ def test_learning_request_accepts_run_id_only():
     assert request.evidence_ids == []
 
 
+def test_learning_launch_accepts_run_id_only():
+    plane = ControlPlane(model_runner=model_runner, evaluator=evaluator)
+    api = TestClient(create_app(plane), base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").status_code == 200
+    assert api.post("/environments/register", json=manifest()).status_code == 201
+    run = api.post("/runs", json={"goal": "read", "environmentId": "neutral", "idempotencyKey": "learning-run-only"}).json()
+
+    response = api.post("/learning/launch", json={"runId": run["runId"]})
+
+    assert response.status_code == 202
+    assert response.json()["runId"] == run["runId"]
+    assert response.json()["predictedEffect"] == ""
+    assert response.json()["evidenceIds"] == []
+
+
 def test_durable_candidates_emit_stable_projection_shape(tmp_path):
     app = create_runtime_app(data_dir=tmp_path)
     runtime = app.state.durable_runtime
@@ -276,6 +291,100 @@ def test_durable_candidates_emit_stable_projection_shape(tmp_path):
             "proposerVersion": "planner-1",
         }
     ]
+
+
+def test_durable_evaluation_launch_derives_server_pins_and_projects_queue_metadata(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    active_hash = runtime.controller.get_active_bundle().content_hash
+    runtime.controller.store.save_candidate(
+        "cand-evaluation-launch",
+        {
+            "base_bundle_hash": active_hash,
+            "candidate_bundle_hash": active_hash,
+            "candidate_json": json.dumps(
+                {
+                    "baseBundleHash": active_hash,
+                    "candidateBundleHash": active_hash,
+                    "editOperations": ["bounded change"],
+                    "changedArtifactHashes": ["patch-hash"],
+                    "supportingEvidenceIds": ["evidence-id"],
+                    "predictedEffect": "improves completion",
+                    "proposerVersion": "planner-1",
+                }
+            ),
+            "state": "validated",
+            "created_at": "now",
+        },
+    )
+    api = TestClient(app, base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").status_code == 200
+
+    response = api.post(
+        "/evaluations",
+        json={"candidateId": "cand-evaluation-launch", "baseBundleHash": active_hash},
+    )
+    assert response.status_code == 202
+    queued = response.json()
+    frozen = runtime._evaluation_protocol.start_candidate_generation()
+    assert queued["protocolHash"] == frozen.protocol_hash
+    assert queued["partitionRef"]["id"] == "validation"
+    assert queued["partitionRef"]["sha256"] == frozen.partition_hashes["finance:validation"]
+
+    listed = api.get("/evaluations")
+    assert listed.status_code == 200
+    projection = listed.json()[0]
+    assert projection["evaluationId"] == queued["evaluationId"]
+    assert projection["candidateId"] == "cand-evaluation-launch"
+    assert projection["state"] == "queued"
+    assert projection["trusted"] is False
+    assert projection["reason"] == "unverified evaluator report"
+
+    queue_row = runtime.controller.store.get_evaluation_queue(queued["evaluationId"])
+    assert queue_row is not None
+    runtime.controller.store.save_evaluation_queue(
+        queued["evaluationId"],
+        {
+            **queue_row,
+            "state": "failed",
+            "payload_json": json.dumps({"state": "failed", "error": "evaluator worker failed"}),
+        },
+    )
+    failed = api.get("/evaluations").json()[0]
+    assert failed["evaluationId"] == queued["evaluationId"]
+    assert failed["candidateId"] == "cand-evaluation-launch"
+    assert failed["state"] == "invalid"
+    assert failed["reason"] == "evaluator worker failed"
+
+    completed_id = "eval-completed"
+    partition_json = json.dumps(queued["partitionRef"], sort_keys=True)
+    runtime.controller.store.save_evaluation_queue(
+        completed_id,
+        {
+            "candidate_id": "cand-evaluation-launch",
+            "candidate_hash": active_hash,
+            "base_hash": active_hash,
+            "protocol_hash": queued["protocolHash"],
+            "partition_ref": partition_json,
+            "state": "completed",
+            "payload_json": json.dumps({"state": "completed"}),
+        },
+    )
+    runtime.controller.store.save_evaluation(
+        completed_id,
+        {
+            "candidate_hash": active_hash,
+            "base_hash": active_hash,
+            "protocol_hash": queued["protocolHash"],
+            "partition_ref": partition_json,
+            "report_json": json.dumps({"validityStatus": "invalid", "error": {"message": "trusted report invalid"}}),
+            "validity": "invalid",
+        },
+    )
+    completed = next(item for item in api.get("/evaluations").json() if item["evaluationId"] == completed_id)
+    assert completed["candidateId"] == "cand-evaluation-launch"
+    assert completed["state"] == "invalid"
+    assert completed["reason"] == "trusted report invalid"
 
 
 def test_durable_launch_retry_does_not_reinvoke_model(tmp_path):
@@ -333,7 +442,7 @@ def test_benchmark_write_uses_authorized_batch_mode(monkeypatch, tmp_path):
                 % capability_id
                 if self.turn == 1 else '{"action":"finish","answer":"applied"}'
             )
-            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"benchmark-{self.turn}", "text": action, "usage": {"outputTokens": 2}}
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"benchmark-{self.turn}", "text": action, "usage": {"outputTokens": 2, "cost": {"total": 0}}}
 
     class FakePrime:
         def __init__(self, config, broker):

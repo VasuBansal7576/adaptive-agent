@@ -11,6 +11,7 @@ export function CandidatesView({
   loading,
   onActionError,
   onRefreshCandidates,
+  onRefreshRuns,
 }: {
   transport: ConsoleTransport;
   candidates: CandidateDiff[];
@@ -18,6 +19,8 @@ export function CandidatesView({
   loading: boolean;
   onActionError: (message: string, correlationId?: string | null) => void;
   onRefreshCandidates: () => void;
+  /** refresh authoritative run records (eligibility) without a reload */
+  onRefreshRuns: () => void;
 }) {
   const [rollbackTarget, setRollbackTarget] = useState<CandidateDiff | null>(null);
   const [reason, setReason] = useState("");
@@ -118,7 +121,7 @@ export function CandidatesView({
         </p>
       </div>
 
-      <LearningCycleButton busy={cycleBusy} onRun={() => setCycleOpen(true)} />
+      <LearningCycleButton busy={cycleBusy} onRun={() => { onRefreshRuns(); setCycleOpen(true); }} />
 
       {loading && <LoadingState label="Loading candidates…" />}
 
@@ -207,7 +210,7 @@ export function CandidatesView({
               <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                 {cand.diff ? "Diff (immutable, bounded)" : "Edit operations (bounded)"}
               </h4>
-              <pre className="mt-1 max-h-72 overflow-auto rounded-lg bg-slate-800 p-3 font-mono text-[11px] leading-relaxed text-slate-200 [overflow-wrap:anywhere]">
+              <pre className="mt-1 max-h-72 overflow-y-auto whitespace-pre-wrap rounded-lg bg-slate-800 p-3 font-mono text-[11px] leading-relaxed text-slate-200 [overflow-wrap:anywhere]">
                 {cand.diff ?? renderEditOperations(cand)}
               </pre>
             </div>
@@ -403,8 +406,9 @@ function LearningCycleModal({
           </label>
           {runs.length === 0 ? (
             <p role="status" className="mt-1 text-[13px] text-slate-400">
-              No completed development runs are eligible yet. Complete a run successfully first, then stage a
-              learning cycle.
+              No completed development runs are eligible yet. Eligibility is declared by the server after the
+              trusted outcome commits — open this dialog again or wait a moment and it will appear; private
+              evaluation evidence is never shown.
             </p>
           ) : (
             <select
@@ -491,7 +495,7 @@ function ActualReportPanel({ report, evaluationId }: { report: EvaluationReportP
     <div className="rounded-lg bg-slate-800/60 p-3">
       <div className="flex items-center justify-between gap-2">
         <p className="text-xs font-semibold text-emerald-300">
-          Trusted evaluation report — {report.comparison} ({isFinal ? "B0/L/A" : "B0/L"})
+          Trusted evaluation report ({report.comparison}) ({isFinal ? "B0/L/A" : "B0/L"})
         </p>
         <StatusBadge status={report.validityStatus === "valid" ? "valid" : "invalid"} />
       </div>

@@ -201,8 +201,11 @@ class CandidateProposalRequest(ApiModel):
 class EvaluationRequest(ApiModel):
     candidate_id: str = Field(alias="candidateId", min_length=1)
     base_bundle_hash: str = Field(alias="baseBundleHash", min_length=1)
-    protocol_hash: str = Field(alias="protocolHash", min_length=1)
-    partition_ref: JsonObject = Field(alias="partitionRef")
+    # Evaluation protocol and partition pins are evaluator-owned.  They are
+    # optional at the operator boundary and are derived from the frozen server
+    # protocol by the durable runtime.
+    protocol_hash: str | None = Field(default=None, alias="protocolHash")
+    partition_ref: JsonObject | None = Field(default=None, alias="partitionRef")
 
 
 class EvaluationLaunchRequest(ApiModel):

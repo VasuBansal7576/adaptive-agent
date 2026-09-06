@@ -33,6 +33,31 @@ from adaptive_agent.evaluation_store import SQLiteRunEvidenceStore, build_durabl
 from adaptive_agent.store import Store
 
 
+def _effective_cost_microunits(
+    explicit_cost: object,
+    nominal_cost_usd: object,
+    *,
+    nominal_status: object = None,
+    nominal_coverage: object = None,
+) -> int | None:
+    """Normalize measured cost, falling back to a complete nominal proxy."""
+    if isinstance(explicit_cost, (int, float)) and not isinstance(explicit_cost, bool) and math.isfinite(float(explicit_cost)) and explicit_cost >= 0:
+        return int(round(float(explicit_cost)))
+    complete_coverage = (
+        nominal_status == "complete"
+        and isinstance(nominal_coverage, Mapping)
+        and isinstance(nominal_coverage.get("knownReceipts"), int)
+        and not isinstance(nominal_coverage.get("knownReceipts"), bool)
+        and isinstance(nominal_coverage.get("totalReceipts"), int)
+        and not isinstance(nominal_coverage.get("totalReceipts"), bool)
+        and nominal_coverage["totalReceipts"] > 0
+        and nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"]
+    )
+    if complete_coverage and isinstance(nominal_cost_usd, (int, float)) and not isinstance(nominal_cost_usd, bool) and math.isfinite(float(nominal_cost_usd)) and nominal_cost_usd >= 0:
+        return int(round(float(nominal_cost_usd) * 1_000_000))
+    return None
+
+
 @dataclass(frozen=True)
 class EvaluationJobResult:
     job_id: str
@@ -533,7 +558,21 @@ class EvaluationJob:
                 self.controller.candidates.quarantine(candidate_id, "validation report failed the promotion gate")
             raise EvaluationError("validation report failed the promotion gate")
         report.require_promotion_evidence(self.protocol, self.packages)
-        self.controller.candidates.promote(candidate_id, report)
+        candidate = self.store.get_candidate(candidate_id)
+        if isinstance(candidate, Mapping) and candidate.get("state") == "promoted":
+            active = self.controller.get_active_bundle()
+            active_hash = getattr(active, "content_hash", None)
+            promoted = [
+                decision
+                for decision in self.store.list_promotions()
+                if decision.get("decision") == "promoted"
+                and decision.get("candidate_hash") == report.candidate_hash
+                and decision.get("base_hash") == report.base_hash
+            ]
+            if active_hash != report.candidate_hash or len(promoted) != 1:
+                raise EvaluationError("promoted candidate does not match the durable validation decision")
+            return
+        self.controller.candidates.promote(candidate_id, report.to_dict())
 
     def _experiment_report(self, stages: Sequence[LifecycleStage], state: Mapping[str, Any], *, stage_name: str | None = None) -> EvaluationReport:
         """Build a strict report from durable validation/final lifecycle receipts."""
@@ -722,7 +761,7 @@ class EvaluationJob:
             )
             if summary.complete and report.validity_status == "valid" and report.promotion_eligible and candidate_id is not None:
                 report.require_promotion_evidence(self.protocol, self.packages)
-                decision = self.controller.candidates.promote(candidate_id, report)
+                decision = self.controller.candidates.promote(candidate_id, report.to_dict())
                 self._save(job_id, comparison, "decided", report, runtime_accounting=accounting)
                 return EvaluationJobResult(job_id, comparison, "decided", report, decision, runtime_accounting=accounting)
             status = "complete" if report.validity_status == "valid" else "incomplete"
@@ -740,8 +779,12 @@ class EvaluationJob:
         economic_cost_microunits = 0.0
         economic_cost_seen = False
         economic_cost_unknown = False
+        effective_cost_microunits = 0.0
+        effective_cost_seen = False
         economic_cost_known_receipts = 0
         nominal_known_receipts = 0
+        nominal_coverage_seen = False
+        nominal_coverage_complete = True
         inference_duration_seconds = 0.0
         inference_duration_seen = False
         economic_statuses: set[str] = set()
@@ -757,6 +800,21 @@ class EvaluationJob:
             input_tokens += int(usage.get("inputTokens", 0) or 0)
             output_tokens += int(usage.get("outputTokens", 0) or 0)
             if isinstance(accounting, dict):
+                nominal_status = accounting.get("nominalCostStatus")
+                nominal_coverage = accounting.get("nominalCostCoverage")
+                if nominal_status is not None or nominal_coverage is not None:
+                    nominal_coverage_seen = True
+                    if not (
+                        nominal_status == "complete"
+                        and isinstance(nominal_coverage, Mapping)
+                        and isinstance(nominal_coverage.get("knownReceipts"), int)
+                        and not isinstance(nominal_coverage.get("knownReceipts"), bool)
+                        and isinstance(nominal_coverage.get("totalReceipts"), int)
+                        and not isinstance(nominal_coverage.get("totalReceipts"), bool)
+                        and nominal_coverage["totalReceipts"] > 0
+                        and nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"]
+                    ):
+                        nominal_coverage_complete = False
                 economic = accounting.get("economicCost")
                 if isinstance(economic, dict):
                     status = economic.get("status")
@@ -791,6 +849,19 @@ class EvaluationJob:
                     nominal_cost += float(value)
                     nominal_seen = True
                     nominal_known_receipts += 1
+            explicit_cost = accounting.get("costMicrounits") if isinstance(accounting, dict) else None
+            nominal_value = accounting.get("nominalCostUsd") if isinstance(accounting, dict) else None
+            if nominal_value is None and isinstance(response, dict):
+                nominal_value = response.get("nominalCostUsd")
+            effective = _effective_cost_microunits(
+                explicit_cost,
+                nominal_value,
+                nominal_status=accounting.get("nominalCostStatus") if isinstance(accounting, dict) else None,
+                nominal_coverage=accounting.get("nominalCostCoverage") if isinstance(accounting, dict) else None,
+            )
+            if effective is not None:
+                effective_cost_microunits += effective
+                effective_cost_seen = True
         if nominal_seen:
             billing_basis = "SDK nominal usage cost; subscription billing is separate and unmeasured"
         elif economic_statuses:
@@ -802,7 +873,8 @@ class EvaluationJob:
             "outputTokens": output_tokens,
             "totalTokens": input_tokens + output_tokens,
             "nominalCostUsd": nominal_cost if nominal_seen else None,
-            "nominalCostStatus": "complete" if nominal_known_receipts == len(observations) else "partial",
+            "effectiveCostMicrounits": effective_cost_microunits if effective_cost_seen else None,
+            "nominalCostStatus": "complete" if observations and nominal_known_receipts == len(observations) and (not nominal_coverage_seen or nominal_coverage_complete) else "partial" if nominal_coverage_seen or observations else None,
             "nominalCostCoverage": {"knownReceipts": nominal_known_receipts, "totalReceipts": len(observations)},
             "economicCostMicrounits": economic_cost_microunits if economic_cost_seen and not economic_cost_unknown else None,
             "economicCostCoverage": {"knownReceipts": economic_cost_known_receipts, "totalReceipts": len(observations)},
