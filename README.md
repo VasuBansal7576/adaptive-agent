@@ -20,6 +20,8 @@ The public repository and its `main` branch were verified at this checkpoint.
 The current checkpoint records 55 combined tests passed in 72.87 seconds, with source bytes verified.
 This is integration evidence, not an achieved performance claim.
 
+Historical verification at `ccf3b3a` recorded 86 focused tests and a full raw Prime scripted production lifecycle passing in 224.41 seconds across 60 training, 360 validation, and 720 final runs, including restart and tamper checks.
+
 Earlier backend and console checks remain historical evidence, including 123 focused backend checks, 71 console tests, clean TypeScript and production-build checks, and a real local API browser pass at 375, 768, and 1440 pixel widths with no overflow or page errors.
 
 Retained root evidence at `a882641` records the full synthetic 1,080-case run, restart coverage, and two authenticated reports passing in 48.25 seconds.
@@ -108,23 +110,27 @@ AppWorld is an external published simulated environment.
 Use an existing AppWorld checkout and an existing Python executable with AppWorld exactly at version `0.1.3.post1`.
 The commands below verify that boundary; they do not install or download AppWorld or Prime Agent.
 
-Replace the portable path and pin placeholders with the exact values for the frozen run.
-The source pin for this checkpoint is `28baed7`.
+Replace the portable path and image pin placeholders with the exact values for the frozen run.
+The source pin must be the full revision derived from the clean frozen Adaptive Agent checkout being executed.
 The image and core planner pins must be exact immutable values, not tags or `image-unpinned`.
 The data directory must be new and empty for `--initialize`.
 
 ```sh
+ADAPTIVE_AGENT_CHECKOUT="/path/to/adaptive-agent"
 APPWORLD_ROOT="/path/to/AppWorld"
 APPWORLD_PYTHON="/path/to/appworld-python"
 APPWORLD_SETUP_MANIFEST="$(mktemp)"
 APPWORLD_DATA_DIR="$(mktemp -d)"
-SOURCE_REVISION="28baed7"
+cd "$ADAPTIVE_AGENT_CHECKOUT"
+test -z "$(git status --porcelain)"
+SOURCE_REVISION="$(git rev-parse HEAD)"
 IMAGE_DIGEST="sha256:<exact-frozen-image-digest>"
-CORE_PLANNER_HASH="<exact-frozen-core-planner-hash>"
+unset ADAPTIVE_AGENT_CORE_PLANNER_HASH
+CORE_PLANNER_HASH="$(uv run python -c 'from adaptive_agent.app import _freeze_core_planner_hash; print(_freeze_core_planner_hash())')"
 
 test -d "$APPWORLD_ROOT/data"
 test -x "$APPWORLD_PYTHON"
-test "$($APPWORLD_PYTHON -c 'import importlib.metadata as m; print(m.version("appworld"))')" = "0.1.3.post1"
+test "$("$APPWORLD_PYTHON" -c 'import importlib.metadata as m; print(m.version("appworld"))')" = "0.1.3.post1"
 
 uv run adaptive-agent-appworld setup \
   --root "$APPWORLD_ROOT" \
@@ -142,7 +148,6 @@ Complete the Prime subscription prerequisites above, including `PRIME_AGENT_CODI
 ```sh
 export ADAPTIVE_AGENT_SOURCE_REVISION="$SOURCE_REVISION"
 export ADAPTIVE_AGENT_IMAGE_DIGEST="$IMAGE_DIGEST"
-export ADAPTIVE_AGENT_CORE_PLANNER_HASH="$CORE_PLANNER_HASH"
 
 uv run adaptive-agent-appworld-experiment \
   --initialize \
