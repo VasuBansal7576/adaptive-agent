@@ -49,6 +49,7 @@ The following records are the fresh root-verified evidence for this checkpoint, 
 | --- | --- | --- | --- |
 | Session-2 final2 backend integration: committed ref `4832487` plus the dirty overlay in `api.py`, `app.py`, `evaluation_job.py`, `evaluation_store.py`, and `tests/test_api.py`; 171 backend tests passed | Current integration evidence | The current control-plane and evaluator-launch integration is test-covered at the reported checkpoint | A committed merge, real provider product run, heldout evaluation, or final performance result |
 | Actual Docker-backed EVAL-003 from the final2 runtime: seven safety cases passed on isolated temporary Store and data paths | Current boundary evidence | The seven safety cases crossed the actual Docker runtime boundary while using an isolated fixture and no paid model call | General model safety, product acceptance, or sealed evaluator performance |
+| EVAL-003 safety hardening at `3261afc` atop `f423fac`; focused safety, core, and lifecycle tests 39 passed | Current safety evidence | Attacker-controlled public-document output, forged approval attempts, no-provider-write behavior, Docker-provenance requirements, fail-closed controller execution, and self-contained payload/content-hash receipts | A full pass without an injected Docker-backed Prime adapter, heldout evaluation, or paid-provider result |
 | Actual Docker-backed EVAL-005 at session-3 ref `6aabe2e`: `child_failure_recovery_and_cap` and `shared_model_cost_token_cap` passed | Current runtime-boundary evidence | Two parent-child, failure, and shared-cost runtime cases crossed the Docker boundary with bounded deterministic probe inputs | Paid-provider behavior, complete EVAL-005 acceptance, or final resource-budget evidence |
 | Four isolated Controller probe executions at session-4 ref `83d2e01` covering EVAL-004 and EVAL-005 passed on fresh temporary Stores and data directories | Current control-boundary evidence | Controller, Broker, candidate, evidence, replay, failure, and reconnect obligations exercised with isolated persistence | A sealed evaluation, cross-environment performance, or proof that historical root QAdata was isolated |
 | Session-5 console ref `ae482da`: 61/61 tests, TypeScript clean, and build clean; latest report had no live smoke | Current console evidence | Console parsing, evaluation status, learning eligibility, responsive master-detail behavior, and honest uncertainty states | Browser-width acceptance, live inference, or sealed evaluation |
@@ -68,6 +69,11 @@ The scoped `0561041` verifier accepted trusted outcome visibility as `evaluator_
 Broker invoice and payment reads plus `apply_payment` were confirmed.
 The full post-fix pytest report was 147 passed with two dependency warnings.
 This receipt is isolated development-smoke evidence only, with no heldout, final, public, or performance claim.
+
+The current EVAL-003 probe accepts optional runtime injection but fails closed without it.
+The `require_runtime=False` option is control-plane unit mode only and cannot establish a full EVAL-003 result.
+Its full runtime path must report Docker in adapter provenance and covers broker escalation, evaluator and harness write denials, and filesystem access denial.
+The focused safety, core, and lifecycle verification was 39 passed, with no service startup or paid model call.
 
 ## Local-main assembly plan
 

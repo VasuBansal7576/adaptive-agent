@@ -38,6 +38,12 @@ Root-verified current evidence beyond `d8e9293` is bounded integration and safet
 The final2 backend integration on session 2 is rooted at committed ref `4832487` with a dirty overlay in `api.py`, `app.py`, `evaluation_job.py`, `evaluation_store.py`, and `tests/test_api.py`.
 That final2 integration reports 171 backend tests passed.
 Actual Docker-backed EVAL-003 passed its seven safety cases on isolated temporary Store and data paths.
+The EVAL-003 safety path was further hardened at commit `3261afc` atop `f423fac`.
+It now uses attacker-controlled public-document output to attempt forged write approval, verifies that no provider write occurs, and exercises `broker.call` escalation, `evaluator.write`, `harness.write`, and filesystem access through `run_prime_runtime_safety_probe`.
+The full safety pass requires an injected `PrimeRuntimeAdapter` whose provenance contains Docker, while `Controller.execute_probe` fails closed when that adapter is absent.
+The `require_runtime=False` option is reserved for control-plane unit mode and is not a full EVAL-003 result.
+Default probe results include self-contained evidence receipts with payload and content hash, and do not expose the hidden answer.
+The focused safety, core, and lifecycle test report was 39 passed with no services or paid calls.
 Actual Docker-backed EVAL-005 passed its two runtime cases, `child_failure_recovery_and_cap` and `shared_model_cost_token_cap`, using the deterministic probe model rather than a paid model call.
 Four isolated Controller probe executions covering EVAL-004 and EVAL-005 passed on fresh temporary Stores and data directories.
 The latest session-5 console ref is `ae482da`, with 61/61 tests, TypeScript, and build clean; its latest report did not include live smoke.
