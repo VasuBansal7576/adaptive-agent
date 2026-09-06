@@ -61,9 +61,10 @@ export function CandidatesView({
     }
   };
 
-  // eligible learning source: a COMPLETED development run the model can learn
-  // from; the durable pipeline generates proposal + evidence from its attempts
-  const eligibleRuns = runs.filter((r) => r.status === "succeeded");
+  // eligible learning source: the server declares learningEligible for trusted
+  // development attempts (including trusted failures; heldout excluded). When
+  // not projected, fall back to succeeded-only.
+  const eligibleRuns = runs.filter((r) => r.learningEligible ?? r.status === "succeeded");
 
   const runCycle = async (input: LearningCycleInput) => {
     setCycleBusy(true);
@@ -130,6 +131,31 @@ export function CandidatesView({
 
       {notice && <Banner tone={notice.tone} title={notice.text.replace(/^[✓✗] /, "")} />}
 
+      {evalJobsError && (
+        <Banner tone="warn" title={`Evaluation status unavailable: ${evalJobsError}`} role="alert" />
+      )}
+
+      {(evalJobs ?? []).filter((j) => !j.verified).length > 0 && (
+        <Banner
+          tone="warn"
+          title={`${(evalJobs ?? []).filter((j) => !j.verified).length} legacy evaluation record(s) preserved as UNVERIFIED`}
+        >
+          These rows are missing a candidate binding or use an unrecognized state. They are never counted as
+          trusted performance evidence.{" "}
+          <ul className="mt-1 list-disc pl-5 font-mono text-[11px]">
+            {(evalJobs ?? [])
+              .filter((j) => !j.verified)
+              .map((j) => (
+                <li key={j.evaluationId} className="break-all">
+                  {j.evaluationId} · state "{j.state}"
+                  {j.trusted ? " · trusted flag present (unverified)" : ""}
+                  {j.reason ? ` · ${j.reason}` : ""}
+                </li>
+              ))}
+          </ul>
+        </Banner>
+      )}
+
       {candidates.map((cand) => (
         <article key={cand.candidateId} className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -161,9 +187,12 @@ export function CandidatesView({
                   ? `Evaluation status unavailable: ${evalJobsError}`
                   : (() => {
                       const jobs = evalJobs?.filter((j) => j.candidateId === cand.candidateId) ?? [];
-                      return jobs.length === 0
-                        ? "No evaluation job recorded for this candidate."
-                        : `Evaluation ${jobs[0].evaluationId}: ${jobs[0].state}${jobs[0].trusted ? " (trusted)" : ""}${jobs[0].reason ? ` — ${jobs[0].reason}` : ""}`;
+                      if (jobs.length === 0) return "No evaluation job recorded for this candidate.";
+                      const job = jobs[0];
+                      if (!job.verified) {
+                        return `Legacy evaluation record ${job.evaluationId} — UNVERIFIED, not performance evidence${job.reason ? ` (${job.reason})` : ""}`;
+                      }
+                      return `Evaluation ${job.evaluationId}: ${job.state}${job.trusted ? " (trusted)" : ""}${job.reason ? ` — ${job.reason}` : ""}`;
                     })()}
             </p>
           )}

@@ -383,9 +383,13 @@ export function createSimulationTransport(options?: {
     },
 
     async listEvaluations() {
+      // raw rows in the API projection shape; the console parser classifies
+      // them (verified vs unverified legacy)
       return [
-        { evaluationId: "eval-sim-001", candidateId: "cand-sim-202", state: "valid" as const, trusted: true },
-      ];
+        { evaluationId: "eval-sim-001", candidateId: "cand-sim-202", state: "valid", trusted: true },
+        // legacy malformed metadata: preserved explicitly unverified
+        { evaluationId: "eval-sim-legacy", state: "completed", trusted: true, validity: "valid" },
+      ] as never;
     },
 
     async reconnect() {

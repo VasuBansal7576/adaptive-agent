@@ -76,15 +76,25 @@ function arr2evals(value: unknown): EvaluationJob[] {
   if (!Array.isArray(value)) throw new SchemaError("evaluations");
   return value.map((item, i) => {
     const o = (item ?? {}) as Record<string, unknown>;
-    const evaluationId = typeof o.evaluationId === "string" ? o.evaluationId : "";
-    const candidateId = typeof o.candidateId === "string" ? o.candidateId : "";
-    const state = typeof o.state === "string" ? o.state : "";
-    if (!evaluationId || !candidateId || !["queued", "running", "valid", "invalid", "cancelled"].includes(state)) {
-      throw new SchemaError(`evaluations[${i}]`);
-    }
-    const job: EvaluationJob = { evaluationId, candidateId, state: state as EvaluationJob["state"] };
+    const evaluationId = typeof o.evaluationId === "string" ? o.evaluationId : `unknown-${i}`;
+    const candidateId = typeof o.candidateId === "string" && o.candidateId ? o.candidateId : null;
+    const rawState = typeof o.state === "string" ? o.state : "";
+    const KNOWN = ["queued", "running", "valid", "invalid", "cancelled"];
+    // legacy/malformed rows (missing candidateId, unknown states like
+    // "completed") are preserved explicitly UNVERIFIED — trusted:true from an
+    // unverifiable row is NEVER normalized into performance evidence
+    const verified = candidateId !== null && KNOWN.includes(rawState);
+    const job: EvaluationJob = {
+      evaluationId,
+      candidateId,
+      state: verified ? (rawState as EvaluationJob["state"]) : "unverified",
+      verified,
+    };
     if (typeof o.trusted === "boolean") job.trusted = o.trusted;
     if (typeof o.reason === "string") job.reason = o.reason;
+    if (o.validity === "invalid" || o.promotionEligible === false) {
+      job.reason = job.reason ?? `legacy record (validity: ${String(o.validity ?? "unknown")})`;
+    }
     if (o.error && typeof o.error === "object" && !Array.isArray(o.error)) {
       const err = o.error as Record<string, unknown>;
       if (typeof err.message === "string") job.reason = err.message;

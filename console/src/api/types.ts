@@ -39,6 +39,9 @@ export type RunRecord = {
   budgetRef: ArtifactRef;
   status: RunStatus;
   lastEventSequence: number;
+  /** server-declared learning eligibility (trusted development attempts;
+   *  heldout excluded). Falls back to succeeded-only when not projected. */
+  learningEligible?: boolean;
   /** recorded by POST /runs and echoed in run-started events */
   executionMode?: "dry_run" | "interactive" | "batch" | "replay";
   outcomeRef?: ArtifactRef;
@@ -172,8 +175,11 @@ export type RunOptions = {
 /** GET /evaluations row: durable evaluation job status per candidate. */
 export type EvaluationJob = {
   evaluationId: string;
-  candidateId: string;
-  state: "queued" | "running" | "valid" | "invalid" | "cancelled";
+  /** legacy QA rows may lack the binding; preserved as null = unverified */
+  candidateId: string | null;
+  state: "queued" | "running" | "valid" | "invalid" | "cancelled" | "unverified";
+  /** true only when candidateId binds AND the state is a recognized enum */
+  verified: boolean;
   trusted?: boolean;
   reason?: string;
 };

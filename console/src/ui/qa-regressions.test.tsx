@@ -86,6 +86,46 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect(sent[0].budget?.modelTokens).toBe(7777);
   });
 
+  it("preserves legacy evaluation rows as UNVERIFIED, never trusted evidence (QA run eval_d123…)", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const transport: ConsoleTransport = {
+      ...sim,
+      // exact legacy QA shape: no candidateId, unknown state, trusted:true
+      listEvaluations: async () =>
+        [
+          { evaluationId: "eval_d1238417af2044118f4982816655d34d", promotionEligible: false, state: "completed", trusted: true, validity: "valid" },
+        ] as never,
+    };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    expect(await screen.findByText(/legacy evaluation record\(s\) preserved as UNVERIFIED/)).toBeInTheDocument();
+    expect(await screen.findByText(/state "completed"/)).toBeInTheDocument();
+    // trusted flag from an unverifiable row is never rendered as evidence
+    expect(screen.getByText(/trusted flag present \(unverified\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/\(trusted\)/)).not.toBeInTheDocument();
+  });
+
+  it("uses learningEligible for the learning source, including trusted failed attempts", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const runs = await sim.listRuns();
+    const eligibleFailed = { ...runs[2], status: "failed" as const, learningEligible: true };
+    const ineligibleSucceeded = { ...runs[3], status: "succeeded" as const, learningEligible: false };
+    const transport: ConsoleTransport = {
+      ...sim,
+      listRuns: async () => [eligibleFailed, ineligibleSucceeded],
+    };
+    render(<App transport={transport} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    await user.click(await screen.findByRole("button", { name: "Run learning cycle" }));
+    const dialog = await screen.findByRole("dialog", { name: "Run learning cycle" });
+    const select = within(dialog).getByLabelText("Completed development run");
+    const options = within(select).getAllByRole("option").map((o) => o.textContent ?? "");
+    expect(options.some((t) => t.includes(eligibleFailed.runId))).toBe(true); // trusted failed dev attempt eligible
+    expect(options.some((t) => t.includes(ineligibleSucceeded.runId))).toBe(false); // server excluded
+  });
+
   it("moves focus to the run detail panel when a run is selected (768 master-detail)", async () => {
     const user = userEvent.setup();
     render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);

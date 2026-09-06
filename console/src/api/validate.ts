@@ -265,6 +265,10 @@ export function parseRun(value: unknown, field: string): RunRecord {
   if (o.executionModes !== undefined) {
     run.executionModes = arr(o.executionModes, `${field}.executionModes`).map((m) => str(m, `${field}.executionModes[]`));
   }
+  if (o.learningEligible !== undefined) {
+    if (typeof o.learningEligible !== "boolean") throw new SchemaError(`${field}.learningEligible`);
+    run.learningEligible = o.learningEligible;
+  }
   if (o.budgetUsed !== undefined) {
     const b = obj(o.budgetUsed, `${field}.budgetUsed`);
     run.budgetUsed = {
