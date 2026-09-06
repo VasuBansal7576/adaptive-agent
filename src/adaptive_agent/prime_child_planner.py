@@ -148,7 +148,8 @@ class LunaChildPlanner:
         """Return a parent proxy that shares and charges this planner ledger."""
         if self.budget is None:
             raise AdapterError("shared planner budget is required for parent accounting")
-        return SharedLedgerModelClient(self.client, self.budget, observation_sink=observation_sink)
+        sink = self.observation_sink if observation_sink is None else observation_sink
+        return SharedLedgerModelClient(self.client, self.budget, observation_sink=sink)
 
     def record_parent_model_usage(self, usage: Mapping[str, Any]) -> int:
         """Record a completed parent receipt in the same trusted ledger.
