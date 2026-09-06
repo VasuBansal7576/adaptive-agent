@@ -123,20 +123,35 @@ class LearningRuntime:
         if not isinstance(environment, Mapping):
             raise LearningRuntimeError("completed run environment is not stored")
         public_doc_reader = getattr(self.store, "get_public_docs", None)
+        manifest_ref = environment.get("manifest_ref")
+        manifest_docs: list[Mapping[str, Any]] = []
+        if isinstance(manifest_ref, str):
+            manifest = self.store.get_artifact(json.loads(manifest_ref)["sha256"])
+            manifest_docs = [doc for doc in manifest.get("docs", []) if isinstance(doc, Mapping)]
         if callable(public_doc_reader):
             docs = public_doc_reader(environment_id)
         else:
-            manifest_ref = environment.get("manifest_ref")
             if not isinstance(manifest_ref, str):
                 raise LearningRuntimeError("completed run public manifest reference is missing")
-            manifest = self.store.get_artifact(json.loads(manifest_ref)["sha256"])
             docs = [{**doc, "content": self.store.get_artifact(doc["sha256"])} for doc in manifest.get("docs", [])]
         supplied_docs = {}
         for supplied in public_documents or ():
             if hasattr(supplied, "document_id"):
-                supplied = {"id": supplied.document_id, "version": supplied.version, "text": supplied.text}
+                supplied = {"id": supplied.document_id, "version": supplied.version, "text": supplied.text, "classification": getattr(supplied, "classification", "learner")}
             if isinstance(supplied, Mapping) and isinstance(supplied.get("id"), str):
                 supplied_docs[supplied["id"]] = dict(supplied)
+        if callable(public_doc_reader):
+            returned_ids = {doc.get("id") for doc in docs if isinstance(doc, Mapping)}
+            for ref in manifest_docs:
+                if ref.get("id") in returned_ids:
+                    continue
+                candidate = supplied_docs.get(ref.get("id"))
+                if candidate is None or candidate.get("classification") in {"operator", "evaluator_only"}:
+                    continue
+                candidate_content = {key: candidate[key] for key in ("id", "version", "text") if key in candidate}
+                if content_hash(_artifact_text(candidate_content)) != ref.get("sha256"):
+                    raise LearningRuntimeError(f"public document hash mismatch: {ref.get('id')}")
+                docs.append({**ref, "content": candidate_content})
         for doc in docs:
             if not isinstance(doc, Mapping) or not isinstance(doc.get("id"), str):
                 raise LearningRuntimeError("public document projection is malformed")
