@@ -5,10 +5,58 @@ from pathlib import Path
 from adaptive_agent.benchmark import ResumableEvaluationDriver
 from adaptive_agent.evaluation import Arm, EvaluationError, EvaluationProtocol, ModelProvenance, Partition, RunObservation, build_environment_packages
 from adaptive_agent.evaluation_store import SQLiteAllocationStore
+from adaptive_agent.models import SkillBundle
 from adaptive_agent.store import Store
 
 
 class BenchmarkDriverTests(unittest.TestCase):
+    def test_benchmark_cells_use_dedicated_runs_and_resume_without_generic_collision(self):
+        packages = build_environment_packages()
+        protocol = EvaluationProtocol()
+        protocol.freeze(packages)
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            bundle = SkillBundle(skills=[])
+            calls = []
+
+            class TrustedEvidence:
+                durable = True
+
+                def verify(self, observation, frozen, package):
+                    return True
+
+            def execute(task, frozen_config, selected_bundle):
+                calls.append(task.task_id)
+                return RunObservation(
+                    task.task_id,
+                    task.environment_ref.id,
+                    Partition.DEVELOPMENT,
+                    frozen_config.seed,
+                    frozen_config.arm,
+                    True,
+                    True,
+                    0,
+                    1,
+                    1.0,
+                    model_provenance=ModelProvenance.REAL_MODEL,
+                    bundle_hash=frozen_config.bundle_hash,
+                )
+
+            first = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedEvidence(), owner_id="owner-a")
+            self.assertTrue(first.run_development_smoke("dedicated").complete)
+            self.assertEqual(len(calls), 1)
+            with store.connect() as conn:
+                benchmark_rows = conn.execute("SELECT benchmark_id, arm, seed, owner_id, status FROM benchmark_task_runs").fetchall()
+                generic_rows = conn.execute("SELECT * FROM task_runs").fetchall()
+            self.assertEqual(len(benchmark_rows), 1)
+            self.assertEqual(dict(benchmark_rows[0])["owner_id"], "owner-a")
+            self.assertEqual(dict(benchmark_rows[0])["status"], "complete")
+            self.assertEqual(generic_rows, [])
+
+            resumed = ResumableEvaluationDriver(store, protocol, packages, execute, bundle, evidence_store=TrustedEvidence(), owner_id="owner-b")
+            self.assertTrue(resumed.run_development_smoke("dedicated").complete)
+            self.assertEqual(len(calls), 1)
+
     def test_live_owner_cannot_be_stolen_by_another_driver(self):
         packages = build_environment_packages()
         protocol = EvaluationProtocol()
