@@ -51,18 +51,16 @@ class SharedLedgerModelClient:
         raw = self.client.invoke(**forwarded)
         if not isinstance(raw, Mapping):
             raise AdapterError("parent model response must be an object")
-        usage = raw.get("usage")
-        if not isinstance(usage, Mapping) or not usage:
-            raise AdapterError("parent model response lacks usage accounting")
         provider = raw.get("provider")
         model = raw.get("model")
+        response_id = raw.get("responseId", raw.get("response_id"))
+        usage = raw.get("usage")
         if model == "gpt-5.6-luna":
             model = MODEL_NAME
         if provider != MODEL_PROVIDER or model != MODEL_NAME:
             raise AdapterError("parent model response is not the pinned Luna subscription")
-        response_id = raw.get("responseId", raw.get("response_id"))
-        if not isinstance(response_id, str) or not response_id.strip():
-            raise AdapterError("parent model response lacks response id")
+        if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
+            raise AdapterError("parent model response lacks response id or usage accounting")
         if self.observation_sink is not None:
             self.observation_sink({
                 "provider": provider,
