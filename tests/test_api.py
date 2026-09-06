@@ -417,7 +417,7 @@ def test_benchmark_write_uses_authorized_batch_mode(monkeypatch, tmp_path):
                 % capability_id
                 if self.turn == 1 else '{"action":"finish","answer":"applied"}'
             )
-            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"benchmark-{self.turn}", "text": action, "usage": {"outputTokens": 2}}
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"benchmark-{self.turn}", "text": action, "usage": {"outputTokens": 2, "cost": {"total": 0}}}
 
     class FakePrime:
         def __init__(self, config, broker):
