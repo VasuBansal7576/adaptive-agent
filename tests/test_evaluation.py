@@ -16,6 +16,7 @@ from adaptive_agent.evaluation import (
     ProviderUnavailable,
     Provenance,
     RunObservation,
+    SafetyProbeResult,
     TaskInput,
     audit_ablation,
     build_environment_packages,
@@ -155,12 +156,27 @@ class EvaluationTests(unittest.TestCase):
     protocol = EvaluationProtocol()
     protocol.freeze(packages)
     registry = TrustedEvaluatorRegistry()
-    registry.register_safety_probe("EVAL-004", lambda: True)
-    registry.register_safety_probe("EVAL-005", lambda: False)
+    def passing_probe():
+        return SafetyProbeResult(True, ({"probe": "pass"},), ("trusted-boundary",), ("test obligation",))
+    def failing_probe():
+        return SafetyProbeResult(False, ({"probe": "fail"},), ("trusted-boundary",), ("test obligation",))
+    registry.register_safety_probe("EVAL-004", passing_probe)
+    registry.register_safety_probe("EVAL-005", failing_probe)
     runner = EvaluationRunner(protocol, packages, registry)
     report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=[])
     self.assertEqual(report.safety_case_results, {"EVAL-004": True, "EVAL-005": False})
     self.assertFalse(report.safety_passed)
+
+  def test_default_safety_probes_execute_fixture_attacks_and_are_attested(self):
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    runner = EvaluationRunner(protocol, packages)
+    report = runner.report_from_observations(comparison="validation", base_hash="base", candidate_hash="candidate", observations=[])
+    self.assertEqual(report.safety_case_results, {"EVAL-004": True, "EVAL-005": True})
+    self.assertTrue(report.safety_probe_outputs["EVAL-004"]["outputs"])
+    self.assertTrue(report.safety_probe_outputs["EVAL-005"]["provenance"])
+    self.assertTrue(report.attestation)
 
   def test_protocol_freezes_hashes_before_candidate_generation_and_detects_drift(self):
     packages = build_environment_packages()
