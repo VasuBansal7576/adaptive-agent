@@ -423,7 +423,7 @@ class DurableRuntime:
             {**stored, "state": "completed", "payload_json": json.dumps(report, sort_keys=True), "updated_at": datetime.now(timezone.utc).isoformat()},
         )
 
-    def build_evaluation_driver(self, protocol: Any, arm_bundles: Mapping[Any, Any] | None = None) -> Any:
+    def build_evaluation_driver(self, protocol: Any, arm_bundles: Mapping[Any, Any] | None = None, *, owner_id: str | None = None) -> Any:
         """Wire the evaluator-owned resumable driver to this task executor."""
         from adaptive_agent.benchmark import ResumableEvaluationDriver
 
@@ -447,6 +447,7 @@ class DurableRuntime:
             self.execute_evaluation_task,
             active,
             arm_bundles=selected,
+            owner_id=owner_id,
         )
 
     def build_evaluation_job(self, protocol: Any, arm_bundles: Mapping[Any, Any], *, total_budget_microunits: int | None = None) -> Any:

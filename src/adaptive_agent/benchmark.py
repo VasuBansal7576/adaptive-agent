@@ -76,7 +76,7 @@ class BenchmarkSummary:
 class ResumableEvaluationDriver:
     """Execute exactly the frozen task panel and resume persisted work."""
 
-    def __init__(self, store: Store, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], execute_evaluation_task: TrustedTaskExecutor, bundle: object, allocation_store: SQLiteAllocationStore | None = None, evidence_store: SQLiteRunEvidenceStore | None = None, arm_bundles: Mapping[Arm | str, object] | None = None) -> None:
+    def __init__(self, store: Store, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], execute_evaluation_task: TrustedTaskExecutor, bundle: object, allocation_store: SQLiteAllocationStore | None = None, evidence_store: SQLiteRunEvidenceStore | None = None, arm_bundles: Mapping[Arm | str, object] | None = None, owner_id: str | None = None) -> None:
         self.store = store
         self.protocol = protocol
         self.packages = dict(packages)
@@ -86,13 +86,9 @@ class ResumableEvaluationDriver:
         self.arm_bundles.setdefault(Arm.B0, bundle)
         self.allocation_store = allocation_store or SQLiteAllocationStore(store)
         self.evidence_store = evidence_store or SQLiteRunEvidenceStore(store)
-        self.owner_id = secrets.token_urlsafe(12)
+        self.owner_id = owner_id or secrets.token_urlsafe(12)
         self._benchmark_lock_held = False
         with store.connect() as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS benchmark_task_runs (benchmark_id TEXT NOT NULL, task_id TEXT NOT NULL, environment_id TEXT NOT NULL, partition TEXT NOT NULL, arm TEXT NOT NULL, seed INTEGER NOT NULL, status TEXT NOT NULL, error TEXT, observation_json TEXT, owner_id TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(benchmark_id, task_id, arm, seed))")
-            columns = {row["name"] for row in conn.execute("PRAGMA table_info(benchmark_task_runs)").fetchall()}
-            if "owner_id" not in columns:
-                conn.execute("ALTER TABLE benchmark_task_runs ADD COLUMN owner_id TEXT")
             conn.execute("CREATE TABLE IF NOT EXISTS benchmark_task_attempts (attempt_id TEXT PRIMARY KEY, benchmark_id TEXT NOT NULL, task_id TEXT NOT NULL, environment_id TEXT NOT NULL, partition TEXT NOT NULL, arm TEXT NOT NULL, seed INTEGER NOT NULL, status TEXT NOT NULL, error TEXT, observation_json TEXT, owner_id TEXT, updated_at TEXT NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS benchmark_plans (benchmark_id TEXT NOT NULL, partition TEXT NOT NULL, fingerprint TEXT NOT NULL, panel_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(benchmark_id, partition))")
             conn.commit()
@@ -203,9 +199,10 @@ class ResumableEvaluationDriver:
             return BenchmarkSummary(benchmark_id, Partition.DEVELOPMENT, (BenchmarkTaskStatus(task.task_id, environment_id, Partition.DEVELOPMENT, arm, seed, "failed", error=str(exc)),), 1)
 
     def _development_smoke_complete(self, benchmark_id: str) -> bool:
-        with self.store.connect() as conn:
-            rows = conn.execute("SELECT task_id, environment_id, arm, seed FROM benchmark_task_runs WHERE benchmark_id = ? AND partition = 'development' AND status = 'complete' AND observation_json IS NOT NULL", (benchmark_id,)).fetchall()
+        rows = self.store.list_task_runs(partition="development", status="complete")
         for row in rows:
+            if row.get("benchmark_id") != benchmark_id or not row.get("arm") or row.get("seed") is None:
+                continue
             arm = Arm(row["arm"])
             status = self._load(benchmark_id, row["task_id"], arm, int(row["seed"]))
             selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
@@ -279,33 +276,42 @@ class ResumableEvaluationDriver:
         return tasks_by_env
 
     def _claim(self, benchmark_id: str, task: TaskInput, arm: Arm, seed: int) -> bool:
-        with self.store.connect() as conn:
-            cursor = conn.execute("INSERT INTO benchmark_task_runs(benchmark_id, task_id, environment_id, partition, arm, seed, status, error, observation_json, owner_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, NULL, ?, datetime('now')) ON CONFLICT(benchmark_id, task_id, arm, seed) DO UPDATE SET status='running', error=NULL, owner_id=?, updated_at=datetime('now') WHERE benchmark_task_runs.status = 'failed' OR (benchmark_task_runs.status = 'running' AND (benchmark_task_runs.owner_id = ? OR ? = 1))", (benchmark_id, task.task_id, task.environment_ref.id, task.partition.value, arm.value, seed, self.owner_id, self.owner_id, self.owner_id, int(self._benchmark_lock_held)))
-            conn.commit()
-            return cursor.rowcount == 1
+        task_run_id = self._task_run_id(benchmark_id, task.task_id, arm, seed)
+        claimed, row = self.store.claim_benchmark_task_run(task_run_id, benchmark_id=benchmark_id, environment_id=task.environment_ref.id, task_id=task.task_id, partition=task.partition.value, arm=arm.value, seed=seed, owner_id=self.owner_id)
+        if claimed:
+            return True
+        if row.get("owner_id") == self.owner_id and row.get("status") == "failed":
+            return self.store.release_task_run(task_run_id, self.owner_id, "running", json.dumps({}))
+        return False
+
+    @staticmethod
+    def _task_run_id(benchmark_id: str, task_id: str, arm: Arm, seed: int) -> str:
+        return f"{benchmark_id}:{task_id}:{arm.value}:{seed}"
 
     def _load(self, benchmark_id: str, task_id: str, arm: Arm, seed: int) -> BenchmarkTaskStatus | None:
-        with self.store.connect() as conn:
-            row = conn.execute("SELECT * FROM benchmark_task_runs WHERE benchmark_id = ? AND task_id = ? AND arm = ? AND seed = ?", (benchmark_id, task_id, arm.value, seed)).fetchone()
+        row = self.store.get_task_run(self._task_run_id(benchmark_id, task_id, arm, seed))
         if not row:
             return None
         observation = None
-        if row["observation_json"]:
-            payload = json.loads(row["observation_json"])
+        state = json.loads(row.get("state_json") or "{}")
+        if isinstance(state, dict) and state.get("observation"):
+            payload = state["observation"]
             payload["partition"] = Partition(payload["partition"])
             payload["arm"] = Arm(payload["arm"])
             payload["provenance"] = Provenance(payload.get("provenance", "deterministic_simulation"))
             payload["model_provenance"] = ModelProvenance(payload.get("model_provenance", "synthetic_model"))
             payload["budget"] = BudgetSpec(**payload["budget"])
             observation = RunObservation(**payload)
-        return BenchmarkTaskStatus(row["task_id"], row["environment_id"], Partition(row["partition"]), Arm(row["arm"]), int(row["seed"]), row["status"], row["error"], observation)
+        return BenchmarkTaskStatus(row["task_id"], row["environment_id"], Partition(row["partition"]), Arm(row["arm"]), int(row["seed"]), row["status"], state.get("error") if isinstance(state, dict) else None, observation)
 
     def _save(self, benchmark_id: str, task: TaskInput, arm: Arm, seed: int, status: str, error: str | None, observation: RunObservation | None) -> None:
         observation_json = json.dumps(json.loads(canonical_json(observation)), sort_keys=True) if observation else None
+        state_json = json.dumps({"observation": json.loads(observation_json) if observation_json else None, "error": error}, sort_keys=True)
         with self.store.connect() as conn:
             conn.execute("INSERT INTO benchmark_task_attempts(attempt_id, benchmark_id, task_id, environment_id, partition, arm, seed, status, error, observation_json, owner_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))", (secrets.token_urlsafe(18), benchmark_id, task.task_id, task.environment_ref.id, task.partition.value, arm.value, seed, status, error, observation_json, self.owner_id))
-            conn.execute("INSERT INTO benchmark_task_runs(benchmark_id, task_id, environment_id, partition, arm, seed, status, error, observation_json, owner_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(benchmark_id, task_id, arm, seed) DO UPDATE SET status=excluded.status, error=excluded.error, observation_json=excluded.observation_json, owner_id=excluded.owner_id, updated_at=excluded.updated_at", (benchmark_id, task.task_id, task.environment_ref.id, task.partition.value, arm.value, seed, status, error, observation_json, self.owner_id))
             conn.commit()
+        if not self.store.release_task_run(self._task_run_id(benchmark_id, task.task_id, arm, seed), self.owner_id, status, state_json):
+            raise EvaluationError("benchmark task run ownership lost before persistence")
 
     @staticmethod
     def _bundle_hash(bundle: object) -> str:

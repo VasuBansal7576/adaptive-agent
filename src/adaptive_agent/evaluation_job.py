@@ -121,7 +121,7 @@ class EvaluationJob:
         accounting = json.loads(row["runtime_accounting_json"] or "{}") if "runtime_accounting_json" in row.keys() else {}
         return EvaluationJobResult(job_id, row["comparison"], row["status"], report, error=row["error"], runtime_accounting=accounting)
 
-    def run(self, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None, candidate_count: int = 1, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0) -> EvaluationJobResult:
+    def run(self, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None, candidate_count: int = 1, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0, owner_id: str | None = None) -> EvaluationJobResult:
         workload = self.planned_workload(candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)
         self._preflight(comparison, workload)
         if comparison == "final" and ablation is None:
@@ -136,6 +136,7 @@ class EvaluationJob:
             self.arm_bundles.get(Arm.B0, self.arm_bundles.get(Arm.B0.value)),
             evidence_store=SQLiteRunEvidenceStore(self.store),
             arm_bundles=self.arm_bundles,
+            owner_id=owner_id,
         )
         report: EvaluationReport | None = None
         observations: tuple[RunObservation, ...] = ()
@@ -242,7 +243,7 @@ class EvaluationJob:
             "billingBasis": billing_basis,
         }
 
-    def run_development_smoke(self, job_id: str):
+    def run_development_smoke(self, job_id: str, *, owner_id: str | None = None):
         """Run the one-task trusted development receipt used by held-out gates."""
         driver = ResumableEvaluationDriver(
             self.store,
@@ -252,6 +253,7 @@ class EvaluationJob:
             self.arm_bundles.get(Arm.B0, self.arm_bundles.get(Arm.B0.value)),
             evidence_store=SQLiteRunEvidenceStore(self.store),
             arm_bundles=self.arm_bundles,
+            owner_id=owner_id,
         )
         return driver.run_development_smoke(job_id)
 
@@ -261,8 +263,8 @@ def build_evaluation_job(store: Store, controller: Controller, protocol: Evaluat
     return EvaluationJob(store, controller, protocol, packages, arm_bundles, execute, total_budget_microunits=total_budget_microunits, max_total_attempts=max_total_attempts)
 
 
-def run_evaluation_job(job: EvaluationJob, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None, candidate_count: int = 1, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0) -> EvaluationJobResult:
-    return job.run(job_id, comparison, base_hash=base_hash, candidate_hash=candidate_hash, candidate_id=candidate_id, ablation=ablation, candidate_count=candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries)
+def run_evaluation_job(job: EvaluationJob, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None, candidate_count: int = 1, training_runs: int | None = None, transfer_runs: int = 0, safety_runs: int = 0, retries: int = 0, owner_id: str | None = None) -> EvaluationJobResult:
+    return job.run(job_id, comparison, base_hash=base_hash, candidate_hash=candidate_hash, candidate_id=candidate_id, ablation=ablation, candidate_count=candidate_count, training_runs=training_runs, transfer_runs=transfer_runs, safety_runs=safety_runs, retries=retries, owner_id=owner_id)
 
 
 def main(argv: list[str] | None = None) -> int:
