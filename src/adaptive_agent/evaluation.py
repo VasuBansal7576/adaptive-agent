@@ -65,6 +65,12 @@ class ModelProvenance(StrEnum):
 def _jsonable(value: Any) -> JsonValue:
     if isinstance(value, StrEnum):
         return value.value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _jsonable(model_dump(mode="json", by_alias=True))
+        except TypeError:
+            return _jsonable(model_dump())
     if hasattr(value, "to_dict"):
         return _jsonable(value.to_dict())
     if is_dataclass(value):

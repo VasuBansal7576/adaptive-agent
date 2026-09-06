@@ -58,28 +58,20 @@ def test_runner_is_durable_and_reports_measured_usage(tmp_path):
 
 def test_production_durable_runtime_adapter_reopens_without_dispatch(tmp_path, monkeypatch):
     import adaptive_agent.app as app_module
-    provider_module = pytest.importorskip("adaptive_agent.appworld_provider")
+    from tests import test_appworld_provider as provider_tests
+    provider_module = __import__("adaptive_agent.appworld_provider", fromlist=["AppWorldPackage"])
     monkeypatch.setenv("ADAPTIVE_AGENT_IMAGE_DIGEST", "sha256:test-image")
     monkeypatch.setenv("ADAPTIVE_AGENT_SOURCE_REVISION", "test-source")
 
-    def public_root():
-        root = tmp_path / "appworld"
-        data = root / "data"
-        for path in (data / "datasets", data / "api_docs" / "function_calling", data / "api_docs" / "standard", data / "tasks" / "dev-1", data / "base_dbs"):
-            path.mkdir(parents=True, exist_ok=True)
-        (data / "version.txt").write_text("0.1.0\n"); (data / "LICENSE").write_text("public test fixture\n"); (data / "base_dbs" / "version.txt").write_text("0.1.0\n")
-        for split, task_id in (("train", "train-1"), ("dev", "dev-1"), ("test_normal", "test-1"), ("test_challenge", "challenge-1")):
-            (data / "datasets" / f"{split}.txt").write_text(task_id + "\n")
-        (data / "tasks" / "dev-1" / "specs.json").write_text(json.dumps({"instruction": "read the clock in dev", "allowed_apps": ["phone"], "datetime": "2023-05-18T12:00:00", "db_version": "0.1.0"}))
-        (data / "api_docs" / "function_calling" / "phone.json").write_text(json.dumps([{"type": "function", "function": {"name": "phone__get_current_date_and_time", "description": "Read the current date and time.", "parameters": {"type": "object", "properties": {}}}}]))
-        (data / "api_docs" / "standard" / "phone.json").write_text(json.dumps({"get_current_date_and_time": {"method": "GET"}})); (data / "base_dbs" / "phone.db").write_bytes(b"fixture")
-        return root
+    public_root = provider_tests._public_root(tmp_path)
+    worker_operations = []
 
     class FakeProcess:
         def __init__(self, *args, **kwargs): self._pid = id(self)
         @property
         def pid(self): return self._pid
         def request(self, operation, payload=None):
+            worker_operations.append(operation)
             if operation == "reset": return {"taskId": payload["taskId"], "allowedApps": ["phone"]}
             if operation == "evaluate": return {"success": True, "numTests": 1, "passCount": 1, "failCount": 0, "taskCompleted": True}
             if operation == "call": return {"date": "Thursday, May 18, 2023"}
@@ -87,14 +79,21 @@ def test_production_durable_runtime_adapter_reopens_without_dispatch(tmp_path, m
         def close(self, **kwargs): return None
 
     monkeypatch.setattr(provider_module, "_JsonLineProcess", FakeProcess)
-    config = provider_module.AppWorldConfig(public_root(), python=sys.executable, allow_test=False)
+    config = provider_module.AppWorldConfig(public_root, python=sys.executable, allow_test=False)
     package = provider_module.AppWorldPackage(config)
+    assert package.task_provenance("dev-1")["officialSplit"] == "dev"
 
     class Model:
         def __init__(self): self.calls = 0
         def invoke(self, *, goal, environment, messages=None, emit=None, **kwargs):
             self.calls += 1
-            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"response-{self.calls}", "text": "finish", "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5, "economicCost": {"status": "measured", "microunits": 7}}, "costMicrounits": 7}
+            run_capability = next(capability for capability in environment["capabilities"] if capability.endswith("appworld__call_read"))
+            if self.calls % 2:
+                code = f'result = host_request({json.dumps({"capabilityId": run_capability, "arguments": {"apiName": "phone__get_current_date_and_time", "arguments": {}}})})'
+                text = json.dumps({"action": "execute", "code": code})
+            else:
+                text = json.dumps({"action": "finish", "answer": "clock read"})
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"response-{self.calls}", "text": text, "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5, "economicCost": {"status": "measured", "microunits": 7}}, "costMicrounits": 7}
 
     model = Model()
     from adaptive_agent.prime_runtime import ChildPlannerBudget, SharedBudget
@@ -112,7 +111,7 @@ def test_production_durable_runtime_adapter_reopens_without_dispatch(tmp_path, m
             return SimpleNamespace(status="ok", result=json.dumps(namespace.get("result")), stdout="", stderr="", error=None)
         def close(self, remove_workspace=True): return None
     monkeypatch.setattr(app_module, "PrimeRuntimeAdapter", FakePrime)
-    app = app_module.create_runtime_app(model_runner=model, evaluator=lambda **_: {"passed": True, "reliable": True}, data_dir=tmp_path)
+    app = app_module.create_runtime_app(model_runner=model, evaluator=None, data_dir=tmp_path)
     runtime = app.state.durable_runtime
     runtime.source_revision = "test-source"
     runtime.packages["appworld"] = package
@@ -125,15 +124,17 @@ def test_production_durable_runtime_adapter_reopens_without_dispatch(tmp_path, m
     runner = AppWorldBenchmarkRunner(tmp_path / "appworld", package, protocol, adapter)
     first = runner.run("production", bundles)
     assert first.provenance_complete and first.ablation_audit["passed"]
-    assert model.calls == 3
-    fresh_app = app_module.create_runtime_app(model_runner=model, evaluator=lambda **_: {"passed": True, "reliable": True}, data_dir=tmp_path)
+    assert model.calls == 6 and worker_operations.count("reset") == 3 and worker_operations.count("call") == 3 and worker_operations.count("evaluate") == 3
+    with runtime.controller.store.connect() as conn:
+        assert any("aggregateEvaluation" in row[0] for row in conn.execute("SELECT metadata_json FROM outcomes"))
+    fresh_app = app_module.create_runtime_app(model_runner=model, evaluator=None, data_dir=tmp_path)
     fresh_runtime = fresh_app.state.durable_runtime
     fresh_runtime.source_revision = "test-source"
     fresh_runtime.packages["appworld"] = package
     fresh_runtime.registry.register(package.manifest)
     fresh_adapter = DurableAppWorldAdapter(fresh_runtime, protocol, {key.value: value for key, value in bundles.items()})
     second = AppWorldBenchmarkRunner(tmp_path / "appworld", package, protocol, fresh_adapter).run("production", bundles)
-    assert second.provenance_complete and model.calls == 3
+    assert second.provenance_complete and model.calls == 6 and worker_operations.count("call") == 3
 
     # A cached usage edit is rejected against the fresh verified accounting,
     # before the shared runtime can dispatch another model request.
@@ -141,19 +142,21 @@ def test_production_durable_runtime_adapter_reopens_without_dispatch(tmp_path, m
         row = conn.execute("SELECT result_json FROM appworld_cells LIMIT 1").fetchone()
         tampered = json.loads(row[0]); tampered["usage"]["inputTokens"] = 7; tampered["usage"]["totalTokens"] = 10
         conn.execute("UPDATE appworld_cells SET result_json=?", (json.dumps(tampered),)); conn.commit()
-    with pytest.raises(ValueError, match="usage receipt does not reconcile"):
+    with pytest.raises(ValueError, match="persisted AppWorld receipt failed verification"):
         AppWorldBenchmarkRunner(tmp_path / "appworld", package, protocol, fresh_adapter).run("production", bundles)
-    assert model.calls == 3
+    assert model.calls == 6
 
     from adaptive_agent.models import SkillBundle
     learned_payload = {**active.model_dump(mode="json", by_alias=True, exclude={"content_hash"}), "skills": [{"skillId": "learned", "version": "1", "procedure": "arbitrary learned procedure"}]}
     learned = SkillBundle.model_validate(learned_payload)
     learned_hash = learned.content_hash
     fresh_runtime.controller.store.save_bundle(learned.bundle_id, learned.parent, learned_hash, json.dumps(learned.model_dump(mode="json", by_alias=True)))
+    assert fresh_runtime.controller.store.get_bundle_by_hash(learned_hash)["content_hash"] == learned_hash
     audit_adapter = DurableAppWorldAdapter(fresh_runtime, protocol)
-    retained = dict(bundles); retained[Arm.A] = learned_hash
+    assert audit_adapter._bundle(learned_hash).content_hash == learned_hash
+    retained = {"B0": learned_hash, "L": learned_hash, "A": learned_hash}
     with pytest.raises(ValueError, match="retains learned skills"):
-        audit_adapter.preflight_bundles({key.value: value for key, value in retained.items()})
+        audit_adapter.preflight_bundles(retained)
 
     # Planner identity is checked by the production adapter before any task
     # is loaded from the catalog.
