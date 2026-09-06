@@ -153,6 +153,9 @@ export type RunOptions = {
     wallTimeSeconds: number;
     costMicrounits?: number;
     currency?: string;
+    /** authoritative trusted budget reference advertised by the control plane
+     *  (2b3fc75); the console submits it verbatim when present */
+    budgetRef?: { id: string; version: string; sha256: string };
   };
   /** authoritative trusted budget reference advertised by the control plane
    *  (01f2462 top level; 2b3fc75 nested form tolerated); submitted verbatim */

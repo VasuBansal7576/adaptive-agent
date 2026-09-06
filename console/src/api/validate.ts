@@ -387,6 +387,11 @@ export function parseRunOptions(value: unknown): RunOptions {
       childRuns: typeof budget.childRuns === "number" ? budget.childRuns : undefined,
       costMicrounits: typeof budget.costMicrounits === "number" ? budget.costMicrounits : undefined,
       currency: typeof budget.currency === "string" ? budget.currency : undefined,
+      // advertised trusted budget ref (2b3fc75); optional for older processes
+      budgetRef:
+        budget.budgetRef && typeof budget.budgetRef === "object" && !Array.isArray(budget.budgetRef)
+          ? parseArtifactRef(budget.budgetRef, "runOptions.budgetDefaults.budgetRef")
+          : undefined,
     },
     // trusted budget ref: top level since 01f2462, nested since 2b3fc75
     budgetRef:
