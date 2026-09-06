@@ -581,7 +581,28 @@ class TestControllerSeam:
             "usage": usage, "costMicrounits": 100, "durationSeconds": 1.5, "versionRefs": version_refs,
         }
         acct_ref = ctl.record_accounting(run_id, accounting, response)
-        assert store.get_artifact(acct_ref)["responseId"] == "resp-1"
+        first = store.get_artifact(acct_ref)
+        assert first["responseId"] == "resp-1"
+        assert first["aggregateUsage"] == usage and first["responseCount"] == 1
+        assert first["aggregateCostMicrounits"] == 100.0 and first["aggregateDurationSeconds"] == 1.5
+
+        # Second receipt (e.g. a retry): per-response usage stays exact while
+        # the cumulative aggregates sum every receipt.
+        usage2 = {"inputTokens": 4, "outputTokens": 2, "totalTokens": 6}
+        response2 = {"responseId": "resp-2", "usage": usage2, "versionRefs": version_refs}
+        ctl.record_model_response(run_id, response2)
+        acct2 = ctl.record_accounting(
+            run_id,
+            {"responseId": "resp-2", "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
+             "usage": usage2, "costMicrounits": 50, "durationSeconds": 0.5, "versionRefs": version_refs},
+            response2,
+        )
+        second = store.get_artifact(acct2)
+        assert second["usage"] == usage2  # exact per-response
+        assert second["aggregateUsage"] == {"inputTokens": 14, "outputTokens": 7, "totalTokens": 21}
+        assert second["aggregateCostMicrounits"] == 150.0
+        assert second["aggregateDurationSeconds"] == 2.0
+        assert second["responseCount"] == 2
 
         outcome = {
             "responseId": "resp-1", "runId": run_id, "taskId": "t-ev", "environmentId": ENV,

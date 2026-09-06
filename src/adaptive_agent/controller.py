@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import json
 import os
 import re
 import time
@@ -717,7 +718,43 @@ class Controller:
             v = accounting.get(key)
             if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0 or v != v or v == float("inf"):
                 raise ValueError(f"accounting.{key} must be a finite non-negative number")
-        ref = self.store.put_artifact(dict(accounting))
+        # Cumulative aggregates sum EVERY receipt for the run (including
+        # retries); this record's own `usage`/`costMicrounits`/`durationSeconds`
+        # remain the exact per-response values.
+        agg = {
+            "inputTokens": int(accounting["usage"]["inputTokens"]),
+            "outputTokens": int(accounting["usage"]["outputTokens"]),
+            "totalTokens": int(accounting["usage"]["totalTokens"]),
+        }
+        agg_cost = float(accounting["costMicrounits"])
+        agg_duration = float(accounting["durationSeconds"])
+        count = 1
+        for row in self.store.list_evidence(run_id):
+            if row["event_type"] != "accounting_recorded":
+                continue
+            try:
+                ev_ref = json.loads(row["source_ref"])
+                ev_payload = self.store.get_artifact(ev_ref["sha256"])
+                prior = self.store.get_artifact(ev_payload["accountingRef"]["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(prior, dict) or not isinstance(prior.get("usage"), dict):
+                continue
+            u = prior["usage"]
+            agg["inputTokens"] += int(u.get("inputTokens", 0))
+            agg["outputTokens"] += int(u.get("outputTokens", 0))
+            agg["totalTokens"] += int(u.get("totalTokens", 0))
+            agg_cost += float(prior.get("costMicrounits", 0) or 0)
+            agg_duration += float(prior.get("durationSeconds", 0) or 0)
+            count += 1
+        payload = dict(accounting)
+        payload.update({
+            "aggregateUsage": agg,
+            "aggregateCostMicrounits": agg_cost,
+            "aggregateDurationSeconds": agg_duration,
+            "responseCount": count,
+        })
+        ref = self.store.put_artifact(payload)
         self.append_event(run_id, "accounting_recorded", {"accountingRef": ref.model_dump(mode="json")}, "system", "operator")
         return ref
 
