@@ -10,6 +10,7 @@ evaluator identity, and the active bundle never enters the learner.
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -931,6 +932,9 @@ class Controller:
             raise ValueError("outcome run/task/environment pins do not match the run")
         if not isinstance(payload.get("passed"), bool) or not isinstance(payload.get("reliable"), bool):
             raise ValueError("outcome.passed/reliable must be booleans")
+        score = payload.get("score")
+        if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score))):
+            raise ValueError("outcome.score must be finite when provided")
         violations = payload.get("safetyViolations", 0)
         if not isinstance(violations, int) or isinstance(violations, bool) or violations < 0:
             raise ValueError("outcome.safetyViolations must be a non-negative integer")
@@ -951,7 +955,7 @@ class Controller:
             if key in payload
         }
         event = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "operator")
-        self.record_outcome(run_id, bool(payload["passed"]), score=payload.get("score"), metadata=payload)
+        self.record_outcome(run_id, bool(payload["passed"]), score=float(score) if score is not None else None, metadata=payload)
         return event
 
     def record_outcome(self, run_id: str, passed: bool, score: float | None = None, metadata: dict[str, Any] | None = None) -> Outcome:
