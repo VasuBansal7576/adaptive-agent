@@ -187,6 +187,6 @@ def test_reused_complete_subcall_returns_persisted_result(tmp_path: Path):
     admission = job.admit_lifecycle_subcall("recovery", "transfer", "leave-out:finance", "child-0")
     result = {"responseId": "child-response", "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "costMicrounits": 1}
     job.record_lifecycle_subcall(admission["admissionId"], result=result)
-    replay = job.admit_lifecycle_subcall("recovery", "transfer", "leave-out:finance", "child-0")
+    replay = _job(tmp_path).admit_lifecycle_subcall("recovery", "transfer", "leave-out:finance", "child-0")
     assert replay["status"] == "complete"
     assert replay["result"] == result
