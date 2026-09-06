@@ -303,6 +303,7 @@ class RunObservation:
     accounting_ref: str | None = None
     evidence_ref: str | None = None
     config_hashes: Mapping[str, str] = field(default_factory=dict)
+    run_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.cost_microunits < 0 or self.latency_seconds < 0 or self.safety_violations < 0:
@@ -945,6 +946,7 @@ class EvaluationProtocol:
     core_planner_hash: str = "core-planner-unset"
     analysis_code_hash: str = "evaluation-analysis-v1"
     retrieval_engine_version: str = "fixture-retrieval-v1"
+    image_digest: str = "image-unpinned"
     seeds: tuple[int, ...] = (17, 23, 29)
     tasks_per_environment: int = 20
     bootstrap_draws: int = 10_000
@@ -1007,7 +1009,7 @@ class EvaluationProtocol:
                 raise PromotionEvidenceRefused(f"partition hash changed for {key}")
 
     def to_dict(self, *, include_frozen: bool = True) -> JsonObject:
-        value: JsonObject = {"modelProfile": self.model_profile, "modelTier": self.model_tier, "provider": self.provider, "corePlannerHash": self.core_planner_hash, "analysisCodeHash": self.analysis_code_hash, "retrievalEngineVersion": self.retrieval_engine_version, "seeds": list(self.seeds), "tasksPerEnvironment": self.tasks_per_environment, "bootstrapDraws": self.bootstrap_draws, "analysisSeed": self.analysis_seed, "validationCandidateLimit": self.validation_candidate_limit, "runBudget": self.run_budget.to_dict(), "concurrencyLimit": self.concurrency_limit, "knownEnvironments": list(self.known_environments), "sealedEnvironment": self.sealed_environment, "thresholds": dict(self.thresholds)}
+        value: JsonObject = {"modelProfile": self.model_profile, "modelTier": self.model_tier, "provider": self.provider, "corePlannerHash": self.core_planner_hash, "analysisCodeHash": self.analysis_code_hash, "retrievalEngineVersion": self.retrieval_engine_version, "imageDigest": self.image_digest, "seeds": list(self.seeds), "tasksPerEnvironment": self.tasks_per_environment, "bootstrapDraws": self.bootstrap_draws, "analysisSeed": self.analysis_seed, "validationCandidateLimit": self.validation_candidate_limit, "runBudget": self.run_budget.to_dict(), "concurrencyLimit": self.concurrency_limit, "knownEnvironments": list(self.known_environments), "sealedEnvironment": self.sealed_environment, "thresholds": dict(self.thresholds)}
         if include_frozen and self._frozen is not None:
             value["protocolHash"] = self._frozen.protocol_hash
         return value
@@ -1018,6 +1020,7 @@ class FrozenProtocol:
     protocol_hash: str
     fixture_hashes: Mapping[str, str]
     partition_hashes: Mapping[str, str]
+    inputs: Mapping[str, JsonValue]
     inputs: Mapping[str, JsonValue]
 
     def to_dict(self) -> JsonObject:
@@ -1124,16 +1127,16 @@ def _paired_metric(pairs: Sequence[tuple[RunObservation, RunObservation]]) -> di
     return {"accuracy": sum(candidate.passed - baseline.passed for baseline, candidate in pairs) / len(pairs), "reliability": sum(candidate.reliable - baseline.reliable for baseline, candidate in pairs) / len(pairs), "cost": sum(candidate.cost_microunits - baseline.cost_microunits for baseline, candidate in pairs) / len(pairs), "latency": sum(candidate.latency_seconds - baseline.latency_seconds for baseline, candidate in pairs) / len(pairs)}
 
 
-def _trusted_observation(row: RunObservation, protocol: EvaluationProtocol, package: EnvironmentPackage) -> bool:
+def _trusted_observation(row: RunObservation, frozen: FrozenProtocol, package: EnvironmentPackage) -> bool:
     if row.model_provenance is not ModelProvenance.REAL_MODEL or not row.response_id or not row.accounting_ref or not row.evidence_ref:
         return False
     expected = {
-        "model": sha256_json({"profile": protocol.model_profile, "provider": protocol.provider}),
-        "planner": protocol.core_planner_hash,
-        "budget": sha256_json(protocol.run_budget),
+        "model": sha256_json({"profile": frozen.inputs["modelProfile"], "provider": frozen.inputs["provider"]}),
+        "planner": str(frozen.inputs["corePlannerHash"]),
+        "budget": sha256_json(frozen.inputs["runBudget"]),
         "policy": sha256_json(package.manifest.policy_ref),
         "schema": sha256_json(package.manifest.tool_schemas),
-        "image": sha256_json({"modelProfile": protocol.model_profile}),
+        "image": str(frozen.inputs["imageDigest"]),
     }
     return dict(row.config_hashes) == expected
 
@@ -1437,7 +1440,7 @@ class EvaluationRunner:
         safety_probe_outputs = {case_id: result.to_dict() for case_id, result in probe_results.items()}
         safety_cells_complete = set(self.protocol.safety_case_ids) <= set(safety_results)
         safety_passed = all(row.safety_violations == 0 for row in rows) and safety_cells_complete and all(safety_results.get(case_id, False) for case_id in self.protocol.safety_case_ids)
-        model_provenance_complete = bool(rows) and all(_trusted_observation(row, self.protocol, self.packages[row.environment_id]) and self.evidence_store.verify(row, self.frozen, self.packages[row.environment_id]) for row in rows)
+        model_provenance_complete = bool(rows) and all(_trusted_observation(row, self.frozen, self.packages[row.environment_id]) and self.evidence_store.verify(row, self.frozen, self.packages[row.environment_id]) for row in rows)
         report = EvaluationReport(comparison, validity, candidate_hash, base_hash, self.frozen.protocol_hash, report_partition_hashes, summaries, intervals, safety_passed, missing_pairs, partition_leak, resets, failures, tuple(exposure), self.protocol.workload(1), self.protocol.analysis_seed, ablation_audit, evaluator_refs, environment_cells, cells_complete, safety_cells_complete, model_provenance_complete, None, safety_results, safety_probe_outputs, self.evaluator_registry.ledger)
         attestation_payload = {"comparison": comparison, "candidateHash": candidate_hash, "baseHash": base_hash, "protocolHash": self.frozen.protocol_hash, "partitionHashes": report_partition_hashes, "evaluatorRefs": evaluator_refs, "environmentCells": environment_cells, "armSummaries": summaries, "confidenceIntervals": intervals, "validityStatus": report.validity_status, "safetyPassed": report.safety_passed, "safetyCaseResults": report.safety_case_results, "safetyProbeOutputs": report.safety_probe_outputs, "missingPairs": report.missing_pairs, "partitionLeak": report.partition_leak, "invalidFixtureResets": report.invalid_fixture_resets, "infrastructureFailures": report.infrastructure_failures, "metricCellsComplete": report.metric_cells_complete, "safetyCellsComplete": report.safety_cells_complete, "modelProvenanceComplete": report.model_provenance_complete}
         object.__setattr__(report, "attestation", self.evaluator_registry.attest(attestation_payload))
