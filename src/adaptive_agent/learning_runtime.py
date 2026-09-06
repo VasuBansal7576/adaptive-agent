@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -27,6 +28,28 @@ def _artifact_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return canonical_json(value)
+
+
+_SECRET_VALUE = re.compile(
+    r"(?i)(?:sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{16}|bearer\s+\S+|"
+    r"(?:api[_-]?key|token|secret|password|authorization|credential)\s*[:=]\s*\S+)"
+)
+_HIDDEN_KEY = re.compile(r"(?i)(?:hidden|expected|evaluator|answer[_ -]?key|secret|credential|api[_-]?key|token|password|authorization)")
+
+
+def _sanitize_learning_value(value: Any) -> Any:
+    """Keep operational shape while excluding credentials and evaluator text."""
+    if isinstance(value, str):
+        return _SECRET_VALUE.sub("[REDACTED]", value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _sanitize_learning_value(item)
+            for key, item in value.items()
+            if not _HIDDEN_KEY.search(str(key))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_learning_value(item) for item in value]
+    return value
 
 
 class StoreModelObservationSink:
@@ -99,61 +122,99 @@ class LearningRuntime:
         environment = self.store.get_environment(environment_id)
         if not isinstance(environment, Mapping):
             raise LearningRuntimeError("completed run environment is not stored")
-        manifest_ref = environment.get("manifest_ref")
-        if not isinstance(manifest_ref, str):
-            raise LearningRuntimeError("completed run public manifest reference is missing")
-        manifest = self.store.get_artifact(json.loads(manifest_ref)["sha256"])
+        public_doc_reader = getattr(self.store, "get_public_docs", None)
+        if callable(public_doc_reader):
+            docs = public_doc_reader(environment_id)
+        else:
+            manifest_ref = environment.get("manifest_ref")
+            if not isinstance(manifest_ref, str):
+                raise LearningRuntimeError("completed run public manifest reference is missing")
+            manifest = self.store.get_artifact(json.loads(manifest_ref)["sha256"])
+            docs = [{**doc, "content": self.store.get_artifact(doc["sha256"])} for doc in manifest.get("docs", [])]
         supplied_docs = {}
         for supplied in public_documents or ():
             if hasattr(supplied, "document_id"):
                 supplied = {"id": supplied.document_id, "version": supplied.version, "text": supplied.text}
             if isinstance(supplied, Mapping) and isinstance(supplied.get("id"), str):
                 supplied_docs[supplied["id"]] = dict(supplied)
-        for doc in manifest.get("docs", []):
-            try:
-                stored_doc = self.store.get_artifact(doc["sha256"])
-            except KeyError:
+        for doc in docs:
+            if not isinstance(doc, Mapping) or not isinstance(doc.get("id"), str):
+                raise LearningRuntimeError("public document projection is malformed")
+            if "content" in doc:
+                stored_doc = doc["content"]
+            else:
                 candidate = supplied_docs.get(doc["id"])
                 if candidate is None:
                     raise LearningRuntimeError(f"public document content is not stored: {doc['id']}")
                 ref = self.store.put_artifact(candidate)
-                if ref.sha256 != doc["sha256"]:
+                if ref.sha256 != doc.get("sha256"):
                     raise LearningRuntimeError(f"public document hash mismatch: {doc['id']}")
                 stored_doc = self.store.get_artifact(doc["sha256"])
             doc_content = _artifact_text(stored_doc)
             record = {"kind": "public_doc", "sourceId": doc["id"], "content": doc_content, "contentHash": content_hash(doc_content), "environmentId": environment_id, "visibility": "public"}
-            persist(f"learning-doc-{doc['sha256']}", record)
+            persist(f"learning-doc-{doc.get('sha256', content_hash(doc_content))}", record)
 
         trusted_outcome = self.store.get_outcome_by_run_id(run_id)
-        if not isinstance(trusted_outcome, Mapping) or not trusted_outcome.get("passed"):
-            raise LearningRuntimeError("completed development run lacks a trusted passing outcome")
-        for event in self.store.list_evidence(run_id):
-            provenance = self.store.evidence_provenance(event["evidence_id"])
-            if not provenance or provenance.get("environment_id") != environment_id or provenance.get("partition") != "development":
-                continue
-            if event.get("trust_class") not in {"broker", "system"}:
-                continue
+        if not isinstance(trusted_outcome, Mapping) or "passed" not in trusted_outcome or not isinstance(trusted_outcome.get("passed"), (bool, int)):
+            raise LearningRuntimeError("completed development run lacks a trusted evaluator outcome")
+        outcome_passed = bool(trusted_outcome["passed"])
+        joined_reader = getattr(self.store, "list_learner_evidence", None)
+        events = joined_reader(environment_id=environment_id, run_id=run_id) if callable(joined_reader) else self.store.list_evidence(run_id)
+        for event in events:
+            if callable(joined_reader):
+                if event.get("partition") != "development" or event.get("environment_id") != environment_id or event.get("run_id") != run_id:
+                    continue
+                if event.get("visibility") != "learner" or event.get("redacted") != 1:
+                    continue
+            else:
+                provenance = self.store.evidence_provenance(event["evidence_id"])
+                if not provenance or provenance.get("environment_id") != environment_id or provenance.get("partition") != "development":
+                    continue
+                if event.get("trust_class") not in {"broker", "system"} or event.get("visibility") not in {"learner", "operator"}:
+                    continue
             # Some session-2 runtimes currently retain broker events as
             # operator-only.  Project only the broker's safe envelope here;
             # never copy its raw payload into learner context.
-            if event.get("visibility") not in {"learner", "operator"} or event.get("event_type") != "tool_result":
+            if event.get("event_type") != "tool_result":
                 continue
-            ref = json.loads(event["source_ref"])
-            payload = self.store.get_artifact(ref["sha256"])
-            # Only retain safe broker metadata, never raw fixture/evaluator text.
-            safe = {key: payload.get(key) for key in ("status", "effect", "toolVersion") if isinstance(payload, Mapping) and key in payload}
+            payload: Mapping[str, Any] = {}
+            source_event = getattr(self.store, "get_evidence", lambda _id: None)(event["evidence_id"])
+            if isinstance(source_event, Mapping) and isinstance(source_event.get("source_ref"), str):
+                ref = json.loads(source_event["source_ref"])
+                raw_payload = self.store.get_artifact(ref["sha256"])
+                if isinstance(raw_payload, Mapping):
+                    payload = raw_payload
+            safe: dict[str, Any] = {key: payload.get(key) for key in ("status", "effect", "toolVersion") if key in payload}
+            call_id = payload.get("callId")
+            call_reader = getattr(self.store, "get_tool_call", None)
+            call = call_reader(call_id) if callable(call_reader) and isinstance(call_id, str) else None
+            if isinstance(call, Mapping) and call.get("run_id") == run_id and call.get("environment_id") == environment_id:
+                safe["tool"] = call.get("tool")
+                try:
+                    safe["input"] = _sanitize_learning_value(json.loads(call.get("arguments_json", "{}")))
+                except (TypeError, json.JSONDecodeError):
+                    pass
+                try:
+                    result = json.loads(call.get("result_json")) if call.get("result_json") else {}
+                except (TypeError, json.JSONDecodeError):
+                    result = {}
+                if isinstance(result, Mapping):
+                    safe["result"] = _sanitize_learning_value({key: result.get(key) for key in ("status", "effect", "output") if key in result})
+                    error = result.get("error")
+                    if isinstance(error, Mapping):
+                        safe["error"] = {key: _sanitize_learning_value(error.get(key)) for key in ("code", "retry") if key in error}
             content = f"Broker development observation: eventType={event['event_type']}; details={canonical_json(safe)}"
-            record = {"kind": "live_evidence", "sourceId": event["evidence_id"], "content": content, "contentHash": content_hash(content), "sourceContentHash": event["content_hash"], "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": event["trust_class"], "trustedOutcome": True}
+            record = {"kind": "live_evidence", "sourceId": event["evidence_id"], "content": content, "contentHash": content_hash(content), "sourceContentHash": event["content_hash"], "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": event.get("trust_class", "broker"), "trustedOutcome": True, "outcomePassed": outcome_passed}
             persist(f"learning-evidence-{event['evidence_id']}", record)
-        outcome_content = "A trusted evaluator outcome is recorded for this completed development run."
-        outcome_record = {"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": outcome_content, "contentHash": content_hash(outcome_content), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True}
+        outcome_content = f"A trusted evaluator outcome is recorded for this completed development run; passed={str(outcome_passed).lower()}."
+        outcome_record = {"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": outcome_content, "contentHash": content_hash(outcome_content), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True, "outcomePassed": outcome_passed}
         persist(f"learning-outcome-{run_id}", outcome_record)
         return raw_records
 
     def propose_completed_run(self, run_id: str, *, goal: str | None = None, feedback: Mapping[str, Any] | None = None, public_documents: Any = ()) -> LearningProposal:
         stored = self.store.get_run(run_id)
-        if not isinstance(stored, Mapping) or stored.get("status") != "succeeded":
-            raise LearningRuntimeError("learning requires a completed successful development run")
+        if not isinstance(stored, Mapping) or stored.get("status") not in {"succeeded", "failed", "cancelled", "timed_out", "outcome_unknown"}:
+            raise LearningRuntimeError("learning requires a completed development run")
         environment_id = stored.get("environment_id")
         if not isinstance(environment_id, str):
             raise LearningRuntimeError("completed run environment binding is missing")
@@ -165,7 +226,9 @@ class LearningRuntime:
         sink = StoreModelObservationSink(self.store, run_id)
         self.service.retriever = self.source_adapter.retriever(environment_id=environment_id, run_id=run_id) if not raw_records else self.source_adapter.retriever_from_raw(raw_records, environment_id=environment_id, run_id=run_id)
         self.service.model_runner = PlannerLearningAdapter(self.service.model_runner.client, sink)
-        return self.service.propose(run_id=run_id, environment_id=environment_id, goal=goal or task["goal"], environment=environment, feedback=feedback or {"status": "succeeded"}, remaining_deadline=self.wall_seconds, token_cap=self.token_budget, max_repair_attempts=1)
+        outcome = self.store.get_outcome_by_run_id(run_id)
+        status = "succeeded" if bool(outcome.get("passed")) else "failed"
+        return self.service.propose(run_id=run_id, environment_id=environment_id, goal=goal or task["goal"], environment=environment, feedback=feedback or {"status": status}, remaining_deadline=self.wall_seconds, token_cap=self.token_budget, max_repair_attempts=1)
 
     def reload_candidate(self, candidate_id: str) -> Mapping[str, Any]:
         candidate = self.store.get_candidate(candidate_id)
