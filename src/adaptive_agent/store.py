@@ -268,6 +268,9 @@ class Store:
             try:
                 existing = conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone()
                 if existing is not None:
+                    if (existing["environment_id"], existing["task_id"], existing["partition"]) != (environment_id, task_id, partition):
+                        conn.rollback()
+                        raise ValueError("task run id is already bound to a different task")
                     conn.commit()
                     return False, dict(existing)
                 conn.execute("INSERT INTO task_runs (task_run_id, environment_id, task_id, partition, status, state_json, updated_at) VALUES (?, ?, ?, ?, 'running', '{}', ?)", (task_run_id, environment_id, task_id, partition, _utcnow()))
@@ -321,7 +324,7 @@ class Store:
     def dev_smoke_ok(self, environment_id: str) -> bool:
         """Whether a passed trusted development run exists for an environment."""
         with self._connect() as conn:
-            row = conn.execute("SELECT 1 FROM outcomes o JOIN runs r ON r.run_id = o.run_id JOIN tasks t ON t.id = r.task_id WHERE r.environment_id = ? AND t.partition = 'development' AND o.passed = 1 LIMIT 1", (environment_id,)).fetchone()
+            row = conn.execute("SELECT 1 FROM outcomes o JOIN runs r ON r.run_id = o.run_id JOIN tasks t ON t.id = r.task_id WHERE r.environment_id = ? AND t.partition = 'development' AND o.passed = 1 AND EXISTS (SELECT 1 FROM evidence e WHERE e.run_id = o.run_id AND e.event_type = 'trusted_outcome' AND e.trust_class = 'evaluator') LIMIT 1", (environment_id,)).fetchone()
             return row is not None
 
     # ------------------------------------------------------------------ generic helpers
