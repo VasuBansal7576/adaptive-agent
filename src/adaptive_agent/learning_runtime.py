@@ -143,6 +143,7 @@ class LearningRuntime:
         existing_reader = getattr(self.store, "list_learning_records", None)
         existing_rows = existing_reader(environment_id=environment_id, run_id=run_id) if callable(existing_reader) else ()
         existing_records: list[Mapping[str, Any]] = []
+        existing_keys: set[tuple[Any, Any]] = set()
         for row in existing_rows or ():
             if not isinstance(row, Mapping):
                 continue
@@ -153,9 +154,15 @@ class LearningRuntime:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(decoded, Mapping):
-                    existing_records.append(decoded)
+                    key = (decoded.get("kind"), decoded.get("sourceId"))
+                    if key not in existing_keys:
+                        existing_keys.add(key)
+                        existing_records.append(decoded)
             elif isinstance(row.get("kind"), str):
-                existing_records.append(row)
+                key = (row.get("kind"), row.get("sourceId"))
+                if key not in existing_keys:
+                    existing_keys.add(key)
+                    existing_records.append(row)
 
         def persist(record_id: str, record: Mapping[str, Any]) -> None:
             encoded = json.dumps(record, sort_keys=True, separators=(",", ":"))
@@ -265,7 +272,10 @@ class LearningRuntime:
                 source_id = record.get("sourceId")
                 if not isinstance(source_id, str) or not source_id.startswith("broker:"):
                     continue
-                persist(f"learning-evidence-{source_id}", record)
+                # Existing rows are already durable. Return them in the raw
+                # projection so a restart does not rewrite them under a new
+                # record-id convention and create duplicate learner sources.
+                raw_records.append(record)
         outcome_content = f"A trusted evaluator outcome is recorded for this completed development run; passed={str(outcome_passed).lower()}."
         outcome_record = {"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": outcome_content, "contentHash": content_hash(outcome_content), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True, "outcomePassed": outcome_passed}
         persist(f"learning-outcome-{run_id}", outcome_record)
