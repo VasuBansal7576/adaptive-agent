@@ -105,6 +105,8 @@ class EvaluationJob:
 
     def run(self, job_id: str, comparison: str, *, base_hash: str, candidate_hash: str, candidate_id: str | None = None, ablation: AblationInput | None = None) -> EvaluationJobResult:
         self._preflight(comparison)
+        if comparison == "final" and ablation is None:
+            raise EvaluationError("final evaluation requires pinned ablation input")
         frozen = self.protocol.start_candidate_generation()
         self._save(job_id, comparison, "running")
         driver = ResumableEvaluationDriver(

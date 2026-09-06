@@ -172,6 +172,31 @@ def test_durable_runtime_builds_production_job_with_bound_executor(tmp_path):
     assert job.arm_bundles[Arm.L] is active
 
 
+def test_evaluation_job_rejects_final_without_pinned_ablation(tmp_path):
+    from adaptive_agent.evaluation import EvaluationError
+    from adaptive_agent.evaluation_job import EvaluationJob
+
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    active = runtime.controller.get_active_bundle()
+    assert active is not None
+    job = EvaluationJob(
+        runtime.controller.store,
+        runtime.controller,
+        protocol,
+        packages,
+        {Arm.B0: active, Arm.L: active, Arm.A: active},
+        runtime.execute_evaluation_task,
+    )
+
+    with pytest.raises(EvaluationError, match="final evaluation requires pinned ablation input"):
+        job.run("final-ablation-missing", "final", base_hash=active.content_hash, candidate_hash=active.content_hash)
+    assert job.readback("final-ablation-missing") is None
+
+
 def test_fixture_provider_reset_uses_executor_seed():
     class Package:
         def __init__(self):
