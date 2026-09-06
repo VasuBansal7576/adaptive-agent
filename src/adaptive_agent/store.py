@@ -506,6 +506,7 @@ class Store:
                 evidence_by_call[payload["callId"]] = ev
 
         out: list[dict[str, Any]] = []
+        matched: set[str] = set()
         for call in calls:
             try:
                 args = json.loads(call["arguments_json"])
@@ -531,6 +532,8 @@ class Store:
             else:
                 status = output = version = effect = result_sha = None
             ev = evidence_by_call.get(call["call_id"], {})
+            if ev:
+                matched.add(call["call_id"])
             out.append({
                 "callId": call["call_id"],
                 "evidenceId": ev.get("evidence_id"),
@@ -545,6 +548,45 @@ class Store:
                 "idempotencyKey": call["idempotency_key"],
                 "argumentsSha256": sha256_json(args),
                 "resultSha256": result_sha,
+                "evidenceContentHash": ev.get("content_hash"),
+                "runId": run_id,
+                "taskId": run["task_id"],
+                "environmentId": run["environment_id"],
+                "partition": "development",
+                "visibility": "learner",
+                "redacted": True,
+            })
+        # Evidence rows with no matching tool_calls row (older app paths that
+        # recorded operator-only tool_result events): project the same safe
+        # fields from the sanitized artifact payload instead of hiding them.
+        for ev in self.list_evidence(run_id):
+            if ev["event_type"] != "tool_result":
+                continue
+            try:
+                ref = json.loads(ev["source_ref"])
+                payload = self.get_artifact(ref["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            call_id = payload.get("callId")
+            if isinstance(call_id, str) and call_id in matched:
+                continue
+            err = payload.get("error")
+            out.append({
+                "callId": call_id,
+                "evidenceId": ev["evidence_id"],
+                "tool": payload.get("tool"),
+                "input": None,
+                "result": sanitize_for_learner(payload.get("output")),
+                "status": payload.get("status"),
+                "errorCode": err.get("code") if isinstance(err, dict) else None,
+                "retry": err.get("retry") if isinstance(err, dict) else None,
+                "version": payload.get("toolVersion"),
+                "effect": payload.get("effect"),
+                "idempotencyKey": None,
+                "argumentsSha256": None,
+                "resultSha256": sha256_json(payload),
                 "evidenceContentHash": ev.get("content_hash"),
                 "runId": run_id,
                 "taskId": run["task_id"],

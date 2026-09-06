@@ -714,6 +714,26 @@ class TestControllerSeam:
         with pytest.raises(KeyError):
             store.list_run_tool_calls("run-missing")
 
+        # Operator-only tool_result evidence (older app path) is projected with
+        # sanitized output and no credential leakage.
+        ctl.append_event(
+            run.run_id,
+            "tool_result",
+            {
+                "callId": "call_orphan", "tool": "update_record", "status": "ok",
+                "output": {"value": "sk-live1234567890abcdef", "token": "api_key=hunter2secret"},
+                "toolVersion": "1",
+            },
+            "broker", "operator",
+        )
+        rows2 = store.list_run_tool_calls(run.run_id)
+        orphan = next(r for r in rows2 if r["callId"] == "call_orphan")
+        assert orphan["visibility"] == "learner" and orphan["redacted"] is True
+        flat = json.dumps(orphan)
+        assert "sk-live1234567890abcdef" not in flat and "hunter2secret" not in flat
+        assert "[REDACTED]" in flat
+        assert orphan["input"] is None and orphan["argumentsSha256"] is None
+
     def test_learning_projection(self, store, registry, broker):
         """Session7 seam: public docs, redacted development evidence + trusted
         outcome, patch bytes. No hidden evaluator content."""
