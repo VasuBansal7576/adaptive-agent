@@ -205,7 +205,7 @@ class DurableRuntime:
                 def act(self, _ctx: Any) -> None:
                     nonlocal invocation
                     invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
-                    runtime.controller.append_event(run_id, "model_observation", {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)}, "system", "operator")
+                    runtime.controller.append_event(run_id, "model_response", {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)}, "system", "operator")
             def evaluate() -> DurableOutcome:
                 outcome = dict(self.evaluator(goal=task.goal, model_output=invocation.text, environment=self._planner_environment(package, run_id))) if self.evaluator is not None and invocation is not None else {"passed": False}
                 return DurableOutcome(runId=run_id, passed=bool(outcome.get("passed") is True), metadata=outcome)
@@ -260,7 +260,7 @@ class DurableRuntime:
 
             def record_model_observation(self, evidence: Mapping[str, Any], *, trusted_parent: bool = False) -> Any:
                 result = prime.record_model_observation(evidence, trusted_parent=trusted_parent)
-                self._controller.append_event(run_id, "model_observation", dict(evidence), "system", "operator")
+                self._controller.append_event(run_id, "model_response", dict(evidence), "system", "operator")
                 return result
         class Driver:
             def __init__(self, controller: Controller) -> None:

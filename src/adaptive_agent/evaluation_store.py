@@ -7,10 +7,10 @@ fallback is never considered durable evidence by :class:`EvaluationReport`.
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any, Protocol, Sequence
 
 from adaptive_agent.evaluation import (
-    BudgetSpec,
     EnvironmentPackage,
     EvaluationRunner,
     EvaluationProtocol,
@@ -63,8 +63,13 @@ class SQLiteTrustedAttestationLedger:
 
     def put(self, token: str, digest: str) -> None:
         with self.store._connect() as conn:
-            conn.execute("INSERT OR REPLACE INTO evaluator_attestations(token, digest, created_at) VALUES (?, ?, datetime('now'))", (token, digest))
-            conn.commit()
+            try:
+                conn.execute("INSERT INTO evaluator_attestations(token, digest, created_at) VALUES (?, ?, datetime('now'))", (token, digest))
+                conn.commit()
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                if self.get(token) != digest:
+                    raise ValueError("attestation token already has a different digest")
 
     def get(self, token: str) -> str | None:
         with self.store._connect() as conn:
@@ -111,9 +116,10 @@ class SQLiteRunEvidenceStore:
         if observation.model_provenance.value != "real_model" or not observation.run_id or not observation.response_id or not observation.accounting_ref or not observation.evidence_ref:
             return False
         evidence = self.store.get_evidence(observation.evidence_ref)
-        if not evidence or evidence.get("run_id") != observation.run_id:
+        if not evidence or not observation.run_id:
             return False
-        if evidence.get("event_type") != "model_observation":
+        run = self.store.get_run(observation.run_id)
+        if not run or run.get("task_id") != observation.task_id or run.get("environment_id") != observation.environment_id:
             return False
         try:
             source_ref = json.loads(evidence["source_ref"])
@@ -123,22 +129,26 @@ class SQLiteRunEvidenceStore:
             return False
         if sha256_json(response) != evidence.get("content_hash"):
             return False
-        if not isinstance(response, dict) or response.get("responseId") != observation.response_id or response.get("provider") != frozen.payload.get("provider"):
+        if not isinstance(response, dict) or response.get("responseId") != observation.response_id or response.get("provider") != frozen.inputs["provider"] or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response":
             return False
-        if not isinstance(accounting, dict) or accounting.get("responseId") != observation.response_id or accounting.get("runId") != observation.run_id or accounting.get("taskId") != observation.task_id or accounting.get("environmentId") != observation.environment_id:
-            return False
-        tool_evidence = [row for row in self.store.list_evidence(observation.run_id) if row.get("trust_class") == "broker" and row.get("event_type") == "tool_result"]
-        if not tool_evidence:
+        if not isinstance(accounting, dict) or accounting.get("responseId") != observation.response_id or accounting.get("runId") != observation.run_id or accounting.get("taskId") != observation.task_id or accounting.get("environmentId") != observation.environment_id or not accounting.get("versionRefs"):
             return False
         expected = {
-            "model": sha256_json({"profile": frozen.payload["modelProfile"], "provider": frozen.payload["provider"]}),
-            "planner": frozen.payload["corePlannerHash"],
-            "budget": sha256_json(frozen.payload["runBudget"]),
+            "model": sha256_json({"profile": frozen.inputs["modelProfile"], "provider": frozen.inputs["provider"]}),
+            "planner": str(frozen.inputs["corePlannerHash"]),
+            "budget": sha256_json(frozen.inputs["runBudget"]),
             "policy": sha256_json(package.manifest.policy_ref),
             "schema": sha256_json(package.manifest.tool_schemas),
-            "image": sha256_json({"imageDigest": frozen.payload["imageDigest"]}),
+            "image": str(frozen.inputs["imageDigest"]),
         }
-        return dict(observation.config_hashes) == expected
+        expected_version_refs = {
+            "policy": package.manifest.policy_ref.sha256,
+            "schema": sha256_json(package.manifest.tool_schemas),
+            "planner": str(frozen.inputs["corePlannerHash"]),
+            "budget": sha256_json(frozen.inputs["runBudget"]),
+            "image": str(frozen.inputs["imageDigest"]),
+        }
+        return dict(observation.config_hashes) == expected and accounting.get("versionRefs") == expected_version_refs
 
 
 def build_durable_adapters(store: Store) -> tuple[TrustedAttestationLedger, SQLiteAllocationStore, RunEvidenceStore]:
