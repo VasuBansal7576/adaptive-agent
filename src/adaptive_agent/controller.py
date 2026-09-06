@@ -333,6 +333,61 @@ def _run_probe(case_id: str) -> list[tuple[str, bool, str]]:
             results.append(("interrupted_promotion_atomic", d2.decision == "promoted" and ok and superseded,
                             f"restart_promote={d2.decision} loser={d} state={'superseded' if superseded else '?'}"))
 
+            # Real injected crash INSIDE the promotion transaction: abort after
+            # the candidate update, before commit, then verify atomicity on
+            # reopen — no partial decision, active pointer untouched, candidate
+            # not marked promoted.
+            ev4 = ctl.append_event(dev_run.run_id, "tool_result", {"v": 4}, "broker", "learner")
+            pre_active = mgr2.get_active_bundle().content_hash
+            cand4 = SkillBundle(parent=base.bundle_id, skills=[SkillVersion(skillId="s4", name="s", version="1", procedure="check twice")])
+            p4_prop = fresh_proposal(base_bundle_hash=pre_active, supporting_evidence_ids=[ev4.evidence_id])
+            p4x = mgr2.submit_candidate(p4_prop, cand4)
+            mgr2.start_evaluation(p4x.candidate_id)
+            with store._connect() as conn:
+                pre_promos = conn.execute("SELECT COUNT(*) AS n FROM promotions").fetchone()["n"]
+            orig_connect = store._connect
+            crash = {"armed": True}
+
+            class _CrashConn:
+                def __init__(self, conn: Any) -> None:
+                    self._c = conn
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._c, name)
+
+                def execute(self, sql: str, *a: Any, **k: Any) -> Any:
+                    if crash["armed"] and "INSERT INTO promotions" in str(sql):
+                        raise RuntimeError("injected crash inside promotion transaction")
+                    return self._c.execute(sql, *a, **k)
+
+            from contextlib import contextmanager as _cm
+
+            @_cm
+            def _crashing():
+                with orig_connect() as conn:
+                    yield _CrashConn(conn)
+
+            store._connect = _crashing  # type: ignore[method-assign]
+            crashed = False
+            try:
+                mgr2.promote(p4x.candidate_id, _valid_report(cand4, pre_active))
+            except RuntimeError as exc:
+                crashed = "injected crash" in str(exc)
+            finally:
+                crash["armed"] = False
+                store._connect = orig_connect  # type: ignore[method-assign]
+            # Reopen: nothing partial may be visible.
+            store3 = Store(store.base_dir)
+            mgr3 = CandidateManager(store3)
+            row4 = store3.get_candidate(p4x.candidate_id)
+            with store3._connect() as conn:
+                promo_rows = conn.execute("SELECT COUNT(*) AS n FROM promotions").fetchone()["n"]
+            active_unchanged = mgr3.get_active_bundle().content_hash == pre_active
+            not_marked = row4["state"] not in ("promoted",)
+            results.append(("promotion_crash_reopen_atomic",
+                            crashed and active_unchanged and not_marked and promo_rows == pre_promos,
+                            f"crashed={crashed} active={'unchanged' if active_unchanged else 'MOVED'} cand={row4['state']} promos={promo_rows}/{pre_promos}"))
+
             val_run = seed_run("t-val", "validation")
             v_ev = ctl.append_broker_result(val_run.run_id, {"v": 9}, development=True)
             ctl.record_outcome(val_run.run_id, passed=True)
@@ -349,20 +404,54 @@ def _run_probe(case_id: str) -> list[tuple[str, bool, str]]:
         ok2, d2 = _denied(lambda: broker.request_tool_call(ENV, _probe_req(dev_run.run_id, "read_record", {"record_id": "record-1"}, "cap-2"), foreign_cap, provider))
         results.append(("caps_enforced", ok1 and ok2, f"budget={d1} scope={d2}"))
 
-        # Child failure: a child run's driver raising propagates to a failed
-        # run status and a run_failed evidence row via execute_run.
-        child = seed_run("t-child", "development")
-        provider.reset(child.run_id)
+        # Child failure: real parent→child linkage. The parent driver creates a
+        # child run bound by parentRunId, executes it through the real
+        # execute_run path (driver raises -> failed + run_failed evidence),
+        # records a failed child step, and its own raise ends the parent run
+        # failed — propagation is observable on BOTH runs.
+        parent = seed_run("t-parent", "development")
+        child_holder: dict[str, Any] = {}
 
         class _Boom:
             def act(self, ctx: "DriverContext") -> None:
                 raise RuntimeError("child driver boom")
 
-        ctl.execute_run(child.run_id, ENV, provider, _Boom())
-        row = store.get_run(child.run_id)
-        fail_evs = [e for e in store.list_evidence(child.run_id) if e["event_type"] == "run_failed"]
-        results.append(("child_failure_propagated", row["status"] == "failed" and bool(fail_evs),
-                        f"status={row['status']} run_failed_events={len(fail_evs)}"))
+        class _ParentDriver:
+            def act(self, ctx: "DriverContext") -> None:
+                child_task = TaskInput(taskId="t-child", environmentRef=ArtifactRef(id=ENV, version="1", sha256="0" * 64), goal="probe", partition="development")
+                registry.register_task(child_task)
+                child = ctl.create_run(
+                    RunRequest(
+                        taskRef=store.put_artifact(child_task.model_dump(mode="json", by_alias=True)),
+                        modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
+                        budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
+                        idempotencyKey="probe-child",
+                        parentRunId=ctx.run_id,
+                    ),
+                    child_task,
+                )
+                child_holder["run_id"] = child.run_id
+                provider.reset(child.run_id)
+                ctl.execute_run(child.run_id, ENV, provider, _Boom())
+                step = ctl.begin_step(ctx.run_id, "child")
+                ctl.finish_step(step, "failed", ToolError(code=ToolErrorCode.OUTCOME_UNKNOWN, message=f"child run {child.run_id} failed"))
+                raise RuntimeError("child run failed")
+
+        ctl.execute_run(parent.run_id, ENV, provider, _ParentDriver())
+        parent_row = store.get_run(parent.run_id)
+        child_row = store.get_run(child_holder["run_id"])
+        parent_fail_evs = [e for e in store.list_evidence(parent.run_id) if e["event_type"] == "run_failed"]
+        child_fail_evs = [e for e in store.list_evidence(child_holder["run_id"]) if e["event_type"] == "run_failed"]
+        with store._connect() as conn:
+            child_steps = conn.execute(
+                "SELECT status FROM steps WHERE run_id = ? AND kind = 'child'", (parent.run_id,)
+            ).fetchall()
+        results.append(("child_failure_propagated",
+                        child_row["parent_run_id"] == parent.run_id
+                        and child_row["status"] == "failed" and bool(child_fail_evs)
+                        and parent_row["status"] == "failed" and bool(parent_fail_evs)
+                        and any(s["status"] == "failed" for s in child_steps),
+                        f"child={child_row['status']}(ev={len(child_fail_evs)}) parent={parent_row['status']}(ev={len(parent_fail_evs)}) steps={[s['status'] for s in child_steps]}"))
 
         cap = _probe_capability(dev_run.run_id, "update_record", "write")
         provider.exec_count = 0
@@ -382,14 +471,17 @@ def _run_probe(case_id: str) -> list[tuple[str, bool, str]]:
         ok, d = _denied(lambda: broker.request_tool_call(ENV, second, cap, provider))
         results.append(("one_use_approval", ok, d))
 
-        # Event reconnect: resumed sequence set must equal the exact tail.
-        all_evs = store.list_evidence(dev_run.run_id)
-        seqs = {e["sequence"] for e in all_evs}
-        cursor = min(seqs)
-        resumed = {e["id"] for e in ctl.events(dev_run.run_id, after_sequence=cursor)}
-        expected = {s for s in seqs if s > cursor}
-        results.append(("event_reconnect_resume", resumed == expected and bool(resumed),
-                        f"resumed={sorted(resumed)} expected={sorted(expected)}"))
+        # Event reconnect at the SSE boundary: a client that consumed up to a
+        # mid-stream cursor, disconnected, and re-subscribes via stream_events
+        # on the terminal parent run must receive exactly the remaining tail —
+        # no replay, no gap — then the generator terminates.
+        all_evs = store.list_evidence(parent.run_id)
+        seqs = sorted(e["sequence"] for e in all_evs)
+        cursor = seqs[len(seqs) // 2]
+        tail = [e["id"] for e in ctl.stream_events(parent.run_id, after_sequence=cursor, poll_interval=0.01, timeout=5.0)]
+        expected = [s for s in seqs if s > cursor]
+        results.append(("event_reconnect_resume", tail == expected and bool(tail),
+                        f"cursor={cursor} tail={tail} expected={expected}"))
 
         # Cancel during uncertain effects: crashed write leaves a prepared call;
         # real cancel_run, then reconcile against the SAME provider marks it
