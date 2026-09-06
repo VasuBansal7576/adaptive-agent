@@ -101,6 +101,27 @@ def test_durable_launch_retry_does_not_reinvoke_model(tmp_path):
     assert api.get(f"/runs/{run['runId']}").json()["status"] == "succeeded"
 
 
+def test_durable_terminal_event_stream_closes_after_completed_run(tmp_path):
+    class RuntimeInvocation:
+        text = "done"
+        provider = "openai-codex"
+        model = "openai-codex/gpt-5.6-luna"
+        response_id = "stream-response"
+        usage = {"inputTokens": 1, "outputTokens": 1}
+
+    app = create_runtime_app(model_runner=lambda **_: RuntimeInvocation(), evaluator=lambda **_: {"passed": True}, data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "terminal-stream"}).json()
+    app.state.durable_runtime.launch(run["runId"])
+
+    response = api.get(f"/runs/{run['runId']}/events")
+    assert response.status_code == 200
+    assert "run_started" in response.text
+    assert response.text.endswith("\n\n")
+
+
 def test_durable_model_accounting_payloads_keep_arm_seed_and_bundle_identity(tmp_path):
     app = create_runtime_app(data_dir=tmp_path)
     api = TestClient(app, base_url="http://127.0.0.1")

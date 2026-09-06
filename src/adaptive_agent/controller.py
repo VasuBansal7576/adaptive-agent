@@ -330,15 +330,27 @@ class Controller:
         seq = after_sequence
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            for ev in self.events(run_id, after_sequence=seq):
-                seq = max(seq, int(ev["id"]))
+            events = self.events(run_id, after_sequence=seq)
+            progressed = False
+            for ev in events:
+                event_id = int(ev["id"])
+                if event_id <= seq:
+                    continue
+                seq = event_id
+                progressed = True
                 yield ev
             run = self.get_run(run_id)
             if run is None:
                 return
             if run.status in (RunStatus.succeeded, RunStatus.failed, RunStatus.cancelled, RunStatus.timed_out):
                 # Drain any events appended at completion.
+                if not events or not progressed:
+                    return
                 for ev in self.events(run_id, after_sequence=seq):
+                    event_id = int(ev["id"])
+                    if event_id <= seq:
+                        continue
+                    seq = event_id
                     yield ev
                 return
             time.sleep(poll_interval)

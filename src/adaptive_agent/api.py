@@ -954,11 +954,16 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
                 while True:
                     events = runtime.events(run_id, sent)
                     run = runtime.get_run(run_id)
+                    progressed = False
                     for event in events:
-                        sent = int(event["id"])
+                        event_id = int(event["id"])
+                        if event_id <= sent:
+                            continue
+                        sent = event_id
+                        progressed = True
                         yield f"id: {sent}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
                     if run is None or run.get("status") in {"succeeded", "failed", "cancelled", "timed_out"}:
-                        if not events:
+                        if not events or not progressed:
                             break
                     await asyncio.sleep(0.05)
 
