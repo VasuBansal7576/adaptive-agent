@@ -39,14 +39,19 @@ class SharedLedgerModelClient:
         raw = self.client.invoke(**kwargs)
         if not isinstance(raw, Mapping):
             raise AdapterError("parent model response must be an object")
+        provider = raw.get("provider")
+        model = raw.get("model")
+        response_id = raw.get("responseId", raw.get("response_id"))
         usage = raw.get("usage")
-        if not isinstance(usage, Mapping) or not usage:
-            raise AdapterError("parent model response lacks usage accounting")
+        if provider != MODEL_PROVIDER or model not in (MODEL_NAME, "gpt-5.6-luna"):
+            raise AdapterError("parent model response is not the pinned Luna subscription")
+        if not isinstance(response_id, str) or not response_id.strip() or not isinstance(usage, Mapping) or not usage:
+            raise AdapterError("parent model response lacks response id or usage accounting")
         if self.observation_sink is not None:
             self.observation_sink({
-                "provider": raw.get("provider"),
-                "model": raw.get("model"),
-                "responseId": raw.get("responseId", raw.get("response_id")),
+                "provider": provider,
+                "model": MODEL_NAME if model == "gpt-5.6-luna" else model,
+                "responseId": response_id,
                 "usage": dict(usage),
             })
         # Charge exactly once, immediately after the provider call. The
