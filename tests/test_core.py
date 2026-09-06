@@ -650,6 +650,10 @@ class TestControllerSeam:
         with pytest.raises(ValueError):
             ctl.record_model_response(run_id, {"responseId": "resp-x", "usage": usage, "versionRefs": {"image": "sha256:aaa"}, "imageDigest": "sha256:bbb"})
         ctl.record_model_response(run_id, {"responseId": "resp-ok", "usage": usage, "versionRefs": {"image": "sha256:aaa"}, "imageDigest": "sha256:aaa"})
+        # Conflicting direct budgetRef against pinned versionRefs.budget rejected.
+        with pytest.raises(ValueError):
+            ctl.record_model_response(run_id, {"responseId": "resp-y", "usage": usage, "versionRefs": {"budget": "sha256:bbb"}, "budgetRef": {"sha256": "sha256:ccc"}})
+        ctl.record_model_response(run_id, {"responseId": "resp-bok", "usage": usage, "versionRefs": {"budget": "sha256:bbb"}, "budgetRef": {"sha256": "sha256:bbb"}})
         with pytest.raises(ValueError):
             ctl.record_accounting(run_id, {**accounting, "taskId": "wrong"}, response)
         with pytest.raises(ValueError):

@@ -508,7 +508,7 @@ class Controller:
                 budget_payload = stored_budget
         except (KeyError, ValueError):
             budget_payload = {}
-        child_depth = budget_payload.get("max_child_depth", budget_payload.get("maxChildDepth"))
+        child_depth = budget_payload.get("max_child_depth", budget_payload.get("maxChildDepth", budget_payload.get("childDepth")))
         self.append_event(
             run.run_id,
             "run_created",
@@ -686,6 +686,14 @@ class Controller:
         direct = payload.get("imageDigest")
         if direct is not None and isinstance(expected, str) and direct != expected:
             raise ValueError("payload imageDigest conflicts with pinned versionRefs.image")
+        direct_budget = payload.get("budgetRef")
+        expected_budget = version_refs.get("budget") if isinstance(version_refs, Mapping) else None
+        if (
+            isinstance(direct_budget, Mapping)
+            and isinstance(expected_budget, str)
+            and direct_budget.get("sha256") != expected_budget
+        ):
+            raise ValueError("payload budgetRef conflicts with pinned versionRefs.budget")
 
     @staticmethod
     def _require_usage(usage: Any) -> dict[str, int]:
