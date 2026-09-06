@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Sequence
@@ -104,6 +105,9 @@ class EvaluationJob:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS evaluation_lifecycle_attempts (job_id TEXT NOT NULL, stage TEXT NOT NULL, cell_key TEXT NOT NULL, attempt INTEGER NOT NULL, status TEXT NOT NULL, result_json TEXT NOT NULL DEFAULT '{}', error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(job_id, stage, cell_key, attempt))"
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS evaluation_lifecycle_bindings (job_id TEXT PRIMARY KEY, binding_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
             conn.commit()
 
     def _lifecycle_budget(self, job_id: str, limits: Mapping[str, int]) -> None:
@@ -143,14 +147,53 @@ class EvaluationJob:
             conn.commit()
             return True
 
+    def _lifecycle_attempt(self, job_id: str, stage: str, cell_key: str, attempt: int) -> tuple[str, dict[str, Any]] | None:
+        with self.store.connect() as conn:
+            row = conn.execute("SELECT status, result_json FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = ? AND cell_key = ? AND attempt = ?", (job_id, stage, cell_key, attempt)).fetchone()
+        if row is None:
+            return None
+        try:
+            result = json.loads(row["result_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result = {}
+        return str(row["status"]), result if isinstance(result, dict) else {}
+
+    @staticmethod
+    def _validate_lifecycle_receipt(stage: str, cell_key: str, result: Mapping[str, Any]) -> None:
+        if result.get("status") not in {"complete", "completed", "succeeded", "success"}:
+            raise EvaluationError("lifecycle callback did not return a successful receipt")
+        if result.get("stage") != stage or result.get("cellKey") != cell_key:
+            raise EvaluationError("lifecycle receipt is not bound to its stage and cell")
+        usage = result.get("usage")
+        if not isinstance(usage, Mapping) or any(not isinstance(usage.get(key), int) or isinstance(usage.get(key), bool) or usage[key] < 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]:
+            raise EvaluationError("lifecycle receipt usage is malformed")
+        tool_calls = result.get("toolCalls", 0)
+        if not isinstance(tool_calls, int) or isinstance(tool_calls, bool) or tool_calls < 0:
+            raise EvaluationError("lifecycle receipt tool calls are malformed")
+        cost = result.get("costMicrounits")
+        if cost is None:
+            if result.get("economicCostStatus") != "unknown":
+                raise EvaluationError("lifecycle receipt cost is missing")
+        elif isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0:
+            raise EvaluationError("lifecycle receipt cost is malformed")
+        wall = result.get("wallSeconds", 0)
+        if isinstance(wall, bool) or not isinstance(wall, (int, float)) or not math.isfinite(wall) or wall < 0:
+            raise EvaluationError("lifecycle receipt wall time is malformed")
+
     def _finish_lifecycle_launch(self, job_id: str, stage: str, cell_key: str, attempt: int, status: str, result: Mapping[str, Any] | None = None, error: str | None = None) -> None:
         payload = dict(result or {})
-        usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else payload
-        input_tokens = int(usage.get("inputTokens", 0) or 0)
-        output_tokens = int(usage.get("outputTokens", 0) or 0)
-        tool_calls = int(payload.get("toolCalls", 0) or 0)
+        current = self._lifecycle_attempt(job_id, stage, cell_key, attempt)
+        if current is not None and current[0] in {"complete", "failed"}:
+            return
+        if status == "complete":
+            self._validate_lifecycle_receipt(stage, cell_key, payload)
+        usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
+        input_tokens = usage.get("inputTokens", 0) if usage else 0
+        output_tokens = usage.get("outputTokens", 0) if usage else 0
+        tool_calls = payload.get("toolCalls", 0)
         wall_micros = int(float(payload.get("wallSeconds", 0) or 0) * 1_000_000)
-        cost = int(payload.get("costMicrounits", 0) or 0)
+        cost_value = payload.get("costMicrounits", 0)
+        cost = int(cost_value) if isinstance(cost_value, (int, float)) and not isinstance(cost_value, bool) else 0
         with self.store.connect() as conn:
             conn.execute("UPDATE evaluation_lifecycle_attempts SET status = ?, result_json = ?, error = ?, updated_at = datetime('now') WHERE job_id = ? AND stage = ? AND cell_key = ? AND attempt = ?", (status, json.dumps(payload, sort_keys=True, default=str), error, job_id, stage, cell_key, attempt))
             conn.execute("UPDATE evaluation_lifecycle_budget SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, tool_calls = tool_calls + ?, wall_micros = wall_micros + ?, cost_microunits = cost_microunits + ?, updated_at = datetime('now') WHERE job_id = ?", (input_tokens, output_tokens, tool_calls, wall_micros, cost, job_id))
@@ -197,12 +240,29 @@ class EvaluationJob:
             raise EvaluationError("lifecycle limits must be non-negative integer totals")
         self._lifecycle_budget(job_id, bound_limits)
         state = dict(context or {})
+        binding = {"protocol": self.protocol.start_candidate_generation().to_dict(), "stages": [{"name": stage.name, "cells": list(stage.cells), "retries": stage.retries} for stage in stages]}
+        encoded_binding = json.dumps(binding, sort_keys=True, default=str)
+        with self.store.connect() as conn:
+            existing_binding = conn.execute("SELECT binding_json FROM evaluation_lifecycle_bindings WHERE job_id = ?", (job_id,)).fetchone()
+            if existing_binding is None:
+                conn.execute("INSERT INTO evaluation_lifecycle_bindings(job_id, binding_json, updated_at) VALUES (?, ?, datetime('now'))", (job_id, encoded_binding))
+            elif existing_binding["binding_json"] != encoded_binding:
+                raise EvaluationError("lifecycle stages or frozen inputs are already bound differently")
+            conn.commit()
         with self.store.connect() as conn:
             completed_stages = []
             for stage in stages:
-                completed = conn.execute("SELECT COUNT(*) AS count FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = ? AND status = 'complete'", (job_id, stage.name)).fetchone()["count"]
-                if completed == len(stage.cells):
+                rows = conn.execute("SELECT cell_key, result_json FROM evaluation_lifecycle_attempts WHERE job_id = ? AND stage = ? AND status = 'complete'", (job_id, stage.name)).fetchall()
+                completed_cells = {row["cell_key"] for row in rows}
+                if completed_cells == set(stage.cells) and len(rows) == len(stage.cells):
                     completed_stages.append(stage.name)
+                for row in rows:
+                    try:
+                        value = json.loads(row["result_json"] or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        value = {}
+                    if isinstance(value, dict):
+                        state.setdefault("results", {}).setdefault(stage.name, {})[row["cell_key"]] = value
         state["completedStages"] = tuple(completed_stages)
         started = time.monotonic()
         self._save(job_id, "experiment", "running", runtime_accounting=self.lifecycle_accounting(job_id))
@@ -214,16 +274,36 @@ class EvaluationJob:
                     result: Mapping[str, Any] | None = None
                     for attempt in range(stage.retries + 1):
                         try:
+                            prior = self._lifecycle_attempt(job_id, stage.name, cell_key, attempt)
+                            if prior is not None:
+                                if prior[0] == "complete":
+                                    self._validate_lifecycle_receipt(stage.name, cell_key, prior[1])
+                                    result = prior[1]
+                                    break
+                                if prior[0] == "running":
+                                    raise EvaluationError(f"lifecycle attempt is still running: {stage.name}/{cell_key}/{attempt}")
+                                if prior[0] == "failed":
+                                    if attempt < stage.retries:
+                                        continue
+                                    raise EvaluationError(f"lifecycle attempt failed without a declared retry: {stage.name}/{cell_key}")
                             if not self._reserve_lifecycle_launch(job_id, stage.name, cell_key, attempt):
-                                result = {"status": "complete", "resumed": True}
+                                prior = self._lifecycle_attempt(job_id, stage.name, cell_key, attempt)
+                                if prior is None or prior[0] != "complete":
+                                    raise EvaluationError(f"lifecycle launch was not reusable: {stage.name}/{cell_key}/{attempt}")
+                                self._validate_lifecycle_receipt(stage.name, cell_key, prior[1])
+                                result = prior[1]
                                 break
                             result = stage.callback(cell_key, {**state, "stage": stage.name, "attempt": attempt})
                             if not isinstance(result, Mapping):
                                 raise EvaluationError("lifecycle callback must return an object")
+                            self._validate_lifecycle_receipt(stage.name, cell_key, result)
                             self._finish_lifecycle_launch(job_id, stage.name, cell_key, attempt, "complete", result)
                             break
                         except Exception as exc:
-                            self._finish_lifecycle_launch(job_id, stage.name, cell_key, attempt, "failed", result, str(exc))
+                            # A callback that fails validation did not produce a
+                            # chargeable receipt.  Persist the failed attempt,
+                            # but never derive accounting from malformed data.
+                            self._finish_lifecycle_launch(job_id, stage.name, cell_key, attempt, "failed", None, str(exc))
                             if attempt >= stage.retries:
                                 raise
                     state.setdefault("results", {}).setdefault(stage.name, {})[cell_key] = dict(result or {})
