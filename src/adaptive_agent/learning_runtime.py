@@ -114,6 +114,27 @@ class LearningRuntime:
         save = getattr(self.store, "save_learning_record", None)
         raw_records: list[Mapping[str, Any]] = []
 
+        # A completed run may have been projected by an earlier process whose
+        # source artifacts have since been compacted. Keep that projection as
+        # the restart source of truth and only fall back to raw CAS joins when
+        # no materialized records are available.
+        existing_reader = getattr(self.store, "list_learning_records", None)
+        existing_rows = existing_reader(environment_id=environment_id, run_id=run_id) if callable(existing_reader) else ()
+        existing_records: list[Mapping[str, Any]] = []
+        for row in existing_rows or ():
+            if not isinstance(row, Mapping):
+                continue
+            encoded = row.get("record_json")
+            if isinstance(encoded, str):
+                try:
+                    decoded = json.loads(encoded)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(decoded, Mapping):
+                    existing_records.append(decoded)
+            elif isinstance(row.get("kind"), str):
+                existing_records.append(row)
+
         def persist(record_id: str, record: Mapping[str, Any]) -> None:
             encoded = json.dumps(record, sort_keys=True, separators=(",", ":"))
             if callable(save):
@@ -135,6 +156,8 @@ class LearningRuntime:
             if not isinstance(manifest_ref, str):
                 raise LearningRuntimeError("completed run public manifest reference is missing")
             docs = [{**doc, "content": self.store.get_artifact(doc["sha256"])} for doc in manifest.get("docs", [])]
+        if not docs:
+            docs = [record for record in existing_records if record.get("kind") == "public_doc"]
         supplied_docs = {}
         for supplied in public_documents or ():
             if hasattr(supplied, "document_id"):
@@ -154,20 +177,23 @@ class LearningRuntime:
                     raise LearningRuntimeError(f"public document hash mismatch: {ref.get('id')}")
                 docs.append({**ref, "content": candidate_content})
         for doc in docs:
-            if not isinstance(doc, Mapping) or not isinstance(doc.get("id"), str):
+            doc_id = doc.get("id") if isinstance(doc, Mapping) else None
+            if not isinstance(doc_id, str) and isinstance(doc, Mapping):
+                doc_id = doc.get("sourceId")
+            if not isinstance(doc, Mapping) or not isinstance(doc_id, str):
                 raise LearningRuntimeError("public document projection is malformed")
             if "content" in doc:
                 stored_doc = doc["content"]
             else:
-                candidate = supplied_docs.get(doc["id"])
+                candidate = supplied_docs.get(doc_id)
                 if candidate is None:
-                    raise LearningRuntimeError(f"public document content is not stored: {doc['id']}")
+                    raise LearningRuntimeError(f"public document content is not stored: {doc_id}")
                 ref = self.store.put_artifact(candidate)
                 if ref.sha256 != doc.get("sha256"):
-                    raise LearningRuntimeError(f"public document hash mismatch: {doc['id']}")
+                    raise LearningRuntimeError(f"public document hash mismatch: {doc_id}")
                 stored_doc = self.store.get_artifact(doc["sha256"])
             doc_content = _artifact_text(stored_doc)
-            record = {"kind": "public_doc", "sourceId": doc["id"], "content": doc_content, "contentHash": content_hash(doc_content), "environmentId": environment_id, "visibility": "public"}
+            record = {"kind": "public_doc", "sourceId": doc_id, "content": doc_content, "contentHash": content_hash(doc_content), "environmentId": environment_id, "visibility": "public"}
             persist(f"learning-doc-{doc.get('sha256', content_hash(doc_content))}", record)
 
         trusted_outcome = self.store.get_outcome_by_run_id(run_id)
@@ -185,9 +211,7 @@ class LearningRuntime:
             persist(record_id, record)
         persisted_projection = []
         if not projected:
-            existing_reader = getattr(self.store, "list_learning_records", None)
-            existing = existing_reader(environment_id=environment_id, run_id=run_id) if callable(existing_reader) else ()
-            for record in existing:
+            for record in existing_records:
                 if not isinstance(record, Mapping) or record.get("kind") != "live_evidence" or not isinstance(record.get("sourceId"), str) or not record["sourceId"].startswith("broker:"):
                     continue
                 if record.get("environmentId") != environment_id or record.get("runId") != run_id or record.get("partition") != "development" or record.get("visibility") != "learner" or record.get("trustClass") != "broker" or record.get("trustedOutcome") is not True:

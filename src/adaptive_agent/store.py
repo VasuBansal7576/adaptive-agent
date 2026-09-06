@@ -638,6 +638,9 @@ class Store:
 
     # ------------------------------------------------------------------ learning records (session7 seam)
     def save_learning_record(self, record_id: str, environment_id: str, run_id: str, record_json: str) -> None:
+        """Persist one immutable learner projection for restart-safe learning."""
+        if not all(isinstance(value, str) and value for value in (record_id, environment_id, run_id, record_json)):
+            raise ValueError("learning record fields must be non-empty strings")
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO learning_records (record_id, environment_id, run_id, record_json, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -646,7 +649,7 @@ class Store:
             conn.commit()
 
     def list_learning_records(self, environment_id: str | None = None, run_id: str | None = None) -> list[dict[str, Any]]:
-        """Read-only learning-record query; filtered by env and/or run."""
+        """Read persisted records, with a safe legacy reconstruction fallback."""
         query = "SELECT * FROM learning_records WHERE 1=1"
         params: list[Any] = []
         if environment_id is not None:
@@ -658,7 +661,44 @@ class Store:
         query += " ORDER BY created_at"
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-            return [dict(r) for r in rows]
+        if rows:
+            return [dict(row) for row in rows]
+        if environment_id is None or run_id is None:
+            return []
+
+        records: list[dict[str, Any]] = []
+        environment = self.get_environment(environment_id)
+        if environment:
+            try:
+                manifest_ref = json.loads(environment["manifest_ref"])
+                manifest = self.get_artifact(manifest_ref["sha256"])
+                for ref in manifest.get("docs", []):
+                    if not isinstance(ref, dict):
+                        continue
+                    content = self.get_artifact(ref["sha256"])
+                    text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":"))
+                    records.append({"kind": "public_doc", "sourceId": ref.get("id", ref["sha256"]), "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "visibility": "public"})
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        trusted = self.has_trusted_outcome(run_id)
+        for row in self.list_evidence(run_id):
+            if row.get("visibility") != "learner":
+                continue
+            try:
+                source = json.loads(row["source_ref"])
+                content = self.get_artifact(source["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":"))
+            provenance = self.evidence_provenance(row["evidence_id"])
+            if not provenance or provenance.get("environment_id") != environment_id or provenance.get("partition") != "development":
+                continue
+            content_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            records.append({"kind": "live_evidence", "sourceId": row["evidence_id"], "content": text, "contentHash": content_digest, "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": row.get("trust_class"), "trustedOutcome": trusted})
+        if trusted:
+            text = "A trusted evaluator outcome is stored for this development run."
+            records.append({"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True})
+        return records
 
     # ------------------------------------------------------------------ generic helpers
     def _insert_json(self, table: str, id_col: str, obj_id: str, data: dict[str, Any]) -> None:
