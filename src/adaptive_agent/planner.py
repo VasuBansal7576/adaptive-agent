@@ -14,6 +14,7 @@ import inspect
 import json
 import os
 import re
+import selectors
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -108,6 +109,24 @@ class LunaInvocation:
 def _bounded_text(value: Any, limit: int) -> str:
     text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
     return text[:limit]
+
+
+def _bounded_usage(value: Any, *, max_keys: int = 32, max_value_chars: int = 256) -> Mapping[str, Any]:
+    """Retain accounting fields without allowing provider metadata to grow unbounded."""
+    if not isinstance(value, Mapping):
+        return {}
+    bounded: dict[str, Any] = {}
+    for index, (key, item) in enumerate(value.items()):
+        if index >= max_keys:
+            break
+        name = _bounded_text(key, 128)
+        if isinstance(item, Mapping):
+            bounded[name] = dict(_bounded_usage(item, max_keys=8, max_value_chars=max_value_chars))
+        elif isinstance(item, (str, int, float, bool)) or item is None:
+            bounded[name] = item if not isinstance(item, str) else item[:max_value_chars]
+        else:
+            bounded[name] = _bounded_text(item, max_value_chars)
+    return bounded
 
 
 def _redact(value: Any) -> Any:
@@ -245,20 +264,59 @@ class PrimeCliModelClient:
         except OSError as exc:
             raise PlannerError(f"unable to launch Prime CLI: {exc}") from exc
 
-        stdout = ""
-        stderr = ""
+        final: dict[str, Any] | None = None
+        stderr_tail = bytearray()
+        streams: dict[int, tuple[Any, bytearray]] = {}
+        selector = selectors.DefaultSelector()
+        if process.stdout is not None:
+            os.set_blocking(process.stdout.fileno(), False)
+            streams[process.stdout.fileno()] = (process.stdout, bytearray())
+            selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        if process.stderr is not None:
+            os.set_blocking(process.stderr.fileno(), False)
+            streams[process.stderr.fileno()] = (process.stderr, bytearray())
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+
+        def consume_stdout_line(line: bytes) -> None:
+            nonlocal final
+            try:
+                event = json.loads(line.decode("utf-8", errors="replace"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return
+            if not isinstance(event, Mapping) or event.get("type") != "message_end":
+                return
+            message = event.get("message")
+            if not isinstance(message, Mapping) or message.get("role") != "assistant":
+                return
+            text = _message_text(message)
+            if not text:
+                return
+            provider, model = _canonical_model(message.get("provider"), message.get("model"))
+            response_id = message.get("responseId", message.get("response_id"))
+            if not isinstance(response_id, str) or not response_id.strip():
+                return
+            final = {
+                "provider": provider,
+                "model": model,
+                "responseId": _bounded_text(response_id, 512),
+                "text": _bounded_text(text, self.max_output_chars),
+                "usage": dict(_bounded_usage(message.get("usage"))),
+            }
 
         def stop_process() -> None:
             if process.poll() is None:
                 process.terminate()
                 try:
-                    process.communicate(timeout=1)
+                    process.wait(timeout=1)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    process.communicate()
+                    process.wait()
+            for stream, _ in streams.values():
+                stream.close()
 
         try:
-            while True:
+            max_line_bytes = max(self.max_output_chars * 8, 1_048_576)
+            while streams:
                 if cancel is not None and cancel.is_set():
                     stop_process()
                     raise PlannerCancelled("model call cancelled")
@@ -266,20 +324,56 @@ class PrimeCliModelClient:
                 if remaining is not None and remaining <= 0:
                     stop_process()
                     raise PlannerTimedOut("model call exceeded deadline")
-                try:
-                    stdout, stderr = process.communicate(timeout=min(0.1, remaining) if remaining is not None else 0.1)
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
+                timeout = min(0.1, remaining) if remaining is not None else 0.1
+                for selected, _ in selector.select(timeout):
+                    stream = selected.fileobj
+                    descriptor = stream.fileno()
+                    try:
+                        chunk = os.read(descriptor, 65_536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(stream)
+                        stream_info = streams.pop(descriptor, None)
+                        if stream_info is not None and selected.data == "stdout":
+                            buffer = stream_info[1]
+                            if buffer:
+                                consume_stdout_line(bytes(buffer))
+                        continue
+                    stream_info = streams.get(descriptor)
+                    if stream_info is None:
+                        continue
+                    buffer = stream_info[1]
+                    if selected.data == "stderr":
+                        stderr_tail.extend(chunk)
+                        del stderr_tail[:-8_192]
+                        continue
+                    buffer.extend(chunk)
+                    if len(buffer) > max_line_bytes:
+                        # A pathological single event cannot consume the parent
+                        # process. Discard that event and resume at its newline.
+                        newline = buffer.rfind(b"\n")
+                        if newline >= 0:
+                            del buffer[: newline + 1]
+                        else:
+                            buffer.clear()
+                    while True:
+                        newline = buffer.find(b"\n")
+                        if newline < 0:
+                            break
+                        line = bytes(buffer[:newline])
+                        del buffer[: newline + 1]
+                        consume_stdout_line(line)
+            process.wait()
         except (PlannerCancelled, PlannerTimedOut):
             stop_process()
             raise
-        if len(stdout) > self.max_output_chars:
-            raise PlannerError("Prime CLI output exceeds the configured limit")
         if process.returncode != 0:
-            detail = stderr.strip()[-2_000:]
+            detail = bytes(stderr_tail).decode("utf-8", errors="replace").strip()[-2_000:]
             raise PlannerError(f"Prime CLI exited with status {process.returncode}: {detail}")
-        return self._parse_events(stdout)
+        if final is None:
+            raise PlannerError("Prime CLI JSON stream did not contain a final assistant message")
+        return final
 
     @staticmethod
     def _parse_events(stdout: str) -> Mapping[str, Any]:
@@ -548,13 +642,25 @@ def make_luna_model_runner(
                         observed["model"] = MODEL_NAME
                 return raw
 
-        result = LunaPlanner(
-            RecordingClient(),
-            kernel,
-            evidence_sink,
-            limits=limits,
-            emit=lambda event: emit(event.kind, event.summary, event.detail),
-        ).run(goal=goal, environment=environment)
+        try:
+            result = LunaPlanner(
+                RecordingClient(),
+                kernel,
+                evidence_sink,
+                limits=limits,
+                emit=lambda event: emit(event.kind, event.summary, event.detail),
+            ).run(goal=goal, environment=environment)
+        except Exception as exc:
+            # A kernel/evaluator failure must not erase the provider usage that
+            # was already observed by the trusted parent.
+            if observed:
+                setattr(exc, "model_observation", {
+                    "provider": observed.get("provider"),
+                    "model": observed.get("model"),
+                    "responseId": observed.get("responseId", observed.get("response_id")),
+                    "usage": dict(_bounded_usage(observed.get("usage"))),
+                })
+            raise
         if result.status != "succeeded":
             raise PlannerError(f"planner ended with status {result.status}")
         provider, model, response_id, usage, answer = observed.get("provider"), observed.get("model"), observed.get("responseId", observed.get("response_id")), observed.get("usage"), result.answer

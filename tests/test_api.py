@@ -92,6 +92,22 @@ def test_unknown_manifest_fields_are_rejected():
     assert api.post("/environments/register", json={**manifest(), "executionModes": ["host"]}).status_code == 422
 
 
+def test_registration_and_run_resolve_complete_trusted_references():
+    api = client()
+    unknown = {**manifest(), "environmentId": "unknown-ref-env", "evaluatorRef": {"id": "missing-evaluator", "version": "1", "sha256": "e"}}
+    assert api.post("/environments/register", json=unknown).status_code == 422
+    run = api.post("/runs", json={
+        "goal": "read the counter", "environmentId": "neutral", "idempotencyKey": "missing-profile",
+        "modelProfileRef": {"id": "model", "version": "1"},
+    })
+    assert run.status_code == 422
+    valid = api.post("/runs", json={"goal": "read the counter", "environmentId": "neutral", "idempotencyKey": "full-profile"})
+    assert valid.status_code == 201
+    stored = api.get(f"/runs/{valid.json()['runId']}").json()
+    assert set(stored["modelProfileRef"]) == {"id", "version", "sha256"}
+    assert set(stored["budgetRef"]) == {"id", "version", "sha256"}
+
+
 def test_unverified_model_provenance_fails_closed():
     class Unverified:
         text = "done"

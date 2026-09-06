@@ -17,7 +17,7 @@ from pydantic import BaseModel as _BaseModel, Field, field_validator, model_vali
 
 
 class BaseModel(_BaseModel):
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
 Visibility = Literal["learner", "operator", "evaluator_only"]
@@ -71,12 +71,24 @@ class EnvironmentManifest(BaseModel):
     policy_ref: ArtifactRef = Field(..., alias="policyRef")
     evaluator_ref: ArtifactRef = Field(..., alias="evaluatorRef")
     reset_ref: ArtifactRef = Field(..., alias="resetRef")
+    execution_modes: list[str] = Field(default_factory=lambda: ["interactive"], alias="executionModes")
     capabilities: list[str] = Field(default_factory=list)
 
     @field_validator("docs", "tool_schemas", mode="before")
     @classmethod
     def ensure_list(cls, v: Any) -> Any:
         return v if v is not None else []
+
+    @model_validator(mode="after")
+    def validate_boundary(self) -> "EnvironmentManifest":
+        if not self.docs:
+            raise ValueError("at least one document reference is required")
+        if not self.tool_schemas:
+            raise ValueError("at least one tool schema is required")
+        allowed = {"interactive", "batch", "dry_run", "replay"}
+        if not self.execution_modes or any(mode not in allowed for mode in self.execution_modes):
+            raise ValueError("executionModes contains an unsupported mode")
+        return self
 
 
 class TaskInput(BaseModel):
@@ -95,6 +107,13 @@ class Budget(BaseModel):
     max_child_depth: int = 1
     max_model_cost: float | None = None
     max_model_tokens: int | None = None
+
+    @model_validator(mode="after")
+    def validate_nonnegative(self) -> "Budget":
+        values = (self.max_tool_calls, self.max_wall_seconds, self.max_concurrent_children, self.max_child_depth, self.max_model_cost, self.max_model_tokens)
+        if any(value is not None and value < 0 for value in values):
+            raise ValueError("budget limits must be non-negative")
+        return self
 
 
 class RunRequest(BaseModel):
@@ -191,7 +210,7 @@ class RunStatus(str, Enum):
 
 
 class RunRecord(BaseModel):
-    run_id: str = Field(default_factory=lambda: new_id("run_"))
+    run_id: str = Field(default_factory=lambda: new_id("run_"), alias="runId")
     task_ref: ArtifactRef = Field(..., alias="taskRef")
     environment_ref: ArtifactRef = Field(..., alias="environmentRef")
     policy_ref: ArtifactRef = Field(..., alias="policyRef")
@@ -207,7 +226,7 @@ class RunRecord(BaseModel):
 
 
 class StepRecord(BaseModel):
-    step_id: str = Field(default_factory=lambda: new_id("step_"))
+    step_id: str = Field(default_factory=lambda: new_id("step_"), alias="stepId")
     run_id: str = Field(..., alias="runId")
     sequence: int
     kind: StepKind

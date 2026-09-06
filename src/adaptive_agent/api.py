@@ -283,7 +283,7 @@ def default_evaluator(*, goal: str, model_output: str, environment: JsonObject) 
 
 
 class ControlPlane:
-    def __init__(self, model_runner: ModelRunner = unavailable_model, evaluator: OutcomeEvaluator = default_evaluator) -> None:
+    def __init__(self, model_runner: ModelRunner = unavailable_model, evaluator: OutcomeEvaluator = default_evaluator, *, seed_test_references: bool = True, default_model_ref: JsonObject | None = None, default_budget_ref: JsonObject | None = None) -> None:
         self.model_runner = model_runner
         self.evaluator = evaluator
         self.environments: dict[str, JsonObject] = {}
@@ -300,6 +300,50 @@ class ControlPlane:
         # Held by the local operator session and never returned in a JSON
         # response or passed into the learner/runtime process.
         self.operator_token = secrets.token_urlsafe(32)
+        self.default_model_ref = default_model_ref or _ref("model-profile", "1")
+        self.default_budget_ref = default_budget_ref or _ref("budget-default", "1")
+        # References are resolved by the trusted control plane.  A non-empty
+        # identifier is not proof that an evaluator, policy, document, model,
+        # or budget exists.  The executable factory adds its fixture refs here.
+        self._trusted_refs: dict[str, set[tuple[str, str, str]]] = {kind: set() for kind in ("docs", "policy", "evaluator", "reset", "model", "budget")}
+        if seed_test_references:
+            self._trusted_refs.update({
+                "docs": {("docs-neutral", "1", "d"), ("console-docs", "1", _hash("console-docs"))},
+                "policy": {("policy", "1", "p")},
+                "evaluator": {("evaluator", "1", "e")},
+                "reset": {("reset", "1", "r")},
+                "model": {("model", "1", "m"), ("model-profile", "1", _hash("model-profile"))},
+                "budget": {("budget", "1", "b"), ("budget-default", "1", _hash("budget-default"))},
+            })
+
+    def trust_reference(self, kind: str, reference: Mapping[str, Any]) -> None:
+        """Register a fully addressed trusted artifact/profile for this process."""
+        if kind not in self._trusted_refs:
+            raise ValueError(f"unknown reference kind: {kind}")
+        if not isinstance(reference, Mapping) or set(reference) != {"id", "version", "sha256"}:
+            raise ValueError(f"{kind} reference must contain id, version, and sha256")
+        key = tuple(reference.get(name) for name in ("id", "version", "sha256"))
+        if not all(isinstance(item, str) and item.strip() for item in key):
+            raise ValueError(f"{kind} reference fields must be non-empty strings")
+        self._trusted_refs[kind].add((key[0], key[1], key[2]))
+
+    def _reference_key(self, value: Any, kind: str) -> tuple[str, str, str]:
+        if not isinstance(value, Mapping) or set(value) != {"id", "version", "sha256"}:
+            raise ValueError(f"{kind} reference must contain id, version, and sha256")
+        key = tuple(value.get(name) for name in ("id", "version", "sha256"))
+        if not all(isinstance(item, str) and item.strip() for item in key):
+            raise ValueError(f"{kind} reference fields must be non-empty strings")
+        typed = (key[0], key[1], key[2])
+        if typed not in self._trusted_refs[kind]:
+            raise ValueError(f"unknown trusted {kind} reference: {typed[0]}@{typed[1]}")
+        return typed
+
+    def validate_registration(self, payload: EnvironmentRegistration) -> None:
+        for document in payload.docs:
+            self._reference_key(document, "docs")
+        self._reference_key(payload.policy_ref, "policy")
+        self._reference_key(payload.evaluator_ref, "evaluator")
+        self._reference_key(payload.reset_ref, "reset")
 
     def create_candidate(self, payload: CandidateProposalRequest) -> JsonObject:
         with self._lock:
@@ -403,13 +447,14 @@ class ControlPlane:
 
     def register_environment(self, payload: EnvironmentRegistration) -> JsonObject:
         with self._lock:
+            self.validate_registration(payload)
             key = f"{payload.environment_id}@{payload.version}"
             manifest = payload.model_dump(by_alias=True, mode="json")
             summary = {
                 "environmentId": payload.environment_id,
                 "version": payload.version,
-                "validationState": "valid",
-                "evaluatorReady": payload.evaluator_ref.get("id") not in {None, "", "unconfigured"},
+                "validationState": "ready",
+                "evaluatorReady": True,
                 "toolCount": len(payload.tool_schemas),
                 "policyScope": str(payload.policy_ref.get("id", "")),
             }
@@ -427,7 +472,14 @@ class ControlPlane:
                 raise KeyError("environment is not registered")
             if payload.execution_mode not in env["manifest"].get("executionModes", ["interactive"]):
                 raise ValueError("execution mode is not declared by environment")
-            canonical = _hash(payload.model_dump(by_alias=True, mode="json"))
+            model_ref = payload.model_profile_ref or self.default_model_ref
+            budget_ref = payload.budget_ref or self.default_budget_ref
+            self._reference_key(model_ref, "model")
+            self._reference_key(budget_ref, "budget")
+            canonical_payload = payload.model_dump(by_alias=True, mode="json")
+            canonical_payload["modelProfileRef"] = model_ref
+            canonical_payload["budgetRef"] = budget_ref
+            canonical = _hash(canonical_payload)
             prior = self.idempotency.get(payload.idempotency_key)
             if prior:
                 prior_run_id, prior_hash = prior
@@ -441,9 +493,9 @@ class ControlPlane:
                 "taskRef": _ref(f"task_{run_id}", "1", {"goal": payload.goal}),
                 "environmentRef": env_ref,
                 "policyRef": env["manifest"]["policyRef"],
-                "modelProfileRef": payload.model_profile_ref or _ref("model-profile", "1"),
+                "modelProfileRef": model_ref,
                 "skillBundleRef": _ref("bundle-active", "1"),
-                "budgetRef": payload.budget_ref or _ref("budget-default", "1"),
+                "budgetRef": budget_ref,
                 "status": "queued",
                 "lastEventSequence": 0,
                 "environmentId": payload.environment_id,
@@ -482,6 +534,7 @@ class ControlPlane:
                 raise KeyError("environment is not registered")
             run["status"] = "running"
             self._emit(run_id, "status", f"Run started in {run['executionMode']} mode with authenticated model runner.")
+        invocation: ModelInvocation | None = None
         try:
             invocation = self.model_runner(goal=run["goal"], environment=env["manifest"], emit=lambda k, s, d=None: self._emit(run_id, k, s, d))
             provider = getattr(invocation, "provider", "")
@@ -510,6 +563,12 @@ class ControlPlane:
         except Exception as exc:  # operational failures become observable run failures
             with self._lock:
                 run["status"] = "failed"
+            # Planner adapters attach the already-authenticated model envelope
+            # when a later kernel/evaluator step fails. Retain that accounting
+            # evidence even though no final invocation was returned.
+            observation = getattr(exc, "model_observation", None)
+            if isinstance(observation, Mapping) and observation.get("usage"):
+                self._emit(run_id, "evidence", "Authenticated model usage retained after downstream failure.", json.dumps(dict(observation), sort_keys=True))
             self._emit(run_id, "status", "Run failed: execution error.", str(exc), {"code": "TOOL_UNAVAILABLE", "message": str(exc), "correlationId": uuid.uuid4().hex, "retry": "never"})
 
     def cancel(self, run_id: str) -> JsonObject:
@@ -563,16 +622,18 @@ def _has_operator_session(request: Request, plane: ControlPlane) -> bool:
     return secrets.compare_digest(token or cookie, plane.operator_token)
 
 
-def create_app(control: ControlPlane | None = None) -> FastAPI:
+def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | None = None) -> FastAPI:
     plane = control or ControlPlane()
     app = FastAPI(title="Adaptive Agent Control API", version="0.1.0")
     app.state.control_plane = plane
+    app.state.durable_runtime = durable_runtime
+    runtime = durable_runtime
 
     @app.middleware("http")
     async def access_boundary(request: Request, call_next: Callable[..., Any]) -> Any:
         if not _same_loopback_origin(request):
             return JSONResponse(status_code=403, content={"code": "FORBIDDEN", "message": "control API requires a loopback Host and same-origin request", "correlationId": uuid.uuid4().hex, "retry": "never"})
-        if request.url.path in {"/health", "/session/bootstrap"}:
+        if request.url.path in {"/", "/index.html", "/health", "/session/bootstrap"} or request.url.path.startswith("/assets/"):
             return await call_next(request)
         if not _has_operator_session(request, plane):
             return JSONResponse(status_code=401, content={"code": "FORBIDDEN", "message": "operator session required", "correlationId": uuid.uuid4().hex, "retry": "never"})
@@ -595,6 +656,8 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
 
     @app.get("/environments")
     def environments() -> list[JsonObject]:
+        if runtime is not None:
+            return runtime.list_environments()
         return plane.list_environments()
 
     @app.post("/environments/validate")
@@ -637,34 +700,58 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
                 taskGoals=json.loads(value["taskGoals"]) if value["taskGoals"].lstrip().startswith("[") else [value["taskGoals"]],
                 policyRef=refs, evaluatorRef=evaluator, resetRef=reset,
             )
+            # Resolve the same trusted references used by registration.  The
+            # form never gets a readiness result merely because fields are non-empty.
+            plane.validate_registration(EnvironmentRegistration(
+                environmentId=value["environmentId"], version=value["version"], toolSchemas=schemas,
+                docs=[{"id": "console-docs", "version": value["version"], "sha256": _hash(value["toolSchemas"])}],
+                taskGoals=json.loads(value["taskGoals"]) if value["taskGoals"].lstrip().startswith("[") else [value["taskGoals"]],
+                policyRef=refs, evaluatorRef=evaluator, resetRef=reset,
+            ))
         except (json.JSONDecodeError, ValueError, ValidationError) as exc:
             return {"ok": False, "missingFields": ["toolSchemas" if "tool" in str(exc).lower() else "manifest"]}
         return {"ok": True, "missingFields": []}
 
     @app.post("/environments/register", status_code=201)
     def register_environment(payload: EnvironmentRegistration) -> JsonObject:
-        return plane.register_environment(payload)
+        try:
+            return plane.register_environment(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Keep the resource-style route as a compatibility alias for clients that
     # model registration as creation.  Both routes use the same strict model.
     @app.post("/environments", status_code=201)
     def register_environment(payload: EnvironmentRegistration) -> JsonObject:
-        return plane.register_environment(payload)
+        try:
+            return plane.register_environment(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/environments/form", status_code=201, include_in_schema=False)
     def register_environment_form(payload: EnvironmentFormRegistration) -> JsonObject:
         try:
-            return plane.register_environment(payload.manifest())
+            manifest = payload.manifest()
+            # Console-generated document content is trusted by this boundary.
+            plane.trust_reference("docs", manifest.docs[0])
+            return plane.register_environment(manifest)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/runs")
     def runs() -> list[JsonObject]:
+        if runtime is not None:
+            return runtime.list_runs()
         with plane._lock:
             return [dict(run) for run in plane.runs.values()]
 
     @app.get("/runs/{run_id}")
     def get_run(run_id: str) -> JsonObject:
+        if runtime is not None:
+            run = runtime.get_run(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            return run
         with plane._lock:
             run = plane.runs.get(run_id)
             if run is None:
@@ -673,6 +760,10 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
 
     @app.get("/runs/{run_id}/evidence")
     def run_evidence(run_id: str) -> list[JsonObject]:
+        if runtime is not None:
+            if runtime.get_run(run_id) is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            return [event for event in runtime.events(run_id) if event.get("event") != "outcome_recorded"]
         with plane._lock:
             if run_id not in plane.runs:
                 raise HTTPException(status_code=404, detail="run not found")
@@ -682,6 +773,8 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
     @app.post("/runs", status_code=201)
     def create_run(payload: CreateRunRequest) -> JsonObject:
         try:
+            if runtime is not None:
+                return runtime.create_run(payload)
             run, existing = plane.create_run(payload)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -693,6 +786,11 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
 
     @app.post("/runs/{run_id}/launch", status_code=202)
     def launch_run(run_id: str, background: BackgroundTasks) -> JsonObject:
+        if runtime is not None:
+            if runtime.get_run(run_id) is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            background.add_task(runtime.launch, run_id)
+            return {"runId": run_id, "status": "accepted"}
         if run_id not in plane.runs:
             raise HTTPException(status_code=404, detail="run not found")
         background.add_task(plane.launch, run_id)
@@ -700,6 +798,24 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
 
     @app.get("/runs/{run_id}/events")
     def run_events(run_id: str, cursor: int = Query(0, ge=0)) -> StreamingResponse:
+        if runtime is not None:
+            if runtime.get_run(run_id) is None:
+                raise HTTPException(status_code=404, detail="run not found")
+
+            async def durable_stream() -> AsyncIterator[str]:
+                sent = cursor
+                while True:
+                    events = runtime.events(run_id, sent)
+                    run = runtime.get_run(run_id)
+                    for event in events:
+                        sent = int(event["id"])
+                        yield f"id: {sent}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
+                    if run is None or run.get("status") in {"succeeded", "failed", "cancelled", "timed_out"}:
+                        if not events:
+                            break
+                    await asyncio.sleep(0.05)
+
+            return StreamingResponse(durable_stream(), media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no"})
         if run_id not in plane.runs:
             raise HTTPException(status_code=404, detail="run not found")
 
@@ -721,6 +837,8 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
     @app.post("/runs/{run_id}/cancel")
     def cancel_run(run_id: str) -> JsonObject:
         try:
+            if runtime is not None:
+                return runtime.cancel(run_id)
             return plane.cancel(run_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -738,6 +856,13 @@ def create_app(control: ControlPlane | None = None) -> FastAPI:
             return {"runId": run_id, "approvalId": approval_id, "approved": payload.approve}
 
     def _launch_learning(payload: LearningRequest) -> JsonObject:
+        if runtime is not None:
+            run = runtime.get_run(payload.run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            artifact = runtime.controller.store.put_artifact({"runId": payload.run_id, "predictedEffect": payload.predicted_effect, "evidenceIds": payload.evidence_ids})
+            runtime.controller.append_event(payload.run_id, "learning_proposal", {"predictedEffect": payload.predicted_effect, "evidenceIds": payload.evidence_ids, "proposalRef": artifact.model_dump(mode="json", by_alias=True)}, "learner", "operator")
+            return {"actionId": f"learn_{uuid.uuid4().hex}", "runId": payload.run_id, "predictedEffect": payload.predicted_effect, "evidenceIds": payload.evidence_ids, "proposalRef": artifact.model_dump(mode="json", by_alias=True), "status": "staged", "createdAt": _now()}
         if payload.run_id not in plane.runs:
             raise HTTPException(status_code=404, detail="run not found")
         action = {"actionId": f"learn_{uuid.uuid4().hex}", "runId": payload.run_id, "predictedEffect": payload.predicted_effect, "evidenceIds": payload.evidence_ids, "status": "staged", "createdAt": _now()}

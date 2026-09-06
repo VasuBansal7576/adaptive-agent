@@ -135,6 +135,23 @@ def test_prime_cli_client_parses_json_lines_and_normalizes_bare_model(tmp_path, 
     assert result["usage"]["totalTokens"] == 10
 
 
+def test_prime_cli_client_discards_unbounded_intermediate_jsonl_events(tmp_path):
+    executable = tmp_path / "prime-agent-many-events"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "for _ in range(3000):\n"
+        " print(json.dumps({'type':'message_update','message':{'role':'assistant','content':[{'type':'text','text':'x'*100}]}}))\n"
+        "print(json.dumps({'type':'message_end','message':{'role':'assistant','provider':'openai-codex','model':'gpt-5.6-luna','responseId':'bounded','content':[{'type':'text','text':'{\\\"action\\\":\\\"finish\\\",\\\"answer\\\":\\\"ok\\\"}'}],'usage':{'totalTokens':17}}}))\n"
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    result = PrimeCliModelClient(executable=str(executable), coding_agent_dir=tmp_path, max_output_chars=64).invoke(
+        goal="goal", environment={}, messages=[], remaining_deadline=5
+    )
+    assert result["text"] == '{"action":"finish","answer":"ok"}'
+    assert result["usage"] == {"totalTokens": 17}
+
+
 def test_model_usage_is_recorded_before_token_cap_rejection():
     client = Client([response("r1", '{"action":"finish","answer":"done"}')])
     sink = Sink()

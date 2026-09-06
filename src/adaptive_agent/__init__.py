@@ -12,6 +12,8 @@ from .models import (
     EvidenceRecord, PromotionDecision, RunRequest, TaskInput, ToolRequest, ToolResult,
 )
 
+Capability = PrimeCapability
+
 _API_EXPORTS = {"ControlPlane", "app", "create_app", "make_authenticated_model_runner"}
 
 
@@ -24,6 +26,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "AdapterError", "ArtifactRef", "PrimeArtifactRef", "PrimeCapability", "CapabilityBroker", "CapabilitySet",
+    "Capability",
     "ControlPlane", "PrimeExecutionMode", "ExecutionResult", "LunaPlanner", "PrimeCliModelClient", "ModelObservation",
     "PlannerError", "PlannerLimits", "PlannerResult", "PrimeRuntimeAdapter", "LunaInvocation", "make_luna_model_runner",
     "PrimeRuntimeConfig", "SecurityViolation", "app", "create_app", "make_authenticated_model_runner",
