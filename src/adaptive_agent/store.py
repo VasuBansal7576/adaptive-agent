@@ -172,6 +172,10 @@ class Store:
                     environment_id TEXT NOT NULL,
                     task_id TEXT NOT NULL,
                     partition TEXT NOT NULL,
+                    benchmark_id TEXT,
+                    arm TEXT,
+                    seed INTEGER,
+                    owner_id TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     state_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL
@@ -323,11 +327,74 @@ class Store:
     def get_task_run(self, task_run_id: str) -> dict[str, Any] | None:
         return self._get_json("task_runs", "task_run_id", task_run_id)
 
+    def claim_benchmark_task_run(
+        self,
+        task_run_id: str,
+        *,
+        benchmark_id: str,
+        environment_id: str,
+        task_id: str,
+        partition: str,
+        arm: str | None = None,
+        seed: int | None = None,
+        owner_id: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Single-owner claim for a benchmark task run.
+
+        Fresh insert -> (True, row) with status 'running' bound to owner_id.
+        Same-owner re-claim (restart/resume) -> (False, existing row).
+        Different owner while the row exists -> (False, existing row); the
+        caller sees the foreign owner and must not take over.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)
+                ).fetchone()
+                if existing is not None:
+                    conn.commit()
+                    return False, dict(existing)
+                conn.execute(
+                    "INSERT INTO task_runs (task_run_id, environment_id, task_id, partition, benchmark_id, arm, seed, owner_id, status, state_json, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', '{}', ?)",
+                    (task_run_id, environment_id, task_id, partition, benchmark_id, arm, seed, owner_id, _utcnow()),
+                )
+                conn.commit()
+                return True, dict(conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone())
+            except Exception:
+                conn.rollback()
+                raise
+
+    def release_task_run(self, task_run_id: str, owner_id: str, status: str, state_json: str | None = None) -> bool:
+        """Owner-guarded status transition; refuses writes from other owners."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT owner_id FROM task_runs WHERE task_run_id = ?", (task_run_id,)
+                ).fetchone()
+                if row is None or row["owner_id"] != owner_id:
+                    conn.rollback()
+                    return False
+                conn.execute(
+                    "UPDATE task_runs SET status = ?, state_json = COALESCE(?, state_json), updated_at = ? WHERE task_run_id = ?",
+                    (status, state_json, _utcnow(), task_run_id),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+
     def list_task_runs(
         self,
         environment_id: str | None = None,
         partition: str | None = None,
         status: str | None = None,
+        benchmark_id: str | None = None,
+        arm: str | None = None,
+        owner_id: str | None = None,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM task_runs WHERE 1=1"
         params: list[Any] = []
@@ -340,6 +407,15 @@ class Store:
         if status is not None:
             query += " AND status = ?"
             params.append(status)
+        if benchmark_id is not None:
+            query += " AND benchmark_id = ?"
+            params.append(benchmark_id)
+        if arm is not None:
+            query += " AND arm = ?"
+            params.append(arm)
+        if owner_id is not None:
+            query += " AND owner_id = ?"
+            params.append(owner_id)
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]

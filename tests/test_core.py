@@ -605,6 +605,32 @@ class TestControllerSeam:
         store2 = Store(workspace)
         assert store2.reserve_allocation("scope", "alloc-2", panels, 3) is None  # restart-safe
 
+    def test_benchmark_task_run_owner_semantics(self, store: Store, workspace):
+        # Single-owner claim with benchmark/arm/seed metadata.
+        claimed, row = store.claim_benchmark_task_run(
+            "btr-1", benchmark_id="bench-1", environment_id=ENV,
+            task_id="t1", partition="validation", arm="B0", seed=42, owner_id="driver-a",
+        )
+        assert claimed and row["owner_id"] == "driver-a" and row["arm"] == "B0" and row["seed"] == 42
+        # Same-owner re-claim resumes; foreign owner refused takeover.
+        again, row = store.claim_benchmark_task_run(
+            "btr-1", benchmark_id="bench-1", environment_id=ENV,
+            task_id="t1", partition="validation", arm="B0", seed=42, owner_id="driver-a",
+        )
+        assert not again and row["owner_id"] == "driver-a"
+        foreign, row = store.claim_benchmark_task_run(
+            "btr-1", benchmark_id="bench-1", environment_id=ENV,
+            task_id="t1", partition="validation", arm="B0", seed=42, owner_id="driver-b",
+        )
+        assert not foreign and row["owner_id"] == "driver-a"
+        # Owner-guarded release.
+        assert not store.release_task_run("btr-1", "driver-b", "complete")
+        assert store.release_task_run("btr-1", "driver-a", "complete")
+        # Restart durability + scoped listing.
+        store2 = Store(workspace)
+        rows = store2.list_task_runs(benchmark_id="bench-1", arm="B0")
+        assert [r["task_run_id"] for r in rows] == ["btr-1"] and rows[0]["status"] == "complete"
+
     def test_dev_smoke_gate_and_learner_hiding(self, store, registry, broker):
         from adaptive_agent.controller import Controller
         from adaptive_agent.models import Budget, ModelProfile, RunRequest
