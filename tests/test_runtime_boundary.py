@@ -7,6 +7,7 @@ it is skipped here and runs when this file is applied to that runtime branch.
 
 from __future__ import annotations
 
+from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
@@ -52,13 +53,15 @@ def test_runtime_retry_uses_fresh_run_identity_after_pre_receipt_failure(tmp_pat
         bundle_hash = bundle["content_hash"]
 
     def config(attempt: int) -> FrozenExecutionConfig:
-        return FrozenExecutionConfig(
-            protocol.start_candidate_generation(),
-            Arm.B0,
-            17,
-            bundle_hash,
-            attempt=attempt,
-        )
+        values = {
+            "protocol": protocol.start_candidate_generation(),
+            "arm": Arm.B0,
+            "seed": 17,
+            "bundle_hash": bundle_hash,
+        }
+        if any(field.name == "attempt" for field in fields(FrozenExecutionConfig)):
+            values["attempt"] = attempt
+        return FrozenExecutionConfig(**values)
 
     with pytest.raises(ValueError, match="trusted model and outcome evidence"):
         runtime.execute_evaluation_task(task, config(0), bundle)
