@@ -591,6 +591,8 @@ class Controller:
 
     # ------------------------------------------------------------------ evidence / SSE
     def append_event(self, run_id: str, event_type: str, payload: dict[str, Any], trust_class: str, visibility: str) -> EvidenceRecord:
+        if event_type == "model_observation":
+            raise ValueError("model_observation is not a canonical evidence event; use model_response")
         # Sanitized feedback boundary: learner-visible events never carry
         # credential-shaped values.
         if visibility == "learner":
@@ -637,6 +639,8 @@ class Controller:
             {
                 "id": r["sequence"],
                 "event": r["event_type"],
+                "eventType": r["event_type"],
+                "visibility": r["visibility"],
                 "data": r,
             }
             for r in rows
@@ -771,7 +775,7 @@ class Controller:
         sv = outcome.get("safetyViolations")
         if not isinstance(sv, int) or isinstance(sv, bool) or sv < 0:
             raise ValueError("outcome.safetyViolations must be a non-negative integer")
-        ev = self.append_event(run_id, "trusted_outcome", dict(outcome), "evaluator", "operator")
+        ev = self.append_event(run_id, "trusted_outcome", dict(outcome), "evaluator", "evaluator_only")
         self.record_outcome(run_id, bool(outcome["passed"]), None, dict(outcome))
         return ev
 
