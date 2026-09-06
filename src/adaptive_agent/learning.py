@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
 import re
 import time
 from copy import deepcopy
@@ -31,6 +32,44 @@ class ModelInvocation(Protocol):
     model: str
     response_id: str
     usage: Mapping[str, Any]
+
+
+def _optional_nonnegative_number(value: Any, label: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+        raise LearningError(f"{label} must be finite and non-negative")
+    return float(value)
+
+
+def _model_accounting(raw: Mapping[str, Any], usage: Mapping[str, Any], duration_seconds: float) -> dict[str, Any]:
+    """Normalize provider usage while keeping billing and nominal cost distinct."""
+    nominal = raw.get("nominalCostUsd")
+    if nominal is None:
+        provider_cost = usage.get("cost")
+        if isinstance(provider_cost, Mapping):
+            nominal = provider_cost.get("total")
+    try:
+        nominal = _optional_nonnegative_number(nominal, "nominalCostUsd")
+    except LearningError:
+        nominal = None
+    measured = raw.get("costMicrounits")
+    try:
+        measured = _optional_nonnegative_number(measured, "costMicrounits")
+    except LearningError:
+        measured = None
+    status = raw.get("economicCostStatus")
+    if status is not None and (not isinstance(status, str) or not status):
+        status = "unknown"
+    # Prime subscription billing is not observable from the invocation.  A
+    # provider SDK cost is nominal usage, never proof of billed spend.
+    status = status or ("measured" if measured is not None else "unknown")
+    return {
+        "durationSeconds": duration_seconds,
+        "economicCostStatus": status,
+        **({"costMicrounits": int(round(measured))} if measured is not None else {}),
+        **({"nominalCostUsd": nominal} if nominal is not None else {}),
+    }
 
 
 class AuthenticatedModelRunner(Protocol):
@@ -186,15 +225,20 @@ class PlannerLearningAdapter:
         for name, value in (("remaining_deadline", remaining_deadline), ("cancel", cancel), ("token_cap", token_cap)):
             if accepts_kwargs or name in parameters:
                 invoke_kwargs[name] = value
+        started = time.monotonic()
         raw = invoke(**invoke_kwargs)
+        duration_seconds = max(time.monotonic() - started, 0.0)
         if not isinstance(raw, Mapping):
             raise LearningError("planner client returned a non-object response")
         provider, model = raw.get("provider"), raw.get("model")
         response_id = raw.get("responseId", raw.get("response_id"))
         text, usage = raw.get("text"), raw.get("usage")
-        if not all(isinstance(value, str) and value.strip() for value in (provider, model, response_id, text)) or not isinstance(usage, Mapping) or not usage:
+        if not all(isinstance(value, str) and value.strip() for value in (provider, model, response_id)) or not isinstance(usage, Mapping) or not usage:
             raise LearningError("planner response provenance is incomplete")
-        self.evidence_sink.record_model_observation({"provider": provider, "model": model, "responseId": response_id, "usage": dict(usage)}, trusted_parent=True)
+        accounting = _model_accounting(raw, usage, duration_seconds)
+        self.evidence_sink.record_model_observation({"provider": provider, "model": model, "responseId": response_id, "usage": dict(usage), **accounting}, trusted_parent=True)
+        if not isinstance(text, str) or not text.strip():
+            raise LearningError("planner response text is missing")
         emit("model", "Authenticated model proposal received.", response_id)
         return _Invocation(text=text, provider=provider, model=model, response_id=response_id, usage=dict(usage))
 

@@ -265,6 +265,123 @@ class DefaultExperimentStageRunner:
             return self._panel_cell(stage, cell_key, context, attempt)
         raise ExperimentRuntimeError(f"unsupported lifecycle stage {stage!r}")
 
+    def recover_evaluation_observations(self, receipt: Mapping[str, Any], *, stage: str | None = None, cell_key: str | None = None) -> tuple[Any, ...]:
+        """Rehydrate strict evaluator observations from durable run evidence."""
+        value = _mapping(receipt, "lifecycle receipt")
+        receipt_stage = stage or value.get("stage")
+        receipt_cell = cell_key or value.get("cellKey")
+        if receipt_stage not in {"validation", "final"} or not isinstance(receipt_cell, str) or not receipt_cell:
+            raise ExperimentRuntimeError("observation recovery requires a validation/final cell")
+        run_ids = value.get("runIds")
+        if not isinstance(run_ids, list) or not run_ids or any(not isinstance(run_id, str) or not run_id for run_id in run_ids):
+            raise ExperimentRuntimeError("lifecycle receipt lacks durable observation run IDs")
+        task_ids = value.get("taskIds")
+        if task_ids is not None and (not isinstance(task_ids, list) or len(task_ids) != len(run_ids) or any(not isinstance(task_id, str) or not task_id for task_id in task_ids)):
+            raise ExperimentRuntimeError("lifecycle receipt task IDs are malformed")
+        from adaptive_agent.evaluation import Arm, BudgetSpec, ModelProvenance, Partition, Provenance, RunObservation
+
+        frozen_inputs = _protocol_inputs(self.protocol)
+        budget_value = _mapping(frozen_inputs["runBudget"], "frozen run budget")
+        budget = BudgetSpec(
+            model_tokens=int(budget_value.get("modelTokens", 0)),
+            tool_calls=int(budget_value.get("toolCalls", 0)),
+            child_runs=int(budget_value.get("childRuns", 0)),
+            wall_time_seconds=int(budget_value.get("wallTimeSeconds", 0)),
+            cost_microunits=int(budget_value.get("costMicrounits", 0)),
+            currency=str(budget_value.get("currency", "USD")),
+            max_child_depth=int(budget_value.get("childDepth", 1)),
+        )
+        observations: list[Any] = []
+        store = self.runtime.controller.store
+        for index, run_id in enumerate(run_ids):
+            run = store.get_run(run_id)
+            if not isinstance(run, Mapping):
+                raise ExperimentRuntimeError(f"durable observation run {run_id!r} is missing")
+            task_id = run.get("task_id")
+            environment_id = run.get("environment_id")
+            task_row = store.get_task(task_id) if isinstance(task_id, str) else None
+            partition = task_row.get("partition") if isinstance(task_row, Mapping) else None
+            if not isinstance(task_id, str) or not isinstance(environment_id, str) or partition != receipt_stage:
+                raise ExperimentRuntimeError(f"observation run {run_id!r} is not bound to {receipt_stage}")
+            if task_ids is not None and task_ids[index] != task_id:
+                raise ExperimentRuntimeError("receipt task IDs do not match durable runs")
+            rows = store.list_evidence(run_id)
+            model_rows = [row for row in rows if row.get("event_type") == "model_response"]
+            outcome_rows = [row for row in rows if row.get("event_type") == "trusted_outcome"]
+            if not model_rows or not outcome_rows:
+                raise ExperimentRuntimeError(f"observation run {run_id!r} lacks trusted model/outcome evidence")
+            model_row, outcome_row = model_rows[-1], outcome_rows[-1]
+            try:
+                model_ref = json.loads(model_row["source_ref"])["sha256"]
+                outcome_ref = json.loads(outcome_row["source_ref"])["sha256"]
+                model_payload = store.get_artifact(model_ref)
+                outcome_payload = store.get_artifact(outcome_ref)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ExperimentRuntimeError(f"observation artifacts for {run_id!r} are malformed") from exc
+            if not isinstance(model_payload, Mapping) or not isinstance(outcome_payload, Mapping):
+                raise ExperimentRuntimeError(f"observation artifacts for {run_id!r} are not objects")
+            accounting_ref = model_payload.get("accountingRef")
+            if isinstance(accounting_ref, Mapping):
+                accounting_ref = accounting_ref.get("sha256")
+            if not isinstance(accounting_ref, str) or not accounting_ref:
+                raise ExperimentRuntimeError(f"observation run {run_id!r} lacks accounting reference")
+            accounting = store.get_artifact(accounting_ref)
+            if not isinstance(accounting, Mapping):
+                raise ExperimentRuntimeError(f"observation accounting for {run_id!r} is missing")
+            try:
+                run_payload = json.loads(run.get("run_json", "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ExperimentRuntimeError(f"observation run {run_id!r} has malformed identity") from exc
+            if not isinstance(run_payload, Mapping):
+                raise ExperimentRuntimeError(f"observation run {run_id!r} has malformed identity")
+            arm = model_payload.get("arm", run_payload.get("arm"))
+            seed = model_payload.get("seed", run_payload.get("seed"))
+            bundle_hash = model_payload.get("bundleHash", run_payload.get("bundleHash"))
+            if arm not in {member.value for member in Arm} or not isinstance(seed, int) or isinstance(seed, bool) or not isinstance(bundle_hash, str):
+                raise ExperimentRuntimeError(f"observation run {run_id!r} identity is incomplete")
+            outcome_meta = outcome_payload.get("metadata", {})
+            if not isinstance(outcome_meta, Mapping):
+                outcome_meta = {}
+            outcome_row_data = store.get_outcome_by_run_id(run_id) or {}
+            try:
+                persisted_meta = json.loads(outcome_row_data.get("metadata_json", "{}"))
+                if isinstance(persisted_meta, Mapping):
+                    outcome_meta = {**persisted_meta, **outcome_meta}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            cost = accounting.get("costMicrounits")
+            duration = accounting.get("durationSeconds", accounting.get("inferenceDurationSeconds"))
+            if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0 or not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration < 0:
+                raise ExperimentRuntimeError(f"observation accounting for {run_id!r} is incomplete")
+            versions = model_payload.get("versionRefs") or accounting.get("versionRefs")
+            if not isinstance(versions, Mapping):
+                raise ExperimentRuntimeError(f"observation run {run_id!r} lacks frozen config hashes")
+            observations.append(RunObservation(
+                task_id, environment_id, Partition(partition), seed, Arm(arm),
+                bool(outcome_payload.get("passed", outcome_row_data.get("passed"))),
+                bool(outcome_meta.get("reliable", outcome_payload.get("reliable", True))),
+                int(outcome_meta.get("safetyViolations", outcome_payload.get("safetyViolations", 0)) or 0),
+                int(cost), float(duration),
+                status=str(run.get("status", "complete")),
+                fixture_reset_ok=bool(outcome_meta.get("fixtureResetOk", True)),
+                infrastructure_failure=outcome_meta.get("infrastructureFailure") if isinstance(outcome_meta.get("infrastructureFailure"), str) else None,
+                provenance=Provenance.DETERMINISTIC_SIMULATION,
+                model_provenance=ModelProvenance.REAL_MODEL,
+                model_profile=str(model_payload.get("modelProfile", frozen_inputs["modelProfile"])),
+                core_planner_hash=str(model_payload.get("corePlannerHash", frozen_inputs["corePlannerHash"])),
+                budget=budget,
+                response_id=model_payload.get("responseId"),
+                accounting_ref=accounting_ref,
+                evidence_ref=model_row.get("evidence_id"),
+                outcome_ref=outcome_row.get("evidence_id"),
+                config_hashes=dict(versions),
+                run_id=run_id,
+                bundle_hash=bundle_hash,
+            ))
+        return tuple(observations)
+
+    recover_observations = recover_evaluation_observations
+
     def _bootstrap(self, cell_key: str) -> Mapping[str, Any]:
         known = tuple(getattr(self.protocol, "known_environments", ()))
         for environment_id in known:
@@ -524,6 +641,8 @@ class DefaultExperimentStageRunner:
             receipt["costMicrounits"] = int(round(float(learning_accounting["nominalCostUsd"]) * 1_000_000))
             receipt["costBasis"] = "nominal_budget_proxy"
             receipt["billingStatus"] = "unknown"
+            receipt["economicCostStatus"] = "unknown"
+            receipt["billingStatus"] = "unknown"
         else:
             receipt["economicCostStatus"] = "unknown"
         return receipt
@@ -629,6 +748,7 @@ class DefaultExperimentStageRunner:
                 cost_seen = True
             economic = payload.get("economicCost")
             billing_unknown = billing_unknown or isinstance(economic, Mapping) and economic.get("status") == "unknown"
+            billing_unknown = billing_unknown or payload.get("economicCostStatus") == "unknown"
         if isinstance(result, Mapping) and observed == 0:
             duration = result.get("wallSeconds")
             if not wall_seen and isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
