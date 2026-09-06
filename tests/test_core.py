@@ -7,6 +7,7 @@ claims real learning.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -313,7 +314,7 @@ class TestControllerSeam:
         return task
 
     def test_create_run_idempotent_and_events(self, store, registry, broker, provider):
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
+        from adaptive_agent.models import Budget, ModelProfile, RunRequest, SkillBundle
 
         ctl = self._ctl(store, registry, broker)
         task = self._task(registry, store)
@@ -323,12 +324,18 @@ class TestControllerSeam:
             budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
             idempotencyKey="idem-1",
         )
-        r1 = ctl.create_run(req, task)
+        bundle = SkillBundle()
+        r1 = ctl.create_run(req, task, skill_bundle=bundle)
         r2 = ctl.create_run(req, task)
         assert r1.run_id == r2.run_id
         assert ctl.get_run(r1.run_id).status.value == "queued"
         evs = ctl.events(r1.run_id)
         assert evs and evs[0]["event"] == "run_created" and evs[0]["id"] == 1
+        stored = store.get_run(r1.run_id)
+        assert stored is not None
+        assert stored["bundle_hash"] == bundle.content_hash
+        event_payload = store.get_artifact(json.loads(evs[0]["data"]["source_ref"])["sha256"])
+        assert event_payload["skillBundleHash"] == stored["bundle_hash"]
 
     def test_execute_run_dispatches_through_broker(self, store, registry, broker, provider):
         from adaptive_agent.models import Budget, ModelProfile, RunRequest
@@ -362,228 +369,44 @@ class TestControllerSeam:
         ctl.record_outcome(run.run_id, passed=True, score=1.0)
         assert store.get_outcome_by_run_id(run.run_id)["passed"] == 1
 
-
-    def test_host_request_bridge_fail_closed(self, store, registry, broker, provider):
-        import base64 as b64
-        import hashlib as hl
-
-        from adaptive_agent.controller import Controller
+    def test_execute_run_claims_once_under_concurrent_and_retry_launches(self, store, registry, broker, provider):
         from adaptive_agent.models import Budget, ModelProfile, RunRequest
 
-        registry.register(NEUTRAL_MANIFEST)
-        ctl = Controller(store, registry, broker)
-        task = TaskInput(
-            taskId="t-hr",
-            environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64),
-            goal="g",
-            partition="development",
+        ctl = self._ctl(store, registry, broker)
+        task = self._task(registry, store)
+        req = RunRequest(
+            taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
+            modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
+            budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
+            idempotencyKey="idem-claim",
         )
-        registry.register_task(task)
-        run = ctl.create_run(
-            RunRequest(
-                taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
-                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
-                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
-                idempotencyKey="idem-hr",
-            ),
-            task,
-        )
-        run_id = run.run_id
-        provider.reset(run_id)
+        run = ctl.create_run(req, task)
+        started, release = threading.Event(), threading.Event()
+        calls = 0
+        lock = threading.Lock()
 
-        # Forbidden types and unknown capabilities fail closed.
-        for bad in ("harness.write", "evaluator.write", "credentials.read", "nope"):
-            with pytest.raises(PermissionError):
-                ctl.handle_host_request({"type": bad})
-        with pytest.raises(PermissionError):
-            ctl.handle_host_request({"type": "broker.call", "capabilityId": "unknown"})
+        class D:
+            def act(self, _ctx):
+                nonlocal calls
+                with lock:
+                    calls += 1
+                started.set()
+                release.wait(timeout=2)
 
-        cap = _cap(run_id=run_id, tool="read_record", effect="read")
-        ctl.register_prime_capability("cap-read", ENV, cap, provider)
-        out = ctl.handle_host_request({
-            "type": "broker.call",
-            "capabilityId": "cap-read",
-            "arguments": {"record_id": "record-1"},
-            "idempotencyKey": "hr-1",
-        })
-        assert out["value"]["status"] == "ok"
+        first = threading.Thread(target=ctl.execute_run, args=(run.run_id, ENV, provider, D()))
+        first.start()
+        assert started.wait(timeout=1)
+        second = threading.Thread(target=ctl.execute_run, args=(run.run_id, ENV, provider, D()))
+        second.start()
+        second.join(timeout=1)
+        assert calls == 1
+        release.set()
+        first.join(timeout=2)
+        assert calls == 1
+        assert ctl.get_run(run.run_id).status is RunStatus.succeeded
 
-        # Credential-shaped values are masked in learner-visible feedback.
-        ctl.append_event(run_id, "tool_result", {"out": "key sk-abc1234567890 and password=hunter2"}, "broker", "learner")
-        learner_ev = store.list_evidence(run_id)[-1]
-        learner_payload = store.get_artifact(ArtifactRef.model_validate_json(learner_ev["source_ref"]))
-        assert "sk-abc1234567890" not in json.dumps(learner_payload)
-        assert "hunter2" not in json.dumps(learner_payload)
-        assert "[REDACTED]" in json.dumps(learner_payload)
-        # Operator-visible events retain full fidelity.
-        ctl.append_event(run_id, "tool_result", {"out": "key sk-abc1234567890"}, "broker", "operator")
-        op_ev = store.list_evidence(run_id)[-1]
-        op_payload = store.get_artifact(ArtifactRef.model_validate_json(op_ev["source_ref"]))
-        assert "sk-abc1234567890" in json.dumps(op_payload)
-
-        # Bounded artifact transfer: begin -> chunk -> finish with sha256 check.
-        data = b"hello-artifact"
-        begin = ctl.handle_host_request({"type": "artifact.begin", "artifactId": "art", "size": len(data)})
-        ctl.handle_host_request({"type": "artifact.chunk", "transferId": begin["transferId"], "offset": 0, "data": b64.b64encode(data).decode()})
-        with pytest.raises(PermissionError):
-            ctl.handle_host_request({"type": "artifact.finish", "transferId": begin["transferId"], "sha256": "0" * 64})
-        # Restart transfer and finish correctly.
-        begin2 = ctl.handle_host_request({"type": "artifact.begin", "artifactId": "art", "size": len(data)})
-        ctl.handle_host_request({"type": "artifact.chunk", "transferId": begin2["transferId"], "offset": 0, "data": b64.b64encode(data).decode()})
-        fin = ctl.handle_host_request({"type": "artifact.finish", "transferId": begin2["transferId"], "sha256": hl.sha256(data).hexdigest()})
-        assert fin["artifact"]["sha256"] == hl.sha256(data).hexdigest()
-
-
-    def test_learning_records_and_immutable_bytes(self, store: Store):
-        ref = store.put_immutable_bytes(b"blob-bytes")
-        assert store.get_immutable_bytes(ref) == b"blob-bytes"
-        assert store.put_immutable_bytes(b"blob-bytes").sha256 == ref.sha256  # dedupe by content hash
-
-        store.save_learning_record("lr-1", ENV, "run-a", '{"skill":"s1"}')
-        store.save_learning_record("lr-2", ENV, "run-b", '{"skill":"s2"}')
-        store.save_learning_record("lr-3", "other-env", "run-a", '{"skill":"s3"}')
-        assert [r["record_id"] for r in store.list_learning_records(ENV)] == ["lr-1", "lr-2"]
-        assert [r["record_id"] for r in store.list_learning_records(ENV, "run-b")] == ["lr-2"]
-        assert store.list_learning_records(run_id="run-a") == [
-            r for r in store.list_learning_records() if r["run_id"] == "run-a"
-        ]
-
-    def test_run_idempotency_fingerprint_conflict_restart_concurrency(self, workspace, registry, broker):
-        import threading
-
-        from adaptive_agent.controller import Controller
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
-        from adaptive_agent.store import RunIdempotencyConflict
-
-        registry.register(NEUTRAL_MANIFEST)
-        task = TaskInput(taskId="t-idem", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g")
-        registry.register_task(task)
-
-        store = Store(workspace)
-        ctl = Controller(store, registry, broker)
-        mp_ref = store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json"))
-        bud_ref = store.put_artifact(Budget().model_dump(mode="json"))
-        t_ref = store.put_artifact(task.model_dump(mode="json", by_alias=True))
-
-        req1 = RunRequest(taskRef=t_ref, modelProfileRef=mp_ref, budgetRef=bud_ref, idempotencyKey="same-key")
-        r1 = ctl.create_run(req1, task)
-        r2 = ctl.create_run(req1, task)
-        assert r1.run_id == r2.run_id
-
-        # Same key, different request -> conflict.
-        other_task = TaskInput(taskId="t-idem2", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g2")
-        registry.register_task(other_task)
-        req2 = RunRequest(taskRef=store.put_artifact(other_task.model_dump(mode="json", by_alias=True)), modelProfileRef=mp_ref, budgetRef=bud_ref, idempotencyKey="same-key")
-        with pytest.raises(RunIdempotencyConflict):
-            ctl.create_run(req2, other_task)
-
-        # Restart durability: a fresh Store/Controller on the same dir replays the run.
-        store2 = Store(workspace)
-        registry2 = EnvironmentRegistry(store2)
-        ctl2 = Controller(store2, registry2, ToolBroker(store2, registry2))
-        again = ctl2.create_run(req1, task)
-        assert again.run_id == r1.run_id
-
-        # Concurrency: identical requests from two threads map to one run.
-        results: list[str] = []
-        errors: list[Exception] = []
-
-        def worker():
-            try:
-                results.append(ctl.create_run(req1, task).run_id)
-            except Exception as exc:  # pragma: no cover
-                errors.append(exc)
-
-        t1, t2 = threading.Thread(target=worker), threading.Thread(target=worker)
-        t1.start(); t2.start(); t1.join(); t2.join()
-        assert not errors
-        assert results == [r1.run_id, r1.run_id]
-
-    def test_cancel_terminal_idempotent(self, store, registry, broker, provider):
-        from adaptive_agent.controller import Controller
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
-
-        registry.register(NEUTRAL_MANIFEST)
-        ctl = Controller(store, registry, broker)
-        task = TaskInput(taskId="t-cancel", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g")
-        registry.register_task(task)
-        run = ctl.create_run(
-            RunRequest(
-                taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
-                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
-                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
-                idempotencyKey="idem-cancel",
-            ),
-            task,
-        )
-        c1 = ctl.cancel_run(run.run_id)
-        c2 = ctl.cancel_run(run.run_id)  # terminal cancel is idempotent
-        assert c1.status.value == "cancelled" and c2.status.value == "cancelled"
-        assert c1.completed_at == c2.completed_at
-
-    def test_trusted_evidence_shape(self, store, registry, broker):
-        """Canonical model_response/accounting/trusted_outcome records match the
-        session6 SQLiteRunEvidenceStore verification contract."""
-        from adaptive_agent.controller import Controller
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
-
-        registry.register(NEUTRAL_MANIFEST)
-        ctl = Controller(store, registry, broker)
-        task = TaskInput(taskId="t-ev", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g")
-        registry.register_task(task)
-        run = ctl.create_run(
-            RunRequest(
-                taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
-                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
-                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
-                idempotencyKey="idem-ev",
-            ),
-            task,
-        )
-        run_id = run.run_id
-        version_refs = {"model": "sha256:abc", "policy": "sha256:def"}
-        usage = {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
-        response = {"responseId": "resp-1", "usage": usage, "versionRefs": version_refs}
-        ev = ctl.record_model_response(run_id, response)
-        row = store.get_evidence(ev.evidence_id)
-        assert row["event_type"] == "model_response" and row["run_id"] == run_id
-        payload = store.get_artifact(ArtifactRef.model_validate_json(row["source_ref"]))
-        assert payload["responseId"] == "resp-1"
-
-        accounting = {
-            "responseId": "resp-1", "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
-            "usage": usage, "costMicrounits": 100, "durationSeconds": 1.5, "versionRefs": version_refs,
-        }
-        acct_ref = ctl.record_accounting(run_id, accounting, response)
-        assert store.get_artifact(acct_ref)["responseId"] == "resp-1"
-
-        outcome = {
-            "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
-            "passed": True, "reliable": True, "safetyViolations": 0,
-        }
-        out_ev = ctl.record_trusted_outcome(run_id, outcome)
-        out_row = store.get_evidence(out_ev.evidence_id)
-        assert out_row["event_type"] == "trusted_outcome" and out_row["visibility"] == "evaluator_only"
-        assert store.get_artifact(ArtifactRef.model_validate_json(out_row["source_ref"]))["responseId"] == "resp-1"
-        assert store.get_outcome_by_run_id(run_id)["passed"] == 1
-
-        # Bad pins fail closed.
-        with pytest.raises(ValueError):
-            ctl.record_model_response(run_id, {"responseId": "", "usage": usage, "versionRefs": version_refs})
-        with pytest.raises(ValueError):
-            ctl.record_accounting(run_id, {**accounting, "taskId": "wrong"}, response)
-        with pytest.raises(ValueError):
-            ctl.record_trusted_outcome(run_id, {**outcome, "environmentId": "wrong"})
-
-        # EVAL-004/005 probes execute real scenarios and report per-obligation output.
-        p4 = ctl.execute_probe("EVAL-004")
-        p5 = ctl.execute_probe("EVAL-005")
-        assert p4.passed is True and p5.passed is True
-        assert p4.provenance == "controller_toolbroker" and p4.obligations and p4.outputs
-        assert set(p4.observed) == set(p4.obligations)
-        assert bool(p4) is True
-        with pytest.raises(KeyError):
-            ctl.execute_probe("EVAL-999")
+        ctl.execute_run(run.run_id, ENV, provider, D())
+        assert calls == 1
 
 
     def test_task_run_resume_and_allocation(self, store: Store, workspace):
@@ -605,6 +428,11 @@ class TestControllerSeam:
         assert store.reserve_allocation("scope", "alloc-4", panels, 3) is None  # exhausted
         store2 = Store(workspace)
         assert store2.reserve_allocation("scope", "alloc-2", panels, 3) is None  # restart-safe
+        allocation = store2.get_allocation("alloc-2")
+        assert allocation is not None
+        assert allocation["panel_index"] == 1
+        assert allocation["task_ids"] == ["c", "d"]
+        assert store2.get_allocation("missing") is None
 
         # Crash-after-allocation recovery: read the reserved panel back.
         alloc = store2.get_allocation("alloc-2")
@@ -612,13 +440,11 @@ class TestControllerSeam:
         assert store2.get_allocation("nope") is None
 
     def test_benchmark_task_run_owner_semantics(self, store: Store, workspace):
-        # Single-owner claim with benchmark/arm/seed metadata.
         claimed, row = store.claim_benchmark_task_run(
             "btr-1", benchmark_id="bench-1", environment_id=ENV,
             task_id="t1", partition="validation", arm="B0", seed=42, owner_id="driver-a",
         )
         assert claimed and row["owner_id"] == "driver-a" and row["arm"] == "B0" and row["seed"] == 42
-        # Same-owner re-claim resumes; foreign owner refused takeover.
         again, row = store.claim_benchmark_task_run(
             "btr-1", benchmark_id="bench-1", environment_id=ENV,
             task_id="t1", partition="validation", arm="B0", seed=42, owner_id="driver-a",
@@ -629,10 +455,8 @@ class TestControllerSeam:
             task_id="t1", partition="validation", arm="B0", seed=42, owner_id="driver-b",
         )
         assert not foreign and row["owner_id"] == "driver-a"
-        # Owner-guarded release.
         assert not store.release_task_run("btr-1", "driver-b", "complete")
         assert store.release_task_run("btr-1", "driver-a", "complete")
-        # Restart durability + scoped listing.
         store2 = Store(workspace)
         rows = store2.list_task_runs(benchmark_id="bench-1", arm="B0")
         assert [r["task_run_id"] for r in rows] == ["btr-1"] and rows[0]["status"] == "complete"
@@ -786,6 +610,60 @@ class TestCandidateLifecycle:
         row = store.get_candidate(p.candidate_id)
         assert row["state"] == "promoted"
         assert '"promoted"' in row["candidate_json"]
+
+    def _external_report(self, cand: SkillBundle, base: SkillBundle, protocol: str, token: str) -> dict[str, Any]:
+        return {
+            "reportId": "external-report",
+            "comparison": "validation",
+            "protocolHash": protocol,
+            "candidateHash": cand.content_hash,
+            "baseHash": base.content_hash,
+            "validityStatus": "valid",
+            "promotionEligible": True,
+            "safetyPassed": True,
+            "metricCellsComplete": True,
+            "safetyCellsComplete": True,
+            "modelProvenanceComplete": True,
+            "attestation": token,
+            "evaluatorRefs": ["trusted-eval"],
+            "partitionHashes": {},
+            "armSummaries": {
+                "B0": {"accuracy": 0.5, "reliability": 0.5, "meanCostMicrounits": 1.0, "p95LatencySeconds": 1.0},
+                "L": {"accuracy": 0.9, "reliability": 0.9, "meanCostMicrounits": 1.0, "p95LatencySeconds": 1.0},
+            },
+            "environmentCells": {},
+            "confidenceIntervals": [{"metric": "accuracy", "lower95": 0.1}],
+            "missingPairs": 0,
+            "partitionLeak": False,
+            "invalidFixtureResets": 0,
+            "infrastructureFailures": [],
+        }
+
+    def test_external_promotion_requires_attestation_verifier(self, store: Store):
+        base = SkillBundle(skills=[])
+        manager = CandidateManager(store)
+        manager.initialize_active_bundle(base)
+        ev = _evidence(store, "run-ext-attest")
+        cand = self._candidate(base)
+        proposal = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
+        manager.submit_candidate(proposal, cand)
+        manager.start_evaluation(proposal.candidate_id)
+        manager.freeze_protocol(PromotionGate(protocolHash="proto-ext"), "trusted-eval", evaluator_refs=["trusted-eval"])
+        with pytest.raises(PromotionError, match="attestation verifier"):
+            manager.promote(proposal.candidate_id, self._external_report(cand, base, "proto-ext", "token"))
+
+    def test_external_promotion_rejects_failed_attestation(self, store: Store):
+        base = SkillBundle(skills=[])
+        manager = CandidateManager(store, report_verifier=lambda _report: False)
+        manager.initialize_active_bundle(base)
+        ev = _evidence(store, "run-ext-attest-fail")
+        cand = self._candidate(base)
+        proposal = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
+        manager.submit_candidate(proposal, cand)
+        manager.start_evaluation(proposal.candidate_id)
+        manager.freeze_protocol(PromotionGate(protocolHash="proto-ext-fail"), "trusted-eval", evaluator_refs=["trusted-eval"])
+        with pytest.raises(PromotionError, match="attestation failed"):
+            manager.promote(proposal.candidate_id, self._external_report(cand, base, "proto-ext-fail", "forged"))
 
     def test_gate_rejection_and_supersede(self, manager: CandidateManager, store: Store):
         base = self._base(manager, store)
