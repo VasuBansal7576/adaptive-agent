@@ -304,10 +304,6 @@ class LearningRuntime:
                 if not isinstance(derived, Mapping) or derived.get("event_type") != "learning_evidence_projection" or derived.get("run_id") != run_id or derived.get("visibility") != "learner" or derived.get("redacted") != 1 or derived.get("trust_class") != "broker":
                     continue
                 persisted_projection.append(record)
-                # Existing rows are already durable. Return them in the raw
-                # projection so restart does not rewrite them under a new
-                # record-id convention and create duplicate learner sources.
-                raw_records.append(record)
         joined_reader = getattr(self.store, "list_learning_evidence", None)
         if not callable(joined_reader):
             raise LearningRuntimeError("Store lacks unified learning evidence seam")
