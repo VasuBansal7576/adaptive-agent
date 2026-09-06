@@ -11,9 +11,11 @@ import type {
   CandidateDiff,
   EnvironmentPackageSummary,
   RunEvent,
+  RunOptions,
   RunRecord,
   RunStatus,
   SkillVersionSummary,
+  TaskOption,
   ToolError,
   ToolErrorCode,
 } from "./types";
@@ -103,6 +105,69 @@ export function parseRunEvent(value: unknown, field: string): RunEvent {
   if (o.error !== undefined) event.error = parseToolError(o.error, `${field}.error`);
   if (o.approval !== undefined) event.approval = parseApproval(o.approval, `${field}.approval`);
   return event;
+}
+
+/** Durable evidence event types -> console event kinds. */
+const EVENT_TYPE_TO_KIND: Record<string, RunEvent["kind"]> = {
+  run_started: "status",
+  run_completed: "status",
+  run_succeeded: "status",
+  run_failed: "status",
+  run_cancelled: "status",
+  run_timed_out: "status",
+  step_started: "step",
+  step_completed: "step",
+  tool_called: "tool",
+  tool_result: "tool",
+  approval: "approval",
+  approval_requested: "approval",
+  approval_decided: "approval",
+  outcome_recorded: "evidence",
+  model_observation: "evidence",
+  evidence: "evidence",
+  budget: "budget",
+  budget_reserved: "budget",
+  budget_recorded: "budget",
+};
+
+/**
+ * Normalize both SSE wire shapes into the console RunEvent:
+ * - plane projection: {runId, sequence, at, kind, summary, ...}
+ * - durable envelope: {id, event, data:{runId, sequence, eventType, ...}}
+ * Unknown or partial payloads raise SchemaError instead of entering UI state.
+ */
+export function normalizeSseEvent(value: unknown, field: string): RunEvent {
+  const o = obj(value, field);
+  if (typeof o.kind === "string" && typeof o.summary === "string" && typeof o.runId === "string") {
+    return parseRunEvent(o, field);
+  }
+  // durable evidence envelope
+  const envelopeId = typeof o.id === "number" ? o.id : undefined;
+  const data = obj(o.data ?? o, `${field}.data`);
+  const runId = str(data.runId, `${field}.data.runId`);
+  const sequence = typeof data.sequence === "number"
+    ? num(data.sequence, `${field}.data.sequence`)
+    : envelopeId !== undefined
+      ? num(envelopeId, `${field}.id`)
+      : (() => { throw new SchemaError(`${field}.sequence`); })();
+  const eventType = str(data.eventType ?? o.event, `${field}.eventType`);
+  const kind = EVENT_TYPE_TO_KIND[eventType] ?? "step";
+  const source = typeof data.sourceRef === "object" && data.sourceRef !== null ? data.sourceRef as Record<string, unknown> : null;
+  const sourceId = source && typeof source.id === "string" ? source.id : null;
+  const contentHash = typeof data.contentHash === "string" ? data.contentHash : null;
+  const detail = sourceId
+    ? `evidence artifact ${sourceId}`
+    : contentHash
+      ? `content ${contentHash.slice(0, 12)}`
+      : undefined;
+  return {
+    runId,
+    sequence,
+    at: typeof data.at === "string" ? data.at : "",
+    kind,
+    summary: `[${eventType}] evidence recorded`,
+    detail,
+  };
 }
 
 export function parseRun(value: unknown, field: string): RunRecord {
@@ -208,7 +273,6 @@ export function parseCandidates(value: unknown): CandidateDiff[] {
 }
 
 const ENV_VALIDATION = ["valid", "invalid", "unchecked"] as const;
-
 export function parseEnvironments(value: unknown): EnvironmentPackageSummary[] {
   return arr(value, "environments").map((item, i) => {
     const o = obj(item, `environments[${i}]`);
@@ -224,5 +288,47 @@ export function parseEnvironments(value: unknown): EnvironmentPackageSummary[] {
       env.missingFields = arr(o.missingFields, `environments[${i}].missingFields`).map((f) => str(f, "missingFields[]"));
     }
     return env;
+  });
+}
+
+export function parseRunOptions(value: unknown): RunOptions {
+  const o = obj(value, "runOptions");
+  const profiles = arr(o.modelProfiles, "runOptions.modelProfiles").map((item, i) => {
+    const p = obj(item, `runOptions.modelProfiles[${i}]`);
+    const ref = obj(p.ref, `runOptions.modelProfiles[${i}].ref`);
+    const out: RunOptions["modelProfiles"][number] = {
+      ref: {
+        id: str(ref.id, `runOptions.modelProfiles[${i}].ref.id`),
+        version: str(ref.version, `runOptions.modelProfiles[${i}].ref.version`),
+        sha256: str(ref.sha256, `runOptions.modelProfiles[${i}].ref.sha256`),
+      },
+      label: str(p.label, `runOptions.modelProfiles[${i}].label`),
+    };
+    if (p.provider !== undefined) out.provider = str(p.provider, `runOptions.modelProfiles[${i}].provider`);
+    if (p.model !== undefined) out.model = str(p.model, `runOptions.modelProfiles[${i}].model`);
+    return out;
+  });
+  const budget = obj(o.budgetDefaults, "runOptions.budgetDefaults");
+  return {
+    modelProfiles: profiles,
+    budgetDefaults: {
+      modelTokens: num(budget.modelTokens, "runOptions.budgetDefaults.modelTokens"),
+      toolCalls: num(budget.toolCalls, "runOptions.budgetDefaults.toolCalls"),
+      wallTimeSeconds: num(budget.wallTimeSeconds, "runOptions.budgetDefaults.wallTimeSeconds"),
+      childRuns: typeof budget.childRuns === "number" ? budget.childRuns : undefined,
+      costMicrounits: typeof budget.costMicrounits === "number" ? budget.costMicrounits : undefined,
+      currency: typeof budget.currency === "string" ? budget.currency : undefined,
+    },
+  };
+}
+
+export function parseTasks(value: unknown): TaskOption[] {
+  return arr(value, "tasks").map((item, i) => {
+    const t = obj(item, `tasks[${i}]`);
+    return {
+      taskId: str(t.taskId, `tasks[${i}].taskId`),
+      goal: str(t.goal, `tasks[${i}].goal`),
+      executionModes: arr(t.executionModes, `tasks[${i}].executionModes`).map((m) => str(m, `tasks[${i}].executionModes[]`)),
+    };
   });
 }

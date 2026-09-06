@@ -122,3 +122,23 @@ export type EnvironmentPackageSummary = {
   executionModes?: string[];
   missingFields?: string[];
 };
+
+/** GET /run-options: authoritative model profile and bounded budget controls. */
+export type RunOptions = {
+  modelProfiles: Array<{ ref: { id: string; version: string; sha256: string }; label: string; provider?: string; model?: string }>;
+  budgetDefaults: {
+    modelTokens: number;
+    toolCalls: number;
+    childRuns?: number;
+    wallTimeSeconds: number;
+    costMicrounits?: number;
+    currency?: string;
+  };
+};
+
+/** GET /environments/{id}/tasks: registered task goals a run may target. */
+export type TaskOption = {
+  taskId: string;
+  goal: string;
+  executionModes: string[];
+};

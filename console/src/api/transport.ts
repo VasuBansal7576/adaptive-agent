@@ -3,8 +3,10 @@ import type {
   CandidateDiff,
   EnvironmentPackageSummary,
   RunEvent,
+  RunOptions,
   RunRecord,
   SkillVersionSummary,
+  TaskOption,
 } from "./types";
 
 /** Canonical SPEC reference object: {id, version, sha256}. */
@@ -20,6 +22,10 @@ export type CanonicalRef = { id: string; version: string; sha256: string };
 export interface ConsoleTransport {
   readonly mode: "simulation" | "live";
   listEnvironments(): Promise<EnvironmentPackageSummary[]>;
+  /** Authoritative model profiles and bounded budget defaults (GET /run-options). */
+  getRunOptions(): Promise<RunOptions>;
+  /** Registered task goals for an environment (durable runs must match one). */
+  getEnvironmentTasks(environmentId: string): Promise<TaskOption[]>;
   listRuns(): Promise<RunRecord[]>;
   listSkills(): Promise<SkillVersionSummary[]>;
   listCandidates(): Promise<CandidateDiff[]>;
@@ -51,6 +57,10 @@ export interface ConsoleTransport {
 export type CreateRunInput = {
   environmentId: string;
   goal: string;
+  /** registered task id from getEnvironmentTasks; sent as the canonical taskRef */
+  taskId?: string;
+  /** server-provided authoritative model ref from run-options (preferred) */
+  modelProfileRef?: { id: string; version: string; sha256: string };
   modelProfile: string;
   /** idempotency key supplied by the console; reused verbatim on retry */
   idempotencyKey: string;

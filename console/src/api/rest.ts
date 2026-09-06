@@ -1,4 +1,4 @@
-import type { RunEvent, RunRecord, SkillVersionSummary, CandidateDiff, EnvironmentPackageSummary } from "./types";
+import type { RunEvent, RunRecord, SkillVersionSummary, CandidateDiff, EnvironmentPackageSummary, RunOptions, TaskOption } from "./types";
 import type {
   ConsoleTransport,
   CreateRunInput,
@@ -25,6 +25,9 @@ import {
   parseRunEvent,
   parseRuns,
   parseSkills,
+  normalizeSseEvent,
+  parseRunOptions,
+  parseTasks,
 } from "./validate";
 
 /** Structured API error carrying the SPEC error envelope for UI surfacing. */
@@ -148,6 +151,9 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
     mode: "live",
 
     listEnvironments: () => validated(json("/environments"), parseEnvironments),
+    getRunOptions: () => validated(json("/run-options"), parseRunOptions),
+    getEnvironmentTasks: (environmentId: string) =>
+      validated(json(`/environments/${encodeURIComponent(environmentId)}/tasks`), parseTasks),
     listRuns: () => validated(json("/runs"), parseRuns),
     listSkills: () => validated(json("/skills"), parseSkills),
     listCandidates: () => validated(json("/candidates"), parseCandidates),
@@ -162,6 +168,8 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       let retryTimer: ReturnType<typeof setTimeout> | null = null;
       let closed = false;
       let lastSequence = fromCursor;
+      let consecutiveFailures = 0;
+      let receivedAny = false;
 
       const start = () => {
         if (closed) return;
@@ -174,10 +182,14 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
         es = new EventSource(`${baseUrl}/runs/${encodeURIComponent(runId)}/events?cursor=${lastSequence}`);
         es.onmessage = (message) => {
           try {
-            // boundary validation before the event enters reducer state
-            const event = parseRunEvent(JSON.parse(message.data), "sse.data");
+            // boundary validation before the event enters reducer state; both
+            // wire shapes are accepted (plane RunEvent and durable evidence
+            // envelope {id, event, data})
+            const event = normalizeSseEvent(JSON.parse(message.data), "sse.data");
             if (event.sequence > lastSequence) {
               lastSequence = event.sequence;
+              receivedAny = true;
+              consecutiveFailures = 0;
               onEvent(event);
             }
             // stale duplicates (sequence <= cursor) are dropped client-side too
@@ -187,12 +199,19 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
         };
         es.onerror = () => {
           es?.close();
-          onState("stale");
-          retryTimer = setTimeout(() => {
-            ensureSession()
-              .then(start)
-              .catch(() => onState("disconnected"));
-          }, 1500);
+          // a terminal run's stream closes server-side; a bounded number of
+          // silent reconnects prevents an endless retry loop
+          if (receivedAny || consecutiveFailures < 5) {
+            onState("stale");
+            consecutiveFailures += 1;
+            retryTimer = setTimeout(() => {
+              ensureSession()
+                .then(start)
+                .catch(() => onState("disconnected"));
+            }, 1500);
+          } else {
+            onState("closed");
+          }
         };
       };
 
@@ -224,19 +243,27 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       }).then(() => undefined),
 
     async createRun(input: CreateRunInput) {
-      // direct projection accepted by the control API. Profile/budget refs are
-      // AUTHORITATIVE trusted-plane references: the plane rejects unknown
-      // (id, version, sha256) tuples, and a ref without sha256 is malformed
-      // and would poison every subsequent list refresh (SchemaError). The
-      // seeded trusted entries are "model-profile" and "budget-default"; their
-      // sha256 is the hash of the canonical JSON encoding of the identifier.
-      const modelProfileRef = await trustedRef("model-profile");
+      // Refs are authoritative: prefer the server-provided model ref from
+      // /run-options; fall back to the seeded trusted ref. A ref without
+      // sha256 would poison every subsequent list refresh (SchemaError).
+      const modelProfileRef = input.modelProfileRef ?? (await trustedRef("model-profile"));
       const budgetRef = await trustedRef("budget-default");
+      const taskRef: Record<string, unknown> = { goal: input.goal, environmentId: input.environmentId };
+      if (input.taskId) taskRef.id = input.taskId;
       const body = {
-        goal: input.goal,
-        environmentId: input.environmentId,
+        taskRef,
         modelProfileRef,
         budgetRef,
+        // durable runtime stores the budget object as the run's budget artifact;
+        // the plane path uses the trusted budgetRef above
+        budget: {
+          modelTokens: input.budget.modelTokenCeiling,
+          toolCalls: input.budget.toolCallCeiling,
+          childRuns: 0,
+          wallTimeSeconds: input.budget.wallSecondsCeiling,
+          costMicrounits: 100000,
+          currency: "USD",
+        },
         idempotencyKey: input.idempotencyKey,
         executionMode: input.executionMode,
       };

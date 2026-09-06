@@ -2,8 +2,10 @@ import type {
   CandidateDiff,
   EnvironmentPackageSummary,
   RunEvent,
+  RunOptions,
   RunRecord,
   SkillVersionSummary,
+  TaskOption,
 } from "./types";
 import type {
   ConsoleTransport,
@@ -12,7 +14,7 @@ import type {
   EnvironmentRegistration,
   LearningCycleInput,
 } from "./transport";
-import { validatePackageFields } from "./transport";
+import { validatePackageFields, sha256Hex } from "./transport";
 import { parseRun } from "./validate";
 
 /**
@@ -273,6 +275,30 @@ export function createSimulationTransport(options?: {
       return structuredClone(environmentCatalog);
     },
 
+    async getRunOptions(): Promise<RunOptions> {
+      // mirrors the live /run-options projection
+      return {
+        modelProfiles: [
+          {
+            ref: { id: "model-profile", version: "1", sha256: await sha256Hex(JSON.stringify("model-profile")) },
+            label: "Luna",
+            provider: "openai-codex",
+            model: "openai-codex/gpt-5.6-luna",
+          },
+        ],
+        budgetDefaults: { modelTokens: 4000, toolCalls: 32, childRuns: 0, wallTimeSeconds: 90, costMicrounits: 100000, currency: "USD" },
+      };
+    },
+
+    async getEnvironmentTasks(environmentId: string): Promise<TaskOption[]> {
+      // deterministic registered tasks per environment
+      const tasks: TaskOption[] = [
+        { taskId: `task-${environmentId}-007`, goal: "Reconcile the Q3 ledger batch and record the outcome.", executionModes: ["interactive", "dry_run"] },
+        { taskId: `task-${environmentId}-011`, goal: "Replay the dispute workflow and summarize the outcome.", executionModes: ["interactive", "replay"] },
+      ];
+      return structuredClone(tasks);
+    },
+
     async listRuns() {
       return structuredClone(runCatalog);
     },
@@ -290,10 +316,10 @@ export function createSimulationTransport(options?: {
       const run: RunRecord = parseRun(
         {
           runId,
-          taskRef: { id: `task-${input.environmentId}`, version: "1", sha256: hash(31 + runCatalog.length) },
+          taskRef: { id: input.taskId ?? `task-${input.environmentId}`, version: "1", sha256: hash(31 + runCatalog.length) },
           environmentRef: { id: `env-${input.environmentId}`, version: "1", sha256: hash(41) },
           policyRef: { id: `policy-${input.environmentId}`, version: "1", sha256: hash(42) },
-          modelProfileRef: { id: input.modelProfile, version: "1", sha256: hash(43) },
+          modelProfileRef: input.modelProfileRef ?? { id: input.modelProfile, version: "1", sha256: hash(43) },
           skillBundleRef: { id: "bundle-active", version: "7", sha256: hash(44) },
           budgetRef: { id: `budget-${input.idempotencyKey.slice(0, 8)}`, version: "1", sha256: hash(45) },
           status: "queued",
