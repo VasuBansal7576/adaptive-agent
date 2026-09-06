@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import math
 import os
 import json
@@ -139,6 +140,11 @@ class DurableRuntime:
         self._run_last_receipt_at: dict[str, float] = {}
         self._run_receipts: dict[str, list[dict[str, Any]]] = {}
         self._approvals: dict[tuple[str, str], bool] = {}
+        # The canonical Controller seam owns lifecycle persistence.  Older
+        # adapters exposed an atomic claim helper; keep a process-local guard
+        # only for the canonical seam, which intentionally leaves claiming to
+        # its caller.
+        self._launch_claim_lock = threading.Lock()
         self._tasks = {
             task.task_id: task
             for name in self.packages
@@ -696,6 +702,137 @@ class DurableRuntime:
         payload["accountingRef"] = accounting_ref.model_dump(mode="json", by_alias=True)
         return self.controller.append_event(run_id, "model_response", payload, "system", "operator")
 
+    def _claim_run(self, run_id: str) -> tuple[bool, Any | None]:
+        """Claim a queued run through whichever canonical seam is present.
+
+        The integrated controller historically exposed ``claim_run``.  The
+        canonical core deliberately keeps that policy at its caller boundary,
+        so this adapter performs the same queued-to-running transition before
+        invoking ``execute_run`` when the helper is absent.
+        """
+        claim = getattr(self.controller, "claim_run", None)
+        if callable(claim):
+            return claim(run_id)
+        with self._launch_claim_lock:
+            current = self.controller.get_run(run_id)
+            if current is None:
+                return False, None
+            if getattr(current, "status", None) != RunStatus.queued:
+                return False, current
+            setter = getattr(self.controller, "_set_run_status", None)
+            if callable(setter):
+                setter(run_id, RunStatus.running)
+            else:
+                self.controller.store.update_run_status(run_id, RunStatus.running.value)
+            self.controller.append_event(run_id, "run_started", {"runId": run_id}, "system", "operator")
+            return True, self.controller.get_run(run_id)
+
+    def _execute_run(self, run_id: str, env_id: str, provider: ToolProvider, driver: Any, evaluate: Any) -> Any:
+        """Invoke the canonical lifecycle seam and bridge legacy evaluator args."""
+        execute = self.controller.execute_run
+        parameters = inspect.signature(execute).parameters
+        kwargs: dict[str, Any] = {}
+        if "evaluate" in parameters:
+            kwargs["evaluate"] = evaluate
+        if "claimed" in parameters:
+            kwargs["claimed"] = True
+        result = execute(run_id, env_id, provider, driver, **kwargs)
+        if "evaluate" in parameters:
+            return result
+
+        # The canonical core marks a completed driver run succeeded.  Apply
+        # the evaluator-owned outcome immediately afterward and reconcile the
+        # terminal status through the controller's own persistence method.
+        current = self.controller.get_run(run_id)
+        if current is None or current.status != RunStatus.succeeded:
+            return result
+        try:
+            outcome = evaluate()
+            self._record_evaluated_outcome(run_id, outcome)
+            status = RunStatus.succeeded if outcome.passed else RunStatus.failed
+        except Exception as exc:
+            self.controller.append_event(run_id, "run_failed", {"error": str(exc)}, "system", "operator")
+            status = RunStatus.failed
+        setter = getattr(self.controller, "_set_run_status", None)
+        if callable(setter):
+            setter(run_id, status)
+        else:
+            completed_at = datetime.now(timezone.utc).isoformat()
+            self.controller.store.update_run_status(run_id, status.value, completed_at=completed_at)
+        return self.controller.get_run(run_id)
+
+    def _record_evaluated_outcome(self, run_id: str, outcome: DurableOutcome) -> Any:
+        """Record evaluator output, preserving the canonical trusted-outcome seam."""
+        trusted = getattr(self.controller, "record_trusted_outcome", None)
+        if callable(trusted):
+            stored = self.controller.store.get_run(run_id)
+            response_id: str | None = None
+            for row in reversed(self.controller.store.list_evidence(run_id)):
+                if row.get("event_type") != "model_response":
+                    continue
+                try:
+                    source = json.loads(row["source_ref"])
+                    payload = self.controller.store.get_artifact(source["sha256"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                candidate = payload.get("responseId") if isinstance(payload, Mapping) else None
+                if isinstance(candidate, str) and candidate:
+                    response_id = candidate
+                    break
+            if stored is not None and response_id is not None:
+                metadata = outcome.metadata if isinstance(outcome.metadata, Mapping) else {}
+                return trusted(
+                    run_id,
+                    {
+                        "responseId": response_id,
+                        "runId": run_id,
+                        "taskId": stored["task_id"],
+                        "environmentId": stored["environment_id"],
+                        "passed": bool(outcome.passed),
+                        "reliable": bool(metadata.get("reliable", outcome.passed)),
+                        "safetyViolations": int(metadata.get("safetyViolations", 0) or 0),
+                    },
+                )
+        return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
+
+    def _dispatch_tool(
+        self,
+        env_id: str,
+        request: ToolRequest,
+        capability: Capability,
+        provider: ToolProvider,
+        *,
+        budget_remaining: dict[str, Any],
+        dry_run: bool,
+    ) -> Any:
+        """Call Controller.dispatch_tool across the canonical/extended seams."""
+        dispatch = self.controller.dispatch_tool
+        parameters = inspect.signature(dispatch).parameters
+        if "budget_remaining" not in parameters and budget_remaining.get("tool_calls", 0) <= 0:
+            raise RuntimeError("tool call budget exhausted")
+        kwargs: dict[str, Any] = {}
+        if "budget_remaining" in parameters:
+            kwargs["budget_remaining"] = budget_remaining
+        if "dry_run" in parameters:
+            kwargs["dry_run"] = dry_run
+        return dispatch(env_id, request, capability, provider, **kwargs)
+
+    def _record_broker_result(self, run_id: str, payload: dict[str, Any], *, development: bool) -> Any:
+        """Persist broker fidelity using the available controller authority."""
+        append = getattr(self.controller, "append_broker_result", None)
+        if callable(append):
+            return append(run_id, payload, development=development)
+        record = getattr(self.controller, "record_broker_tool_result", None)
+        if callable(record):
+            parameters = inspect.signature(record).parameters
+            if "development" in parameters:
+                return record(run_id, payload, development=development)
+            return record(run_id, payload)
+        # The canonical core has no broker-result convenience method.  Keep
+        # the operator event durable without inventing a second projection
+        # authority in the application adapter.
+        return self.controller.append_event(run_id, "tool_result", payload, "broker", "operator")
+
     def launch(self, run_id: str, *, task_override: Any | None = None, package_override: Any | None = None, model_client_override: Any | None = None, seed: int = 0, arm: str = "B0", bundle_hash: str | None = None, core_planner_hash: str | None = None, image_digest: str | None = None) -> None:
         stored = self.controller.store.get_run(run_id)
         if not stored:
@@ -704,7 +841,7 @@ class DurableRuntime:
         package = package_override or self.packages.get(stored["environment_id"])
         if not task or not package:
             raise KeyError("development task not found")
-        claimed, current = self.controller.claim_run(run_id)
+        claimed, current = self._claim_run(run_id)
         if current is None:
             raise KeyError("run not found")
         if not claimed:
@@ -726,7 +863,7 @@ class DurableRuntime:
             def evaluate() -> DurableOutcome:
                 outcome = dict(self.evaluator(goal=task.goal, model_output=invocation.text, environment=self._planner_environment(package, run_id))) if self.evaluator is not None and invocation is not None else {"passed": False}
                 return DurableOutcome(runId=run_id, passed=bool(outcome.get("passed") is True), metadata=outcome)
-            self.controller.execute_run(run_id, package.environment_id, provider, DirectDriver(), evaluate=evaluate, claimed=True)
+            self._execute_run(run_id, package.environment_id, provider, DirectDriver(), evaluate)
             self._cancel_events.pop(run_id, None)
             self._run_started_at.pop(run_id, None)
             self._run_last_receipt_at.pop(run_id, None)
@@ -750,9 +887,9 @@ class DurableRuntime:
             schema = self.registry.get_tool_schema(package.environment_id, capability.tool)
             if run is not None and run.execution_mode == "batch" and schema is not None and schema.effect == "write":
                 request.approval_token = self.controller.broker.issue_approval(package.environment_id, run_id, capability.tool, dict(arguments), request.idempotency_key)
-            result = self.controller.dispatch_tool(package.environment_id, request, durable_capability, provider, budget_remaining=budget_remaining, dry_run=run is not None and run.execution_mode == "dry_run")
+            result = self._dispatch_tool(package.environment_id, request, durable_capability, provider, budget_remaining=budget_remaining, dry_run=run is not None and run.execution_mode == "dry_run")
             partition = self.controller.store.get_task(stored["task_id"]).get("partition") if stored and self.controller.store.get_task(stored["task_id"]) else None
-            self.controller.append_broker_result(
+            self._record_broker_result(
                 run_id,
                 result.model_dump(mode="json", by_alias=True),
                 development=partition == "development",
@@ -830,7 +967,7 @@ class DurableRuntime:
             fixture = package.evaluate(task.task_id, provider.session)
             return DurableOutcome(runId=run_id, passed=fixture.passed, score=1.0 if fixture.passed else 0.0, metadata={"reason": fixture.reason, "evaluatorVersion": fixture.evaluator_version, "plannerStatus": result.status})
         try:
-            self.controller.execute_run(run_id, package.environment_id, provider, driver, evaluate=evaluate, claimed=True)
+            self._execute_run(run_id, package.environment_id, provider, driver, evaluate)
         finally:
             if prime is not None:
                 prime.close(remove_workspace=True)
