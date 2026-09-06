@@ -173,7 +173,7 @@ class LearningRuntime:
         if not isinstance(trusted_outcome, Mapping) or "passed" not in trusted_outcome or not isinstance(trusted_outcome.get("passed"), (bool, int)):
             raise LearningRuntimeError("completed development run lacks a trusted evaluator outcome")
         outcome_passed = bool(trusted_outcome["passed"])
-        joined_reader = getattr(self.store, "list_learner_evidence", None)
+        joined_reader = getattr(self.store, "list_learning_evidence", None) or getattr(self.store, "list_learner_evidence", None)
         events = joined_reader(environment_id=environment_id, run_id=run_id) if callable(joined_reader) else self.store.list_evidence(run_id)
         for event in events:
             if callable(joined_reader):
@@ -200,6 +200,11 @@ class LearningRuntime:
                 if isinstance(raw_payload, Mapping):
                     payload = raw_payload
             safe: dict[str, Any] = {key: payload.get(key) for key in ("status", "effect", "toolVersion") if key in payload}
+            # A narrow Store join may already return these allowlisted fields;
+            # consume that projection without reopening raw operator evidence.
+            for key in ("tool", "input", "result", "error", "callId", "toolVersion", "status", "effect"):
+                if key in event:
+                    safe[key] = _sanitize_learning_value(event[key])
             call_id = payload.get("callId")
             call_reader = getattr(self.store, "get_tool_call", None)
             call = call_reader(call_id) if callable(call_reader) and isinstance(call_id, str) else None
