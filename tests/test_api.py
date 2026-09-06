@@ -441,6 +441,75 @@ def test_evaluation_job_rejects_final_without_pinned_ablation(tmp_path):
     assert job.readback("final-ablation-missing") is None
 
 
+def test_evaluation_launch_rejects_missing_frozen_protocol_before_queueing(tmp_path, monkeypatch):
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    queued = False
+
+    def queue(_payload):
+        nonlocal queued
+        queued = True
+        return {"evaluationId": "eval-unpinned"}
+
+    monkeypatch.setattr(runtime, "queue_evaluation", queue)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").status_code == 200
+    response = api.post(
+        "/evaluations/launch",
+        json={
+            "candidateId": "candidate",
+            "baseBundleHash": runtime.controller.get_active_bundle().content_hash,
+            "protocolHash": "missing-protocol",
+            "partitionRef": {"id": "validation", "version": "1", "sha256": "v"},
+        },
+    )
+    assert response.status_code == 409
+    assert "persisted frozen protocol" in response.json()["detail"]["message"]
+    assert not queued
+
+
+def test_evaluation_launch_passes_persisted_frozen_protocol_to_background(tmp_path, monkeypatch):
+    captured = []
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    protocol_hash = "pinned-protocol"
+    gate_json = json.dumps({"protocolHash": protocol_hash})
+    runtime.controller.store.save_frozen_protocol(protocol_hash, gate_json, "trusted-evaluator")
+    active = runtime.controller.get_active_bundle()
+    assert active is not None
+
+    monkeypatch.setattr(
+        runtime,
+        "queue_evaluation",
+        lambda _payload: {"evaluationId": "eval-pinned", "protocolHash": protocol_hash, "state": "queued"},
+    )
+    monkeypatch.setattr(
+        runtime.controller,
+        "get_candidate",
+        lambda _candidate_id: {"candidate_bundle_hash": active.content_hash},
+    )
+    monkeypatch.setattr(runtime.controller.store, "get_bundle_by_hash", lambda _bundle_hash: None)
+    monkeypatch.setattr(
+        runtime,
+        "run_evaluation_job",
+        lambda task, frozen, bundle: captured.append((task, frozen, bundle)),
+    )
+    api = TestClient(app, base_url="http://127.0.0.1")
+    assert api.get("/session/bootstrap").status_code == 200
+    response = api.post(
+        "/evaluations/launch",
+        json={
+            "candidateId": "candidate",
+            "baseBundleHash": active.content_hash,
+            "protocolHash": protocol_hash,
+            "partitionRef": {"id": "validation", "version": "1", "sha256": "v"},
+        },
+    )
+    assert response.status_code == 202
+    assert captured and captured[0][1]["protocol_hash"] == protocol_hash
+    assert captured[0][0]["protocolHash"] == protocol_hash
+
+
 def test_fixture_provider_reset_uses_executor_seed():
     class Package:
         def __init__(self):
