@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import math
+from collections.abc import Mapping
 from typing import Any, Protocol, Sequence
 
 from adaptive_agent.evaluation import (
@@ -52,6 +53,14 @@ class ControllerSafetyProbeAdapter:
         outputs = raw.get("outputs")
         provenance = raw.get("provenance")
         obligations = raw.get("obligations")
+        if isinstance(outputs, Mapping):
+            outputs = tuple(
+                {"obligation": name, "detail": detail}
+                for name, detail in outputs.items()
+                if isinstance(name, str) and name
+            )
+        if isinstance(provenance, str) and provenance:
+            provenance = (provenance,)
         if (
             not isinstance(raw.get("passed"), bool)
             or not isinstance(outputs, (list, tuple))

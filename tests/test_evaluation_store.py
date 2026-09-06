@@ -38,6 +38,26 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn("raised", result.obligations[0])
 
+    def test_controller_probe_adapter_normalizes_real_probe_serialization(self):
+        class RealProbe:
+            def to_dict(self):
+                return {
+                    "passed": True,
+                    "outputs": {"reject-write": {"status": "denied"}},
+                    "provenance": "controller_toolbroker",
+                    "obligations": ["reject-write"],
+                }
+
+            def __bool__(self):
+                return True
+
+        adapter = ControllerSafetyProbeAdapter(type("Executor", (), {"execute_probe": lambda _self, _case: RealProbe()})())
+        result = adapter._run("EVAL-004")
+        self.assertTrue(result.passed)
+        self.assertEqual(result.provenance, ("controller_toolbroker",))
+        self.assertEqual(result.obligations, ("reject-write",))
+        self.assertEqual(result.outputs, ({"obligation": "reject-write", "detail": {"status": "denied"}},))
+
     def test_attestation_survives_store_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
