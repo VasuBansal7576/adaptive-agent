@@ -354,13 +354,7 @@ class DefaultExperimentStageRunner:
                 raise ExperimentRuntimeError(f"observation artifacts for {run_id!r} are malformed") from exc
             if not isinstance(model_payload, Mapping) or not isinstance(outcome_payload, Mapping):
                 raise ExperimentRuntimeError(f"observation artifacts for {run_id!r} are not objects")
-            try:
-                run_payload = json.loads(run.get("run_json", "{}"))
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise ExperimentRuntimeError(f"observation run {run_id!r} has malformed identity") from exc
-            if not isinstance(run_payload, Mapping):
-                raise ExperimentRuntimeError(f"observation run {run_id!r} has malformed identity")
-            accounting_ref = run_payload.get("finalAccountingRef") or model_payload.get("accountingRef")
+            accounting_ref = model_payload.get("accountingRef")
             if isinstance(accounting_ref, Mapping):
                 accounting_ref = accounting_ref.get("sha256")
             if not isinstance(accounting_ref, str) or not accounting_ref:
@@ -368,6 +362,12 @@ class DefaultExperimentStageRunner:
             accounting = store.get_artifact(accounting_ref)
             if not isinstance(accounting, Mapping):
                 raise ExperimentRuntimeError(f"observation accounting for {run_id!r} is missing")
+            try:
+                run_payload = json.loads(run.get("run_json", "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ExperimentRuntimeError(f"observation run {run_id!r} has malformed identity") from exc
+            if not isinstance(run_payload, Mapping):
+                raise ExperimentRuntimeError(f"observation run {run_id!r} has malformed identity")
             arm = model_payload.get("arm", run_payload.get("arm"))
             seed = model_payload.get("seed", run_payload.get("seed"))
             bundle_hash = model_payload.get("bundleHash", run_payload.get("bundleHash"))
