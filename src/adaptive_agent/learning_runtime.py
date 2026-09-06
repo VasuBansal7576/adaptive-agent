@@ -256,8 +256,9 @@ class LearningRuntime:
                 if key in event and event[key] is not None
             }
             content = f"Broker development observation: {canonical_json(safe)}"
-            record = {"kind": "live_evidence", "sourceId": f"broker:{evidence_id}", "content": content, "contentHash": content_hash(content), "sourceContentHash": event.get("evidenceContentHash"), "sourceEvidenceId": evidence_id, "sourceCallId": event.get("callId"), "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": True, "outcomePassed": outcome_passed}
-            persist(f"learning-broker-{evidence_id}", record)
+            source_id = evidence_id if evidence_id.startswith("broker:") else f"broker:{evidence_id}"
+            record = {"kind": "live_evidence", "sourceId": source_id, "content": content, "contentHash": content_hash(content), "sourceContentHash": event.get("evidenceContentHash"), "sourceEvidenceId": evidence_id, "sourceCallId": event.get("callId"), "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": True, "outcomePassed": outcome_passed}
+            persist(f"learning-broker-{source_id}", record)
         outcome_content = f"A trusted evaluator outcome is recorded for this completed development run; passed={str(outcome_passed).lower()}."
         outcome_record = {"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": outcome_content, "contentHash": content_hash(outcome_content), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True, "outcomePassed": outcome_passed}
         persist(f"learning-outcome-{run_id}", outcome_record)
