@@ -355,6 +355,7 @@ class TestControllerSeam:
         payload = store.get_artifact(ArtifactRef.model_validate_json(created["source_ref"]))
         assert payload["imageDigest"] == "image-unpinned"
         assert payload["maxChildDepth"] == 1  # frozen Budget.max_child_depth propagated
+        assert payload["skillBundleHash"]  # exact arm bundle hash pinned
 
         # Legacy event type rejected at both the Controller and Store layers.
         with pytest.raises(ValueError):

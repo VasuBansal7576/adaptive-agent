@@ -100,6 +100,7 @@ class Store:
                     task_id TEXT NOT NULL,
                     environment_id TEXT NOT NULL,
                     bundle_id TEXT NOT NULL,
+                    bundle_hash TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL UNIQUE,
                     request_fingerprint TEXT NOT NULL DEFAULT '',
@@ -229,6 +230,10 @@ class Store:
                 );
                 """
             )
+            # Migration: bundle_hash column for runs created before the pin.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+            if "bundle_hash" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN bundle_hash TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     @contextmanager
