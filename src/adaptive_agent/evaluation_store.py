@@ -142,6 +142,15 @@ class SQLiteRunEvidenceStore:
         if not run or run.get("task_id") != observation.task_id or run.get("environment_id") != observation.environment_id:
             return False
         try:
+            run_payload = json.loads(run.get("run_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if run_payload.get("arm") != observation.arm.value or run_payload.get("seed") != observation.seed:
+            return False
+        bundle = self.store.get_bundle(run.get("bundle_id", ""))
+        if not bundle or not isinstance(bundle.get("content_hash"), str):
+            return False
+        try:
             source_ref = json.loads(evidence["source_ref"])
             accounting = self.store.get_artifact(observation.accounting_ref)
             response = self.store.get_artifact(source_ref["sha256"])
@@ -160,6 +169,15 @@ class SQLiteRunEvidenceStore:
         if not isinstance(usage, dict) or not isinstance(accounting_usage, dict) or usage != accounting_usage:
             return False
         if accounting.get("responseId") != observation.response_id or accounting.get("runId") != observation.run_id or accounting.get("taskId") != observation.task_id or accounting.get("environmentId") != observation.environment_id:
+            return False
+        if accounting.get("arm") != observation.arm.value or accounting.get("seed") != observation.seed or accounting.get("bundleHash") != bundle["content_hash"]:
+            return False
+        if observation.bundle_hash != accounting["bundleHash"]:
+            return False
+        expected_bundles = run_payload.get("armBundles") or run_payload.get("bundlesByArm") or {}
+        if expected_bundles and expected_bundles.get(observation.arm.value) != accounting["bundleHash"]:
+            return False
+        if response.get("arm") != accounting["arm"] or response.get("seed") != accounting["seed"] or response.get("bundleHash") != accounting["bundleHash"]:
             return False
         if outcome.get("responseId") != observation.response_id or outcome.get("runId") != observation.run_id or outcome.get("taskId") != observation.task_id or outcome.get("environmentId") != observation.environment_id:
             return False

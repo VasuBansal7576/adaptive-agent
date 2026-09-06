@@ -305,6 +305,7 @@ class RunObservation:
     outcome_ref: str | None = None
     config_hashes: Mapping[str, str] = field(default_factory=dict)
     run_id: str | None = None
+    bundle_hash: str | None = None
 
     def __post_init__(self) -> None:
         if self.cost_microunits < 0 or self.latency_seconds < 0 or self.safety_violations < 0:
@@ -1034,6 +1035,8 @@ class AblationInput:
     system_instructions: str
     retrieval_inputs: tuple[str, ...]
     artifacts: tuple[Mapping[str, str], ...] = ()
+    baseline_inventory: tuple[Mapping[str, str], ...] = ()
+    removed_learned_hashes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1052,6 +1055,16 @@ def audit_ablation(value: AblationInput) -> AblationAudit:
     for index, artifact in enumerate(value.artifacts):
         if artifact.get("source") in {"learned", "candidate", "promotion"}:
             hits.append(f"artifact:{index}")
+    pinned_removed = set(value.removed_learned_hashes)
+    for artifact in value.baseline_inventory:
+        if artifact.get("source") in {"learned", "candidate", "promotion"} or artifact.get("kind") == "learned":
+            artifact_hash = artifact.get("hash") or artifact.get("contentHash") or artifact.get("sha256")
+            if artifact_hash:
+                pinned_removed.add(artifact_hash)
+    for index, artifact in enumerate(value.artifacts):
+        artifact_hash = artifact.get("hash") or artifact.get("contentHash") or artifact.get("sha256")
+        if artifact_hash in pinned_removed:
+            hits.append(f"retained-hash:{index}")
     return AblationAudit(not hits, tuple(hits), sha256_json({"bundleHash": value.bundle_hash, "hits": hits}))
 
 

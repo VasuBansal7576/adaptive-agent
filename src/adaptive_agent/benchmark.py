@@ -39,6 +39,7 @@ class FrozenExecutionConfig:
     protocol: FrozenProtocol
     arm: Arm
     seed: int
+    bundle_hash: str | None = None
 
 
 TrustedTaskExecutor = Callable[[TaskInput, FrozenExecutionConfig, object], RunObservation]
@@ -75,12 +76,13 @@ class BenchmarkSummary:
 class ResumableEvaluationDriver:
     """Execute exactly the frozen task panel and resume persisted work."""
 
-    def __init__(self, store: Store, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], execute_evaluation_task: TrustedTaskExecutor, bundle: object, allocation_store: SQLiteAllocationStore | None = None, evidence_store: SQLiteRunEvidenceStore | None = None) -> None:
+    def __init__(self, store: Store, protocol: EvaluationProtocol, packages: Mapping[str, EnvironmentPackage], execute_evaluation_task: TrustedTaskExecutor, bundle: object, allocation_store: SQLiteAllocationStore | None = None, evidence_store: SQLiteRunEvidenceStore | None = None, arm_bundles: Mapping[Arm | str, object] | None = None) -> None:
         self.store = store
         self.protocol = protocol
         self.packages = dict(packages)
         self.execute_evaluation_task = execute_evaluation_task
         self.bundle = bundle
+        self.arm_bundles = dict(arm_bundles or {})
         self.allocation_store = allocation_store or SQLiteAllocationStore(store)
         self.evidence_store = evidence_store or SQLiteRunEvidenceStore(store)
         self.owner_id = secrets.token_urlsafe(12)
@@ -111,18 +113,28 @@ class ResumableEvaluationDriver:
         with self._benchmark_lock(benchmark_id):
             return self._run_locked(benchmark_id, partition, base_hash=base_hash, candidate_hash=candidate_hash)
 
-    def _run_locked(self, benchmark_id: str, partition: Partition, *, base_hash: str = "", candidate_hash: str = "") -> BenchmarkSummary:
+    def run_development_smoke(self, benchmark_id: str) -> BenchmarkSummary:
+        """Record one trusted development receipt for held-out authorization."""
+        smoke_id = f"{benchmark_id}:smoke"
+        with self._benchmark_lock(benchmark_id):
+            return self._run_locked(smoke_id, Partition.DEVELOPMENT, smoke=True)
+
+    def _run_locked(self, benchmark_id: str, partition: Partition, *, base_hash: str = "", candidate_hash: str = "", smoke: bool = False) -> BenchmarkSummary:
         frozen = self.protocol.start_candidate_generation()
         partition = Partition(partition)
         if partition is not Partition.DEVELOPMENT and not self._development_smoke_complete(benchmark_id):
             raise EvaluationError("development smoke with trusted evidence is required before held-out panels")
-        tasks_by_env = self._tasks_for_partition(benchmark_id, partition, base_hash, candidate_hash, frozen)
-        arms = (Arm.B0, Arm.L) if partition is not Partition.FINAL else (Arm.B0, Arm.L, Arm.A)
+        tasks_by_env = self._tasks_for_partition(benchmark_id, partition, base_hash, candidate_hash, frozen, smoke=smoke)
+        if smoke:
+            first_environment = next(iter(tasks_by_env))
+            tasks_by_env = {first_environment: tasks_by_env[first_environment][:1]}
+        arms = (Arm.B0,) if partition is Partition.DEVELOPMENT else ((Arm.B0, Arm.L) if partition is not Partition.FINAL else (Arm.B0, Arm.L, Arm.A))
+        seeds = (self.protocol.seeds[0],) if partition is Partition.DEVELOPMENT else self.protocol.seeds
         statuses: list[BenchmarkTaskStatus] = []
         for environment_id, tasks in tasks_by_env.items():
             package = self.packages[environment_id]
             for task in tasks:
-                for seed in self.protocol.seeds:
+                for seed in seeds:
                     for arm in arms:
                         prior = self._load(benchmark_id, task.task_id, arm, seed)
                         if prior is not None and prior.status == "complete":
@@ -136,7 +148,9 @@ class ResumableEvaluationDriver:
                                 statuses.append(existing)
                             continue
                         try:
-                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed), self.bundle)
+                            selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
+                            bundle_hash = selected_bundle.content_hash if hasattr(selected_bundle, "content_hash") else None
+                            observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash), selected_bundle)
                             self._validate_observation(observation, task, environment_id, partition, seed, arm)
                             if not self.evidence_store.verify(observation, frozen, package):
                                 raise EvaluationError("runtime observation lacks trusted persisted evidence")
@@ -145,7 +159,7 @@ class ResumableEvaluationDriver:
                         except Exception as exc:
                             self._save(benchmark_id, task, arm, seed, "failed", str(exc), None)
                             statuses.append(BenchmarkTaskStatus(task.task_id, environment_id, partition, arm, seed, "failed", error=str(exc)))
-        expected_count = sum(len(tasks) for tasks in tasks_by_env.values()) * len(self.protocol.seeds) * len(arms)
+        expected_count = sum(len(tasks) for tasks in tasks_by_env.values()) * len(seeds) * len(arms)
         return BenchmarkSummary(benchmark_id, partition, tuple(statuses), expected_count)
 
     def _development_smoke_complete(self, benchmark_id: str) -> bool:
@@ -157,7 +171,7 @@ class ResumableEvaluationDriver:
                 return True
         return False
 
-    def _tasks_for_partition(self, benchmark_id: str, partition: Partition, base_hash: str, candidate_hash: str, frozen: FrozenProtocol) -> dict[str, tuple[TaskInput, ...]]:
+    def _tasks_for_partition(self, benchmark_id: str, partition: Partition, base_hash: str, candidate_hash: str, frozen: FrozenProtocol, *, smoke: bool = False) -> dict[str, tuple[TaskInput, ...]]:
         if hasattr(self.bundle, "model_dump"):
             bundle_value = self.bundle.model_dump(mode="json")
         elif hasattr(self.bundle, "to_dict"):
@@ -166,7 +180,13 @@ class ResumableEvaluationDriver:
             bundle_value = dict(self.bundle)
         else:
             bundle_value = {"type": f"{type(self.bundle).__module__}.{type(self.bundle).__qualname__}"}
-        plan_fingerprint = sha256_json({"protocol": frozen.protocol_hash, "partition": partition.value, "base": base_hash, "candidate": candidate_hash, "bundle": sha256_json(bundle_value)})
+        arm_bundle_values = {
+            str(key.value if isinstance(key, Arm) else key): (
+                value.model_dump(mode="json") if hasattr(value, "model_dump") else value.to_dict() if hasattr(value, "to_dict") else dict(value) if isinstance(value, Mapping) else {"type": f"{type(value).__module__}.{type(value).__qualname__}"}
+            )
+            for key, value in self.arm_bundles.items()
+        }
+        plan_fingerprint = sha256_json({"protocol": frozen.protocol_hash, "partition": partition.value, "base": base_hash, "candidate": candidate_hash, "bundle": sha256_json(bundle_value), "armBundles": arm_bundle_values, "smoke": smoke})
         with self.store.connect() as conn:
             plan = conn.execute("SELECT * FROM benchmark_plans WHERE benchmark_id = ? AND partition = ?", (benchmark_id, partition.value)).fetchone()
         if plan is not None:

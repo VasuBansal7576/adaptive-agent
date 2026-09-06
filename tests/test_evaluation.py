@@ -355,6 +355,13 @@ class EvaluationTests(unittest.TestCase):
     self.assertFalse(dirty.passed)
     self.assertEqual(dirty.retained_learned_artifacts, ("artifact:0",))
 
+  def test_ablation_audit_uses_pinned_hashes_even_without_markers(self):
+    clean = audit_ablation(AblationInput("base", "generic", (), baseline_inventory=({"kind": "learned", "hash": "skill-hash"},)))
+    self.assertTrue(clean.passed)
+    retained = audit_ablation(AblationInput("base", "generic", (), ({"hash": "skill-hash", "procedure": "unmarked"},), baseline_inventory=({"kind": "learned", "hash": "skill-hash"},)))
+    self.assertFalse(retained.passed)
+    self.assertIn("retained-hash:0", retained.retained_learned_artifacts)
+
 
   def test_protocol_counts_and_budget_match_spec_defaults(self):
     protocol = EvaluationProtocol()

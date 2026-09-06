@@ -9,6 +9,24 @@ from adaptive_agent.store import Store
 
 
 class BenchmarkDriverTests(unittest.TestCase):
+    def test_development_smoke_is_one_trusted_run(self):
+        packages = build_environment_packages()
+        protocol = EvaluationProtocol()
+        protocol.freeze(packages)
+        with tempfile.TemporaryDirectory() as directory:
+            calls = []
+            def execute(task, frozen_config, bundle):
+                calls.append((task.task_id, frozen_config.seed, frozen_config.arm))
+                return RunObservation(task.task_id, task.environment_ref.id, Partition.DEVELOPMENT, frozen_config.seed, frozen_config.arm, True, True, 0, 1, 1.0, model_provenance=ModelProvenance.REAL_MODEL)
+            class TrustedSmokeEvidence:
+                durable = True
+                def verify(self, observation, frozen, package):
+                    return True
+            result = ResumableEvaluationDriver(Store(Path(directory)), protocol, packages, execute, object(), evidence_store=TrustedSmokeEvidence()).run_development_smoke("smoke")
+            self.assertTrue(result.complete)
+            self.assertEqual(result.expected_count, 1)
+            self.assertEqual(len(calls), 1)
+
     def test_live_owner_cannot_be_stolen_by_another_driver(self):
         packages = build_environment_packages()
         protocol = EvaluationProtocol()
