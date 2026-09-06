@@ -233,6 +233,8 @@ class Controller:
 
     # ------------------------------------------------------------------ evidence / SSE
     def append_event(self, run_id: str, event_type: str, payload: dict[str, Any], trust_class: str, visibility: str) -> EvidenceRecord:
+        if event_type == "model_observation":
+            raise ValueError("model_observation is not a canonical evidence event; use model_response")
         seq = self.store.next_event_sequence(run_id)
         ev = EvidenceRecord(
             runId=run_id,
