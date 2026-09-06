@@ -85,7 +85,9 @@ class ResumableEvaluationDriver:
         self.packages = dict(packages)
         self.execute_evaluation_task = execute_evaluation_task
         self.bundle = bundle
-        self.arm_bundles = dict(arm_bundles or {})
+        # The positional bundle is the baseline arm for the development smoke
+        # and remains the default when callers do not provide an arm map.
+        self.arm_bundles = dict(arm_bundles or {Arm.B0: bundle})
         self.allocation_store = allocation_store or SQLiteAllocationStore(store)
         self.evidence_store = evidence_store or SQLiteRunEvidenceStore(store)
         self.owner_id = secrets.token_urlsafe(12)
