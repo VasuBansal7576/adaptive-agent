@@ -690,6 +690,7 @@ class EvaluationJob:
             if stage is None or not isinstance(stage_results, Mapping):
                 continue
             query_rows: list[Any] = []
+            support_rows: list[Any] = []
             source_ids: list[str] = []
             task_ids: list[str] = []
             query_input = query_output = query_total = query_cost = 0
@@ -699,12 +700,17 @@ class EvaluationJob:
                     continue
                 recovered = recover(receipt, stage=name, cell_key=cell_key)
                 wanted = set(receipt.get("queryRunIds", receipt.get("runIds", ())))
+                support_wanted = set(receipt.get("supportRunIds", ()))
                 new_query_rows = [row for row in recovered if getattr(row, "run_id", None) in wanted]
+                new_support_rows = [row for row in recovered if getattr(row, "run_id", None) in support_wanted]
                 query_rows.extend(new_query_rows)
+                support_rows.extend(new_support_rows)
                 source_ids.extend(value for value in receipt.get("sourceRunIds", receipt.get("trainingSourceRunIds", ())) if isinstance(value, str))
                 source_ids.extend(value for value in receipt.get("supportRunIds", ()) if isinstance(value, str))
                 task_ids.extend(value for value in receipt.get("queryTaskIds", ()) if isinstance(value, str))
                 task_ids.extend(value for value in receipt.get("supportTaskIds", ()) if isinstance(value, str))
+                task_ids.extend(getattr(row, "task_id") for row in new_query_rows if isinstance(getattr(row, "task_id", None), str))
+                task_ids.extend(getattr(row, "task_id") for row in new_support_rows if isinstance(getattr(row, "task_id", None), str))
                 for row in new_query_rows:
                     accounting = self.store.get_artifact(row.accounting_ref) if row.accounting_ref else None
                     usage = accounting.get("usage", {}) if isinstance(accounting, Mapping) else {}
@@ -713,6 +719,14 @@ class EvaluationJob:
                     query_total += int(usage.get("totalTokens", 0) or 0)
                     query_cost += int(row.cost_microunits)
             learning_input = learning_output = learning_total = learning_cost = 0
+            support_input = support_output = support_total = support_cost = 0
+            for row in support_rows:
+                accounting = self.store.get_artifact(row.accounting_ref) if row.accounting_ref else None
+                usage = accounting.get("usage", {}) if isinstance(accounting, Mapping) else {}
+                support_input += int(usage.get("inputTokens", 0) or 0)
+                support_output += int(usage.get("outputTokens", 0) or 0)
+                support_total += int(usage.get("totalTokens", 0) or 0)
+                support_cost += int(row.cost_microunits)
             for cell_key in stage.cells:
                 receipt = stage_results.get(cell_key)
                 learning = receipt.get("learningReceipt") if isinstance(receipt, Mapping) else None
@@ -724,7 +738,7 @@ class EvaluationJob:
                     learning_cost += int(learning["costMicrounits"])
             metric = _summary(query_rows)
             summaries[name] = {"query": metric.to_dict(), "queryCount": metric.count, "exact": True}
-            overhead[name] = {"query": {"inputTokens": query_input, "outputTokens": query_output, "totalTokens": query_total, "costMicrounits": query_cost}, "supportAndLearning": {"inputTokens": learning_input, "outputTokens": learning_output, "totalTokens": learning_total, "costMicrounits": learning_cost}, "supportAndLearningIncluded": True}
+            overhead[name] = {"query": {"inputTokens": query_input, "outputTokens": query_output, "totalTokens": query_total, "costMicrounits": query_cost}, "support": {"inputTokens": support_input, "outputTokens": support_output, "totalTokens": support_total, "costMicrounits": support_cost}, "learning": {"inputTokens": learning_input, "outputTokens": learning_output, "totalTokens": learning_total, "costMicrounits": learning_cost}, "supportAndLearningIncluded": True}
             exposure[name] = {"taskIds": sorted(set(task_ids)), "sourceRunIds": sorted(set(source_ids)), "queryRunIds": sorted({getattr(row, "run_id", "") for row in query_rows if getattr(row, "run_id", None)}), "exact": True}
         return {"summaries": summaries, "overhead": overhead, "exposure": exposure, "limitations": ("Transfer and adaptation are small-sample auxiliary measurements, not primary promotion panels.",)}
 
