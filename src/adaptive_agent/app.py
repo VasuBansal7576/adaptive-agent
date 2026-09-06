@@ -482,11 +482,23 @@ class DurableRuntime:
 
     def list_evaluations(self) -> list[dict[str, Any]]:
         out = []
+        report_ids: set[str] = set()
         for row in self.controller.store.list_evaluations():
             try:
-                out.append(json.loads(row["report_json"]))
+                report = json.loads(row["report_json"])
+                if isinstance(report, dict):
+                    out.append(report)
+                    if isinstance(report.get("evaluationId"), str):
+                        report_ids.add(report["evaluationId"])
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
+        for row in self.controller.store.list_evaluation_queue():
+            try:
+                queued = json.loads(row["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(queued, dict) and row["evaluation_id"] not in report_ids:
+                out.append(queued)
         return out
 
     def active_versions(self) -> list[dict[str, Any]]:
