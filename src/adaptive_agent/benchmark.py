@@ -39,7 +39,10 @@ class FrozenExecutionConfig:
     protocol: FrozenProtocol
     arm: Arm
     seed: int
-    bundle_hash: str
+    # Optional for compatibility with evaluator callbacks that only consume
+    # the frozen protocol, arm, and seed. The durable driver always supplies
+    # it and validates the returned observation against the selected bundle.
+    bundle_hash: str | None = None
 
 
 TrustedTaskExecutor = Callable[[TaskInput, FrozenExecutionConfig, object], RunObservation]
