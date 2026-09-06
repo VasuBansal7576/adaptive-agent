@@ -124,14 +124,14 @@ class ResumableEvaluationDriver:
         partition = Partition(partition)
         if partition is not Partition.DEVELOPMENT and not self._development_smoke_complete(benchmark_id):
             raise EvaluationError("development smoke with trusted evidence is required before held-out panels")
-        tasks_by_env = self._tasks_for_partition(benchmark_id, partition, base_hash, candidate_hash, frozen, smoke=smoke)
-        if smoke:
-            first_environment = next(iter(tasks_by_env))
-            tasks_by_env = {first_environment: tasks_by_env[first_environment][:1]}
         arms = (Arm.B0,) if partition is Partition.DEVELOPMENT else ((Arm.B0, Arm.L) if partition is not Partition.FINAL else (Arm.B0, Arm.L, Arm.A))
         missing_arms = [arm.value for arm in arms if arm not in self.arm_bundles and arm.value not in self.arm_bundles]
         if missing_arms:
             raise EvaluationError(f"missing expected arm bundles before execution: {', '.join(missing_arms)}")
+        tasks_by_env = self._tasks_for_partition(benchmark_id, partition, base_hash, candidate_hash, frozen, smoke=smoke)
+        if smoke:
+            first_environment = next(iter(tasks_by_env))
+            tasks_by_env = {first_environment: tasks_by_env[first_environment][:1]}
         seeds = (self.protocol.seeds[0],) if partition is Partition.DEVELOPMENT else self.protocol.seeds
         statuses: list[BenchmarkTaskStatus] = []
         for environment_id, tasks in tasks_by_env.items():
