@@ -810,9 +810,15 @@ def test_trusted_outcome_is_operator_visible_but_excluded_from_learner_evidence(
     stored = app.state.durable_runtime.controller.store.get_evidence(evidence.evidence_id)
     assert evidence.visibility == "operator"
     assert stored is not None and stored["visibility"] == "operator"
+    artifact_ref = json.loads(stored["source_ref"])
+    artifact = app.state.durable_runtime.controller.store.get_artifact(artifact_ref["sha256"])
+    assert isinstance(artifact, dict)
+    assert "reason" not in artifact
+    assert "private evaluator details stay out of learner context" not in json.dumps(artifact)
     operator_events = [event for event in controller.events(run["runId"]) if event["event"] == "trusted_outcome"]
     assert len(operator_events) == 1
     assert operator_events[0]["data"]["visibility"] == "operator"
+    assert "reason" not in operator_events[0]["data"].get("detail", "")
     learner_rows = app.state.durable_runtime.controller.store.list_learner_evidence(
         environment_id="finance", run_id=run["runId"]
     )

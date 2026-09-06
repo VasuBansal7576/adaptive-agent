@@ -748,7 +748,10 @@ class Controller:
             error = payload.get("error")
             return {"summary": "Runtime failure recorded", "detail": str(error)} if isinstance(error, str) and error else {"summary": "Runtime failure recorded"}
         if event_type in {"outcome_recorded", "trusted_outcome"}:
-            fields = {key: payload[key] for key in ("passed", "score", "reason") if key in payload}
+            # Trusted evaluator details stay out of the operator projection.
+            # This also protects legacy rows written before the canonical
+            # trusted-outcome seam applied its allowlist.
+            fields = {key: payload[key] for key in ("passed", "score") if key in payload}
             detail = json.dumps(fields, sort_keys=True, separators=(",", ":")) if fields else ""
             return {"summary": "Trusted outcome check recorded", **({"detail": detail} if detail else {})}
         if event_type == "tool_result":
@@ -931,12 +934,20 @@ class Controller:
         if not isinstance(fixture_reset_ok, bool):
             raise ValueError("outcome.fixtureResetOk must be a boolean")
         payload["fixtureResetOk"] = fixture_reset_ok
-        # Trusted evaluator evidence is operator-visible for audit and console
-        # projections.  The learner path remains excluded at the Store SQL
-        # boundary, which only returns redacted broker rows with learner
-        # visibility.
+        # Persist only the canonical attestation fields. Evaluator rationale,
+        # hidden answers, and implementation details stay out of durable
+        # artifacts and operator projections.
+        payload = {
+            key: payload[key]
+            for key in (
+                "responseId", "runId", "taskId", "environmentId", "passed",
+                "reliable", "safetyViolations", "fixtureResetOk", "score",
+                "arm", "seed", "bundleHash",
+            )
+            if key in payload
+        }
         event = self.append_event(run_id, "trusted_outcome", payload, "evaluator", "operator")
-        self.record_outcome(run_id, bool(payload["passed"]), metadata=payload)
+        self.record_outcome(run_id, bool(payload["passed"]), score=payload.get("score"), metadata=payload)
         return event
 
     def record_outcome(self, run_id: str, passed: bool, score: float | None = None, metadata: dict[str, Any] | None = None) -> Outcome:
