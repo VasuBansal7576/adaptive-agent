@@ -114,11 +114,13 @@ def test_control_plane_runner_adapter_returns_authenticated_final_invocation():
     assert events[-1][0] == "status"
 
 
-def test_prime_cli_client_parses_json_lines_and_normalizes_bare_model(tmp_path):
+def test_prime_cli_client_parses_json_lines_and_normalizes_bare_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHOULD_NOT_COPY", "secret")
     executable = tmp_path / "prime-agent"
     executable.write_text(
         "#!/usr/bin/env python3\n"
-        "import json\n"
+        "import json, os\n"
+        "if 'SHOULD_NOT_COPY' in os.environ: raise SystemExit(17)\n"
         "print(json.dumps({'type': 'message_end', 'message': {\n"
         "  'role': 'assistant', 'provider': 'openai-codex', 'model': 'gpt-5.6-luna',\n"
         "  'responseId': 'resp-cli', 'content': [{'type': 'text', 'text': '{\\\"action\\\":\\\"finish\\\",\\\"answer\\\":\\\"ok\\\"}'}],\n"

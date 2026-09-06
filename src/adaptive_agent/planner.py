@@ -223,7 +223,14 @@ class PrimeCliModelClient:
             "--",
             history,
         ]
-        env = os.environ.copy()
+        # Keep the subprocess environment deliberately small.  Authentication
+        # is loaded from the AO-authorized coding-agent directory; parent
+        # provider keys and unrelated secrets must not cross this boundary.
+        env = {
+            key: value
+            for key in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
+            if (value := os.environ.get(key)) is not None
+        }
         env["PRIME_AGENT_CODING_AGENT_DIR"] = coding_agent_dir
         started = time.monotonic()
         try:
