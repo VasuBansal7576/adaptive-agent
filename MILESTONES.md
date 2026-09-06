@@ -23,11 +23,14 @@ No additional workers are spawned during this documentation task.
 
 ## Current root checkpoint
 
-As of 2026-09-06, the verified public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent), and the clean root-committed `main` checkpoint is `61e700b`.
-This checkpoint includes the integrated backend and console evidence; the prior backup remains retained.
+As of 2026-09-06, the verified public repository is [github.com/VasuBansal7576/adaptive-agent](https://github.com/VasuBansal7576/adaptive-agent), and the clean root-committed `main` checkpoint is `ccf3b3a`.
+This checkpoint is public and verified; the prior backend and console checks remain historical evidence.
 
-Current verification records 123 focused backend checks passed, 71 console tests passed, clean TypeScript and production-build checks, and a real local API browser pass at 375, 768, and 1440 pixel widths with no overflow or page errors.
-These are scripted integration and browser checks, not a performance measurement.
+The current checkpoint records 86 focused tests passed.
+A full raw Prime scripted production lifecycle passed in 224.41 seconds across 60 training, 360 validation, and 720 final runs, including restart and tamper checks.
+This is lifecycle evidence, not an achieved improvement claim.
+
+Earlier backend and console checks remain historical evidence, including 123 focused backend checks, 71 console tests, clean TypeScript and production-build checks, and a real local API browser pass at 375, 768, and 1440 pixel widths with no overflow or page errors.
 
 Retained root evidence at `a882641` records the full synthetic 1,080-case run, restart coverage, and two authenticated reports passing in 48.25 seconds.
 The combined production bytes at `2a54cf9` reproduced that same full synthetic pass.
@@ -35,12 +38,20 @@ Core and API verification recorded 64 passing checks, and the corrected privacy 
 An earlier retained backend report recorded 240 passing checks.
 These are synthetic or bounded integration evidence, not a measured generalization result.
 
-The real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC and failed before the held-out phase after one successful task and five development budget exhaustions.
+An earlier real benchmark attempt on `2a54cf9` started at 2026-09-06 13:53 UTC and failed before the held-out phase after one successful task and five development budget exhaustions.
 It produced no learning result, validation result, final metrics, or measured improvement.
 M4 is not complete and must not be represented as passed.
 
-The AppWorld work remains in worker 2, where the full runtime integration still has a serialization failure and is not accepted or merged.
-Multi-run learning in worker 4 is still awaiting its fix and commit.
+The AppWorld adapter is integrated at `ccf3b3a` with installed AppWorld `0.1.3.post1`.
+A real TRAIN run produced a strict receipt but exhausted its 20,000-token task budget.
+The full AppWorld CLI workload of 8 train tasks, 20 dev tasks times 3, and 20 test tasks times 3 remains under review.
+
+Multi-run learning is integrated.
+Actual learning used a 15-run source set and 60 training attempts, with 48 successes and 12 budget failures.
+Learner usage of 6,678 input and 582 output tokens produced an unpromoted candidate; receipt accounting then failed, and that failure was fixed generically.
+
+A fresh actual original full experiment has been RUNNING against frozen source `ccf3b3a` since 2026-09-06 17:57 UTC.
+No new held-out report is available, so M4 remains unproven.
 
 The strict provider output-token cap remains an accepted but unmet criterion.
 The SDK nominal cost is a proxy, and economic billing is unknown.
