@@ -1,7 +1,18 @@
-"""Adaptive Agent backend core.
+"""Bounded execution primitives for Adaptive Agent."""
 
-Domain-agnostic Track 1 agent backend: durable Store, safe ToolBroker, canonical
-Controller seam for the control API, and promotion-gated CandidateManager.
-"""
+from .prime_child_planner import ChildObservationSink, LunaChildPlanner, SharedLedgerModelClient
+from .prime_safety_probe import run_eval_005_prime_runtime_probe
+from .prime_runtime import (
+    AdapterError, ArtifactRef, Capability, CapabilityBroker, CapabilitySet,
+    ChildPlan, ChildPlanRequest, ChildPlannerBudget, ExecutionMode, ExecutionResult, ModelObservation,
+    ParsedModelUsage, parse_model_usage,
+    PrimeRuntimeAdapter, PrimeRuntimeConfig, SharedBudget,
+    SecurityViolation,
+)
 
-__version__ = "0.1.0"
+__all__ = [
+    "AdapterError", "ArtifactRef", "Capability", "CapabilityBroker", "ChildObservationSink", "LunaChildPlanner", "SharedLedgerModelClient",
+    "CapabilitySet", "ChildPlan", "ChildPlanRequest", "ChildPlannerBudget", "ExecutionMode",
+    "ExecutionResult", "ModelObservation", "ParsedModelUsage", "parse_model_usage", "PrimeRuntimeAdapter", "PrimeRuntimeConfig",
+    "SecurityViolation", "SharedBudget", "run_eval_005_prime_runtime_probe",
+]

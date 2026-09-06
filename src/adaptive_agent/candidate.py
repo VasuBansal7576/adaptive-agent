@@ -408,7 +408,9 @@ class CandidateManager:
             raise PromotionError("report contains invalid or leaked evidence")
         if not report["attestation"]:
             raise PromotionError("report is not attested by a trusted evaluator")
-        if self.report_verifier is not None and not self.report_verifier(report):
+        if self.report_verifier is None:
+            raise PromotionError("report attestation verifier is not configured")
+        if not self.report_verifier(report):
             raise PromotionError("report attestation failed verification")
 
         arms = report["armSummaries"]

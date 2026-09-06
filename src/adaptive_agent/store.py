@@ -8,6 +8,7 @@ candidates, frozen evaluation protocols, promotions, and the active-bundle linea
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -22,7 +23,8 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# Credential-shaped values are masked before learner-visible projection.
+_SENSITIVE_KEY = re.compile(r"(?i)(?:hidden|expected|evaluator|answer[_ -]?key|approval|secret|credential|api[_-]?key|token|password|authorization)")
+
 _SECRET_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
@@ -33,19 +35,18 @@ _SECRET_PATTERNS = (
 
 def sanitize_for_learner(value: Any) -> Any:
     if isinstance(value, str):
-        out = value
-        for pat in _SECRET_PATTERNS:
-            out = pat.sub("[REDACTED]", out)
-        return out
+        for pattern in _SECRET_PATTERNS:
+            value = pattern.sub("[REDACTED]", value)
+        return value
     if isinstance(value, dict):
-        return {k: sanitize_for_learner(v) for k, v in value.items()}
+        return {
+            key: sanitize_for_learner(item)
+            for key, item in value.items()
+            if not _SENSITIVE_KEY.search(str(key))
+        }
     if isinstance(value, (list, tuple)):
-        return [sanitize_for_learner(v) for v in value]
+        return [sanitize_for_learner(item) for item in value]
     return value
-
-
-class RunIdempotencyConflict(ValueError):
-    """An idempotency key was reused with a different request fingerprint."""
 
 
 class Store:
@@ -99,9 +100,10 @@ class Store:
                     task_id TEXT NOT NULL,
                     environment_id TEXT NOT NULL,
                     bundle_id TEXT NOT NULL,
+                    bundle_hash TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL UNIQUE,
-                    request_fingerprint TEXT NOT NULL DEFAULT '',
+                    request_fingerprint TEXT,
                     last_event_sequence INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
                     completed_at TEXT,
@@ -155,6 +157,18 @@ class Store:
                     report_json TEXT NOT NULL,
                     validity TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS evaluation_queue (
+                    evaluation_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL,
+                    candidate_hash TEXT NOT NULL,
+                    base_hash TEXT NOT NULL,
+                    protocol_hash TEXT NOT NULL,
+                    partition_ref TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS promotions (
                     decision_id TEXT PRIMARY KEY,
                     candidate_hash TEXT NOT NULL,
@@ -194,6 +208,10 @@ class Store:
                     environment_id TEXT NOT NULL,
                     task_id TEXT NOT NULL,
                     partition TEXT NOT NULL,
+                    benchmark_id TEXT,
+                    arm TEXT,
+                    seed INTEGER,
+                    owner_id TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     state_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL
@@ -207,13 +225,6 @@ class Store:
                     created_at TEXT NOT NULL,
                     UNIQUE(scope_id, panel_index)
                 );
-                CREATE TABLE IF NOT EXISTS learning_records (
-                    record_id TEXT PRIMARY KEY,
-                    environment_id TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
-                    record_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
                 CREATE TABLE IF NOT EXISTS outcomes (
                     outcome_id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL UNIQUE,
@@ -222,8 +233,33 @@ class Store:
                     metadata_json TEXT NOT NULL,
                     checked_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS learning_records (
+                    record_id TEXT PRIMARY KEY,
+                    environment_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)").fetchall()}
+            for name, declaration in (("benchmark_id", "TEXT"), ("arm", "TEXT"), ("seed", "INTEGER"), ("owner_id", "TEXT")):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE task_runs ADD COLUMN {name} {declaration}")
+            # Migration: bundle_hash column for runs created before the pin.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+            if "bundle_hash" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN bundle_hash TEXT NOT NULL DEFAULT ''")
+            if "request_fingerprint" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN request_fingerprint TEXT")
+            frozen_cols = {r["name"] for r in conn.execute("PRAGMA table_info(frozen_protocols)").fetchall()}
+            for name, declaration in (
+                ("evaluator_refs_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("fixture_hashes_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("partition_hashes_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                if name not in frozen_cols:
+                    conn.execute(f"ALTER TABLE frozen_protocols ADD COLUMN {name} {declaration}")
             conn.commit()
 
     @contextmanager
@@ -235,15 +271,10 @@ class Store:
         finally:
             conn.close()
 
-    @contextmanager
+    # Public transaction seam used by evaluator-owned resumable drivers.
+    # Keep the implementation shared with the Store's internal callers.
     def connect(self) -> Iterator[sqlite3.Connection]:
-        """Public transaction seam for trusted adapters (evaluator/benchmark).
-
-        Same semantics as _connect; exposed so session-owned adapters do not
-        depend on a private method. Callers must commit explicitly.
-        """
-        with self._connect() as conn:
-            yield conn
+        return self._connect()
 
     # ------------------------------------------------------------------ artifacts
     def put_artifact(self, data: Any) -> ArtifactRef:
@@ -272,50 +303,43 @@ class Store:
             return json.load(f)
 
     def has_artifact(self, sha: str) -> bool:
-        return (self.artifact_dir / f"{sha}.json").exists()
+        return (self.artifact_dir / f"{sha}.json").exists() or (self.artifact_dir / f"{sha}.bin").exists()
 
-    def put_immutable_bytes(self, data: bytes) -> ArtifactRef:
-        """Content-addressed immutable blob store (arbitrary bytes)."""
+    def put_immutable_bytes(self, data: bytes) -> dict[str, Any]:
+        """Persist exact bytes by SHA-256 for patches and other opaque inputs."""
         import hashlib
 
-        sha = hashlib.sha256(data).hexdigest()
-        path = self.artifact_dir / f"{sha}.bin"
+        value = bytes(data)
+        digest = hashlib.sha256(value).hexdigest()
+        path = self.artifact_dir / f"{digest}.bin"
+        if path.exists() and path.read_bytes() != value:
+            raise ValueError("immutable artifact digest collision")
         if not path.exists():
-            tmp = self.artifact_dir / f"{sha}.tmp"
-            tmp.write_bytes(data)
+            tmp = self.artifact_dir / f"{digest}.tmp"
+            tmp.write_bytes(value)
             tmp.replace(path)
-        return ArtifactRef(id=f"blob_{sha[:16]}", version="1", sha256=sha)
+        return {"sha256": digest, "size": len(value), "immutable": True}
 
-    def get_immutable_bytes(self, ref: ArtifactRef | str) -> bytes:
-        sha = ref.sha256 if isinstance(ref, ArtifactRef) else ref
-        path = self.artifact_dir / f"{sha}.bin"
+    def get_immutable_bytes(self, digest: str) -> bytes:
+        path = self.artifact_dir / f"{digest}.bin"
         if not path.exists():
-            raise KeyError(f"blob {sha} not found")
+            raise KeyError(f"immutable artifact {digest} not found")
         return path.read_bytes()
 
     # ------------------------------------------------------------------ resumable task runs (benchmark seam)
-    def claim_task_run(
-        self,
-        task_run_id: str,
-        environment_id: str,
-        task_id: str,
-        partition: str,
-    ) -> tuple[bool, dict[str, Any]]:
-        """Atomically claim a task run (pending -> running). Returns
-        (True, row) for a fresh claim, (False, existing row) when resuming."""
+    def claim_task_run(self, task_run_id: str, environment_id: str, task_id: str, partition: str) -> tuple[bool, dict[str, Any]]:
+        """Atomically claim a task run, returning an existing row on resume."""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                existing = conn.execute(
-                    "SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)
-                ).fetchone()
+                existing = conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone()
                 if existing is not None:
+                    if (existing["environment_id"], existing["task_id"], existing["partition"]) != (environment_id, task_id, partition):
+                        conn.rollback()
+                        raise ValueError("task run id is already bound to a different task")
                     conn.commit()
                     return False, dict(existing)
-                conn.execute(
-                    "INSERT INTO task_runs (task_run_id, environment_id, task_id, partition, status, state_json, updated_at) VALUES (?, ?, ?, ?, 'running', '{}', ?)",
-                    (task_run_id, environment_id, task_id, partition, _utcnow()),
-                )
+                conn.execute("INSERT INTO task_runs (task_run_id, environment_id, task_id, partition, status, state_json, updated_at) VALUES (?, ?, ?, ?, 'running', '{}', ?)", (task_run_id, environment_id, task_id, partition, _utcnow()))
                 conn.commit()
                 return True, dict(conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone())
             except Exception:
@@ -324,414 +348,104 @@ class Store:
 
     def update_task_run_status(self, task_run_id: str, status: str, state_json: str | None = None) -> None:
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE task_runs SET status = ?, state_json = COALESCE(?, state_json), updated_at = ? WHERE task_run_id = ?",
-                (status, state_json, _utcnow(), task_run_id),
-            )
+            conn.execute("UPDATE task_runs SET status = ?, state_json = COALESCE(?, state_json), updated_at = ? WHERE task_run_id = ?", (status, state_json, _utcnow(), task_run_id))
             conn.commit()
 
     def get_task_run(self, task_run_id: str) -> dict[str, Any] | None:
         return self._get_json("task_runs", "task_run_id", task_run_id)
 
-    def list_task_runs(
-        self,
-        environment_id: str | None = None,
-        partition: str | None = None,
-        status: str | None = None,
-    ) -> list[dict[str, Any]]:
+    def claim_benchmark_task_run(
+        self, task_run_id: str, *, benchmark_id: str, environment_id: str,
+        task_id: str, partition: str, arm: str | None = None,
+        seed: int | None = None, owner_id: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Claim a benchmark task once and refuse foreign-owner takeover."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone()
+            if existing is not None:
+                row = dict(existing)
+                if (row["environment_id"], row["task_id"], row["partition"], row.get("benchmark_id"), row.get("arm"), row.get("seed")) != (environment_id, task_id, partition, benchmark_id, arm, seed):
+                    conn.rollback()
+                    raise ValueError("task run id is already bound to different benchmark inputs")
+                conn.commit()
+                return False, row
+            conn.execute(
+                "INSERT INTO task_runs(task_run_id, environment_id, task_id, partition, benchmark_id, arm, seed, owner_id, status, state_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', '{}', ?)",
+                (task_run_id, environment_id, task_id, partition, benchmark_id, arm, seed, owner_id, _utcnow()),
+            )
+            conn.commit()
+            return True, dict(conn.execute("SELECT * FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone())
+
+    def release_task_run(self, task_run_id: str, owner_id: str, status: str, state_json: str | None = None) -> bool:
+        """Update a task run only when its current owner matches."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT owner_id FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone()
+            if row is None or row["owner_id"] != owner_id:
+                conn.rollback()
+                return False
+            conn.execute("UPDATE task_runs SET status = ?, state_json = COALESCE(?, state_json), updated_at = ? WHERE task_run_id = ?", (status, state_json, _utcnow(), task_run_id))
+            conn.commit()
+            return True
+
+    def list_task_runs(self, environment_id: str | None = None, partition: str | None = None, status: str | None = None, benchmark_id: str | None = None, arm: str | None = None, owner_id: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM task_runs WHERE 1=1"
         params: list[Any] = []
-        if environment_id is not None:
-            query += " AND environment_id = ?"
-            params.append(environment_id)
-        if partition is not None:
-            query += " AND partition = ?"
-            params.append(partition)
-        if status is not None:
-            query += " AND status = ?"
-            params.append(status)
+        for column, value in (("environment_id", environment_id), ("partition", partition), ("status", status), ("benchmark_id", benchmark_id), ("arm", arm), ("owner_id", owner_id)):
+            if value is not None:
+                query += f" AND {column} = ?"
+                params.append(value)
         with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
-            return [dict(r) for r in rows]
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
 
-    # ------------------------------------------------------------------ atomic evaluation allocation
-    def reserve_allocation(
-        self,
-        scope_id: str,
-        allocation_id: str,
-        panels: list[list[str]],
-        limit: int,
-    ) -> int | None:
-        """Atomically reserve the next free panel for a validation allocation.
-
-        Mirrors the benchmark/evaluator contract: None when the allocation id is
-        already consumed or the panel pool is exhausted; the reserved panel
-        index on success. Restart-safe: persisted in SQLite.
-        """
+    def reserve_allocation(self, scope_id: str, allocation_id: str, panels: list[list[str]], limit: int) -> int | None:
+        """Atomically reserve the next free evaluator panel."""
         if not panels or len(panels) < limit:
             raise ValueError("allocation panels must cover the configured limit")
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                existing = conn.execute(
-                    "SELECT panel_index FROM evaluator_allocations WHERE allocation_id = ?",
-                    (allocation_id,),
-                ).fetchone()
-                if existing:
+                if conn.execute("SELECT 1 FROM evaluator_allocations WHERE allocation_id = ?", (allocation_id,)).fetchone() is not None:
                     conn.commit()
                     return None
-                used = {
-                    int(r["panel_index"])
-                    for r in conn.execute(
-                        "SELECT panel_index FROM evaluator_allocations WHERE scope_id = ?",
-                        (scope_id,),
-                    ).fetchall()
-                }
-                index = next((i for i in range(limit) if i not in used), None)
+                used = {int(row["panel_index"]) for row in conn.execute("SELECT panel_index FROM evaluator_allocations WHERE scope_id = ?", (scope_id,)).fetchall()}
+                index = next((candidate for candidate in range(limit) if candidate not in used), None)
                 if index is None:
                     conn.commit()
                     return None
                 task_ids = list(panels[index])
-                conn.execute(
-                    "INSERT INTO evaluator_allocations (scope_id, allocation_id, panel_index, panel_hash, task_ids_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (scope_id, allocation_id, index, sha256_json(task_ids), json.dumps(task_ids, sort_keys=True), _utcnow()),
-                )
+                conn.execute("INSERT INTO evaluator_allocations (scope_id, allocation_id, panel_index, panel_hash, task_ids_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", (scope_id, allocation_id, index, sha256_json(task_ids), json.dumps(task_ids, sort_keys=True), _utcnow()))
                 conn.commit()
                 return index
             except Exception:
                 conn.rollback()
                 raise
 
-    # ------------------------------------------------------------------ trusted development smoke gate
-    def dev_smoke_ok(self, environment_id: str) -> bool:
-        """True when the environment has at least one development-partition run
-        with a trusted outcome recorded (the held-out gate prerequisite)."""
+    def get_allocation(self, allocation_id: str) -> dict[str, Any] | None:
+        """Read a reserved evaluator panel with decoded task IDs."""
         with self._connect() as conn:
             row = conn.execute(
-                """SELECT 1 FROM outcomes o
-                    JOIN runs r ON r.run_id = o.run_id
-                    JOIN tasks t ON t.id = r.task_id
-                    WHERE r.environment_id = ? AND t.partition = 'development' AND o.passed = 1
-                    LIMIT 1""",
-                (environment_id,),
+                "SELECT * FROM evaluator_allocations WHERE allocation_id = ?",
+                (allocation_id,),
             ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        try:
+            task_ids = json.loads(value.get("task_ids_json", "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("stored evaluator allocation has invalid task IDs") from exc
+        if not isinstance(task_ids, list) or not all(isinstance(task_id, str) for task_id in task_ids):
+            raise ValueError("stored evaluator allocation task IDs must be strings")
+        value["task_ids"] = task_ids
+        return value
+
+    def dev_smoke_ok(self, environment_id: str) -> bool:
+        """Whether a passed trusted development run exists for an environment."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM outcomes o JOIN runs r ON r.run_id = o.run_id JOIN tasks t ON t.id = r.task_id WHERE r.environment_id = ? AND t.partition = 'development' AND o.passed = 1 AND EXISTS (SELECT 1 FROM evidence e WHERE e.run_id = o.run_id AND e.event_type = 'trusted_outcome' AND e.trust_class = 'evaluator') LIMIT 1", (environment_id,)).fetchone()
             return row is not None
-
-    # ------------------------------------------------------------------ learning projection (session7 seam)
-    def get_public_docs(self, environment_id: str) -> list[dict[str, Any]]:
-        """Public document contents for a manifest's doc refs.
-
-        Only artifacts without a restricted classification are returned;
-        artifacts classified 'operator' or 'evaluator_only' are excluded so no
-        hidden evaluator content reaches the learner.
-        """
-        row = self.get_environment(environment_id)
-        if not row:
-            return []
-        manifest_ref = ArtifactRef.model_validate_json(row["manifest_ref"])
-        manifest = self.get_artifact(manifest_ref)
-        out: list[dict[str, Any]] = []
-        for doc in manifest.get("docs", []):
-            ref = doc if isinstance(doc, dict) else {}
-            sha = ref.get("sha256")
-            if not sha or not self.has_artifact(sha):
-                continue
-            payload = self.get_artifact(sha)
-            if isinstance(payload, dict) and payload.get("classification") in ("operator", "evaluator_only"):
-                continue
-            out.append({"id": ref.get("id"), "version": ref.get("version"), "sha256": sha, "content": payload})
-        return out
-
-    def list_learner_evidence(
-        self,
-        environment_id: str | None = None,
-        run_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Redacted learner-visible DEVELOPMENT evidence joined to run/task and
-        the trusted outcome (when present). Never returns operator or
-        evaluator_only rows, and never non-development partitions."""
-        query = (
-            "SELECT e.evidence_id, e.run_id, e.sequence, e.event_type, e.content_hash, "
-            "e.trust_class, e.visibility, e.redacted, "
-            "r.task_id, r.environment_id, t.partition, "
-            "o.passed AS outcome_passed, o.score AS outcome_score, o.checked_at AS outcome_checked_at "
-            "FROM evidence e "
-            "JOIN runs r ON r.run_id = e.run_id "
-            "JOIN tasks t ON t.id = r.task_id "
-            "LEFT JOIN outcomes o ON o.run_id = e.run_id "
-            "WHERE e.visibility = 'learner' AND e.redacted = 1 AND t.partition = 'development'"
-        )
-        params: list[Any] = []
-        if environment_id is not None:
-            query += " AND r.environment_id = ?"
-            params.append(environment_id)
-        if run_id is not None:
-            query += " AND e.run_id = ?"
-            params.append(run_id)
-        query += " ORDER BY e.run_id, e.sequence"
-        with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
-            return [dict(r) for r in rows]
-
-    def list_learning_evidence(
-        self,
-        environment_id: str | None = None,
-        run_id: str | None = None,
-        include_broker_projection: bool = True,
-    ) -> list[dict[str, Any]]:
-        """The runtime's development evidence feed.
-
-        Returns sanitized learner-visible evidence rows (kind="evidence",
-        joined to trusted outcome) plus, per development run in scope, the
-        broker call/evidence join rows from list_run_tool_calls
-        (kind="broker_call") — canonical safe fields only, never raw
-        operator/evaluator_only rows.
-        """
-        evidence = [dict(r, kind="evidence") for r in self.list_learner_evidence(environment_id, run_id)]
-        if not include_broker_projection:
-            return evidence
-        query = (
-            "SELECT r.run_id FROM runs r JOIN tasks t ON t.id = r.task_id "
-            "WHERE t.partition = 'development'"
-        )
-        params: list[Any] = []
-        if environment_id is not None:
-            query += " AND r.environment_id = ?"
-            params.append(environment_id)
-        if run_id is not None:
-            query += " AND r.run_id = ?"
-            params.append(run_id)
-        with self._connect() as conn:
-            run_ids = [r["run_id"] for r in conn.execute(query, params).fetchall()]
-        calls: list[dict[str, Any]] = []
-        for rid in run_ids:
-            calls.extend(dict(r, kind="broker_call") for r in self.list_run_tool_calls(rid))
-        return evidence + calls
-
-    # ------------------------------------------------------------------ broker call/evidence join (session7 seam)
-    def list_run_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
-        """Read-only sanitized projection of one DEVELOPMENT run's broker calls
-        joined to their evidence rows.
-
-        Fails closed on non-development partitions and unknown runs. Each row:
-        call_id, evidence_id, tool, input, result, errorCode, retry, version,
-        arguments_sha256, result_sha256, run/task/environment bindings.
-        Approval tokens are never included.
-        """
-        run = self.get_run(run_id)
-        if run is None:
-            raise KeyError(f"run {run_id!r} not found")
-        task = self.get_task(run["task_id"])
-        if not task or task.get("partition") != "development":
-            raise PermissionError("tool-call projection is development-partition only")
-
-        # Restrict the projection to tools and input fields declared by the
-        # environment manifest. Missing or malformed manifests fail closed.
-        schema_keys: dict[str, set[str]] | None = {}
-        environment = self.get_environment(run["environment_id"])
-        if environment:
-            try:
-                manifest_ref = json.loads(environment["manifest_ref"])
-                manifest = self.get_artifact(manifest_ref["sha256"])
-                for schema in manifest.get("toolSchemas", []):
-                    if isinstance(schema, dict) and isinstance(schema.get("name"), str):
-                        properties = (schema.get("inputSchema") or {}).get("properties") or {}
-                        schema_keys[schema["name"]] = set(properties)
-            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, AttributeError):
-                schema_keys = None
-        if not schema_keys:
-            return []
-
-        def valid_source(event: dict[str, Any]) -> dict[str, Any] | None:
-            if event["event_type"] != "tool_result" or event["trust_class"] != "broker":
-                return None
-            if event["visibility"] not in {"learner", "operator"}:
-                return None
-            try:
-                source_ref = json.loads(event["source_ref"])
-                payload = self.get_artifact(source_ref["sha256"])
-            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
-                return None
-            if event.get("content_hash") != source_ref["sha256"]:
-                return None
-            return payload if isinstance(payload, dict) else None
-
-        calls = [
-            r for r in self.list_tool_calls(run_id)
-        ]
-        evidence_by_call: dict[str, dict[str, Any]] = {}
-        for ev in self.list_evidence(run_id):
-            payload = valid_source(ev)
-            if payload is not None and isinstance(payload.get("callId"), str):
-                evidence_by_call[payload["callId"]] = ev
-
-        out: list[dict[str, Any]] = []
-        matched: set[str] = set()
-        for call in calls:
-            try:
-                args = json.loads(call["arguments_json"])
-            except (TypeError, json.JSONDecodeError):
-                args = {}
-            result: dict[str, Any] = {}
-            error_code = retry = None
-            if call.get("result_json"):
-                try:
-                    result = json.loads(call["result_json"])
-                except (TypeError, json.JSONDecodeError):
-                    result = {}
-            if isinstance(result, dict):
-                err = result.get("error")
-                if isinstance(err, dict):
-                    error_code = err.get("code")
-                    retry = err.get("retry")
-                status = result.get("status")
-                output = result.get("output")
-                version = result.get("toolVersion")
-                effect = result.get("effect")
-                result_sha = sha256_json(result)
-            else:
-                status = output = version = effect = result_sha = None
-            allowed = schema_keys.get(call["tool"])
-            if allowed is None:
-                continue
-            ev = evidence_by_call.get(call["call_id"], {})
-            if ev:
-                matched.add(call["call_id"])
-            out.append({
-                "callId": call["call_id"],
-                "evidenceId": ev.get("evidence_id"),
-                "tool": call["tool"],
-                "input": sanitize_for_learner({key: args[key] for key in args if key in allowed}),
-                "result": sanitize_for_learner(output) if output is not None else None,
-                "status": status,
-                "errorCode": error_code,
-                "retry": retry,
-                "version": version,
-                "effect": effect or call.get("effect"),
-                "idempotencyKey": call["idempotency_key"],
-                "argumentsSha256": sha256_json(args),
-                "resultSha256": result_sha,
-                "evidenceContentHash": ev.get("content_hash"),
-                "runId": run_id,
-                "taskId": run["task_id"],
-                "environmentId": run["environment_id"],
-                "partition": "development",
-                "visibility": "learner",
-                "redacted": True,
-            })
-        # Evidence rows with no matching tool_calls row (older app paths that
-        # recorded operator-only tool_result events): project the same safe
-        # fields from the sanitized artifact payload instead of hiding them.
-        for ev in self.list_evidence(run_id):
-            if ev["event_type"] != "tool_result" or ev["trust_class"] != "broker" or ev["visibility"] != "operator":
-                continue
-            payload = valid_source(ev)
-            if payload is None:
-                # Preserve a minimal bound row only when the source artifact
-                # cannot be resolved. A resolved hash mismatch is tampering.
-                try:
-                    source_ref = json.loads(ev["source_ref"])
-                    self.get_artifact(source_ref["sha256"])
-                except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
-                    payload = {}
-                else:
-                    continue
-            call_id = payload.get("callId")
-            if isinstance(call_id, str) and call_id in matched:
-                continue
-            tool = payload.get("tool")
-            allowed = schema_keys.get(tool) if isinstance(tool, str) else None
-            if tool is not None and allowed is None:
-                continue
-            raw_input = payload.get("input")
-            err = payload.get("error")
-            out.append({
-                "callId": call_id,
-                "evidenceId": ev["evidence_id"],
-                "tool": tool,
-                "input": sanitize_for_learner({key: raw_input[key] for key in raw_input if allowed is not None and key in allowed}) if isinstance(raw_input, dict) else None,
-                "result": sanitize_for_learner(payload.get("output")),
-                "status": payload.get("status"),
-                "errorCode": err.get("code") if isinstance(err, dict) else None,
-                "retry": err.get("retry") if isinstance(err, dict) else None,
-                "version": payload.get("toolVersion"),
-                "effect": payload.get("effect"),
-                "idempotencyKey": None,
-                "argumentsSha256": None,
-                "resultSha256": sha256_json(payload),
-                "evidenceContentHash": ev.get("content_hash"),
-                "runId": run_id,
-                "taskId": run["task_id"],
-                "environmentId": run["environment_id"],
-                "partition": "development",
-                "visibility": "learner",
-                "redacted": True,
-            })
-        return out
-
-    # ------------------------------------------------------------------ learning records (session7 seam)
-    def save_learning_record(self, record_id: str, environment_id: str, run_id: str, record_json: str) -> None:
-        """Persist one immutable learner projection for restart-safe learning."""
-        if not all(isinstance(value, str) and value for value in (record_id, environment_id, run_id, record_json)):
-            raise ValueError("learning record fields must be non-empty strings")
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO learning_records (record_id, environment_id, run_id, record_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                (record_id, environment_id, run_id, record_json, _utcnow()),
-            )
-            conn.commit()
-
-    def list_learning_records(self, environment_id: str | None = None, run_id: str | None = None) -> list[dict[str, Any]]:
-        """Read persisted records, with a safe legacy reconstruction fallback."""
-        query = "SELECT * FROM learning_records WHERE 1=1"
-        params: list[Any] = []
-        if environment_id is not None:
-            query += " AND environment_id = ?"
-            params.append(environment_id)
-        if run_id is not None:
-            query += " AND run_id = ?"
-            params.append(run_id)
-        query += " ORDER BY created_at"
-        with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
-        if rows:
-            return [dict(row) for row in rows]
-        if environment_id is None or run_id is None:
-            return []
-
-        records: list[dict[str, Any]] = []
-        environment = self.get_environment(environment_id)
-        if environment:
-            try:
-                manifest_ref = json.loads(environment["manifest_ref"])
-                manifest = self.get_artifact(manifest_ref["sha256"])
-                for ref in manifest.get("docs", []):
-                    if not isinstance(ref, dict):
-                        continue
-                    content = self.get_artifact(ref["sha256"])
-                    text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":"))
-                    records.append({"kind": "public_doc", "sourceId": ref.get("id", ref["sha256"]), "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "visibility": "public"})
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                pass
-        trusted = self.has_trusted_outcome(run_id)
-        for row in self.list_evidence(run_id):
-            if row.get("visibility") != "learner":
-                continue
-            try:
-                source = json.loads(row["source_ref"])
-                content = self.get_artifact(source["sha256"])
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                continue
-            text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":"))
-            provenance = self.evidence_provenance(row["evidence_id"])
-            if not provenance or provenance.get("environment_id") != environment_id or provenance.get("partition") != "development":
-                continue
-            content_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            records.append({"kind": "live_evidence", "sourceId": row["evidence_id"], "content": text, "contentHash": content_digest, "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": row.get("trust_class"), "trustedOutcome": trusted})
-        if trusted:
-            text = "A trusted evaluator outcome is stored for this development run."
-            records.append({"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True})
-        return records
 
     # ------------------------------------------------------------------ generic helpers
     def _insert_json(self, table: str, id_col: str, obj_id: str, data: dict[str, Any]) -> None:
@@ -761,6 +475,11 @@ class Store:
 
     def get_environment(self, env_id: str) -> dict[str, Any] | None:
         return self._get_json("environments", "id", env_id)
+
+    def list_environments(self) -> list[dict[str, Any]]:
+        """List registered environment rows for controller diagnostics."""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM environments ORDER BY id").fetchall()]
 
     def register_task(self, task_id: str, environment_id: str, version: str, task_ref: str, partition: str, goal: str) -> None:
         with self._connect() as conn:
@@ -794,57 +513,32 @@ class Store:
             row = conn.execute("SELECT * FROM runs WHERE idempotency_key = ?", (key,)).fetchone()
             return dict(row) if row else None
 
-    def create_run_idempotent(
-        self,
-        idempotency_key: str,
-        request_fingerprint: str,
-        run_data: dict[str, Any],
-    ) -> tuple[str, dict[str, Any]]:
-        """Atomic request-fingerprint run creation.
+    def claim_run(self, run_id: str) -> bool | None:
+        """Atomically claim a queued run for one executor.
 
-        Returns ("exists", row) when the key already belongs to an identical
-        request, ("created", row) on success, and raises
-        RunIdempotencyConflict when the key is bound to different content.
+        ``None`` means the run does not exist, ``True`` means this caller
+        changed queued to running, and ``False`` means another caller already
+        claimed it or it is terminal.  The serialized RunRecord is updated in
+        the same transaction as the status column so a restart cannot observe
+        a partially claimed run.
         """
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            try:
-                existing = conn.execute(
-                    "SELECT * FROM runs WHERE idempotency_key = ?", (idempotency_key,)
-                ).fetchone()
-                if existing is not None:
-                    conn.commit()
-                    row = dict(existing)
-                    if row.get("request_fingerprint") != request_fingerprint:
-                        raise RunIdempotencyConflict(
-                            f"idempotency key {idempotency_key!r} already bound to a different request"
-                        )
-                    return "exists", row
-                run_data = dict(run_data)
-                run_id = run_data.pop("run_id", None)
-                if run_id is None:
-                    raise ValueError("run_data must include run_id")
-                run_data["idempotency_key"] = idempotency_key
-                run_data["request_fingerprint"] = request_fingerprint
-                columns = ["run_id"] + list(run_data.keys())
-                values = [run_id] + list(run_data.values())
-                conn.execute(
-                    f"INSERT INTO runs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
-                    values,
-                )
-                conn.commit()
-                row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-                return "created", dict(row)
-            except RunIdempotencyConflict:
-                raise
-            except Exception:
+            row = conn.execute("SELECT status, run_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
                 conn.rollback()
-                raise
-
-    def list_environments(self) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM environments ORDER BY registered_at").fetchall()
-            return [dict(r) for r in rows]
+                return None
+            if row["status"] != "queued":
+                conn.rollback()
+                return False
+            payload = json.loads(row["run_json"])
+            payload["status"] = "running"
+            changed = conn.execute("UPDATE runs SET status = ?, run_json = ? WHERE run_id = ? AND status = 'queued'", ("running", json.dumps(payload, sort_keys=True), run_id)).rowcount == 1
+            if changed:
+                conn.commit()
+            else:
+                conn.rollback()
+            return changed
 
     def update_run_status(
         self,
@@ -1043,6 +737,74 @@ class Store:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def save_learning_record(self, record_id: str, environment_id: str, run_id: str, record_json: str) -> None:
+        """Persist one immutable learner projection for restart-safe learning."""
+        if not all(isinstance(value, str) and value for value in (record_id, environment_id, run_id, record_json)):
+            raise ValueError("learning record fields must be non-empty strings")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO learning_records (record_id, environment_id, run_id, record_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (record_id, environment_id, run_id, record_json, _utcnow()),
+            )
+            conn.commit()
+
+    def list_learning_records(self, environment_id: str | None = None, run_id: str | None = None) -> list[dict[str, Any]]:
+        """Read the narrow, persisted projection exposed to learning."""
+        with self._connect() as conn:
+            query = "SELECT * FROM learning_records WHERE 1=1"
+            params: list[Any] = []
+            if environment_id is not None:
+                query += " AND environment_id = ?"
+                params.append(environment_id)
+            if run_id is not None:
+                query += " AND run_id = ?"
+                params.append(run_id)
+            query += " ORDER BY created_at, record_id"
+            rows = conn.execute(query, params).fetchall()
+        if rows:
+            return [dict(row) for row in rows]
+
+        # Older stores predate the materialized projection. Reconstruct it
+        # only when no persisted rows exist, preserving the existing safety
+        # checks and allowing those stores to migrate on the next launch.
+        if environment_id is None or run_id is None:
+            return []
+        records: list[dict[str, Any]] = []
+        environment = self.get_environment(environment_id)
+        if environment:
+            try:
+                manifest_ref = json.loads(environment["manifest_ref"])
+                manifest = self.get_artifact(manifest_ref["sha256"])
+                for ref in manifest.get("docs", []):
+                    if not isinstance(ref, dict):
+                        continue
+                    content = self.get_artifact(ref["sha256"])
+                    text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":"))
+                    records.append({"kind": "public_doc", "sourceId": ref.get("id", ref["sha256"]), "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "visibility": "public"})
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        trusted_row = self.get_outcome_by_run_id(run_id)
+        trusted = isinstance(trusted_row, Mapping)
+        outcome_passed = bool(trusted_row.get("passed")) if trusted_row is not None else False
+        for row in self.list_evidence(run_id):
+            if row.get("visibility") != "learner":
+                continue
+            try:
+                source = json.loads(row["source_ref"])
+                content = self.get_artifact(source["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, separators=(",", ":"))
+            provenance = self.evidence_provenance(row["evidence_id"])
+            if not provenance or provenance.get("environment_id") != environment_id:
+                continue
+            content_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            records.append({"kind": "live_evidence", "sourceId": row["evidence_id"], "content": text, "contentHash": content_digest, "environmentId": environment_id, "runId": run_id, "partition": provenance.get("partition"), "visibility": "learner", "trustClass": row.get("trust_class"), "trustedOutcome": trusted})
+        if trusted:
+            text = "A trusted evaluator outcome is stored for this development run."
+            records.append({"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": text, "contentHash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": trusted, "outcomePassed": outcome_passed})
+        return records
+
     def evidence_provenance(self, evidence_id: str) -> dict[str, Any] | None:
         """Join evidence -> run -> task to expose partition and terminal status."""
         with self._connect() as conn:
@@ -1061,6 +823,212 @@ class Store:
         with self._connect() as conn:
             row = conn.execute("SELECT 1 FROM outcomes WHERE run_id = ?", (run_id,)).fetchone()
             return row is not None
+
+    # ------------------------------------------------------------------ narrow learning projections
+    def get_public_docs(self, environment_id: str) -> list[dict[str, Any]]:
+        """Return manifest documents that are safe for learner context."""
+        row = self.get_environment(environment_id)
+        if not row:
+            return []
+        manifest_ref = ArtifactRef.model_validate_json(row["manifest_ref"])
+        manifest = self.get_artifact(manifest_ref)
+        output: list[dict[str, Any]] = []
+        for raw in manifest.get("docs", []):
+            if not isinstance(raw, dict):
+                continue
+            sha = raw.get("sha256")
+            if not isinstance(sha, str) or not self.has_artifact(sha):
+                continue
+            payload = self.get_artifact(sha)
+            if isinstance(payload, dict) and payload.get("classification") in {"operator", "evaluator_only"}:
+                continue
+            output.append({"id": raw.get("id"), "version": raw.get("version"), "sha256": sha, "content": payload})
+        return output
+
+    def list_learner_evidence(self, environment_id: str | None = None, run_id: str | None = None) -> list[dict[str, Any]]:
+        """Return only redacted broker tool observations from DEVELOPMENT.
+
+        The join binds each row to its run, task partition, environment, and
+        trusted outcome presence. Raw evaluator/operator evidence is excluded
+        at the SQL boundary rather than filtered by learner code.
+        """
+        query = ("SELECT e.evidence_id, e.run_id, e.sequence, e.event_type, e.content_hash, "
+                 "e.trust_class, e.visibility, e.redacted, r.task_id, r.environment_id, r.status AS run_status, t.partition, "
+                 "1 AS trusted_outcome, o.passed AS outcome_passed "
+                 "FROM evidence e JOIN runs r ON r.run_id=e.run_id JOIN tasks t ON t.id=r.task_id "
+                 "LEFT JOIN outcomes o ON o.run_id=e.run_id "
+                 "WHERE e.visibility='learner' AND e.redacted=1 AND e.trust_class='broker' "
+                 "AND e.event_type IN ('tool_result','learning_evidence_projection') AND t.partition='development' "
+                 "AND r.status IN ('succeeded','failed','cancelled','timed_out','outcome_unknown') "
+                 "AND o.run_id IS NOT NULL")
+        params: list[Any] = []
+        if environment_id is not None:
+            query += " AND r.environment_id=?"
+            params.append(environment_id)
+        if run_id is not None:
+            query += " AND e.run_id=?"
+            params.append(run_id)
+        query += " ORDER BY e.run_id, e.sequence"
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def list_run_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
+        """Return a sanitized broker-call projection for one development run.
+
+        The projection joins prepared tool calls with broker result evidence.
+        It deliberately omits approval tokens and keeps only fields that the
+        learner may use for procedural improvement.
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            raise KeyError(f"run {run_id!r} not found")
+        task = self.get_task(run.get("task_id")) if isinstance(run.get("task_id"), str) else None
+        if not task or task.get("partition") != "development":
+            raise PermissionError("tool-call projection is development-partition only")
+
+        # Restrict the projection to tools and input fields declared by the
+        # environment manifest. Missing or malformed manifests fail closed.
+        schema_keys: dict[str, set[str]] | None = {}
+        environment = self.get_environment(run["environment_id"])
+        if environment:
+            try:
+                manifest_ref = json.loads(environment["manifest_ref"])
+                manifest = self.get_artifact(manifest_ref["sha256"])
+                for schema in manifest.get("toolSchemas", []):
+                    if isinstance(schema, dict) and isinstance(schema.get("name"), str):
+                        properties = (schema.get("inputSchema") or {}).get("properties") or {}
+                        schema_keys[schema["name"]] = set(properties)
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, AttributeError):
+                schema_keys = None
+        if not schema_keys:
+            return []
+
+        def valid_source(event: dict[str, Any]) -> dict[str, Any] | None:
+            if event["event_type"] != "tool_result" or event["trust_class"] != "broker":
+                return None
+            if event["visibility"] not in {"learner", "operator"}:
+                return None
+            try:
+                source_ref = json.loads(event["source_ref"])
+                payload = self.get_artifact(source_ref["sha256"])
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                return None
+            if event.get("content_hash") != source_ref["sha256"]:
+                return None
+            return payload if isinstance(payload, dict) else None
+
+        with self._connect() as conn:
+            calls = [dict(row) for row in conn.execute("SELECT * FROM tool_calls WHERE run_id = ? ORDER BY rowid", (run_id,)).fetchall()]
+        evidence_by_call: dict[str, dict[str, Any]] = {}
+        for event in self.list_evidence(run_id):
+            payload = valid_source(event)
+            if payload is not None and isinstance(payload.get("callId"), str):
+                evidence_by_call[payload["callId"]] = event
+
+        out: list[dict[str, Any]] = []
+        matched: set[str] = set()
+        for call in calls:
+            try:
+                arguments = json.loads(call["arguments_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                arguments = {}
+            result: Any = None
+            status = error_code = retry = version = effect = result_hash = None
+            if isinstance(call.get("result_json"), str):
+                try:
+                    result = json.loads(call["result_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result = None
+            if isinstance(result, dict):
+                status = result.get("status")
+                output = result.get("output")
+                error = result.get("error")
+                version = result.get("toolVersion")
+                effect = result.get("effect") or call.get("effect")
+                if isinstance(error, dict):
+                    error_code, retry = error.get("code"), error.get("retry")
+                result_hash = sha256_json(result)
+            else:
+                output = None
+                effect = call.get("effect")
+            allowed = schema_keys.get(call["tool"])
+            if allowed is None:
+                continue
+            event = evidence_by_call.get(call["call_id"], {})
+            if event:
+                matched.add(call["call_id"])
+            out.append({
+                "callId": call["call_id"], "evidenceId": event.get("evidence_id"), "tool": call["tool"],
+                "input": sanitize_for_learner({key: arguments[key] for key in arguments if key in allowed}), "result": sanitize_for_learner(output), "status": status,
+                "errorCode": error_code, "retry": retry, "version": version, "effect": effect,
+                "idempotencyKey": call["idempotency_key"], "argumentsSha256": sha256_json(arguments),
+                "resultSha256": result_hash, "evidenceContentHash": event.get("content_hash"),
+                "runId": run_id, "taskId": run["task_id"], "environmentId": run["environment_id"],
+                "partition": "development", "visibility": "learner", "redacted": True,
+            })
+        # Older runtime versions persisted tool-result evidence without a
+        # prepared-call row. Preserve that history as a minimal safe record.
+        for event in self.list_evidence(run_id):
+            # An unjoined operator row is raw broker fidelity, not a learner
+            # projection.  Only a learner-visible event may use this legacy
+            # fallback; prepared calls above can still derive a safe row from
+            # their persisted result while retaining the operator evidence
+            # solely for provenance.
+            if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker" or event.get("visibility") != "operator":
+                continue
+            payload = valid_source(event)
+            if payload is None:
+                # Preserve a minimal bound row only when the source artifact
+                # cannot be resolved. A resolved hash mismatch is tampering.
+                try:
+                    source_ref = json.loads(event["source_ref"])
+                    self.get_artifact(source_ref["sha256"])
+                except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                    payload = {}
+                else:
+                    continue
+            call_id = payload.get("callId")
+            if isinstance(call_id, str) and call_id in matched:
+                continue
+            tool = payload.get("tool")
+            allowed = schema_keys.get(tool) if isinstance(tool, str) else None
+            if payload and not isinstance(tool, str):
+                continue
+            if tool is not None and allowed is None:
+                continue
+            raw_input = payload.get("input")
+            error = payload.get("error")
+            out.append({
+                "callId": call_id, "evidenceId": event.get("evidence_id"), "tool": tool,
+                "input": sanitize_for_learner({key: raw_input[key] for key in raw_input if allowed is not None and key in allowed}) if isinstance(raw_input, dict) else None, "result": sanitize_for_learner(payload.get("output")), "status": payload.get("status"),
+                "errorCode": error.get("code") if isinstance(error, dict) else None,
+                "retry": error.get("retry") if isinstance(error, dict) else None,
+                "version": payload.get("toolVersion"), "effect": payload.get("effect"),
+                "idempotencyKey": None, "argumentsSha256": None, "resultSha256": sha256_json(payload),
+                "evidenceContentHash": event.get("content_hash"), "runId": run_id,
+                "taskId": run["task_id"], "environmentId": run["environment_id"],
+                "partition": "development", "visibility": "learner", "redacted": True,
+            })
+        return out
+
+    def list_learning_evidence(self, environment_id: str | None = None, run_id: str | None = None, include_broker_projection: bool = True) -> list[dict[str, Any]]:
+        """Return the bounded learner evidence feed joined to trusted runs."""
+        evidence = [dict(row, kind="evidence") for row in self.list_learner_evidence(environment_id, run_id)]
+        if not include_broker_projection:
+            return evidence
+        query = "SELECT r.run_id FROM runs r JOIN tasks t ON t.id = r.task_id WHERE t.partition = 'development'"
+        params: list[Any] = []
+        if environment_id is not None:
+            query += " AND r.environment_id = ?"
+            params.append(environment_id)
+        if run_id is not None:
+            query += " AND r.run_id = ?"
+            params.append(run_id)
+        with self._connect() as conn:
+            run_ids = [str(row["run_id"]) for row in conn.execute(query, params).fetchall()]
+        for rid in run_ids:
+            evidence.extend(dict(row, kind="broker_call") for row in self.list_run_tool_calls(rid))
+        return evidence
 
     # ------------------------------------------------------------------ tool calls / approvals
     def prepare_tool_call(self, data: dict[str, Any]) -> bool:
@@ -1169,14 +1137,6 @@ class Store:
     def get_tool_call(self, call_id: str) -> dict[str, Any] | None:
         return self._get_json("tool_calls", "call_id", call_id)
 
-    def list_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM tool_calls WHERE run_id = ? ORDER BY rowid",
-                (run_id,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
     def get_tool_call_by_idempotency(self, run_id: str, idempotency_key: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -1234,24 +1194,15 @@ class Store:
         protocol_hash: str,
         gate_json: str,
         evaluator_id: str,
+        *,
         evaluator_refs: list[str] | None = None,
         fixture_hashes: dict[str, str] | None = None,
         partition_hashes: dict[str, str] | None = None,
     ) -> None:
         with self._connect() as conn:
             conn.execute(
-                """INSERT INTO frozen_protocols (protocol_hash, gate_json, evaluator_id,
-                    evaluator_refs_json, fixture_hashes_json, partition_hashes_json, frozen_at, active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
-                (
-                    protocol_hash,
-                    gate_json,
-                    evaluator_id,
-                    json.dumps(sorted(evaluator_refs or [])),
-                    json.dumps(fixture_hashes or {}, sort_keys=True),
-                    json.dumps(partition_hashes or {}, sort_keys=True),
-                    _utcnow(),
-                ),
+                "INSERT INTO frozen_protocols (protocol_hash, gate_json, evaluator_id, evaluator_refs_json, fixture_hashes_json, partition_hashes_json, frozen_at, active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                (protocol_hash, gate_json, evaluator_id, json.dumps(evaluator_refs or []), json.dumps(fixture_hashes or {}), json.dumps(partition_hashes or {}), _utcnow()),
             )
             conn.commit()
 
@@ -1272,6 +1223,47 @@ class Store:
     def save_evaluation(self, report_id: str, data: dict[str, Any]) -> None:
         self._insert_json("evaluations", "report_id", report_id, data)
 
+    def save_evaluation_queue(self, evaluation_id: str, data: dict[str, Any]) -> None:
+        """Persist queue metadata separately from trusted evaluation reports."""
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO evaluation_queue(
+                    evaluation_id, candidate_id, candidate_hash, base_hash,
+                    protocol_hash, partition_ref, state, payload_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(evaluation_id) DO UPDATE SET
+                    candidate_id=excluded.candidate_id,
+                    candidate_hash=excluded.candidate_hash,
+                    base_hash=excluded.base_hash,
+                    protocol_hash=excluded.protocol_hash,
+                    partition_ref=excluded.partition_ref,
+                    state=excluded.state,
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at""",
+                (
+                    evaluation_id,
+                    data["candidate_id"],
+                    data["candidate_hash"],
+                    data["base_hash"],
+                    data["protocol_hash"],
+                    data["partition_ref"],
+                    data["state"],
+                    data["payload_json"],
+                    data.get("created_at", _utcnow()),
+                    data.get("updated_at", _utcnow()),
+                ),
+            )
+            conn.commit()
+
+    def get_evaluation_queue(self, evaluation_id: str) -> dict[str, Any] | None:
+        return self._get_json("evaluation_queue", "evaluation_id", evaluation_id)
+
+    def list_evaluation_queue(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM evaluation_queue ORDER BY created_at").fetchall()
+            return [dict(row) for row in rows]
+
     def get_evaluation(self, report_id: str) -> dict[str, Any] | None:
         return self._get_json("evaluations", "report_id", report_id)
 
@@ -1282,6 +1274,11 @@ class Store:
                 (protocol_hash, candidate_hash),
             ).fetchone()
             return dict(row) if row else None
+
+    def list_evaluations(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM evaluations ORDER BY report_id").fetchall()
+            return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------ promotions
     def save_promotion(self, decision_id: str, data: dict[str, Any]) -> None:

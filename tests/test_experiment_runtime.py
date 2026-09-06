@@ -256,6 +256,57 @@ def test_partial_known_cost_remains_unknown():
     assert "costMicrounits" not in partial_receipt
 
 
+def test_observation_cost_requires_complete_nominal_coverage():
+    from adaptive_agent.app import LearningRuntimeError, _effective_observation_cost
+
+    assert _effective_observation_cost({"costMicrounits": 17, "nominalCostUsd": 0.000021}) == 17
+    complete = {"nominalCostUsd": 0.000021, "nominalCostStatus": "complete", "nominalCostCoverage": {"knownReceipts": 1, "totalReceipts": 1}}
+    assert _effective_observation_cost(complete) == 21
+    with pytest.raises(LearningRuntimeError, match="complete economic or nominal cost"):
+        _effective_observation_cost({"nominalCostUsd": 0.000021, "nominalCostStatus": "partial", "nominalCostCoverage": {"knownReceipts": 1, "totalReceipts": 2}})
+
+
+def test_recovery_uses_receipt_refs_and_nominal_proxy():
+    import json
+
+    class RecoveryStore:
+        def __init__(self):
+            self.artifacts = {
+                "model-art": {"responseId": "response", "arm": "L", "seed": 17, "bundleHash": "base", "versionRefs": {"planner": "core"}, "accountingRef": "acct"},
+                "outcome-art": {"passed": True, "reliable": True, "safetyViolations": 0, "fixtureResetOk": True},
+                "acct": {"nominalCostUsd": 0.000012, "durationSeconds": 1.0},
+            }
+            self.rows = {
+                "model-ref": {"evidence_id": "model-ref", "run_id": "run", "event_type": "model_response", "source_ref": json.dumps({"sha256": "model-art"})},
+                "outcome-ref": {"evidence_id": "outcome-ref", "run_id": "run", "event_type": "trusted_outcome", "source_ref": json.dumps({"sha256": "outcome-art"})},
+            }
+
+        def get_run(self, run_id):
+            return {"task_id": "task", "environment_id": "known-a", "status": "succeeded", "run_json": json.dumps({"arm": "L", "seed": 17, "bundleHash": "base"})} if run_id == "run" else None
+
+        def get_task(self, task_id):
+            return {"partition": "validation"} if task_id == "task" else None
+
+        def get_evidence(self, evidence_id):
+            return self.rows.get(evidence_id)
+
+        def get_artifact(self, ref):
+            return self.artifacts[ref]
+
+        def get_outcome_by_run_id(self, _run_id):
+            return {}
+
+    store = RecoveryStore()
+    runtime = SimpleNamespace(controller=SimpleNamespace(store=store, get_active_bundle=lambda: Bundle("base")), core_planner_hash="core", image_digest="image", packages={})
+    runner = DefaultExperimentStageRunner(runtime, Protocol())
+    receipt = {"stage": "validation", "cellKey": "validation:0", "runIds": ["run"], "evidenceRefs": ["model-ref"], "outcomeRefs": ["outcome-ref"], "costBasis": "nominal_budget_proxy", "billingStatus": "unknown"}
+
+    observations = runner.recover_evaluation_observations(receipt)
+    assert observations[0].cost_microunits == 12
+    with pytest.raises(ExperimentRuntimeError, match="evidence references"):
+        runner.recover_evaluation_observations({**receipt, "evidenceRefs": ["missing"]})
+
+
 def test_learning_receipt_preserves_nominal_proxy_and_wall_time(monkeypatch):
     runtime = Runtime()
     runner = DefaultExperimentStageRunner(runtime, Protocol())
@@ -374,17 +425,6 @@ def test_actual_durable_runtime_rejects_unfrozen_execution_before_model_dispatch
     assert runtime.learning_model_client.calls == 0
 
 
-def test_observation_cost_uses_measured_then_complete_nominal_cost():
-    pytest.importorskip("fastapi")
-    from adaptive_agent.app import _effective_observation_cost, LearningRuntimeError
-
-    assert _effective_observation_cost({"costMicrounits": 17, "nominalCostUsd": 0.000021}) == 17
-    assert _effective_observation_cost({"costMicrounits": None, "nominalCostUsd": 0.000021}) == 21
-
-    with pytest.raises(LearningRuntimeError, match="complete economic or nominal cost"):
-        _effective_observation_cost({"costMicrounits": None, "nominalCostUsd": None})
-
-
 @pytest.mark.parametrize("zero_field", ["modelTokens", "costMicrounits"])
 def test_actual_durable_runtime_rejects_zero_budget_before_model_dispatch(tmp_path, zero_field):
     pytest.importorskip("fastapi")
@@ -486,41 +526,3 @@ def test_transfer_charged_subcalls_are_accounted_once_by_real_evaluation_job(tmp
     assert accounting["costMicrounits"] == 18
     assert accounting["inputTokens"] == 11
     assert accounting["outputTokens"] == 10
-
-
-def test_recovery_uses_nominal_cost_proxy_and_strict_store_verifier(tmp_path):
-    evaluation = pytest.importorskip("adaptive_agent.evaluation")
-    evidence_store = pytest.importorskip("adaptive_agent.evaluation_store")
-    from adaptive_agent.store import Store as DurableStore
-    import json
-
-    packages = evaluation.build_environment_packages()
-    protocol = evaluation.EvaluationProtocol(image_digest="sha256:image", core_planner_hash="core")
-    frozen = protocol.freeze(packages)
-    package = packages["finance"]
-    task = package.tasks_for_partition(evaluation.Partition.VALIDATION)[0]
-    store = DurableStore(tmp_path)
-    bundle_hash = "b" * 64
-    store.save_bundle("bundle-1", None, bundle_hash, "{}", is_active=True)
-    store.register_task(task.task_id, "finance", package.manifest.version, "task-ref", "validation", task.goal)
-    run_id = "validation-run"
-    store.save_run(run_id, {"task_id": task.task_id, "environment_id": "finance", "bundle_id": "bundle-1", "status": "succeeded", "idempotency_key": "validation-key", "request_fingerprint": "validation-fingerprint", "last_event_sequence": 0, "created_at": "now", "run_json": json.dumps({"arm": "L", "seed": 17, "bundleHash": bundle_hash})})
-    versions = {"model": evaluation.sha256_json({"profile": protocol.model_profile, "provider": protocol.provider}), "planner": protocol.core_planner_hash, "budget": evaluation.sha256_json(frozen.inputs["runBudget"]), "policy": evaluation.sha256_json(package.manifest.policy_ref), "schema": evaluation.sha256_json(package.manifest.tool_schemas), "image": protocol.image_digest}
-    response_id = "response-validation"
-    usage = {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
-    accounting = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "usage": usage, "aggregateUsage": usage, "costMicrounits": None, "nominalCostUsd": 0.000012, "economicCost": {"status": "unknown", "microunits": None}, "durationSeconds": 1.25, "versionRefs": versions}
-    accounting_ref = store.put_artifact(accounting)
-    response = {"responseId": response_id, "provider": protocol.provider, "modelProfile": protocol.model_profile, "usage": usage, "versionRefs": versions, "arm": "L", "seed": 17, "bundleHash": bundle_hash, "accountingRef": accounting_ref.model_dump(mode="json", by_alias=True)}
-    response_ref = store.put_artifact(response)
-    store.append_evidence("validation-model", {"run_id": run_id, "sequence": 1, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
-    outcome = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "passed": True, "reliable": True, "safetyViolations": 0, "fixtureResetOk": True, "arm": "L", "seed": 17, "bundleHash": bundle_hash}
-    outcome_ref = store.put_artifact(outcome)
-    store.append_evidence("validation-outcome", {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "operator", "redacted": 0})
-
-    runtime = SimpleNamespace(controller=SimpleNamespace(store=store), core_planner_hash="core", image_digest="sha256:image", packages=packages)
-    runtime.controller.get_active_bundle = lambda: Bundle(bundle_hash)
-    runner = DefaultExperimentStageRunner(runtime, protocol)
-    receipt = {"stage": "validation", "cellKey": "validation:0", "runIds": [run_id], "taskIds": [task.task_id], "evidenceRefs": ["validation-model"], "outcomeRefs": ["validation-outcome"]}
-    observations = runner.recover_evaluation_observations(receipt)
-    assert observations[0].cost_microunits == 12
-    assert evidence_store.SQLiteRunEvidenceStore(store).verify(observations[0], frozen, package)

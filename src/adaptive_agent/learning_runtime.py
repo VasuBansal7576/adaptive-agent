@@ -159,24 +159,20 @@ class LearningRuntime:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(decoded, Mapping):
-                    environment_binding = row.get("environment_id")
-                    if not isinstance(environment_binding, str):
-                        environment_binding = decoded.get("environmentId")
-                    run_binding = row.get("run_id")
-                    if not isinstance(run_binding, str):
-                        run_binding = decoded.get("runId")
-                    record = {
-                        **decoded,
-                        "environmentId": environment_binding,
-                        "runId": run_binding,
-                    }
-                    key = (record.get("kind"), record.get("sourceId"))
+                    # The Store row is the authoritative restart binding. A
+                    # compacted record_json may omit environment/run IDs, and
+                    # learner supplied JSON must never be able to relabel it.
+                    row_environment = row.get("environment_id")
+                    row_run = row.get("run_id")
+                    if isinstance(row_environment, str) and isinstance(row_run, str):
+                        decoded = {**decoded, "environmentId": row_environment, "runId": row_run}
+                    key = (decoded.get("kind"), decoded.get("sourceId"))
                     if key not in existing_keys:
                         existing_keys.add(key)
                         existing_indexes[key] = len(existing_records)
-                        existing_records.append(record)
+                        existing_records.append(decoded)
                     elif key not in encoded_keys:
-                        existing_records[existing_indexes[key]] = record
+                        existing_records[existing_indexes[key]] = decoded
                     encoded_keys.add(key)
             elif isinstance(row.get("kind"), str):
                 key = (row.get("kind"), row.get("sourceId"))
@@ -229,6 +225,9 @@ class LearningRuntime:
             else:
                 valid = False
             if valid:
+                # Reuse each durable source once on restart. The materialized
+                # record is already canonical and must not be rewritten under
+                # a fresh record id.
                 raw_records.append(record)
                 materialized_keys.add(key)
 
@@ -252,6 +251,9 @@ class LearningRuntime:
                 manifest = self.store.get_artifact(json.loads(manifest_ref)["sha256"])
                 manifest_docs = [doc for doc in manifest.get("docs", []) if isinstance(doc, Mapping)]
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                # A restart can retain the narrow learner projection after
+                # source CAS compaction.  Existing records are sufficient in
+                # that case; a run with no projection still fails closed below.
                 manifest = {}
         if callable(public_doc_reader):
             try:
@@ -305,6 +307,7 @@ class LearningRuntime:
         trusted_outcome = self.store.get_outcome_by_run_id(run_id)
         if not isinstance(trusted_outcome, Mapping) or "passed" not in trusted_outcome or not isinstance(trusted_outcome.get("passed"), (bool, int)):
             raise LearningRuntimeError("completed development run lacks a trusted evaluator outcome")
+        trusted_outcome_present = bool(trusted_outcome)
         outcome_passed = bool(trusted_outcome["passed"])
         run_row = self.store.get_run(run_id)
         try:
@@ -315,8 +318,9 @@ class LearningRuntime:
                 outcome_passed=outcome_passed,
             )
         except (LearningProjectionError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            # Compacted source CAS is recoverable only from previously
-            # persisted, provenance-validated learner projections below.
+            # If the raw broker source was compacted, continue with a
+            # previously persisted and validated projection.  Without one,
+            # the unified evidence seam below reports the missing dependency.
             projected = []
         for record_id, record in projected:
             persist(record_id, record)
@@ -353,10 +357,10 @@ class LearningRuntime:
             }
             content = f"Broker development observation: {canonical_json(safe)}"
             source_id = evidence_id if evidence_id.startswith("broker:") else f"broker:{evidence_id}"
-            record = {"kind": "live_evidence", "sourceId": source_id, "content": content, "contentHash": content_hash(content), "sourceContentHash": event.get("evidenceContentHash"), "sourceEvidenceId": evidence_id, "sourceCallId": event.get("callId"), "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": True, "outcomePassed": outcome_passed}
+            record = {"kind": "live_evidence", "sourceId": source_id, "content": content, "contentHash": content_hash(content), "sourceContentHash": event.get("evidenceContentHash"), "sourceEvidenceId": evidence_id, "sourceCallId": event.get("callId"), "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": trusted_outcome_present, "outcomePassed": outcome_passed}
             persist(f"learning-broker-{source_id}", record)
         outcome_content = f"A trusted evaluator outcome is recorded for this completed development run; passed={str(outcome_passed).lower()}."
-        outcome_record = {"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": outcome_content, "contentHash": content_hash(outcome_content), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": True, "outcomePassed": outcome_passed}
+        outcome_record = {"kind": "task_state", "sourceId": f"outcome:{run_id}", "content": outcome_content, "contentHash": content_hash(outcome_content), "environmentId": environment_id, "runId": run_id, "visibility": "learner", "trustedOutcome": trusted_outcome_present, "outcomePassed": outcome_passed}
         persist(f"learning-outcome-{run_id}", outcome_record)
         return raw_records
 

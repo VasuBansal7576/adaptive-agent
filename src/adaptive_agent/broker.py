@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -169,30 +168,17 @@ def _error_result(call_id: str, tool_version: str, error: ToolError) -> ToolResu
     )
 
 
-Authorizer = Callable[[str, ToolRequest, ToolSchema], ToolError | None]
-
-
 class ToolBroker:
-    """Enforces policy, approvals, and idempotency for tool calls.
+    """Enforces policy, approvals, and idempotency for tool calls."""
 
-    `authorizer` is an optional authoritative authorization callback injected by
-    the trusted parent (e.g. Prime's CapabilityBroker). It is consulted after
-    local capability and schema checks, before any prepared record exists.
-    Returning a ToolError denies the call (FORBIDDEN-shaped); returning None
-    allows dispatch to proceed through the remaining fail-closed checks. When no
-    authorizer is injected, all local checks still apply — the broker never
-    defaults to permissive.
-    """
-
-    def __init__(
-        self,
-        store: Store,
-        registry: EnvironmentRegistry,
-        authorizer: Authorizer | None = None,
-    ) -> None:
+    def __init__(self, store: Store, registry: EnvironmentRegistry) -> None:
         self.store = store
         self.registry = registry
-        self.authorizer = authorizer
+
+    def _error_result(self, call_id: str, tool_version: str, error: ToolError) -> ToolResult:
+        result = _error_result(call_id, tool_version, error)
+        evidence_ref = self.store.put_artifact(result.model_dump(mode="json", by_alias=True))
+        return result.model_copy(update={"broker_evidence_ref": evidence_ref})
 
     # ------------------------------------------------------------------ approvals
     def issue_approval(
@@ -226,11 +212,12 @@ class ToolBroker:
         capability: Capability,
         provider: ToolProvider,
         budget_remaining: dict[str, Any] | None = None,
+        dry_run: bool = False,
     ) -> ToolResult:
         """Validate, authorize, and dispatch (or replay) a tool call."""
         schema = self.registry.get_tool_schema(env_id, request.tool)
         if schema is None:
-            return _error_result(
+            return self._error_result(
                 request.call_id,
                 "unknown",
                 ToolError(
@@ -243,13 +230,13 @@ class ToolBroker:
         # Capability: run/env/tool/effect/scope/expiry
         cap_err = capability.covers(env_id, request, schema)
         if cap_err is not None:
-            return _error_result(request.call_id, schema.version, cap_err)
+            return self._error_result(request.call_id, schema.version, cap_err)
 
         # Argument schema validation
         try:
             validate_arguments(schema, request.arguments)
         except SchemaValidationError as exc:
-            return _error_result(
+            return self._error_result(
                 request.call_id,
                 schema.version,
                 ToolError(
@@ -259,15 +246,9 @@ class ToolBroker:
                 ),
             )
 
-        # Injected authoritative authorizer (Prime CapabilityBroker seam).
-        if self.authorizer is not None:
-            auth_err = self.authorizer(env_id, request, schema)
-            if auth_err is not None:
-                return _error_result(request.call_id, schema.version, auth_err)
-
         # Budget
         if budget_remaining is not None and budget_remaining.get("tool_calls", 0) <= 0:
-            return _error_result(
+            return self._error_result(
                 request.call_id,
                 schema.version,
                 ToolError(
@@ -283,7 +264,7 @@ class ToolBroker:
         existing = self.store.get_tool_call_by_idempotency(request.run_id, request.idempotency_key)
         if existing is not None:
             if existing["arguments_json"] != canonical_args or existing["tool"] != request.tool:
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -297,7 +278,7 @@ class ToolBroker:
                 return prior.model_copy(update={"call_id": request.call_id})
             # Prepared but unresolved: do not redispatch.
             if provider.effect(request.tool) == "write":
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -318,9 +299,9 @@ class ToolBroker:
             "arguments_json": canonical_args,
             "idempotency_key": request.idempotency_key,
         }
-        if schema.effect == "write":
+        if schema.effect == "write" and not dry_run:
             if not request.approval_token:
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -338,7 +319,7 @@ class ToolBroker:
                 canonical_args,
             )
             if status == "conflict":
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -348,7 +329,7 @@ class ToolBroker:
                     ),
                 )
             if status != "ok":
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -367,7 +348,7 @@ class ToolBroker:
                 if existing and existing["result_json"]:
                     prior = ToolResult.model_validate_json(existing["result_json"])
                     return prior.model_copy(update={"call_id": request.call_id})
-                return _error_result(
+                return self._error_result(
                     request.call_id,
                     schema.version,
                     ToolError(
@@ -379,8 +360,8 @@ class ToolBroker:
 
         # Execute
         try:
-            output = provider.execute(request.run_id, request.tool, request.arguments)
-            effect = "confirmed" if provider.effect(request.tool) == "write" else "none"
+            output = {"dryRun": True, "tool": request.tool} if dry_run else provider.execute(request.run_id, request.tool, request.arguments)
+            effect = "none" if dry_run else "confirmed" if provider.effect(request.tool) == "write" else "none"
             result = ToolResult(
                 call_id=request.call_id,
                 tool_version=schema.version,

@@ -176,7 +176,10 @@ class CreateRunRequest(ApiModel):
 
 class LearningRequest(ApiModel):
     run_id: str = Field(alias="runId", min_length=1)
-    predicted_effect: str = Field(alias="predictedEffect", min_length=1)
+    # The completed run is the sole source of learning evidence and proposal
+    # metadata.  Keep the legacy fields optional for older callers, but do not
+    # require operators to invent values that the durable runtime ignores.
+    predicted_effect: str = Field(default="", alias="predictedEffect")
     evidence_ids: list[str] = Field(default_factory=list, alias="evidenceIds")
 
 
@@ -198,8 +201,22 @@ class CandidateProposalRequest(ApiModel):
 class EvaluationRequest(ApiModel):
     candidate_id: str = Field(alias="candidateId", min_length=1)
     base_bundle_hash: str = Field(alias="baseBundleHash", min_length=1)
-    protocol_hash: str = Field(alias="protocolHash", min_length=1)
-    partition_ref: JsonObject = Field(alias="partitionRef")
+    # Evaluation protocol and partition pins are evaluator-owned.  They are
+    # optional at the operator boundary and are derived from the frozen server
+    # protocol by the durable runtime.
+    protocol_hash: str | None = Field(default=None, alias="protocolHash")
+    partition_ref: JsonObject | None = Field(default=None, alias="partitionRef")
+
+
+class EvaluationLaunchRequest(ApiModel):
+    """Operator launch input; protocol and partition pins are server-owned."""
+
+    candidate_id: str = Field(alias="candidateId", min_length=1)
+    base_bundle_hash: str = Field(alias="baseBundleHash", min_length=1)
+    # Accepted for compatibility with older clients; durable runtime launch
+    # ignores these and derives the frozen values from its server protocol.
+    protocol_hash: str | None = Field(default=None, alias="protocolHash")
+    partition_ref: JsonObject | None = Field(default=None, alias="partitionRef")
 
 
 class CandidateDecisionRequest(ApiModel):
@@ -902,7 +919,10 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
         if runtime is not None:
             if runtime.get_run(run_id) is None:
                 raise HTTPException(status_code=404, detail="run not found")
-            return [event for event in runtime.events(run_id) if event.get("event") != "outcome_recorded"]
+            # DurableRuntime.events applies the visibility projection and
+            # enriches operator-visible payloads.  Do not drop outcome rows
+            # here; evaluator-only rows have already been removed there.
+            return runtime.events(run_id)
         with plane._lock:
             if run_id not in plane.runs:
                 raise HTTPException(status_code=404, detail="run not found")
@@ -951,11 +971,16 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
                 while True:
                     events = runtime.events(run_id, sent)
                     run = runtime.get_run(run_id)
+                    progressed = False
                     for event in events:
-                        sent = int(event["id"])
+                        event_id = int(event["id"])
+                        if event_id <= sent:
+                            continue
+                        sent = event_id
+                        progressed = True
                         yield f"id: {sent}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
                     if run is None or run.get("status") in {"succeeded", "failed", "cancelled", "timed_out"}:
-                        if not events:
+                        if not events or not progressed:
                             break
                     await asyncio.sleep(0.05)
 
@@ -1031,7 +1056,7 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
 
     @app.get("/learning/runtime")
     def learning_runtime(
-        environment_id: str = Query(..., alias="environmentId", min_length=1),
+        environment_id: str | None = Query(None, alias="environmentId", min_length=1),
         run_id: str = Query(..., alias="runId", min_length=1),
     ) -> JsonObject:
         """Expose the Store-owned learner projection for one development run."""
@@ -1076,21 +1101,20 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
             raise HTTPException(status_code=409, detail={"code": "VERSION_CONFLICT", "message": str(exc), "correlationId": uuid.uuid4().hex, "retry": "never"}) from exc
 
     @app.post("/evaluations/launch", status_code=202)
-    def launch_evaluation(payload: EvaluationRequest, background: BackgroundTasks) -> JsonObject:
+    def launch_evaluation(payload: EvaluationLaunchRequest, background: BackgroundTasks) -> JsonObject:
         """Queue and execute one trusted evaluation task in the background."""
         try:
             if runtime is None:
-                return plane.queue_evaluation(payload)
-            evaluation = runtime.queue_evaluation(payload)
-            candidate = runtime.controller.get_candidate(payload.candidate_id)
-            if candidate is None:
-                raise KeyError("candidate not found")
-            candidate_hash = candidate.get("candidate_bundle_hash")
-            bundle = runtime.controller.store.get_bundle_by_hash(candidate_hash) if isinstance(candidate_hash, str) else None
-            frozen = runtime.controller.store.get_frozen_protocol(payload.protocol_hash)
-            task = {**evaluation, "candidateId": payload.candidate_id}
-            background.add_task(runtime.run_evaluation_job, task, frozen, bundle)
-            return {**evaluation, "state": "accepted"}
+                raise ValueError("evaluation launch requires the durable runtime")
+            if getattr(runtime, "_evaluation_protocol", None) is None:
+                raise ValueError("runtime evaluation launch requires evaluator-owned EvaluationJob.run")
+            if payload.protocol_hash is not None or payload.partition_ref is not None:
+                raise ValueError("runtime evaluation launch requires evaluator-owned EvaluationJob.run")
+            # Launch bindings are resolved from the server's frozen protocol;
+            # legacy client-supplied pin fields are intentionally discarded.
+            queued = runtime.queue_evaluation(payload.model_copy(update={"protocol_hash": None, "partition_ref": None}))
+            background.add_task(runtime.launch_evaluation, queued["evaluationId"])
+            return queued
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1110,7 +1134,7 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
         if runtime is not None:
             if runtime.controller.get_candidate(candidate_id) is None:
                 raise HTTPException(status_code=404, detail="candidate or evaluation not found")
-            if runtime.controller.store.get_evaluation(payload.evaluation_id) is None:
+            if runtime.controller.store.get_evaluation(payload.evaluation_id) is None and runtime.controller.store.get_evaluation_queue(payload.evaluation_id) is None:
                 raise HTTPException(status_code=404, detail="candidate or evaluation not found")
             raise HTTPException(status_code=403, detail={"code": "FORBIDDEN", "message": "only the trusted evaluator may decide a candidate", "correlationId": uuid.uuid4().hex, "retry": "never"})
         with plane._lock:

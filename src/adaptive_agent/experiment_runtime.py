@@ -10,6 +10,7 @@ runtime's trusted learning entry point.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -194,7 +195,20 @@ def _observation_receipt(runtime: Any, stage: str, cell_key: str, observations: 
             cost += current_cost
             cost_seen = True
         economic_unknown = economic_unknown or economic_status == "unknown" or current_cost is None
-        if current_nominal is not None:
+        accounting_value = runtime.controller.store.get_artifact(getattr(observation, "accounting_ref", ""))
+        nominal_coverage = accounting_value.get("nominalCostCoverage") if isinstance(accounting_value, Mapping) else None
+        nominal_complete = (
+            isinstance(accounting_value, Mapping)
+            and accounting_value.get("nominalCostStatus") == "complete"
+            and isinstance(nominal_coverage, Mapping)
+            and isinstance(nominal_coverage.get("knownReceipts"), int)
+            and not isinstance(nominal_coverage.get("knownReceipts"), bool)
+            and isinstance(nominal_coverage.get("totalReceipts"), int)
+            and not isinstance(nominal_coverage.get("totalReceipts"), bool)
+            and nominal_coverage["totalReceipts"] > 0
+            and nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"]
+        )
+        if current_nominal is not None and nominal_complete:
             nominal += current_nominal
             nominal_seen = True
         else:
@@ -280,9 +294,16 @@ class DefaultExperimentStageRunner:
             raise ExperimentRuntimeError("lifecycle receipt task IDs are malformed")
         evidence_refs = value.get("evidenceRefs")
         outcome_refs = value.get("outcomeRefs")
-        if (not isinstance(evidence_refs, list) or len(evidence_refs) != len(run_ids) or any(not isinstance(ref, str) or not ref for ref in evidence_refs) or
-                not isinstance(outcome_refs, list) or len(outcome_refs) != len(run_ids) or any(not isinstance(ref, str) or not ref for ref in outcome_refs)):
+        if (
+            not isinstance(evidence_refs, list)
+            or len(evidence_refs) != len(run_ids)
+            or any(not isinstance(ref, str) or not ref for ref in evidence_refs)
+            or not isinstance(outcome_refs, list)
+            or len(outcome_refs) != len(run_ids)
+            or any(not isinstance(ref, str) or not ref for ref in outcome_refs)
+        ):
             raise ExperimentRuntimeError("lifecycle receipt evidence references are incomplete")
+        receipt_proxy = value.get("costBasis") == "nominal_budget_proxy" and value.get("billingStatus") == "unknown"
         from adaptive_agent.evaluation import Arm, BudgetSpec, ModelProvenance, Partition, Provenance, RunObservation
 
         frozen_inputs = _protocol_inputs(self.protocol)
@@ -312,7 +333,16 @@ class DefaultExperimentStageRunner:
                 raise ExperimentRuntimeError("receipt task IDs do not match durable runs")
             model_row = store.get_evidence(evidence_refs[index])
             outcome_row = store.get_evidence(outcome_refs[index])
-            if not isinstance(model_row, Mapping) or not isinstance(outcome_row, Mapping) or model_row.get("run_id") != run_id or outcome_row.get("run_id") != run_id or model_row.get("event_type") != "model_response" or outcome_row.get("event_type") != "trusted_outcome":
+            if (
+                not isinstance(model_row, Mapping)
+                or not isinstance(outcome_row, Mapping)
+                or model_row.get("evidence_id") != evidence_refs[index]
+                or outcome_row.get("evidence_id") != outcome_refs[index]
+                or model_row.get("run_id") != run_id
+                or outcome_row.get("run_id") != run_id
+                or model_row.get("event_type") != "model_response"
+                or outcome_row.get("event_type") != "trusted_outcome"
+            ):
                 raise ExperimentRuntimeError(f"receipt evidence references are not bound to observation run {run_id!r}")
             try:
                 model_ref = json.loads(model_row["source_ref"])["sha256"]
@@ -352,23 +382,43 @@ class DefaultExperimentStageRunner:
                     outcome_meta = {**persisted_meta, **outcome_meta}
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
-            cost = accounting.get("costMicrounits")
-            if cost is None:
-                nominal = accounting.get("nominalCostUsd")
-                if isinstance(nominal, (int, float)) and not isinstance(nominal, bool) and nominal >= 0:
-                    cost = int(round(float(nominal) * 1_000_000))
-            duration = accounting.get("durationSeconds", accounting.get("inferenceDurationSeconds"))
-            if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0 or not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration < 0:
-                raise ExperimentRuntimeError(f"observation accounting for {run_id!r} is incomplete")
-            versions = model_payload.get("versionRefs") or accounting.get("versionRefs")
-            if not isinstance(versions, Mapping):
-                raise ExperimentRuntimeError(f"observation run {run_id!r} lacks frozen config hashes")
             passed = outcome_payload.get("passed")
             reliable = outcome_meta.get("reliable", outcome_payload.get("reliable"))
             safety_violations = outcome_meta.get("safetyViolations", outcome_payload.get("safetyViolations"))
             fixture_reset_ok = outcome_meta.get("fixtureResetOk", outcome_payload.get("fixtureResetOk"))
-            if not isinstance(passed, bool) or not isinstance(reliable, bool) or not isinstance(safety_violations, int) or isinstance(safety_violations, bool) or safety_violations < 0 or not isinstance(fixture_reset_ok, bool):
+            if (
+                not isinstance(passed, bool)
+                or not isinstance(reliable, bool)
+                or not isinstance(safety_violations, int)
+                or isinstance(safety_violations, bool)
+                or safety_violations < 0
+                or not isinstance(fixture_reset_ok, bool)
+            ):
                 raise ExperimentRuntimeError(f"observation outcome metrics for {run_id!r} are incomplete")
+            cost = accounting.get("costMicrounits")
+            if cost is None:
+                nominal = accounting.get("nominalCostUsd")
+                coverage = accounting.get("nominalCostCoverage")
+                complete_coverage = (
+                    accounting.get("nominalCostStatus") == "complete"
+                    and isinstance(coverage, Mapping)
+                    and isinstance(coverage.get("knownReceipts"), int)
+                    and not isinstance(coverage.get("knownReceipts"), bool)
+                    and isinstance(coverage.get("totalReceipts"), int)
+                    and not isinstance(coverage.get("totalReceipts"), bool)
+                    and coverage["totalReceipts"] > 0
+                    and coverage["knownReceipts"] == coverage["totalReceipts"]
+                )
+                nominal_valid = isinstance(nominal, (int, float)) and not isinstance(nominal, bool) and math.isfinite(float(nominal)) and nominal >= 0
+                coverage_disclosed = "nominalCostStatus" in accounting or "nominalCostCoverage" in accounting
+                if nominal_valid and (complete_coverage or (receipt_proxy and not coverage_disclosed)):
+                    cost = int(round(float(nominal) * 1_000_000))
+            duration = accounting.get("durationSeconds", accounting.get("inferenceDurationSeconds"))
+            if not isinstance(cost, (int, float)) or isinstance(cost, bool) or not math.isfinite(float(cost)) or cost < 0 or not isinstance(duration, (int, float)) or isinstance(duration, bool) or not math.isfinite(float(duration)) or duration < 0:
+                raise ExperimentRuntimeError(f"observation accounting for {run_id!r} is incomplete")
+            versions = model_payload.get("versionRefs") or accounting.get("versionRefs")
+            if not isinstance(versions, Mapping):
+                raise ExperimentRuntimeError(f"observation run {run_id!r} lacks frozen config hashes")
             observations.append(RunObservation(
                 task_id, environment_id, Partition(partition), seed, Arm(arm),
                 passed,

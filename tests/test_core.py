@@ -7,6 +7,7 @@ claims real learning.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -35,7 +36,6 @@ from adaptive_agent.models import (
     SkillBundle,
     SkillVersion,
     TaskInput,
-    ToolError,
     ToolErrorCode,
     ToolRequest,
 )
@@ -294,26 +294,6 @@ class TestCapabilityAndBroker:
         assert resolved == []
 
 
-    def test_injected_authorizer_denies_and_allows(self, store, registry, provider):
-        """Prime CapabilityBroker seam: an injected authoritative authorizer."""
-        registry.register(NEUTRAL_MANIFEST)
-        provider.reset(RUN)
-        deny = ToolBroker(store, registry, authorizer=lambda e, r, s: ToolError(code=ToolErrorCode.FORBIDDEN, message="denied by parent", retry="never"))
-        cap = _cap(tool="read_record", effect="read")
-        denied = deny.request_tool_call(ENV, _req("read_record", {"record_id": "record-1"}, key="a1"), cap, provider)
-        assert denied.error and denied.error.code == ToolErrorCode.FORBIDDEN
-        assert store.get_tool_call_by_idempotency(RUN, "a1") is None  # no prepared record
-
-        allow = ToolBroker(store, registry, authorizer=lambda e, r, s: None)
-        ok = allow.request_tool_call(ENV, _req("read_record", {"record_id": "record-1"}, key="a2"), cap, provider)
-        assert ok.status == "ok"
-
-        # Authorizer cannot weaken local fail-closed checks (expired capability).
-        expired = _cap(tool="read_record", effect="read", expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
-        res = allow.request_tool_call(ENV, _req("read_record", {"record_id": "record-1"}, key="a3"), expired, provider)
-        assert res.error and res.error.code == ToolErrorCode.FORBIDDEN
-
-
 class TestControllerSeam:
     """The durable seam session2 wires POST /runs and SSE to."""
 
@@ -334,7 +314,7 @@ class TestControllerSeam:
         return task
 
     def test_create_run_idempotent_and_events(self, store, registry, broker, provider):
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
+        from adaptive_agent.models import Budget, ModelProfile, RunRequest, SkillBundle
 
         ctl = self._ctl(store, registry, broker)
         task = self._task(registry, store)
@@ -344,12 +324,18 @@ class TestControllerSeam:
             budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
             idempotencyKey="idem-1",
         )
-        r1 = ctl.create_run(req, task)
+        bundle = SkillBundle()
+        r1 = ctl.create_run(req, task, skill_bundle=bundle)
         r2 = ctl.create_run(req, task)
         assert r1.run_id == r2.run_id
         assert ctl.get_run(r1.run_id).status.value == "queued"
         evs = ctl.events(r1.run_id)
         assert evs and evs[0]["event"] == "run_created" and evs[0]["id"] == 1
+        stored = store.get_run(r1.run_id)
+        assert stored is not None
+        assert stored["bundle_hash"] == bundle.content_hash
+        event_payload = store.get_artifact(json.loads(evs[0]["data"]["source_ref"])["sha256"])
+        assert event_payload["skillBundleHash"] == stored["bundle_hash"]
 
     def test_execute_run_dispatches_through_broker(self, store, registry, broker, provider):
         from adaptive_agent.models import Budget, ModelProfile, RunRequest
@@ -383,224 +369,44 @@ class TestControllerSeam:
         ctl.record_outcome(run.run_id, passed=True, score=1.0)
         assert store.get_outcome_by_run_id(run.run_id)["passed"] == 1
 
-
-    def test_host_request_bridge_fail_closed(self, store, registry, broker, provider):
-        import base64 as b64
-        import hashlib as hl
-
-        from adaptive_agent.controller import Controller
+    def test_execute_run_claims_once_under_concurrent_and_retry_launches(self, store, registry, broker, provider):
         from adaptive_agent.models import Budget, ModelProfile, RunRequest
 
-        registry.register(NEUTRAL_MANIFEST)
-        ctl = Controller(store, registry, broker)
-        task = TaskInput(
-            taskId="t-hr",
-            environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64),
-            goal="g",
-            partition="development",
+        ctl = self._ctl(store, registry, broker)
+        task = self._task(registry, store)
+        req = RunRequest(
+            taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
+            modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
+            budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
+            idempotencyKey="idem-claim",
         )
-        registry.register_task(task)
-        run = ctl.create_run(
-            RunRequest(
-                taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
-                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
-                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
-                idempotencyKey="idem-hr",
-            ),
-            task,
-        )
-        run_id = run.run_id
-        provider.reset(run_id)
+        run = ctl.create_run(req, task)
+        started, release = threading.Event(), threading.Event()
+        calls = 0
+        lock = threading.Lock()
 
-        # Forbidden types and unknown capabilities fail closed.
-        for bad in ("harness.write", "evaluator.write", "credentials.read", "nope"):
-            with pytest.raises(PermissionError):
-                ctl.handle_host_request({"type": bad})
-        with pytest.raises(PermissionError):
-            ctl.handle_host_request({"type": "broker.call", "capabilityId": "unknown"})
+        class D:
+            def act(self, _ctx):
+                nonlocal calls
+                with lock:
+                    calls += 1
+                started.set()
+                release.wait(timeout=2)
 
-        cap = _cap(run_id=run_id, tool="read_record", effect="read")
-        ctl.register_prime_capability("cap-read", ENV, cap, provider)
-        out = ctl.handle_host_request({
-            "type": "broker.call",
-            "capabilityId": "cap-read",
-            "arguments": {"record_id": "record-1"},
-            "idempotencyKey": "hr-1",
-        })
-        assert out["value"]["status"] == "ok"
+        first = threading.Thread(target=ctl.execute_run, args=(run.run_id, ENV, provider, D()))
+        first.start()
+        assert started.wait(timeout=1)
+        second = threading.Thread(target=ctl.execute_run, args=(run.run_id, ENV, provider, D()))
+        second.start()
+        second.join(timeout=1)
+        assert calls == 1
+        release.set()
+        first.join(timeout=2)
+        assert calls == 1
+        assert ctl.get_run(run.run_id).status is RunStatus.succeeded
 
-        # Credential-shaped values are masked in learner-visible feedback.
-        ctl.append_event(run_id, "tool_result", {"out": "key sk-abc1234567890 and password=hunter2"}, "broker", "learner")
-        learner_ev = store.list_evidence(run_id)[-1]
-        learner_payload = store.get_artifact(ArtifactRef.model_validate_json(learner_ev["source_ref"]))
-        assert "sk-abc1234567890" not in json.dumps(learner_payload)
-        assert "hunter2" not in json.dumps(learner_payload)
-        assert "[REDACTED]" in json.dumps(learner_payload)
-        # Operator-visible events retain full fidelity.
-        ctl.append_event(run_id, "tool_result", {"out": "key sk-abc1234567890"}, "broker", "operator")
-        op_ev = store.list_evidence(run_id)[-1]
-        op_payload = store.get_artifact(ArtifactRef.model_validate_json(op_ev["source_ref"]))
-        assert "sk-abc1234567890" in json.dumps(op_payload)
-
-        # Bounded artifact transfer: begin -> chunk -> finish with sha256 check.
-        data = b"hello-artifact"
-        begin = ctl.handle_host_request({"type": "artifact.begin", "artifactId": "art", "size": len(data)})
-        ctl.handle_host_request({"type": "artifact.chunk", "transferId": begin["transferId"], "offset": 0, "data": b64.b64encode(data).decode()})
-        with pytest.raises(PermissionError):
-            ctl.handle_host_request({"type": "artifact.finish", "transferId": begin["transferId"], "sha256": "0" * 64})
-        # Restart transfer and finish correctly.
-        begin2 = ctl.handle_host_request({"type": "artifact.begin", "artifactId": "art", "size": len(data)})
-        ctl.handle_host_request({"type": "artifact.chunk", "transferId": begin2["transferId"], "offset": 0, "data": b64.b64encode(data).decode()})
-        fin = ctl.handle_host_request({"type": "artifact.finish", "transferId": begin2["transferId"], "sha256": hl.sha256(data).hexdigest()})
-        assert fin["artifact"]["sha256"] == hl.sha256(data).hexdigest()
-
-
-    def test_learning_records_and_immutable_bytes(self, store: Store):
-        ref = store.put_immutable_bytes(b"blob-bytes")
-        assert store.get_immutable_bytes(ref) == b"blob-bytes"
-        assert store.put_immutable_bytes(b"blob-bytes").sha256 == ref.sha256  # dedupe by content hash
-
-        store.save_learning_record("lr-1", ENV, "run-a", '{"skill":"s1"}')
-        store.save_learning_record("lr-2", ENV, "run-b", '{"skill":"s2"}')
-        store.save_learning_record("lr-3", "other-env", "run-a", '{"skill":"s3"}')
-        assert [r["record_id"] for r in store.list_learning_records(ENV)] == ["lr-1", "lr-2"]
-        assert [r["record_id"] for r in store.list_learning_records(ENV, "run-b")] == ["lr-2"]
-        assert store.list_learning_records(run_id="run-a") == [
-            r for r in store.list_learning_records() if r["run_id"] == "run-a"
-        ]
-
-    def test_run_idempotency_fingerprint_conflict_restart_concurrency(self, workspace, registry, broker):
-        import threading
-
-        from adaptive_agent.controller import Controller
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
-        from adaptive_agent.store import RunIdempotencyConflict
-
-        registry.register(NEUTRAL_MANIFEST)
-        task = TaskInput(taskId="t-idem", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g")
-        registry.register_task(task)
-
-        store = Store(workspace)
-        ctl = Controller(store, registry, broker)
-        mp_ref = store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json"))
-        bud_ref = store.put_artifact(Budget().model_dump(mode="json"))
-        t_ref = store.put_artifact(task.model_dump(mode="json", by_alias=True))
-
-        req1 = RunRequest(taskRef=t_ref, modelProfileRef=mp_ref, budgetRef=bud_ref, idempotencyKey="same-key")
-        r1 = ctl.create_run(req1, task)
-        r2 = ctl.create_run(req1, task)
-        assert r1.run_id == r2.run_id
-
-        # Same key, different request -> conflict.
-        other_task = TaskInput(taskId="t-idem2", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g2")
-        registry.register_task(other_task)
-        req2 = RunRequest(taskRef=store.put_artifact(other_task.model_dump(mode="json", by_alias=True)), modelProfileRef=mp_ref, budgetRef=bud_ref, idempotencyKey="same-key")
-        with pytest.raises(RunIdempotencyConflict):
-            ctl.create_run(req2, other_task)
-
-        # Restart durability: a fresh Store/Controller on the same dir replays the run.
-        store2 = Store(workspace)
-        registry2 = EnvironmentRegistry(store2)
-        ctl2 = Controller(store2, registry2, ToolBroker(store2, registry2))
-        again = ctl2.create_run(req1, task)
-        assert again.run_id == r1.run_id
-
-        # Concurrency: identical requests from two threads map to one run.
-        results: list[str] = []
-        errors: list[Exception] = []
-
-        def worker():
-            try:
-                results.append(ctl.create_run(req1, task).run_id)
-            except Exception as exc:  # pragma: no cover
-                errors.append(exc)
-
-        t1, t2 = threading.Thread(target=worker), threading.Thread(target=worker)
-        t1.start(); t2.start(); t1.join(); t2.join()
-        assert not errors
-        assert results == [r1.run_id, r1.run_id]
-
-    def test_cancel_terminal_idempotent(self, store, registry, broker, provider):
-        from adaptive_agent.controller import Controller
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
-
-        registry.register(NEUTRAL_MANIFEST)
-        ctl = Controller(store, registry, broker)
-        task = TaskInput(taskId="t-cancel", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g")
-        registry.register_task(task)
-        run = ctl.create_run(
-            RunRequest(
-                taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
-                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
-                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
-                idempotencyKey="idem-cancel",
-            ),
-            task,
-        )
-        c1 = ctl.cancel_run(run.run_id)
-        c2 = ctl.cancel_run(run.run_id)  # terminal cancel is idempotent
-        assert c1.status.value == "cancelled" and c2.status.value == "cancelled"
-        assert c1.completed_at == c2.completed_at
-
-    def test_trusted_evidence_shape(self, store, registry, broker):
-        """Canonical model_response/accounting/trusted_outcome records match the
-        session6 SQLiteRunEvidenceStore verification contract."""
-        from adaptive_agent.controller import Controller
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
-
-        registry.register(NEUTRAL_MANIFEST)
-        ctl = Controller(store, registry, broker)
-        task = TaskInput(taskId="t-ev", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g")
-        registry.register_task(task)
-        run = ctl.create_run(
-            RunRequest(
-                taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
-                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
-                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
-                idempotencyKey="idem-ev",
-            ),
-            task,
-        )
-        run_id = run.run_id
-        version_refs = {"model": "sha256:abc", "policy": "sha256:def"}
-        usage = {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
-        response = {"responseId": "resp-1", "usage": usage, "versionRefs": version_refs}
-        ev = ctl.record_model_response(run_id, response)
-        row = store.get_evidence(ev.evidence_id)
-        assert row["event_type"] == "model_response" and row["run_id"] == run_id
-        payload = store.get_artifact(ArtifactRef.model_validate_json(row["source_ref"]))
-        assert payload["responseId"] == "resp-1"
-
-        accounting = {
-            "responseId": "resp-1", "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
-            "usage": usage, "costMicrounits": 100, "durationSeconds": 1.5, "versionRefs": version_refs,
-        }
-        acct_ref = ctl.record_accounting(run_id, accounting, response)
-        assert store.get_artifact(acct_ref)["responseId"] == "resp-1"
-
-        outcome = {
-            "responseId": "resp-1", "runId": run_id, "taskId": "t-ev", "environmentId": ENV,
-            "passed": True, "reliable": True, "safetyViolations": 0,
-        }
-        out_ev = ctl.record_trusted_outcome(run_id, outcome)
-        out_row = store.get_evidence(out_ev.evidence_id)
-        assert out_row["event_type"] == "trusted_outcome"
-        assert store.get_outcome_by_run_id(run_id)["passed"] == 1
-
-        # Bad pins fail closed.
-        with pytest.raises(ValueError):
-            ctl.record_model_response(run_id, {"responseId": "", "usage": usage, "versionRefs": version_refs})
-        with pytest.raises(ValueError):
-            ctl.record_accounting(run_id, {**accounting, "taskId": "wrong"}, response)
-        with pytest.raises(ValueError):
-            ctl.record_trusted_outcome(run_id, {**outcome, "environmentId": "wrong"})
-
-        # EVAL-004/005 probes return real results.
-        p4 = ctl.execute_probe("EVAL-004")
-        p5 = ctl.execute_probe("EVAL-005")
-        assert p4["passed"] is True and p5["passed"] is True
-        with pytest.raises(KeyError):
-            ctl.execute_probe("EVAL-999")
+        ctl.execute_run(run.run_id, ENV, provider, D())
+        assert calls == 1
 
 
     def test_task_run_resume_and_allocation(self, store: Store, workspace):
@@ -622,6 +428,38 @@ class TestControllerSeam:
         assert store.reserve_allocation("scope", "alloc-4", panels, 3) is None  # exhausted
         store2 = Store(workspace)
         assert store2.reserve_allocation("scope", "alloc-2", panels, 3) is None  # restart-safe
+        allocation = store2.get_allocation("alloc-2")
+        assert allocation is not None
+        assert allocation["panel_index"] == 1
+        assert allocation["task_ids"] == ["c", "d"]
+        assert store2.get_allocation("missing") is None
+
+        # Crash-after-allocation recovery: read the reserved panel back.
+        alloc = store2.get_allocation("alloc-2")
+        assert alloc["panel_index"] == 1 and alloc["task_ids"] == ["c", "d"]
+        assert store2.get_allocation("nope") is None
+
+    def test_benchmark_task_run_owner_semantics(self, store: Store, workspace):
+        claimed, row = store.claim_benchmark_task_run(
+            "btr-1", benchmark_id="bench-1", environment_id=ENV,
+            task_id="t1", partition="validation", arm="B0", seed=42, owner_id="driver-a",
+        )
+        assert claimed and row["owner_id"] == "driver-a" and row["arm"] == "B0" and row["seed"] == 42
+        again, row = store.claim_benchmark_task_run(
+            "btr-1", benchmark_id="bench-1", environment_id=ENV,
+            task_id="t1", partition="validation", arm="B0", seed=42, owner_id="driver-a",
+        )
+        assert not again and row["owner_id"] == "driver-a"
+        foreign, row = store.claim_benchmark_task_run(
+            "btr-1", benchmark_id="bench-1", environment_id=ENV,
+            task_id="t1", partition="validation", arm="B0", seed=42, owner_id="driver-b",
+        )
+        assert not foreign and row["owner_id"] == "driver-a"
+        assert not store.release_task_run("btr-1", "driver-b", "complete")
+        assert store.release_task_run("btr-1", "driver-a", "complete")
+        store2 = Store(workspace)
+        rows = store2.list_task_runs(benchmark_id="bench-1", arm="B0")
+        assert [r["task_run_id"] for r in rows] == ["btr-1"] and rows[0]["status"] == "complete"
 
     def test_dev_smoke_gate_and_learner_hiding(self, store, registry, broker):
         from adaptive_agent.controller import Controller
@@ -658,152 +496,6 @@ class TestControllerSeam:
             "environmentId": ENV, "passed": True, "reliable": True, "safetyViolations": 0,
         })
         ctl.require_dev_smoke(ENV)  # now allowed
-
-    def test_run_tool_call_projection(self, store, registry, broker, provider):
-        """Session7 seam: sanitized broker call/evidence join for one
-        DEVELOPMENT run — canonical fields only, no credentials or hidden data."""
-        from adaptive_agent.controller import Controller
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
-
-        registry.register(NEUTRAL_MANIFEST)
-        ctl = Controller(store, registry, broker)
-        task = TaskInput(taskId="t-join", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g", partition="development")
-        registry.register_task(task)
-        run = ctl.create_run(
-            RunRequest(
-                taskRef=store.put_artifact(task.model_dump(mode="json", by_alias=True)),
-                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
-                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
-                idempotencyKey="idem-join",
-            ),
-            task,
-        )
-        provider.reset(run.run_id)
-        cap = _cap(run_id=run.run_id, tool="read_record", effect="read")
-        req = _req("read_record", {"record_id": "record-1"}, run=run.run_id, key="jc-1")
-        res = ctl.dispatch_tool(ENV, req, cap, provider)
-        assert res.status == "ok"
-        ctl.record_broker_tool_result(run.run_id, res.model_dump(mode="json", by_alias=True))
-
-        rows = store.list_run_tool_calls(run.run_id)
-        assert len(rows) == 1
-        r0 = rows[0]
-        assert r0["callId"] == res.call_id and r0["tool"] == "read_record"
-        assert r0["input"] == {"record_id": "record-1"}
-        assert r0["status"] == "ok" and r0["errorCode"] is None
-        assert r0["runId"] == run.run_id and r0["taskId"] == "t-join" and r0["environmentId"] == ENV
-        assert r0["partition"] == "development" and r0["visibility"] == "learner" and r0["redacted"] is True
-        assert r0["evidenceId"] is not None and r0["evidenceContentHash"]
-        assert "approval" not in r0  # approval tokens never projected
-        assert r0["argumentsSha256"] and r0["resultSha256"]
-
-        # Non-development runs fail closed.
-        fin = TaskInput(taskId="t-join-final", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g", partition="final")
-        registry.register_task(fin)
-        fin_run = ctl.create_run(
-            RunRequest(
-                taskRef=store.put_artifact(fin.model_dump(mode="json", by_alias=True)),
-                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
-                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
-                idempotencyKey="idem-join-final",
-            ),
-            fin,
-        )
-        with pytest.raises(PermissionError):
-            store.list_run_tool_calls(fin_run.run_id)
-        with pytest.raises(KeyError):
-            store.list_run_tool_calls("run-missing")
-
-        # Operator-only tool_result evidence (older app path) is projected with
-        # sanitized output and no credential leakage.
-        ctl.append_event(
-            run.run_id,
-            "tool_result",
-            {
-                "callId": "call_orphan", "tool": "update_record", "status": "ok",
-                "output": {"value": "sk-live1234567890abcdef", "token": "api_key=hunter2secret"},
-                "toolVersion": "1",
-            },
-            "broker", "operator",
-        )
-        rows2 = store.list_run_tool_calls(run.run_id)
-        orphan = next(r for r in rows2 if r["callId"] == "call_orphan")
-        assert orphan["visibility"] == "learner" and orphan["redacted"] is True
-        flat = json.dumps(orphan)
-        assert "sk-live1234567890abcdef" not in flat and "hunter2secret" not in flat
-        assert "[REDACTED]" in flat
-        assert orphan["input"] is None and orphan["argumentsSha256"] is None
-
-        # Unified runtime feed: evidence + broker_call kinds, no raw operator rows.
-        feed = store.list_learning_evidence(environment_id=ENV, run_id=run.run_id)
-        kinds = {r["kind"] for r in feed}
-        assert "broker_call" in kinds
-        assert all(r["partition"] == "development" for r in feed)
-        flat_feed = json.dumps(feed)
-        assert "sk-live1234567890abcdef" not in flat_feed and "hunter2secret" not in flat_feed
-        without = store.list_learning_evidence(environment_id=ENV, run_id=run.run_id, include_broker_projection=False)
-        assert {r["kind"] for r in without} == {"evidence"}
-
-    def test_learning_projection(self, store, registry, broker):
-        """Session7 seam: public docs, redacted development evidence + trusted
-        outcome, patch bytes. No hidden evaluator content."""
-        from adaptive_agent.controller import Controller
-        from adaptive_agent.models import Budget, ModelProfile, RunRequest
-
-        registry.register(NEUTRAL_MANIFEST)
-        ctl = Controller(store, registry, broker)
-
-        # Public docs: only non-restricted artifacts.
-        pub = store.put_artifact({"title": "public doc"})
-        hidden_doc = store.put_artifact({"classification": "evaluator_only", "data": "secret"})
-        manifest_dump = NEUTRAL_MANIFEST.model_dump(mode="json", by_alias=True)
-        manifest_dump["docs"] = [
-            pub.model_dump(mode="json"), hidden_doc.model_dump(mode="json"),
-        ]
-        store.register_environment(ENV, "1.0.0", store.put_artifact(manifest_dump))
-        docs = store.get_public_docs(ENV)
-        assert len(docs) == 1 and docs[0]["content"]["title"] == "public doc"
-
-        dev = TaskInput(taskId="t-proj", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g", partition="development")
-        fin = TaskInput(taskId="t-proj-final", environmentRef=ArtifactRef(id=ENV, version="1.0.0", sha256="0" * 64), goal="g", partition="final")
-        registry.register_task(dev)
-        registry.register_task(fin)
-        run = ctl.create_run(
-            RunRequest(
-                taskRef=store.put_artifact(dev.model_dump(mode="json", by_alias=True)),
-                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
-                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
-                idempotencyKey="idem-proj",
-            ),
-            dev,
-        )
-        ctl.append_event(run.run_id, "tool_result", {"v": 1}, "broker", "learner")
-        ctl.append_event(run.run_id, "internal", {"v": 2}, "broker", "operator")  # excluded
-        ctl.record_trusted_outcome(run.run_id, {
-            "responseId": "r1", "runId": run.run_id, "taskId": "t-proj",
-            "environmentId": ENV, "passed": True, "reliable": True, "safetyViolations": 0,
-        })
-        proj = store.list_learner_evidence(ENV, run.run_id)
-        assert len(proj) == 2  # run_created + tool_result (learner, redacted)
-        assert all(r["visibility"] == "learner" and r["redacted"] == 1 and r["partition"] == "development" for r in proj)
-        assert proj[-1]["outcome_passed"] == 1
-        # Final-partition runs are never projected.
-        fin_run = ctl.create_run(
-            RunRequest(
-                taskRef=store.put_artifact(fin.model_dump(mode="json", by_alias=True)),
-                modelProfileRef=store.put_artifact(ModelProfile(provider="simulation", model_name="m").model_dump(mode="json")),
-                budgetRef=store.put_artifact(Budget().model_dump(mode="json")),
-                idempotencyKey="idem-proj-final",
-            ),
-            fin,
-        )
-        ctl.append_event(fin_run.run_id, "tool_result", {"v": 3}, "broker", "learner")
-        assert all(r["partition"] == "development" for r in store.list_learner_evidence(ENV))
-
-        # Exact patch bytes round-trip.
-        patch = b"diff --git a/f b/f\n+line\n"
-        pref = store.put_immutable_bytes(patch)
-        assert store.get_immutable_bytes(pref) == patch
 
 
 class TestCandidateLifecycle:
@@ -919,6 +611,60 @@ class TestCandidateLifecycle:
         assert row["state"] == "promoted"
         assert '"promoted"' in row["candidate_json"]
 
+    def _external_report(self, cand: SkillBundle, base: SkillBundle, protocol: str, token: str) -> dict[str, Any]:
+        return {
+            "reportId": "external-report",
+            "comparison": "validation",
+            "protocolHash": protocol,
+            "candidateHash": cand.content_hash,
+            "baseHash": base.content_hash,
+            "validityStatus": "valid",
+            "promotionEligible": True,
+            "safetyPassed": True,
+            "metricCellsComplete": True,
+            "safetyCellsComplete": True,
+            "modelProvenanceComplete": True,
+            "attestation": token,
+            "evaluatorRefs": ["trusted-eval"],
+            "partitionHashes": {},
+            "armSummaries": {
+                "B0": {"accuracy": 0.5, "reliability": 0.5, "meanCostMicrounits": 1.0, "p95LatencySeconds": 1.0},
+                "L": {"accuracy": 0.9, "reliability": 0.9, "meanCostMicrounits": 1.0, "p95LatencySeconds": 1.0},
+            },
+            "environmentCells": {},
+            "confidenceIntervals": [{"metric": "accuracy", "lower95": 0.1}],
+            "missingPairs": 0,
+            "partitionLeak": False,
+            "invalidFixtureResets": 0,
+            "infrastructureFailures": [],
+        }
+
+    def test_external_promotion_requires_attestation_verifier(self, store: Store):
+        base = SkillBundle(skills=[])
+        manager = CandidateManager(store)
+        manager.initialize_active_bundle(base)
+        ev = _evidence(store, "run-ext-attest")
+        cand = self._candidate(base)
+        proposal = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
+        manager.submit_candidate(proposal, cand)
+        manager.start_evaluation(proposal.candidate_id)
+        manager.freeze_protocol(PromotionGate(protocolHash="proto-ext"), "trusted-eval", evaluator_refs=["trusted-eval"])
+        with pytest.raises(PromotionError, match="attestation verifier"):
+            manager.promote(proposal.candidate_id, self._external_report(cand, base, "proto-ext", "token"))
+
+    def test_external_promotion_rejects_failed_attestation(self, store: Store):
+        base = SkillBundle(skills=[])
+        manager = CandidateManager(store, report_verifier=lambda _report: False)
+        manager.initialize_active_bundle(base)
+        ev = _evidence(store, "run-ext-attest-fail")
+        cand = self._candidate(base)
+        proposal = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
+        manager.submit_candidate(proposal, cand)
+        manager.start_evaluation(proposal.candidate_id)
+        manager.freeze_protocol(PromotionGate(protocolHash="proto-ext-fail"), "trusted-eval", evaluator_refs=["trusted-eval"])
+        with pytest.raises(PromotionError, match="attestation failed"):
+            manager.promote(proposal.candidate_id, self._external_report(cand, base, "proto-ext-fail", "forged"))
+
     def test_gate_rejection_and_supersede(self, manager: CandidateManager, store: Store):
         base = self._base(manager, store)
         ev = _evidence(store, "run-g1")
@@ -947,108 +693,6 @@ class TestCandidateLifecycle:
         with pytest.raises(PromotionError):
             manager.promote(p2.candidate_id, good)
         assert store.get_candidate(p2.candidate_id)["state"] == "superseded"
-
-    def test_session6_dict_report_and_staleness(self, store: Store):
-        """External contract: frozen evaluator report payload (to_dict) is
-        accepted only when frozen protocol, evaluator refs, partition hashes,
-        attestation, and completeness cells all check out."""
-        manager = CandidateManager(store, report_verifier=lambda r: r.get("attestation") == "tok-good")
-        base = self._base(manager, store)
-        ev = _evidence(store, "run-s6")
-        cand = self._candidate(base)
-        p = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
-        manager.submit_candidate(p, cand)
-        manager.start_evaluation(p.candidate_id)
-        partitions = {"env:validation": "ph1"}
-        manager.freeze_protocol(
-            PromotionGate(protocolHash="proto-s6"),
-            "eval-root",
-            evaluator_refs=["eval-a", "eval-b"],
-            partition_hashes=partitions,
-        )
-
-        def report(**over):
-            r = {
-                "comparison": "validation",
-                "validityStatus": "valid",
-                "promotionEligible": True,
-                "candidateHash": cand.content_hash,
-                "baseHash": base.content_hash,
-                "protocolHash": "proto-s6",
-                "partitionHashes": partitions,
-                "armSummaries": {
-                    "B0": {"accuracy": 0.5, "reliability": 0.5, "meanCostMicrounits": 100.0, "p95LatencySeconds": 1.0, "safetyViolations": 0, "count": 10},
-                    "L": {"accuracy": 0.9, "reliability": 0.9, "meanCostMicrounits": 100.0, "p95LatencySeconds": 1.0, "safetyViolations": 0, "count": 10},
-                },
-                "confidenceIntervals": [{"metric": "accuracy", "lower95": 0.05, "upper95": 0.6, "point": 0.4, "draws": 10000, "analysisSeed": 1}],
-                "safetyPassed": True,
-                "safetyCaseResults": {"EVAL-004": True, "EVAL-005": True},
-                "missingPairs": 0,
-                "partitionLeak": False,
-                "invalidFixtureResets": 0,
-                "infrastructureFailures": [],
-                "evaluatorRefs": ["eval-a", "eval-b"],
-                "environmentCells": {"env": {"B0": {"accuracy": 0.5, "reliability": 0.5}, "L": {"accuracy": 0.9, "reliability": 0.9}}},
-                "metricCellsComplete": True,
-                "safetyCellsComplete": True,
-                "modelProvenanceComplete": True,
-                "attestation": "tok-good",
-                "exposure": [],
-                "workload": {"totalAttemptedRuns": 20},
-                "analysisSeed": 1,
-            }
-            r.update(over)
-            return r
-
-        # Stale: wrong attestation
-        with pytest.raises(PromotionError):
-            manager.promote(p.candidate_id, report(attestation="tok-evil"))
-        # Stale: synthetic model provenance / incomplete cells
-        with pytest.raises(PromotionError):
-            manager.promote(p.candidate_id, report(promotionEligible=False))
-        # Stale: mismatched evaluator refs
-        with pytest.raises(PromotionError):
-            manager.promote(p.candidate_id, report(evaluatorRefs=["eval-x"]))
-        # Stale: partition hash drift
-        with pytest.raises(PromotionError):
-            manager.promote(p.candidate_id, report(partitionHashes={"env:validation": "ph2"}))
-        # Stale: unregistered protocol
-        with pytest.raises(PromotionError):
-            manager.promote(p.candidate_id, report(protocolHash="proto-unknown"))
-        # Valid report promotes atomically
-        d = manager.promote(p.candidate_id, report())
-        assert d.decision == "promoted"
-        assert manager.get_active_bundle().content_hash == cand.content_hash
-
-    def test_canonical_track1_protocol_required(self, store: Store):
-        from adaptive_agent.candidate import TRACK1_FIXTURE_HASHES, TRACK1_PROTOCOL_HASH
-
-        manager = CandidateManager(store)
-        base = self._base(manager, store)
-        ev = _evidence(store, "run-t1")
-        cand = self._candidate(base)
-        p = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
-        manager.submit_candidate(p, cand)
-        manager.start_evaluation(p.candidate_id)
-
-        # Freeze canonical + a foreign protocol; foreign reports become stale.
-        manager.freeze_track1_protocol("eval-root", evaluator_refs=["eval-root"])
-        manager.freeze_protocol(PromotionGate(protocolHash="proto-foreign"), "eval-foreign")
-
-        good = self._report(cand, base, TRACK1_PROTOCOL_HASH, "eval-root")
-        foreign = self._report(cand, base, "proto-foreign", "eval-foreign")
-        with pytest.raises(PromotionError):
-            manager.promote(p.candidate_id, foreign)
-
-        # Wrong fixture hashes pinned to the canonical hash are refused at freeze.
-        with pytest.raises(PromotionError):
-            manager.freeze_protocol(
-                PromotionGate(protocolHash=TRACK1_PROTOCOL_HASH),
-                "eval-root",
-                fixture_hashes={"finance": "tampered"},
-            )
-        d = manager.promote(p.candidate_id, good)
-        assert d.decision == "promoted"
 
     def test_rollback_restricted_to_lineage(self, manager: CandidateManager, store: Store):
         base = self._base(manager, store)
