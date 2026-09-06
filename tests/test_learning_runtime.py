@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,7 +22,7 @@ if core_src:
 try:
     from adaptive_agent.candidate import CandidateManager
     from adaptive_agent.learning import PlannerLearningAdapter
-    from adaptive_agent.learning_runtime import LearningRuntime, StoreModelObservationSink
+    from adaptive_agent.learning_runtime import LearningRuntime, LearningRuntimeError, StoreModelObservationSink
     from adaptive_agent.models import CandidateProposal, SkillBundle, SkillVersion
 except ImportError as exc:
     pytest.skip(f"durable core is unavailable in this isolated worker: {exc}", allow_module_level=True)
@@ -47,6 +48,91 @@ class FakeClient:
         import json
 
         return {"provider": "openai-codex", "model": "test-luna", "responseId": "resp-runtime-test", "text": json.dumps(payload), "usage": {"totalTokens": 12}}
+
+
+PRIME_LEARNING_USAGE = {
+    "input": 6678,
+    "output": 582,
+    "totalTokens": 7260,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "cost": {"cacheRead": 0, "cacheWrite": 0, "input": 0.006678, "output": 0.003492, "total": 0.01017},
+}
+
+
+class PrimeUsageLearningClient(FakeClient):
+    def __init__(self, usage):
+        super().__init__()
+        self.usage = usage
+
+    def invoke(self, **kwargs):
+        response = super().invoke(**kwargs)
+        response["usage"] = dict(self.usage)
+        return response
+
+
+def _learning_receipt_from_proposal(store, manager, proposal):
+    from adaptive_agent.experiment_runtime import DefaultExperimentStageRunner
+
+    candidate = proposal.authoritative_candidate
+    runner = DefaultExperimentStageRunner.__new__(DefaultExperimentStageRunner)
+    runner.runtime = SimpleNamespace(controller=SimpleNamespace(store=store))
+    runner.base_hash = manager.get_active_bundle().content_hash
+    runner.pins = {}
+    result = {
+        "candidate": {
+            "candidateId": candidate.get("candidate_id", candidate.get("candidateId")),
+            "candidateBundleHash": candidate.get("candidate_bundle_hash", candidate.get("candidateBundleHash")),
+            "baseBundleHash": candidate.get("base_bundle_hash", candidate.get("baseBundleHash")),
+        },
+    }
+    return runner._learning_receipt("learning", RUN, result, bind_primary=True)
+
+
+def test_prime_learning_usage_is_normalized_at_sink_and_completes_experiment_receipt(tmp_path: Path):
+    store, manager, _ = _setup_store(tmp_path)
+    runtime = LearningRuntime.build(
+        store=store,
+        manager=manager,
+        model_client=PrimeUsageLearningClient(PRIME_LEARNING_USAGE),
+        token_budget=20_000,
+        wall_seconds=20,
+    )
+
+    proposal = runtime.propose_completed_run(RUN)
+    receipt = _learning_receipt_from_proposal(store, manager, proposal)
+
+    assert receipt["usage"] == {"inputTokens": 6678, "outputTokens": 582, "totalTokens": 7260}
+    assert receipt["modelObservationRefs"]
+    assert receipt["economicCostStatus"] == "unknown"
+    assert receipt["costMicrounits"] == 10170
+    assert receipt["costBasis"] == "nominal_budget_proxy"
+
+    import json
+
+    row = next(row for row in store.list_evidence(RUN) if row["event_type"] == "learning_model_observation")
+    payload = store.get_artifact(json.loads(row["source_ref"])["sha256"])
+    assert payload["usage"]["inputTokens"] == 6678
+    assert payload["usage"]["outputTokens"] == 582
+    assert payload["usage"]["totalTokens"] == 7260
+    assert payload["usage"]["cacheRead"] == 0
+    assert payload["usage"]["cacheWrite"] == 0
+    assert payload["usage"]["cost"] == PRIME_LEARNING_USAGE["cost"]
+    assert payload["nominalCostUsd"] == 0.01017
+    assert payload["economicCostStatus"] == "unknown"
+
+
+def test_contradictory_prime_learning_usage_is_rejected_before_candidate_persistence(tmp_path: Path):
+    store, manager, _ = _setup_store(tmp_path)
+    contradictory = {**PRIME_LEARNING_USAGE, "totalTokens": 7261}
+    runtime = LearningRuntime.build(store=store, manager=manager, model_client=PrimeUsageLearningClient(contradictory))
+
+    with pytest.raises(LearningRuntimeError, match="totalTokens"):
+        runtime.propose_completed_run(RUN)
+
+    assert not any(row["event_type"] == "learning_model_observation" for row in store.list_evidence(RUN))
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 0
 
 
 def test_runtime_composes_durable_learning_and_restart_readback(tmp_path: Path):
