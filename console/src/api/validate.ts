@@ -107,6 +107,24 @@ export function parseRunEvent(value: unknown, field: string): RunEvent {
   return event;
 }
 
+/** Operator-readable summaries per durable event type; distinguishes runtime
+ *  failures from outcome-check results so a dry_run preview is not mistaken
+ *  for a runtime error. */
+const SUMMARY_BY_TYPE: Record<string, string> = {
+  run_created: "Run created",
+  run_started: "Run started",
+  run_failed: "Runtime failure recorded",
+  run_cancelled: "Run cancelled",
+  run_completed: "Run completed",
+  run_succeeded: "Run completed",
+  run_timed_out: "Run timed out",
+  outcome_recorded: "Trusted outcome check recorded",
+  model_observation: "Model observation recorded",
+  step_started: "Step started",
+  step_completed: "Step completed",
+  approval: "Approval recorded",
+};
+
 /** Durable evidence event types -> console event kinds. */
 const EVENT_TYPE_TO_KIND: Record<string, RunEvent["kind"]> = {
   run_created: "status",
@@ -168,19 +186,38 @@ export function normalizeSseEvent(value: unknown, field: string): RunEvent {
   }
   const contentHashRaw = data.contentHash ?? data.content_hash;
   const contentHash = typeof contentHashRaw === "string" ? contentHashRaw : null;
+  // safe operator payload fields when the projection includes them
+  // (visibility-gated server-side; evaluator_only rows never reach the client)
+  const payloadSummaryRaw = data.summary ?? data.payload_summary;
+  const payloadDetailRaw = data.detail ?? data.payload_detail;
   const detail = sourceId
     ? `evidence artifact ${sourceId}`
     : contentHash
       ? `content ${contentHash.slice(0, 12)}`
       : undefined;
-  return {
+  const event: RunEvent = {
     runId,
     sequence,
     at: typeof data.at === "string" ? data.at : "",
     kind,
-    summary: `[${eventType}] evidence recorded`,
-    detail,
+    summary:
+      typeof payloadSummaryRaw === "string" && payloadSummaryRaw
+        ? payloadSummaryRaw
+        : (SUMMARY_BY_TYPE[eventType] ?? `[${eventType}] evidence recorded`),
   };
+  if (typeof payloadDetailRaw === "string" && payloadDetailRaw) event.detail = payloadDetailRaw;
+  else if (typeof detail === "string") event.detail = detail;
+  else if (payloadDetailRaw !== undefined) event.detail = String(payloadDetailRaw);
+  const evidenceIdRaw = data.evidenceId ?? data.evidence_id;
+  event.evidence = {
+    evidenceId: typeof evidenceIdRaw === "string" ? evidenceIdRaw : undefined,
+    sourceRefId: sourceId ?? undefined,
+    contentHash: contentHash ?? undefined,
+    trustClass: typeof data.trustClass === "string" ? data.trustClass : typeof data.trust_class === "string" ? data.trust_class : undefined,
+    visibility: typeof data.visibility === "string" ? data.visibility : undefined,
+    redacted: typeof data.redacted === "boolean" ? data.redacted : typeof data.redacted === "number" ? data.redacted === 1 : undefined,
+  };
+  return event;
 }
 
 export function parseRun(value: unknown, field: string): RunRecord {

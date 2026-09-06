@@ -50,6 +50,15 @@ export type RunRecord = {
   budgetUsed?: { calls: number; callsCeiling: number; wallSeconds: number; wallCeiling: number };
 };
 
+export type EvidenceProvenance = {
+  evidenceId?: string;
+  sourceRefId?: string;
+  contentHash?: string;
+  trustClass?: string;
+  visibility?: string;
+  redacted?: boolean;
+};
+
 export type RunEvent = {
   runId: string;
   sequence: number;
@@ -57,8 +66,10 @@ export type RunEvent = {
   kind: "status" | "step" | "tool" | "evidence" | "budget" | "approval";
   summary: string;
   detail?: string; // untrusted text; rendered escaped only
-  approval?: ApprovalRequest;
   error?: ToolError;
+  approval?: ApprovalRequest;
+  /** provenance from the durable evidence row; expandable in the UI */
+  evidence?: EvidenceProvenance;
 };
 
 export type ApprovalRequest = {

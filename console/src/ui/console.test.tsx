@@ -29,7 +29,7 @@ describe("console (simulation fixtures)", () => {
     await userEvent.click(screen.getAllByRole("button", { name: /run-sim-1003/ })[0]);
     // OUTCOME_UNKNOWN banner appears with correlation id and reconciliation guidance
     expect(await screen.findByText("Tool error: OUTCOME_UNKNOWN")).toBeInTheDocument();
-    expect(await screen.findByText(/do not repeat the operation manually/)).toBeInTheDocument();
+    expect((await screen.findAllByText(/do not repeat the operation manually/)).length).toBeGreaterThanOrEqual(1);
   });
 
   it("registers keyboard tab navigation across console sections", async () => {

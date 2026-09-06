@@ -214,23 +214,57 @@ export function RunView({
               ) : (
                 <ol className="mt-2 space-y-2" aria-label="Run events">
                   {runEvents.map((event) => (
-                    <li key={event.sequence} className="flex gap-3 rounded-lg bg-slate-800/60 px-3 py-2">
-                      <span className="w-10 shrink-0 font-mono text-xs text-slate-500">#{event.sequence}</span>
-                      <div className="min-w-0">
-                        <p className="text-[13px] text-slate-200">
-                          <span className="mr-2 rounded bg-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-300">
-                            {KIND_LABEL[event.kind]}
-                          </span>
-                          {event.summary}
-                        </p>
-                        {event.error && (
-                          <p className="mt-1 text-xs text-rose-300">
-                            {event.error.code} · retry: {event.error.retry} · correlation {event.error.correlationId}
-                          </p>
-                        )}
-                        {event.detail && <p className="mt-1 text-xs text-slate-400">{event.detail}</p>}
-                        <p className="mt-0.5 font-mono text-[10px] text-slate-600">{event.at}</p>
-                      </div>
+                    <li key={event.sequence} className="rounded-lg bg-slate-800/60 px-3 py-2">
+                      <details>
+                        <summary className="flex cursor-pointer list-none gap-3 [&::-webkit-details-marker]:hidden">
+                          <span className="w-10 shrink-0 font-mono text-xs text-slate-500">#{event.sequence}</span>
+                          <div className="min-w-0 flex-1">
+                            <p className="text-[13px] text-slate-200">
+                              <span className="mr-2 rounded bg-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-300">
+                                {KIND_LABEL[event.kind]}
+                              </span>
+                              {event.summary}
+                              {event.evidence?.evidenceId && (
+                                <span className="ml-2 align-middle">
+                                  <span aria-hidden="true" className="text-slate-500">▸</span>
+                                  <span className="sr-only">— evidence details available, expand to inspect</span>
+                                </span>
+                              )}
+                            </p>
+                            {event.error && (
+                              <p className="mt-1 text-xs text-rose-300">
+                                {event.error.code} · retry: {event.error.retry} · correlation {event.error.correlationId}
+                              </p>
+                            )}
+                            {event.detail && <p className="mt-1 text-xs text-slate-400">{event.detail}</p>}
+                            <p className="mt-0.5 font-mono text-[10px] text-slate-600">{event.at}</p>
+                          </div>
+                        </summary>
+                        <div className="mt-2 border-t border-slate-700/60 pt-2 pl-13">
+                          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[11px]">
+                            <dt className="text-slate-500">Evidence</dt>
+                            <dd className="font-mono text-slate-300">{event.evidence?.evidenceId ?? "—"}</dd>
+                            <dt className="text-slate-500">Artifact</dt>
+                            <dd className="font-mono text-slate-300">{event.evidence?.sourceRefId ?? "—"}</dd>
+                            <dt className="text-slate-500">Trust class</dt>
+                            <dd className="text-slate-300">{event.evidence?.trustClass ?? "—"}</dd>
+                            <dt className="text-slate-500">Visibility</dt>
+                            <dd className="text-slate-300">{event.evidence?.visibility ?? "—"}</dd>
+                            <dt className="text-slate-500">Redacted</dt>
+                            <dd className="text-slate-300">
+                              {event.evidence?.redacted === undefined ? "—" : event.evidence.redacted ? "yes" : "no"}
+                            </dd>
+                          </dl>
+                          {event.evidence?.contentHash && (
+                            <p className="mt-1 font-mono text-[10px] text-slate-600">{event.evidence.contentHash}</p>
+                          )}
+                          {event.error && (
+                            <p className="mt-1 text-[11px] text-slate-400">
+                              {describeToolError(event.error)}
+                            </p>
+                          )}
+                        </div>
+                      </details>
                     </li>
                   ))}
                 </ol>

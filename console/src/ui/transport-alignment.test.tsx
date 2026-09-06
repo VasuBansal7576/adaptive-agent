@@ -44,7 +44,7 @@ describe("durable SSE event normalization", () => {
     expect(event.runId).toBe("r1");
     expect(event.sequence).toBe(7);
     expect(event.kind).toBe("status");
-    expect(event.summary).toContain("run_started");
+    expect(event.summary).toBe("Run started");
     expect(event.detail).toContain("art-1");
   });
 
@@ -79,7 +79,7 @@ describe("durable SSE event normalization", () => {
     expect(event.runId).toBe("run_9811");
     expect(event.sequence).toBe(1);
     expect(event.kind).toBe("status");
-    expect(event.summary).toContain("run_created");
+    expect(event.summary).toBe("Run created");
     expect(event.detail).toContain("art_9baec1f5358fbce8");
   });
 
