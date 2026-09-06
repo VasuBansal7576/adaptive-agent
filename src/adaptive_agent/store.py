@@ -646,7 +646,7 @@ class Store:
                  "FROM evidence e JOIN runs r ON r.run_id=e.run_id JOIN tasks t ON t.id=r.task_id "
                  "LEFT JOIN outcomes o ON o.run_id=e.run_id "
                  "WHERE e.visibility='learner' AND e.redacted=1 AND e.trust_class='broker' "
-                 "AND e.event_type='tool_result' AND t.partition='development' "
+                 "AND e.event_type IN ('tool_result','learning_evidence_projection') AND t.partition='development' "
                  "AND r.status IN ('succeeded','failed','cancelled','timed_out','outcome_unknown') "
                  "AND o.run_id IS NOT NULL")
         params: list[Any] = []

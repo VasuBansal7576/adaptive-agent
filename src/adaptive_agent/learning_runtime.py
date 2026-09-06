@@ -134,8 +134,6 @@ class LearningRuntime:
 
     def _materialize_run_records(self, *, environment_id: str, run_id: str, public_documents: Any = ()) -> list[Mapping[str, Any]]:
         save = getattr(self.store, "save_learning_record", None)
-        raw_records: list[Mapping[str, Any]] = []
-
         # A completed run may have been projected by an earlier process whose
         # source artifacts have since been compacted. Keep that projection as
         # the restart source of truth and only fall back to raw CAS joins when
@@ -164,12 +162,22 @@ class LearningRuntime:
                     existing_keys.add(key)
                     existing_records.append(row)
 
+        # Keep already materialized rows in the request projection.  They are
+        # the restart source of truth when the original CAS payloads have
+        # been compacted, and they also prevent a restart from silently
+        # dropping public documents from retrieval context.
+        raw_records: list[Mapping[str, Any]] = list(existing_records)
+        materialized_keys: set[tuple[Any, Any]] = set(existing_keys)
+
         def persist(record_id: str, record: Mapping[str, Any]) -> None:
+            key = (record.get("kind"), record.get("sourceId"))
+            if key in materialized_keys:
+                return
             encoded = json.dumps(record, sort_keys=True, separators=(",", ":"))
             if callable(save):
                 save(record_id, environment_id, run_id, encoded)
-            else:
-                raw_records.append(record)
+            raw_records.append(record)
+            materialized_keys.add(key)
         environment = self.store.get_environment(environment_id)
         if not isinstance(environment, Mapping):
             raise LearningRuntimeError("completed run environment is not stored")
@@ -231,7 +239,7 @@ class LearningRuntime:
             # Some session-2 runtimes currently retain broker events as
             # operator-only.  Project only the broker's safe envelope here;
             # never copy its raw payload into learner context.
-            if event.get("event_type") != "tool_result":
+            if event.get("event_type") not in {"tool_result", "learning_evidence_projection"}:
                 continue
             payload: Mapping[str, Any] = {}
             source_event = getattr(self.store, "get_evidence", lambda _id: None)(event["evidence_id"])
@@ -260,8 +268,9 @@ class LearningRuntime:
                     if isinstance(error, Mapping):
                         safe["error"] = {key: _sanitize_learning_value(error.get(key)) for key in ("code", "retry") if key in error}
             content = f"Broker development observation: eventType={event['event_type']}; details={canonical_json(safe)}"
-            record = {"kind": "live_evidence", "sourceId": event["evidence_id"], "content": content, "contentHash": content_hash(content), "sourceContentHash": event["content_hash"], "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": event.get("trust_class", "broker"), "trustedOutcome": True, "outcomePassed": outcome_passed}
-            persist(f"learning-evidence-{event['evidence_id']}", record)
+            source_id = f"broker:{event['evidence_id']}"
+            record = {"kind": "live_evidence", "sourceId": source_id, "content": content, "contentHash": content_hash(content), "sourceContentHash": event["content_hash"], "environmentId": environment_id, "runId": run_id, "partition": "development", "visibility": "learner", "trustClass": event.get("trust_class", "broker"), "trustedOutcome": True, "outcomePassed": outcome_passed}
+            persist(f"learning-evidence-{source_id}", record)
         # A run may already contain the narrow broker projection written by a
         # prior process.  Reuse those immutable records on restart when the
         # source event rows are no longer available as raw tool_result rows.
