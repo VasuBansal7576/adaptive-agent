@@ -45,7 +45,7 @@ M4 is not complete and must not be represented as passed.
 
 The AppWorld adapter and CLI are integrated with installed AppWorld `0.1.3.post1`.
 A separate actual AppWorld experiment remains RUNNING against frozen source `28baed7`.
-Its 8 train cells and 16 completed dev cells have all ended with observed model-budget failures; no final report or achieved improvement claim is available, and immutable jobs continue.
+Its 8 training attempts exhausted the model budget; the development stage is in progress, with no final report or achieved improvement claim available, and immutable jobs continue.
 
 Multi-run learning is integrated.
 On frozen source `15e1624`, actual training completed 60 tasks, with 48 successes and 12 budget failures.
@@ -56,7 +56,7 @@ The original full experiment against frozen source `ccf3b3a` stopped at 2026-09-
 Its 60-task training stage completed with 50 successes and 10 model-budget failures, learning generated an unpromoted candidate, and 3 transfer, 3 adaptation, and 3 safety cells completed.
 Validation reached 116 completed cells and 1 infrastructure failure, then failed closed; no validation report or final 720-cell panel exists, so M4 remains unmet.
 
-A generic-error evaluation run did not produce trusted model and outcome evidence.
+The evaluator stopped because a run lacked trusted model and outcome evidence.
 The operator error was that the Prime CLI JSON stream did not contain a final assistant message.
 The upstream cause was not retained and is not known.
 The Prime JSON terminal-error parsing gap is being fixed separately for a future source revision; the zero-retry frozen run was not restarted or edited.
