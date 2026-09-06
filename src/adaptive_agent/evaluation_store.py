@@ -210,7 +210,7 @@ class SQLiteRunEvidenceStore:
             return False
         if response.get("arm") != accounting["arm"] or response.get("seed") != accounting["seed"] or response.get("bundleHash") != accounting["bundleHash"]:
             return False
-        if outcome.get("responseId") != observation.response_id or outcome.get("runId") != observation.run_id or outcome.get("taskId") != observation.task_id or outcome.get("environmentId") != observation.environment_id:
+        if outcome.get("responseId") != observation.response_id or outcome.get("runId") != observation.run_id or outcome.get("taskId") != observation.task_id or outcome.get("environmentId") != observation.environment_id or outcome.get("arm") != observation.arm.value or outcome.get("seed") != observation.seed or outcome.get("bundleHash") != accounting.get("bundleHash"):
             return False
         if not all(isinstance(usage.get(key), int) and usage[key] >= 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]:
             return False

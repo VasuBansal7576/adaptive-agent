@@ -101,7 +101,7 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             response_ref = store.put_artifact(response)
             store.append_evidence("evidence-1", {"run_id": run_id, "sequence": 1, "event_type": "model_response", "content_hash": response_ref.sha256, "source_ref": response_ref.model_dump_json(by_alias=True), "trust_class": "broker", "visibility": "operator", "redacted": 0})
             accounting_ref = store.put_artifact({"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "usage": usage, "costMicrounits": 1, "durationSeconds": 1.0, "versionRefs": version_refs, "arm": "L", "seed": 17, "bundleHash": bundle.content_hash})
-            outcome = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "passed": True, "reliable": True, "safetyViolations": 0}
+            outcome = {"responseId": response_id, "runId": run_id, "taskId": task.task_id, "environmentId": "finance", "arm": "L", "seed": 17, "bundleHash": bundle.content_hash, "passed": True, "reliable": True, "safetyViolations": 0}
             outcome_ref = store.put_artifact(outcome)
             store.append_evidence("outcome-1", {"run_id": run_id, "sequence": 2, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": outcome_ref.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "operator", "redacted": 0})
             expected = {"model": sha256_json({"profile": protocol.model_profile, "provider": protocol.provider}), "planner": protocol.core_planner_hash, "budget": sha256_json(frozen.inputs["runBudget"]), "policy": sha256_json(package.manifest.policy_ref), "schema": sha256_json(package.manifest.tool_schemas), "image": protocol.image_digest}
@@ -143,6 +143,11 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             tampered_outcome = store.put_artifact({**outcome, "passed": False})
             store.append_evidence("tampered-outcome", {"run_id": run_id, "sequence": 6, "event_type": "trusted_outcome", "content_hash": outcome_ref.sha256, "source_ref": tampered_outcome.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0})
             self.assertFalse(verifier.verify(dataclasses.replace(row, outcome_ref="tampered-outcome"), frozen, package))
+            for index, (field, value) in enumerate((("arm", "B0"), ("seed", 999), ("bundleHash", "f" * 64)), start=7):
+                relabeled = store.put_artifact({**outcome, field: value})
+                evidence_id = f"relabeled-outcome-{field}"
+                store.append_evidence(evidence_id, {"run_id": run_id, "sequence": index, "event_type": "trusted_outcome", "content_hash": relabeled.sha256, "source_ref": relabeled.model_dump_json(by_alias=True), "trust_class": "evaluator", "visibility": "evaluator_only", "redacted": 0})
+                self.assertFalse(verifier.verify(dataclasses.replace(row, outcome_ref=evidence_id), frozen, package))
 
 
 if __name__ == "__main__":
