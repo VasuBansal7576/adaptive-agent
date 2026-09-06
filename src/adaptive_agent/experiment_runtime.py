@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Mapping
 
+from adaptive_agent.learning_runtime import LEARNING_SOURCE_RUN_CAP
+
 
 class ExperimentRuntimeError(RuntimeError):
     """Raised when a lifecycle cell cannot be backed by durable evidence."""
@@ -609,27 +611,135 @@ class DefaultExperimentStageRunner:
             raise ExperimentRuntimeError("learning requires completed development receipts")
         return values
 
+    # Bounded stratified learning selection: at most LEARNING_SOURCE_RUN_CAP
+    # completed development source runs enter one candidate proposal's declared
+    # exposure set.  A protocol may pin a smaller bound via
+    # inputs.learningSelection.maxRuns.
+    _DEFAULT_LEARNING_SOURCE_CAP = LEARNING_SOURCE_RUN_CAP
+
+    def _learning_source_cap(self) -> int:
+        sel = self.inputs.get("learningSelection")
+        if isinstance(sel, Mapping) and "maxRuns" in sel:
+            value = sel["maxRuns"]
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0 or value > LEARNING_SOURCE_RUN_CAP:
+                raise ExperimentRuntimeError("learningSelection.maxRuns must be a positive integer within the frozen bound")
+            return value
+        return self._DEFAULT_LEARNING_SOURCE_CAP
+
+    def _select_learning_runs(self, receipts: list[Mapping[str, Any]], *, excluded: str | None = None) -> tuple[list[str], list[str]]:
+        """Bounded, deterministic, stratified selection of development sources.
+
+        Every candidate run must be a completed run in the receipt's declared
+        environment, bound to a development task, and carry a trusted outcome
+        — invalid sources fail closed.  Failed attempts are eligible.  The
+        leave-out environment and any run beyond the cap are returned in the
+        ignored list so they are never claimed as learner exposure.
+        """
+        store = self.runtime.controller.store
+        get_task = getattr(store, "get_task", None)
+        by_env: dict[str, list[str]] = {}
+        status_of: dict[str, str] = {}
+        env_of: dict[str, str] = {}
+        ignored: list[str] = []
+        for receipt in receipts:
+            environment_id = receipt.get("environmentId")
+            if not isinstance(environment_id, str) or not environment_id:
+                raise ExperimentRuntimeError("training receipt lacks an environment binding")
+            run_ids = receipt.get("runIds")
+            if not isinstance(run_ids, list) or not run_ids or any(not isinstance(run_id, str) or not run_id for run_id in run_ids):
+                raise ExperimentRuntimeError("training receipt lacks durable run ids")
+            if environment_id == excluded:
+                ignored.extend(run_ids)
+                continue
+            for run_id in run_ids:
+                stored = store.get_run(run_id)
+                if not isinstance(stored, Mapping) or stored.get("status") not in {"succeeded", "failed", "cancelled", "timed_out", "outcome_unknown"}:
+                    raise ExperimentRuntimeError(f"learning source {run_id!r} is not a completed development run")
+                if stored.get("environment_id") != environment_id:
+                    raise ExperimentRuntimeError(f"learning source {run_id!r} is not bound to its declared environment")
+                if callable(get_task):
+                    task = get_task(stored.get("task_id"))
+                    if not isinstance(task, Mapping) or task.get("partition") != "development":
+                        raise ExperimentRuntimeError(f"learning source {run_id!r} is not a development run")
+                if store.get_outcome_by_run_id(run_id) is None:
+                    raise ExperimentRuntimeError(f"learning source {run_id!r} lacks a trusted development outcome")
+                bucket = by_env.setdefault(environment_id, [])
+                if run_id not in bucket:
+                    bucket.append(run_id)
+                    status_of[run_id] = str(stored.get("status"))
+                    env_of[run_id] = environment_id
+        cap = self._learning_source_cap()
+        envs = sorted(by_env)
+        for env in envs:
+            # Deterministic order: failed attempts first, then run id.  Plain
+            # id ordering could silently omit every failure inside the bound.
+            by_env[env].sort(key=lambda run_id: (status_of[run_id] != "failed", run_id))
+        selected: list[str] = []
+        # Round-robin across domains so every eligible environment contributes
+        # before any environment contributes a second run.
+        while envs and len(selected) < cap:
+            progressed = False
+            for env in list(envs):
+                if by_env[env]:
+                    selected.append(by_env[env].pop(0))
+                    progressed = True
+                else:
+                    envs.remove(env)
+                if len(selected) >= cap:
+                    break
+            if not progressed:
+                break
+        overflow = [run_id for env in sorted(by_env) for run_id in by_env[env]]
+        if not any(status_of[run_id] == "failed" for run_id in selected):
+            # Include a failed source when one exists, without dropping
+            # environment coverage: swap out the last selected run of an
+            # environment that a failed overflow run can still represent.
+            for failed_run in (run_id for run_id in overflow if status_of[run_id] == "failed"):
+                failed_env = env_of[failed_run]
+                slots = [index for index, run_id in enumerate(selected) if env_of[run_id] == failed_env]
+                if slots:
+                    dropped = selected[slots[-1]]
+                    selected[slots[-1]] = failed_run
+                    overflow = [run_id for run_id in overflow if run_id != failed_run] + [dropped]
+                    break
+        ignored.extend(overflow)
+        if not selected:
+            raise ExperimentRuntimeError("learning has no eligible development source run")
+        return selected, ignored
+
+    def _declare_learning_selection(self, cell_key: str, selected: list[str], ignored: list[str], *, excluded: str | None) -> tuple[Mapping[str, Any], Mapping[str, Any] | None]:
+        """Persist the declared exposure selection so ignored runs are never
+        claimed as learner context."""
+        declaration = {
+            "stage": "learning",
+            "cellKey": cell_key,
+            "strategy": "stratified-round-robin",
+            "maxRuns": self._learning_source_cap(),
+            "excludedEnvironment": excluded,
+            "sourceRunIds": list(selected),
+            "ignoredRunIds": list(ignored),
+        }
+        put = getattr(self.runtime.controller.store, "put_artifact", None)
+        ref = put(declaration).model_dump(mode="json", by_alias=True) if callable(put) else None
+        return declaration, ref
+
     def _learning(self, cell_key: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
         receipts = self._training_results(context)
-        candidate_source = next(iter(receipts), None)
-        if candidate_source is None:
-            raise ExperimentRuntimeError("learning has no development source receipt")
-        run_id = _required_string(candidate_source.get("runIds", [None])[0], "development source run")
-        stored = self.runtime.controller.store.get_run(run_id)
-        if not isinstance(stored, Mapping) or stored.get("status") not in {"succeeded", "failed", "cancelled", "timed_out", "outcome_unknown"}:
-            raise ExperimentRuntimeError("candidate generation requires a completed development run")
-        if self.runtime.controller.store.get_outcome_by_run_id(run_id) is None:
-            raise ExperimentRuntimeError("candidate generation requires a trusted development outcome")
-        return self._candidate_from_run(run_id, cell_key, bind_primary=True, context=context)
+        selected, ignored = self._select_learning_runs(receipts)
+        declaration, selection_ref = self._declare_learning_selection(cell_key, selected, ignored, excluded=None)
+        return self._candidate_from_run(selected[0], cell_key, bind_primary=True, context=context, source_run_ids=selected, ignored_run_ids=ignored, selection=(declaration, selection_ref))
 
-    def _candidate_from_run(self, run_id: str, cell_key: str, *, bind_primary: bool, prior_learning_refs: set[str] | None = None, context: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+    def _candidate_from_run(self, run_id: str, cell_key: str, *, bind_primary: bool, prior_learning_refs: set[str] | None = None, context: Mapping[str, Any] | None = None, source_run_ids: list[str] | None = None, ignored_run_ids: list[str] | None = None, selection: tuple[Mapping[str, Any], Mapping[str, Any] | None] | None = None) -> Mapping[str, Any]:
         stored = self.runtime.controller.store.get_run(run_id)
         if not isinstance(stored, Mapping) or stored.get("status") not in {"succeeded", "failed", "cancelled", "timed_out", "outcome_unknown"}:
             raise ExperimentRuntimeError("candidate generation requires a completed run")
         if self.runtime.controller.store.get_outcome_by_run_id(run_id) is None:
             raise ExperimentRuntimeError("candidate generation requires a trusted outcome")
+        source_set = list(source_run_ids) if source_run_ids else [run_id]
         baseline_refs = prior_learning_refs if prior_learning_refs is not None else self._learning_observation_ids(run_id)
-        admission = self._admit_subcall(context, f"learning:{cell_key}:{run_id}")
+        # The admission key binds the exact declared source set: replaying a
+        # checkpoint reproduces the same selection, never a wider one.
+        admission = self._admit_subcall(context, f"learning:{cell_key}:{','.join(source_set)}")
         if admission is not None and admission.get("reused") is True:
             if admission.get("dispatchAllowed") is not False:
                 raise ExperimentRuntimeError("reused nested learning admission lacks dispatch prohibition")
@@ -646,8 +756,9 @@ class DefaultExperimentStageRunner:
         if admission is not None and admission.get("dispatchAllowed") is not True:
             raise ExperimentRuntimeError("nested learning admission did not authorize dispatch")
         try:
-            result = self.runtime.launch_learning(SimpleNamespace(run_id=run_id))
-            receipt = dict(self._learning_receipt(cell_key, run_id, result, bind_primary=bind_primary, prior_learning_refs=baseline_refs))
+            payload = SimpleNamespace(run_id=run_id, run_ids=source_set) if len(source_set) > 1 else SimpleNamespace(run_id=run_id)
+            result = self.runtime.launch_learning(payload)
+            receipt = dict(self._learning_receipt(cell_key, run_id, result, bind_primary=bind_primary, prior_learning_refs=baseline_refs, source_run_ids=source_set, ignored_run_ids=ignored_run_ids, selection=selection))
             if admission is not None:
                 receipt["nestedAdmissionId"] = admission.get("admissionId")
                 receipt["nestedAdmissions"] = [admission.get("admissionId")]
@@ -690,7 +801,7 @@ class DefaultExperimentStageRunner:
         if callable(recorder):
             recorder(admission.get("admissionId"), result=result, error=error)
 
-    def _learning_receipt(self, cell_key: str, run_id: str, result: Any, *, bind_primary: bool, prior_learning_refs: set[str] | None = None) -> Mapping[str, Any]:
+    def _learning_receipt(self, cell_key: str, run_id: str, result: Any, *, bind_primary: bool, prior_learning_refs: set[str] | None = None, source_run_ids: list[str] | None = None, ignored_run_ids: list[str] | None = None, selection: tuple[Mapping[str, Any], Mapping[str, Any] | None] | None = None) -> Mapping[str, Any]:
         result = _mapping(result, "learning result")
         candidate = _mapping(result.get("candidate"), "learning candidate")
         candidate_id = _required_string(candidate.get("candidateId", candidate.get("candidate_id")), "candidate id")
@@ -713,11 +824,17 @@ class DefaultExperimentStageRunner:
             "pins": dict(self.pins),
             "candidateId": candidate_id,
             "candidateBundleHash": candidate_hash,
-            "sourceRunIds": [run_id],
+            "sourceRunIds": list(source_run_ids) if source_run_ids else [run_id],
+            "ignoredRunIds": list(ignored_run_ids or []),
             "modelObservationRefs": learning_refs,
             "nestedAdmissions": [],
             "nestedCheckpoints": list(learning_refs),
         }
+        if selection is not None:
+            declaration, selection_ref = selection
+            receipt["learningSelection"] = dict(declaration)
+            if selection_ref is not None:
+                receipt["learningSelectionRef"] = dict(selection_ref)
         if not learning_accounting.get("accountingComplete", False):
             if learning_accounting.get("costMicrounits") is not None:
                 receipt["costMicrounits"] = learning_accounting["costMicrounits"]
@@ -743,12 +860,9 @@ class DefaultExperimentStageRunner:
         eligible = [receipt for receipt in receipts if receipt.get("environmentId") != excluded]
         if not eligible:
             raise ExperimentRuntimeError("transfer training set does not prove leave-one-environment-out exclusion")
-        source = eligible[0]
-        run_ids = source.get("runIds")
-        if not isinstance(run_ids, list) or not run_ids or not isinstance(run_ids[0], str):
-            raise ExperimentRuntimeError("transfer source receipt lacks a durable run")
-        run_id = run_ids[0]
-        receipt = self._candidate_from_run(run_id, f"leave-out:{excluded}", bind_primary=False, context=context)
+        selected, ignored = self._select_learning_runs(receipts, excluded=excluded)
+        declaration, selection_ref = self._declare_learning_selection(f"leave-out:{excluded}", selected, ignored, excluded=excluded)
+        receipt = self._candidate_from_run(selected[0], f"leave-out:{excluded}", bind_primary=False, context=context, source_run_ids=selected, ignored_run_ids=ignored, selection=(declaration, selection_ref))
         return _load_bundle(self.runtime, receipt["candidateBundleHash"]), receipt
 
     def _learning_observation_usage(self, run_id: str, *, prior_refs: set[str] | None = None) -> tuple[dict[str, int], list[str]]:
