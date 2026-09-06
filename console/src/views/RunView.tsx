@@ -362,7 +362,10 @@ export const MODEL_PROFILES = [
   { ref: { id: "model-profile", version: "1", sha256: "" }, label: "GPT-5.6 Luna (subscription)" },
 ];
 
-const BUDGET_FALLBACK = { modelTokens: 4000, toolCalls: 32, wallTimeSeconds: 90 };
+// Used ONLY while /run-options is unavailable or before it resolves; the
+// value mirrors the control plane's authoritative default (20,000 tokens) and
+// is always overwritten by server-advertised budgetDefaults when they arrive.
+const BUDGET_FALLBACK = { modelTokens: 20000, toolCalls: 32, wallTimeSeconds: 90 };
 
 function NewRunDialog({
   open,
@@ -395,6 +398,9 @@ function NewRunDialog({
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const goalRef = useRef<HTMLTextAreaElement>(null);
+  // last server-advertised token default (20000 on the current control plane);
+  // the reset path uses it instead of any hardcoded literal
+  const lastAdvertisedTokens = useRef<number | null>(null);
   // run-options defaults must never clobber operator edits that land while the
   // options request is in flight
   const budgetTouched = useRef(false);
@@ -423,6 +429,7 @@ function NewRunDialog({
           setModelProfiles(options.modelProfiles.map((p) => ({ ref: p.ref, label: p.label })));
           setModelProfile(options.modelProfiles[0].label);
         }
+        lastAdvertisedTokens.current = options.budgetDefaults.modelTokens;
         if (!budgetTouched.current) {
           setToolCallCeiling(String(options.budgetDefaults.toolCalls));
           setWallSecondsCeiling(String(options.budgetDefaults.wallTimeSeconds));
@@ -513,9 +520,10 @@ function NewRunDialog({
     });
     setSubmitting(false);
     if (ok) {
-      // success: fresh key for the next dialog session
+      // success: fresh key for the next dialog session; token budget resets to
+      // the server-advertised default, never a hardcoded literal
       setGoal("");
-      setModelTokenCeiling("20000");
+      setModelTokenCeiling(String(lastAdvertisedTokens.current ?? BUDGET_FALLBACK.modelTokens));
       setFieldErrors({});
       setSubmitNotice(null);
       setIdempotencyKey(newIdempotencyKey());

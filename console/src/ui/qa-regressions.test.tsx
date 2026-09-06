@@ -85,6 +85,24 @@ describe("qa regressions: createRun recovery and honesty", () => {
     expect(sent[0].budget?.modelTokens).toBe(7777);
   });
 
+  it("resets the token budget to the advertised default after success, never a hardcoded literal", async () => {
+    const user = userEvent.setup();
+    render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
+    await screen.findAllByRole("button", { name: /run-sim-1001/ });
+    await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
+    let dialog = await screen.findByRole("dialog", { name: "Create run" });
+    // server-advertised default (sim /run-options: 4000 in the fixture; live is 20000)
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000), { timeout: 3000 });
+    await user.type(within(dialog).getByLabelText("Goal"), "advertised reset probe");
+    await user.click(within(dialog).getByRole("button", { name: "Create run" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    // reopen: the token budget returns to the ADVERTISED default (4000 here),
+    // proving the reset path follows the server value rather than a literal
+    await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
+    dialog = await screen.findByRole("dialog", { name: "Create run" });
+    await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(4000), { timeout: 3000 });
+  });
+
   it("restricts mode choices to the selected environment's declared modes", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
