@@ -1186,7 +1186,10 @@ class DurableRuntime:
             aggregate_inference += float(duration_value)
             receipt_economic_status = raw.get("economicCostStatus")
             if not isinstance(receipt_economic_status, str) or not receipt_economic_status:
-                receipt_economic_status = "unknown" if cost_value is None else "measured"
+                # A provider SDK nominal estimate is not proof of billed
+                # spend. Require an explicit status when a nominal USD value
+                # accompanies a microunit admission proxy.
+                receipt_economic_status = "unknown" if cost_value is None or nominal_value is not None else "measured"
             receipts.append({"responseId": receipt_id, "usage": receipt_usage, "durationSeconds": float(duration_value), "status": str(raw.get("status", "complete")), "economicCostStatus": receipt_economic_status, **({"costMicrounits": cost_value} if cost_value is not None else {}), **({"nominalCostUsd": float(nominal_value)} if nominal_value is not None else {})})
         self._run_last_receipt_at[run_id] = now
         self._run_receipts.setdefault(run_id, []).extend(receipts)
@@ -1198,14 +1201,41 @@ class DurableRuntime:
                 aggregate[key] = total
         aggregate_inference = sum(float(item.get("durationSeconds", 0.0)) for item in all_receipts)
         explicit_cost = any("costMicrounits" in item for item in all_receipts)
-        aggregate_cost = sum(float(item["costMicrounits"]) for item in all_receipts if "costMicrounits" in item)
+        # A receipt may carry either an explicit microunit value or only the
+        # SDK's nominal USD total. Include every known proxy in the aggregate,
+        # including mixed measured/nominal retry receipts.
+        aggregate_cost_values = [
+            float(item["costMicrounits"])
+            if "costMicrounits" in item
+            else float(item["nominalCostUsd"]) * 1_000_000
+            for item in all_receipts
+            if "costMicrounits" in item or "nominalCostUsd" in item
+        ]
+        aggregate_cost = sum(aggregate_cost_values)
         economic_statuses = {str(item.get("economicCostStatus")) for item in all_receipts if isinstance(item.get("economicCostStatus"), str)}
         aggregate_cost_unknown = any(status == "unknown" for status in economic_statuses) or any("costMicrounits" not in item for item in all_receipts)
+        economic_known_receipts = sum(
+            1
+            for item in all_receipts
+            if item.get("economicCostStatus") == "measured" and "costMicrounits" in item
+        )
         nominal_values = [float(item["nominalCostUsd"]) for item in all_receipts if "nominalCostUsd" in item]
         nominal_cost_usd = sum(nominal_values) if nominal_values else None
         nominal_coverage = {"knownReceipts": len(nominal_values), "totalReceipts": len(all_receipts)}
         nominal_status = "complete" if nominal_coverage["knownReceipts"] == nominal_coverage["totalReceipts"] else "partial"
-        nominal_proxy_fields = {"costBasis": "nominal_budget_proxy", "billingStatus": "unknown"} if not explicit_cost and nominal_status == "complete" else {}
+        # Keep a complete SDK nominal estimate in the accounting ledger so
+        # shared budget and evaluation aggregation can charge the same proxy.
+        # ``economicCost`` below remains unknown unless the provider supplied
+        # an explicit measured receipt.
+        accounting_cost = int(round(aggregate_cost)) if explicit_cost else (
+            round(nominal_cost_usd * 1_000_000)
+            if nominal_status == "complete" and nominal_cost_usd is not None
+            else None
+        )
+        nominal_proxy_fields = {
+            "costBasis": "nominal_budget_proxy",
+            "billingStatus": "unknown",
+        } if nominal_status == "complete" and nominal_cost_usd is not None and (not explicit_cost or aggregate_cost_unknown) else {}
         usage = dict(canonical_usage(evidence.get("usage")))
         if all_receipts:
             usage.update({key: value for key, value in all_receipts[-1]["usage"].items() if key in cache_keys or key == "cost"})
@@ -1276,8 +1306,8 @@ class DurableRuntime:
             "seed": seed,
             "bundleHash": bundle_hash,
             "versionRefs": version_refs,
-            "costMicrounits": aggregate_cost if explicit_cost else None,
-            "economicCost": {"status": economic_status, "microunits": aggregate_cost if explicit_cost and not aggregate_cost_unknown else None, "coverage": {"knownReceipts": sum(1 for item in all_receipts if "costMicrounits" in item), "totalReceipts": len(all_receipts)}},
+            "costMicrounits": accounting_cost,
+            "economicCost": {"status": economic_status, "microunits": int(round(aggregate_cost)) if explicit_cost and not aggregate_cost_unknown else None, "coverage": {"knownReceipts": economic_known_receipts, "totalReceipts": len(all_receipts)}},
             "nominalCostUsd": nominal_cost_usd,
             "nominalCostStatus": nominal_status,
             "nominalCostCoverage": nominal_coverage,
@@ -1490,7 +1520,23 @@ class DurableRuntime:
                 def act(self, _ctx: Any) -> None:
                     nonlocal invocation
                     invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
-                    runtime._record_model_response(run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest})
+                    runtime._record_model_response(
+                        run_id,
+                        package,
+                        {
+                            "provider": invocation.provider,
+                            "model": invocation.model,
+                            "responseId": invocation.response_id,
+                            "usage": dict(invocation.usage),
+                            "arm": arm,
+                            "seed": seed,
+                            "bundleHash": bundle_hash,
+                            "corePlannerHash": core_planner_hash,
+                            "imageDigest": image_digest,
+                            **({"nominalCostUsd": invocation.nominalCostUsd} if hasattr(invocation, "nominalCostUsd") else {}),
+                            **({"economicCostStatus": invocation.economicCostStatus} if hasattr(invocation, "economicCostStatus") else {}),
+                        },
+                    )
             def evaluate() -> DurableOutcome:
                 outcome = runtime._invoke_evaluator(run_id=run_id, goal=task.goal, model_output=invocation.text, environment=runtime._planner_environment(package, run_id)) if invocation is not None else None
                 outcome = outcome or {"passed": False}

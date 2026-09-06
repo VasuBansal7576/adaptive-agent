@@ -664,9 +664,44 @@ def test_durable_model_accounting_preserves_sdk_nominal_cost_and_cache_usage(tmp
     accounting = store.get_artifact(payload["accountingRef"]["sha256"])
     assert payload["nominalCostUsd"] == 0.0125
     assert accounting["nominalCostUsd"] == 0.0125
+    assert accounting["costMicrounits"] == 12500
+    assert accounting["costBasis"] == "nominal_budget_proxy"
+    assert accounting["billingStatus"] == "unknown"
     assert accounting["economicCost"]["microunits"] is None
+    assert accounting["economicCost"]["coverage"] == {"knownReceipts": 0, "totalReceipts": 1}
     assert accounting["aggregateUsage"]["cacheReadInputTokens"] == 3
     assert accounting["receipts"][0]["usage"]["cost"]["total"] == 0.0125
+
+
+def test_durable_model_accounting_keeps_unknown_billing_without_zero_cost(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "unknown-sdk-cost"}).json()
+    runtime = app.state.durable_runtime
+    store = runtime.controller.store
+    bundle_hash = runtime.controller.get_active_bundle().content_hash
+    runtime._record_model_response(
+        run["runId"],
+        runtime.packages["finance"],
+        {
+            "provider": "openai-codex",
+            "model": "openai-codex/gpt-5.6-luna",
+            "responseId": "unknown-cost-response",
+            "usage": {"inputTokens": 2, "outputTokens": 1, "totalTokens": 3},
+            "arm": "B0",
+            "seed": 9,
+            "bundleHash": bundle_hash,
+        },
+    )
+    row = next(item for item in store.list_evidence(run["runId"]) if item["event_type"] == "model_response")
+    payload = store.get_artifact(json.loads(row["source_ref"])["sha256"])
+    accounting = store.get_artifact(payload["accountingRef"]["sha256"])
+    assert accounting["costMicrounits"] is None
+    assert accounting["economicCost"] == {"status": "unknown", "microunits": None, "coverage": {"knownReceipts": 0, "totalReceipts": 1}}
+    assert accounting["nominalCostUsd"] is None
+    assert not any(key in accounting for key in ("costBasis", "billingStatus"))
 
 
 def test_durable_runtime_builds_production_job_with_bound_executor(tmp_path):

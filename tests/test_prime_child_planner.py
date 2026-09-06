@@ -69,11 +69,23 @@ class UsageNormalizationTests(unittest.TestCase):
 class CostGuardTests(unittest.TestCase):
     def test_sdk_nominal_cost_is_canonical_microunits(self):
         receipt = parse_model_usage({"inputTokens": 9, "outputTokens": 1, "cost": {"total": 0.00001}}, require_cost=True)
-        self.assertEqual((receipt.tokens, receipt.cost_microunits, receipt.currency), (10, 10, "USD"))
+        self.assertEqual((receipt.tokens, receipt.cost_microunits, receipt.currency, receipt.nominal_cost_usd, receipt.economic_cost_microunits), (10, 10, "USD", 0.00001, None))
         with self.assertRaises(AdapterError):
             parse_model_usage({"totalTokens": 10, "inputTokens": 9, "outputTokens": 1, "cost": {"total": 0.00001}, "costMicrounits": 11}, require_cost=True)
         with self.assertRaises(AdapterError):
             parse_model_usage({"inputTokens": 9, "outputTokens": 1, "cost": {"total": 0.00001, "currency": "EUR"}}, require_cost=True)
+
+    def test_explicit_economic_cost_is_measured_separately_from_sdk_nominal(self):
+        receipt = parse_model_usage(
+            {
+                "inputTokens": 9,
+                "outputTokens": 1,
+                "cost": {"total": 0.00001},
+                "economicCost": {"status": "measured", "microunits": 12},
+            },
+            require_cost=True,
+        )
+        self.assertEqual((receipt.cost_microunits, receipt.nominal_cost_usd, receipt.economic_cost_microunits), (10, 0.00001, 12))
 
     def test_unknown_cost_preserves_receipt_tokens_and_blocks_future_dispatch(self):
         ledger = SharedBudget(30, 1000, 4, 1, 100, max_model_cost_microunits=10)
@@ -143,6 +155,9 @@ class CostGuardTests(unittest.TestCase):
             planner(request(ledger))
         self.assertEqual(ledger.model_cost_microunits_used, 11)
         self.assertEqual([item["costMicrounits"] for item in observations], [7, 4])
+        self.assertEqual([item["nominalCostUsd"] for item in observations], [0.000007, 0.000004])
+        self.assertEqual([item["economicCostStatus"] for item in observations], ["unknown", "unknown"])
+        self.assertEqual([item["costBasis"] for item in observations], ["nominal_budget_proxy", "nominal_budget_proxy"])
         self.assertEqual(len(observations), 2)
         with self.assertRaises(SecurityViolation):
             parent.invoke(goal="blocked", environment={}, messages=[], remaining_deadline=5)

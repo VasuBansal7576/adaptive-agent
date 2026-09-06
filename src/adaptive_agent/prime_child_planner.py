@@ -11,6 +11,31 @@ MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "openai-codex/gpt-5.6-luna"
 
 
+def _cost_observation(receipt: Any) -> dict[str, Any]:
+    """Expose the admission proxy separately from billed economic cost."""
+    if receipt.economic_cost_microunits is not None:
+        fields: dict[str, Any] = {
+            "costMicrounits": receipt.economic_cost_microunits,
+            "economicCostStatus": "measured",
+            "costBasis": "explicit_measured",
+        }
+        if receipt.nominal_cost_usd is not None:
+            fields["nominalCostUsd"] = receipt.nominal_cost_usd
+        return fields
+    if receipt.cost_microunits is not None:
+        fields: dict[str, Any] = {
+            # SDK usage.cost.total is a nominal proxy used by the shared
+            # budget. Subscription billing is not observable here.
+            "costMicrounits": receipt.cost_microunits,
+            "economicCostStatus": "unknown",
+            "costBasis": "nominal_budget_proxy",
+        }
+        if receipt.nominal_cost_usd is not None:
+            fields["nominalCostUsd"] = receipt.nominal_cost_usd
+        return fields
+    return {"economicCostStatus": "unknown"}
+
+
 class ChildModelClient(Protocol):
     def invoke(self, **kwargs: Any) -> Mapping[str, Any]: ...
 
@@ -73,7 +98,7 @@ class SharedLedgerModelClient:
                 "model": model,
                 "responseId": response_id,
                 "usage": dict(usage),
-                **({"costMicrounits": receipt.cost_microunits, "economicCostStatus": "measured"} if receipt.cost_microunits is not None else ({"economicCostStatus": "unknown"} if self.budget.max_model_cost_microunits is not None else {})),
+                **_cost_observation(receipt),
             })
         # Charge exactly once, immediately after the provider call. The
         # observation sink persists the response envelope before exhaustion.
@@ -243,7 +268,7 @@ class LunaChildPlanner:
             "model": MODEL_NAME if model == "gpt-5.6-luna" else model,
             "responseId": response_id,
             "usage": dict(usage),
-            **({"costMicrounits": receipt.cost_microunits, "economicCostStatus": "measured"} if receipt.cost_microunits is not None else ({"economicCostStatus": "unknown"} if request.budget.max_model_cost_microunits is not None else {})),
+            **_cost_observation(receipt),
         }
         # Persist the trusted receipt before parsing or enforcing the shared
         # cap. A malformed/over-cap plan must not erase provider evidence.
