@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 import json
 import sqlite3
+import sys
 import pytest
 
 from adaptive_agent.appworld_benchmark import AppWorldBenchmarkRunner, AppWorldCellResult, AppWorldProtocol, DurableAppWorldAdapter
@@ -57,8 +58,37 @@ def test_runner_is_durable_and_reports_measured_usage(tmp_path):
 
 def test_production_durable_runtime_adapter_reopens_without_dispatch(tmp_path, monkeypatch):
     import adaptive_agent.app as app_module
+    provider_module = pytest.importorskip("adaptive_agent.appworld_provider")
     monkeypatch.setenv("ADAPTIVE_AGENT_IMAGE_DIGEST", "sha256:test-image")
     monkeypatch.setenv("ADAPTIVE_AGENT_SOURCE_REVISION", "test-source")
+
+    def public_root():
+        root = tmp_path / "appworld"
+        data = root / "data"
+        for path in (data / "datasets", data / "api_docs" / "function_calling", data / "api_docs" / "standard", data / "tasks" / "dev-1", data / "base_dbs"):
+            path.mkdir(parents=True, exist_ok=True)
+        (data / "version.txt").write_text("0.1.0\n"); (data / "LICENSE").write_text("public test fixture\n"); (data / "base_dbs" / "version.txt").write_text("0.1.0\n")
+        for split, task_id in (("train", "train-1"), ("dev", "dev-1"), ("test_normal", "test-1"), ("test_challenge", "challenge-1")):
+            (data / "datasets" / f"{split}.txt").write_text(task_id + "\n")
+        (data / "tasks" / "dev-1" / "specs.json").write_text(json.dumps({"instruction": "read the clock in dev", "allowed_apps": ["phone"], "datetime": "2023-05-18T12:00:00", "db_version": "0.1.0"}))
+        (data / "api_docs" / "function_calling" / "phone.json").write_text(json.dumps([{"type": "function", "function": {"name": "phone__get_current_date_and_time", "description": "Read the current date and time.", "parameters": {"type": "object", "properties": {}}}}]))
+        (data / "api_docs" / "standard" / "phone.json").write_text(json.dumps({"get_current_date_and_time": {"method": "GET"}})); (data / "base_dbs" / "phone.db").write_bytes(b"fixture")
+        return root
+
+    class FakeProcess:
+        def __init__(self, *args, **kwargs): self._pid = id(self)
+        @property
+        def pid(self): return self._pid
+        def request(self, operation, payload=None):
+            if operation == "reset": return {"taskId": payload["taskId"], "allowedApps": ["phone"]}
+            if operation == "evaluate": return {"success": True, "numTests": 1, "passCount": 1, "failCount": 0, "taskCompleted": True}
+            if operation == "call": return {"date": "Thursday, May 18, 2023"}
+            return {"closed": True}
+        def close(self, **kwargs): return None
+
+    monkeypatch.setattr(provider_module, "_JsonLineProcess", FakeProcess)
+    config = provider_module.AppWorldConfig(public_root(), python=sys.executable, allow_test=False)
+    package = provider_module.AppWorldPackage(config)
 
     class Model:
         def __init__(self): self.calls = 0
@@ -85,61 +115,42 @@ def test_production_durable_runtime_adapter_reopens_without_dispatch(tmp_path, m
     app = app_module.create_runtime_app(model_runner=model, evaluator=lambda **_: {"passed": True, "reliable": True}, data_dir=tmp_path)
     runtime = app.state.durable_runtime
     runtime.source_revision = "test-source"
+    runtime.packages["appworld"] = package
+    runtime.registry.register(package.manifest)
     active = runtime.controller.get_active_bundle()
     assert active is not None
-    base = runtime.packages["finance"]
-    tasks = base.tasks_for_partition(Partition.VALIDATION)
-    source_task = tasks[0]
-    from adaptive_agent.models import ArtifactRef as DurableRef, EnvironmentManifest as DurableManifest, ToolSchema as DurableSchema
-    durable_manifest = DurableManifest(environmentId="appworld", version="1", docs=[DurableRef(id="docs", version="1", sha256="d")], toolSchemas=[DurableSchema(name=t.name, version=t.version, inputSchema=t.input_schema, outputSchema=t.output_schema, effect=t.effect) for t in base.manifest.tool_schemas], policyRef=DurableRef(id="policy", version="1", sha256="p"), evaluatorRef=DurableRef(id="eval", version="1", sha256="e"), resetRef=DurableRef(id="reset", version="1", sha256="r"), executionModes=["batch"])
-
-    class Catalog:
-        def split_ids(self, split): return (source_task.task_id,) if split == "test_normal" else ()
-        def dataset_hash(self): return "production-dataset"
-        def task(self, task_id, split, allow_test=False): return SimpleNamespace(task_id=task_id, instruction=source_task.goal, split=split)
-
-    class Package:
-        catalog = Catalog()
-        manifest = durable_manifest
-        environment_id = "appworld"
-        reset = base.reset
-        evaluate = base.evaluate
-
-    runtime.packages["appworld"] = base
-    runtime.registry.register(Package.manifest)
-    protocol = AppWorldProtocol.freeze(Package(), model_profile="openai-codex/gpt-5.6-luna", core_planner_hash=runtime.core_planner_hash, official_split="test_normal", image_digest=runtime.image_digest, source_revision="test-source", dataset_content_hash="production-dataset", published_count=1, seeds=(0,))
+    protocol = AppWorldProtocol.freeze(package, model_profile="openai-codex/gpt-5.6-luna", core_planner_hash=runtime.core_planner_hash, official_split="dev", image_digest=runtime.image_digest, source_revision="test-source", dataset_content_hash=package.catalog.dataset_hash(), published_count=1, seeds=(0,))
     bundles = {Arm.B0: active.content_hash, Arm.L: active.content_hash, Arm.A: active.content_hash}
     adapter = DurableAppWorldAdapter(runtime, protocol, {key.value: value for key, value in bundles.items()})
-    runner = AppWorldBenchmarkRunner(tmp_path / "appworld", Package(), protocol, adapter)
+    runner = AppWorldBenchmarkRunner(tmp_path / "appworld", package, protocol, adapter)
     first = runner.run("production", bundles)
     assert first.provenance_complete and first.ablation_audit["passed"]
     assert model.calls == 3
     fresh_app = app_module.create_runtime_app(model_runner=model, evaluator=lambda **_: {"passed": True, "reliable": True}, data_dir=tmp_path)
     fresh_runtime = fresh_app.state.durable_runtime
     fresh_runtime.source_revision = "test-source"
-    fresh_runtime.packages["appworld"] = fresh_runtime.packages["finance"]
+    fresh_runtime.packages["appworld"] = package
+    fresh_runtime.registry.register(package.manifest)
     fresh_adapter = DurableAppWorldAdapter(fresh_runtime, protocol, {key.value: value for key, value in bundles.items()})
-    second = AppWorldBenchmarkRunner(tmp_path / "appworld", Package(), protocol, fresh_adapter).run("production", bundles)
+    second = AppWorldBenchmarkRunner(tmp_path / "appworld", package, protocol, fresh_adapter).run("production", bundles)
     assert second.provenance_complete and model.calls == 3
 
     # A cached usage edit is rejected against the fresh verified accounting,
     # before the shared runtime can dispatch another model request.
     with sqlite3.connect(tmp_path / "appworld" / "appworld-benchmark.sqlite3") as conn:
         row = conn.execute("SELECT result_json FROM appworld_cells LIMIT 1").fetchone()
-        tampered = json.loads(row[0]); tampered["usage"]["inputTokens"] = 999
+        tampered = json.loads(row[0]); tampered["usage"]["inputTokens"] = 7; tampered["usage"]["totalTokens"] = 10
         conn.execute("UPDATE appworld_cells SET result_json=?", (json.dumps(tampered),)); conn.commit()
     with pytest.raises(ValueError, match="usage receipt does not reconcile"):
-        AppWorldBenchmarkRunner(tmp_path / "appworld", Package(), protocol, fresh_adapter).run("production", bundles)
+        AppWorldBenchmarkRunner(tmp_path / "appworld", package, protocol, fresh_adapter).run("production", bundles)
     assert model.calls == 3
 
     from adaptive_agent.models import SkillBundle
-    learned_payload = {**active.model_dump(mode="json", by_alias=True, exclude={"contentHash"}), "skills": [{"skillId": "learned", "version": "1", "procedure": "arbitrary learned procedure"}]}
-    learned_hash = sha256_json(learned_payload)
-    learned_payload["contentHash"] = learned_hash
+    learned_payload = {**active.model_dump(mode="json", by_alias=True, exclude={"content_hash"}), "skills": [{"skillId": "learned", "version": "1", "procedure": "arbitrary learned procedure"}]}
     learned = SkillBundle.model_validate(learned_payload)
+    learned_hash = learned.content_hash
+    fresh_runtime.controller.store.save_bundle(learned.bundle_id, learned.parent, learned_hash, json.dumps(learned.model_dump(mode="json", by_alias=True)))
     audit_adapter = DurableAppWorldAdapter(fresh_runtime, protocol)
-    original_bundle = audit_adapter._bundle
-    audit_adapter._bundle = lambda bundle_hash: learned if bundle_hash == learned_hash else original_bundle(bundle_hash)
     retained = dict(bundles); retained[Arm.A] = learned_hash
     with pytest.raises(ValueError, match="retains learned skills"):
         audit_adapter.preflight_bundles({key.value: value for key, value in retained.items()})
