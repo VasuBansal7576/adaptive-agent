@@ -892,6 +892,47 @@ class DurableRuntime:
                 )
         return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
 
+    def _durable_evaluator_evidence(self, run_id: str) -> list[dict[str, Any]]:
+        """Return immutable model/kernel event payloads to the trusted evaluator."""
+        events: list[dict[str, Any]] = []
+        for row in self.controller.store.list_evidence(run_id):
+            event_type = row.get("event_type")
+            if event_type not in {"model_response", "kernel"}:
+                continue
+            try:
+                source_ref = json.loads(row["source_ref"])
+                payload = self.controller.store.get_artifact(source_ref["sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, Mapping):
+                events.append({
+                    "evidenceId": row.get("evidence_id"),
+                    "sequence": row.get("sequence"),
+                    "eventType": event_type,
+                    "payload": dict(payload),
+                })
+        return events
+
+    def _invoke_evaluator(self, *, run_id: str, goal: str, model_output: str, environment: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """Call the trusted evaluator with durable execution evidence when supported."""
+        if self.evaluator is None:
+            return None
+        kwargs: dict[str, Any] = {
+            "goal": goal,
+            "model_output": model_output,
+            "environment": dict(environment),
+            "run_id": run_id,
+            "evidence": self._durable_evaluator_evidence(run_id),
+        }
+        try:
+            parameters = inspect.signature(self.evaluator).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+        forwarded = kwargs if accepts_kwargs or not parameters else {key: value for key, value in kwargs.items() if key in parameters}
+        result = self.evaluator(**forwarded)
+        return dict(result) if isinstance(result, Mapping) else None
+
     def _dispatch_tool(
         self,
         env_id: str,
@@ -958,7 +999,8 @@ class DurableRuntime:
                     invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
                     runtime._record_model_response(run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest})
             def evaluate() -> DurableOutcome:
-                outcome = dict(self.evaluator(goal=task.goal, model_output=invocation.text, environment=self._planner_environment(package, run_id))) if self.evaluator is not None and invocation is not None else {"passed": False}
+                outcome = runtime._invoke_evaluator(run_id=run_id, goal=task.goal, model_output=invocation.text, environment=runtime._planner_environment(package, run_id)) if invocation is not None else None
+                outcome = outcome or {"passed": False}
                 return DurableOutcome(runId=run_id, passed=bool(outcome.get("passed") is True), metadata=outcome)
             self._execute_run(run_id, package.environment_id, provider, DirectDriver(), evaluate)
             self._cancel_events.pop(run_id, None)
@@ -1063,6 +1105,19 @@ class DurableRuntime:
             result = driver.result
             if result is None or result.status != "succeeded":
                 return DurableOutcome(runId=run_id, passed=False, metadata={"status": result.status if result else "planner_failed"})
+            evaluated = runtime._invoke_evaluator(
+                run_id=run_id,
+                goal=task.goal,
+                model_output=result.answer or "",
+                environment=runtime._planner_environment(package, run_id),
+            )
+            if evaluated is not None:
+                passed = evaluated.get("passed") is True
+                try:
+                    score = float(evaluated.get("score", 1.0 if passed else 0.0))
+                except (TypeError, ValueError):
+                    score = 1.0 if passed else 0.0
+                return DurableOutcome(runId=run_id, passed=passed, score=score, metadata=evaluated)
             fixture = package.evaluate(task.task_id, provider.session)
             return DurableOutcome(runId=run_id, passed=fixture.passed, score=1.0 if fixture.passed else 0.0, metadata={"reason": fixture.reason, "evaluatorVersion": fixture.evaluator_version, "plannerStatus": result.status})
         try:
