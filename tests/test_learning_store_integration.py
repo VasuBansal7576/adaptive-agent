@@ -59,7 +59,11 @@ def _setup_store(tmp_path: Path):
     evidence_ref = store.put_artifact(evidence_content)
     evidence_id = "ev-durable"
     store.append_evidence(evidence_id, {"run_id": RUN, "sequence": 1, "event_type": "tool_result", "content_hash": sha256_json(evidence_content), "source_ref": evidence_ref.model_dump_json(), "trust_class": "broker", "visibility": "learner", "redacted": 1})
-    store.save_outcome("out-durable", {"run_id": RUN, "passed": 0, "score": 0.0, "metadata_json": "{}", "checked_at": datetime.now(timezone.utc).isoformat()})
+    store.save_outcome("out-durable", {"run_id": RUN, "passed": 1, "score": 1.0, "metadata_json": "{}", "checked_at": datetime.now(timezone.utc).isoformat()})
+    doc_content = "Public reconciliation documentation."
+    store.save_learning_record("learning-doc-artifact", ENVIRONMENT, RUN, json.dumps({"kind": "public_doc", "sourceId": doc_ref.id, "content": doc_content, "contentHash": content_hash(doc_content), "environmentId": ENVIRONMENT, "visibility": "public"}, sort_keys=True, separators=(",", ":")))
+    safe_content = "Broker development observation: eventType=tool_result; details={\"effect\":\"none\",\"status\":\"ok\"}"
+    store.save_learning_record("learning-evidence-ev-durable", ENVIRONMENT, RUN, json.dumps({"kind": "live_evidence", "sourceId": evidence_id, "content": safe_content, "contentHash": content_hash(safe_content), "environmentId": ENVIRONMENT, "runId": RUN, "partition": "development", "visibility": "learner", "trustClass": "broker", "trustedOutcome": True}, sort_keys=True, separators=(",", ":")))
     manager = CandidateManager(store)
     base = SkillBundle(skills=[SkillVersion(skillId="existing", version="1", procedure="Keep the existing procedure.")])
     manager.initialize_active_bundle(base)
