@@ -41,19 +41,24 @@ def test_failed_stage_reconciles_all_responses_once_and_missing_receipt_stays_un
     runtime = app.state.durable_runtime
     package = runtime.packages["finance"]
     bundle_hash = runtime.controller.get_active_bundle().content_hash
-    runtime._record_model_response(run["runId"], package, {
-        "provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": "batch",
-        "arm": "B0", "seed": 17, "bundleHash": bundle_hash,
-        "usage": {"inputTokens": 30, "outputTokens": 6, "totalTokens": 36},
-        "receipts": [
-            {"responseId": "r1", "usage": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12}, "costMicrounits": 3, "durationSeconds": 1.0},
-            {"responseId": "r2", "usage": {"inputTokens": 20, "outputTokens": 4, "totalTokens": 24}, "costMicrounits": 5, "durationSeconds": 2.0},
-        ],
-    })
+    class MultiResponseClient:
+        def invoke(self, runtime, run_id):
+            runtime._record_model_response(run_id, package, {
+                "provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": "batch",
+                "arm": "B0", "seed": 17, "bundleHash": bundle_hash,
+                "usage": {"inputTokens": 30, "outputTokens": 6, "totalTokens": 36},
+                "receipts": [
+                    {"responseId": "r1", "usage": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12}, "costMicrounits": 3, "durationSeconds": 1.0},
+                    {"responseId": "r2", "usage": {"inputTokens": 20, "outputTokens": 4, "totalTokens": 24}, "costMicrounits": 5, "durationSeconds": 2.0},
+                ],
+            })
+            raise RuntimeError("token budget exhausted after broker effect")
+
+    client = MultiResponseClient()
 
     class FailedStage:
         def act(self, _ctx):
-            raise RuntimeError("token budget exhausted after broker effect")
+            client.invoke(runtime, run["runId"])
 
     runtime._claim_run(run["runId"])
     runtime._execute_run(
