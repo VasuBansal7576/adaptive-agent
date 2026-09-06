@@ -810,6 +810,15 @@ def _seed_durable_stack(plane: ControlPlane, store_dir: Path) -> tuple[Controlle
         # operator training tasks.
         if not public_tasks:
             continue
+        # Persist learner-facing document contents under the exact manifest
+        # hashes. The manifest carries references only; without these CAS
+        # objects a restarted learning runtime cannot safely reconstruct the
+        # public context. Evaluator-only documents are intentionally excluded.
+        for document in package.learner_documents():
+            document_ref = store.put_artifact({"id": document.document_id, "version": document.version, "text": document.text})
+            expected_ref = next((ref for ref in manifest.docs if ref.id == document.document_id and ref.version == document.version), None)
+            if expected_ref is None or document_ref.sha256 != expected_ref.sha256:
+                raise RuntimeError(f"public document hash mismatch for {manifest.environment_id}:{document.document_id}")
         for kind, ref in (("policy", manifest.policy_ref), ("evaluator", manifest.evaluator_ref), ("reset", manifest.reset_ref)):
             plane.trust_reference(kind, ref.to_dict())
         for ref in manifest.docs:

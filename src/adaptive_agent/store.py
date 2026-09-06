@@ -634,11 +634,21 @@ class Store:
         return output
 
     def list_learner_evidence(self, environment_id: str | None = None, run_id: str | None = None) -> list[dict[str, Any]]:
-        """Join redacted learner evidence to DEVELOPMENT provenance."""
+        """Return only redacted broker tool observations from DEVELOPMENT.
+
+        The join binds each row to its run, task partition, environment, and
+        trusted outcome presence. Raw evaluator/operator evidence is excluded
+        at the SQL boundary rather than filtered by learner code.
+        """
         query = ("SELECT e.evidence_id, e.run_id, e.sequence, e.event_type, e.content_hash, "
-                 "e.trust_class, e.visibility, e.redacted, r.task_id, r.environment_id, t.partition "
+                 "e.trust_class, e.visibility, e.redacted, r.task_id, r.environment_id, r.status AS run_status, t.partition, "
+                 "1 AS trusted_outcome, o.passed AS outcome_passed "
                  "FROM evidence e JOIN runs r ON r.run_id=e.run_id JOIN tasks t ON t.id=r.task_id "
-                 "WHERE e.visibility='learner' AND e.redacted=1 AND t.partition='development'")
+                 "LEFT JOIN outcomes o ON o.run_id=e.run_id "
+                 "WHERE e.visibility='learner' AND e.redacted=1 AND e.trust_class='broker' "
+                 "AND e.event_type='tool_result' AND t.partition='development' "
+                 "AND r.status IN ('succeeded','failed','cancelled','timed_out','outcome_unknown') "
+                 "AND o.run_id IS NOT NULL")
         params: list[Any] = []
         if environment_id is not None:
             query += " AND r.environment_id=?"
