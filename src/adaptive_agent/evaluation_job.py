@@ -61,6 +61,8 @@ class EvaluationJob:
         self.protocol = protocol
         self.packages = dict(packages)
         self.arm_bundles = dict(arm_bundles)
+        if not callable(execute):
+            raise EvaluationError("evaluation job requires a bound trusted executor")
         self.execute = execute
         self.total_budget_microunits = total_budget_microunits
         if max_total_attempts is not None and max_total_attempts < 0:
@@ -266,7 +268,12 @@ def run_evaluation_job(job: EvaluationJob, job_id: str, comparison: str, *, base
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run a production job from an application-owned factory."""
+    """Run a production job from an application-owned, fully bound factory.
+
+    The factory must return an ``EvaluationJob`` with the frozen protocol,
+    fixture packages, arm bundles, and trusted runtime executor already bound.
+    The CLI deliberately cannot reconstruct those dependencies from a Store.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--factory", required=True)
     parser.add_argument("--store", required=True)
@@ -281,7 +288,14 @@ def main(argv: list[str] | None = None) -> int:
     if not separator:
         parser.error("--factory must be module:callable")
     factory = getattr(importlib.import_module(module_name), function_name)
-    job = factory(Store(args.store))
+    try:
+        job = factory(Store(args.store))
+    except Exception as exc:
+        print(f"evaluation factory failed closed: {exc}")
+        return 2
+    if not isinstance(job, EvaluationJob):
+        print("evaluation factory failed closed: it must return a fully bound EvaluationJob")
+        return 2
     if args.smoke:
         result = job.run_development_smoke(args.job)
         print(result)
