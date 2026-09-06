@@ -16,6 +16,7 @@ pointer. It:
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from adaptive_agent.models import (
     SkillBundle,
     sha256_json,
 )
+from adaptive_agent.performance_gate import GateConfig, evaluate_performance_gate
 from adaptive_agent.store import Store
 
 
@@ -86,6 +88,7 @@ class _ReportView:
     paired_runs: list[Any]
     partition_ref: ArtifactRef
     uncertainty: dict[str, Any]
+    required_environments: tuple[str, ...]
     raw: Any
 
 
@@ -358,6 +361,21 @@ class CandidateManager:
             m = report.metrics
             if None in (m.accuracy, m.reliability, m.mean_cost, m.p95_latency_ms):
                 raise PromotionError("report missing required metric cells")
+            uncertainty = {
+                **report.uncertainty,
+                "evaluator_refs": [report.evaluator_provenance],
+                "comparison": report.uncertainty.get("comparison", "validation"),
+                "baseline_count": report.uncertainty.get("baseline_count", 1),
+                "candidate_count": report.uncertainty.get("candidate_count", 1),
+                "per_environment": {
+                    environment: {
+                        **values,
+                        "baseline_count": values.get("baseline_count", 1),
+                        "candidate_count": values.get("candidate_count", 1),
+                    }
+                    for environment, values in report.uncertainty.get("per_environment", {}).items()
+                },
+            }
             return _ReportView(
                 report_id=report.report_id,
                 protocol_hash=report.protocol_hash,
@@ -373,10 +391,8 @@ class CandidateManager:
                 safety_results=dict(report.safety_results),
                 paired_runs=list(report.paired_run_ids),
                 partition_ref=report.partition_ref,
-                uncertainty={
-                    **report.uncertainty,
-                    "evaluator_refs": [report.evaluator_provenance],
-                },
+                uncertainty=uncertainty,
+                required_environments=tuple(uncertainty.get("required_environments", uncertainty.get("per_environment", {}).keys())),
                 raw=report,
             )
 
@@ -396,65 +412,83 @@ class CandidateManager:
         missing = [k for k in required if k not in report]
         if missing:
             raise PromotionError(f"report missing required cells: {missing}")
+        for key in ("metricCellsComplete", "safetyCellsComplete", "modelProvenanceComplete"):
+            if report[key] is not True:
+                raise PromotionError(f"report {key} is not complete")
         if report["validityStatus"] != "valid":
             raise PromotionError("evaluation report is not valid")
         if report.get("modelProvenanceValid") is False:
             raise PromotionError("synthetic-model provenance is not promotable")
-        if not report["promotionEligible"]:
+        if report["promotionEligible"] is not True:
             raise PromotionError(
                 "report is not promotion-eligible (missing cells, safety, or "
                 "synthetic-model provenance)"
             )
-        safety_cases = dict(report.get("safetyCaseResults") or {})
-        if not report["safetyPassed"] or not (safety_cases or report["safetyCellsComplete"]):
-            raise PromotionError("report missing required safety cells")
-        if report["missingPairs"] or report["partitionLeak"] or report["invalidFixtureResets"] or report["infrastructureFailures"]:
-            raise PromotionError("report contains invalid or leaked evidence")
-        if not report["attestation"]:
+        if not isinstance(report["attestation"], str) or not report["attestation"]:
             raise PromotionError("report is not attested by a trusted evaluator")
         if self.report_verifier is None:
             raise PromotionError("report attestation verifier is not configured")
         if not self.report_verifier(report):
             raise PromotionError("report attestation failed verification")
+        safety_cases = dict(report.get("safetyCaseResults") or {})
+        if report["safetyPassed"] is not True or not safety_cases or report["safetyCellsComplete"] is not True:
+            raise PromotionError("report missing required safety cells")
+        if report["missingPairs"] or report["partitionLeak"] or report["invalidFixtureResets"] or report["infrastructureFailures"]:
+            raise PromotionError("report contains invalid or leaked evidence")
 
         arms = report["armSummaries"]
+        if not isinstance(arms, Mapping):
+            raise PromotionError("report arm summaries are missing or invalid")
         b0 = arms.get("B0") or {}
         learned = arms.get("L") or {}
-        if not learned or "accuracy" not in learned:
+        if not isinstance(b0, Mapping) or not isinstance(learned, Mapping) or not learned or "accuracy" not in learned:
             raise PromotionError("report missing learned-arm metric cells")
+        for arm_name, summary in (("B0", b0), ("L", learned)):
+            if isinstance(summary.get("count"), bool) or not isinstance(summary.get("count"), int) or summary["count"] <= 0:
+                raise PromotionError(f"report {arm_name} metric count is missing or invalid")
+            for metric in ("accuracy", "reliability", "meanCostMicrounits", "p95LatencySeconds"):
+                value = summary.get(metric)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    raise PromotionError(f"report {arm_name} {metric} is missing or invalid")
 
         # Confidence intervals: use the accuracy lower bound as the gate CI.
-        ci_lower = 0.0
+        ci_lower = None
         for est in report["confidenceIntervals"]:
-            if est.get("metric") == "accuracy":
-                ci_lower = est.get("lower95", 0.0)
+            if isinstance(est, Mapping) and est.get("metric") == "accuracy":
+                ci_lower = est.get("lower95")
                 break
 
         env_cells = report["environmentCells"]
+        if not isinstance(env_cells, Mapping):
+            raise PromotionError("report environment metric cells are missing or invalid")
         per_env = {}
         for env, cells in env_cells.items():
+            if not isinstance(cells, Mapping):
+                raise PromotionError(f"report environment metric cells are invalid for {env}")
             per_env[env] = {
-                "baseline_accuracy": (cells.get("B0") or {}).get("accuracy", 0.0),
-                "candidate_accuracy": (cells.get("L") or {}).get("accuracy", 0.0),
-                "baseline_reliability": (cells.get("B0") or {}).get("reliability", 0.0),
-                "candidate_reliability": (cells.get("L") or {}).get("reliability", 0.0),
+                "baseline_accuracy": (cells.get("B0") or {}).get("accuracy"),
+                "candidate_accuracy": (cells.get("L") or {}).get("accuracy"),
+                "baseline_reliability": (cells.get("B0") or {}).get("reliability"),
+                "candidate_reliability": (cells.get("L") or {}).get("reliability"),
+                "baseline_count": (cells.get("B0") or {}).get("count"),
+                "candidate_count": (cells.get("L") or {}).get("count"),
             }
 
         suspicious = any(
             name == "suspicious" or (isinstance(v, bool) and v is False and "suspicious" in name)
             for name, v in safety_cases.items()
         )
-        safety_results = safety_cases or {"safety_cells_complete": True}
+        safety_results = safety_cases
         return _ReportView(
             report_id=str(report.get("reportId") or report.get("analysisSeed", "report")),
             protocol_hash=str(report["protocolHash"]),
             candidate_hash=str(report["candidateHash"]),
             base_hash=str(report["baseHash"] or ""),
             provenance="|".join(sorted(report["evaluatorRefs"])) if report["evaluatorRefs"] else "",
-            accuracy=float(learned.get("accuracy", 0.0)),
-            reliability=float(learned.get("reliability", 0.0)),
-            mean_cost=float(learned.get("meanCostMicrounits", 0.0)),
-            p95_latency=float(learned.get("p95LatencySeconds", 0.0)),
+            accuracy=float(learned["accuracy"]),
+            reliability=float(learned["reliability"]),
+            mean_cost=float(learned["meanCostMicrounits"]),
+            p95_latency=float(learned["p95LatencySeconds"]),
             safety_violations=int(learned.get("safetyViolations", 0)),
             suspicious=suspicious,
             safety_results=safety_results,
@@ -465,15 +499,19 @@ class CandidateManager:
                 sha256=sha256_json(report["partitionHashes"]),
             ),
             uncertainty={
-                "baseline_accuracy": float(b0.get("accuracy", 0.0)),
+                "baseline_accuracy": float(b0["accuracy"]),
+                "baseline_count": b0.get("count"),
                 "ci_lower": ci_lower,
-                "baseline_cost": float(b0.get("meanCostMicrounits", 0.0)),
-                "baseline_latency": float(b0.get("p95LatencySeconds", 0.0)),
+                "baseline_reliability": float(b0["reliability"]),
+                "baseline_cost": float(b0["meanCostMicrounits"]),
+                "baseline_latency": float(b0["p95LatencySeconds"]),
+                "candidate_count": learned.get("count"),
                 "per_environment": per_env,
                 "evaluator_refs": sorted(report["evaluatorRefs"]),
                 "partition_hashes": dict(report["partitionHashes"]),
                 "comparison": report["comparison"],
             },
+            required_environments=tuple(report.get("expectedEnvironments") or env_cells),
             raw=report,
         )
 
@@ -490,6 +528,8 @@ class CandidateManager:
             raise PromotionError("report has no paired runs")
         if not view.provenance:
             raise PromotionError("report missing evaluator provenance")
+        if view.uncertainty.get("comparison") != "validation":
+            raise PromotionError("final reports cannot activate a candidate; promotion requires validation")
 
     # ------------------------------------------------------------------ promotion
     def promote(self, candidate_id: str, report: EvaluationReport | Mapping[str, Any]) -> PromotionDecision:
@@ -583,40 +623,60 @@ class CandidateManager:
         return promotion
 
     def _check_gate(self, view: _ReportView, gate: PromotionGate) -> tuple[str, str]:
-        if view.safety_violations > 0 or any(v is False for v in view.safety_results.values()):
-            return "rejected", "safety check failed"
         if view.suspicious:
             return "quarantined", "suspicious code flagged"
-
-        baseline_accuracy = view.uncertainty.get("baseline_accuracy", 0.0)
-        gain = view.accuracy - baseline_accuracy
-        if gain < gate.min_balanced_accuracy_gain:
-            return "rejected", f"accuracy gain {gain:.3f} below threshold {gate.min_balanced_accuracy_gain}"
-        ci = view.uncertainty.get("ci_lower", 0.0)
-        if ci <= gate.ci_lower_bound:
-            return "rejected", f"CI lower bound {ci:.3f} not above {gate.ci_lower_bound}"
-
-        if gate.require_per_environment_non_regression:
-            for env, vals in view.uncertainty.get("per_environment", {}).items():
-                if vals.get("candidate_accuracy", 0) < vals.get("baseline_accuracy", 0):
-                    return "rejected", f"observed regression in environment {env}"
-                if vals.get("candidate_reliability", 0) < vals.get("baseline_reliability", 0):
-                    return "rejected", f"observed reliability regression in environment {env}"
-
-        base_cost = view.uncertainty.get("baseline_cost", 0.0)
-        base_latency = view.uncertainty.get("baseline_latency", 0.0)
-        if base_cost < 0 or base_latency < 0:
-            return "rejected", "baseline cost and latency must be non-negative"
-        if base_cost == 0 and view.mean_cost > 0:
-            return "rejected", "candidate cost is non-zero against a zero-cost baseline"
-        if base_latency == 0 and view.p95_latency > 0:
-            return "rejected", "candidate latency is non-zero against a zero-latency baseline"
-        if base_cost > 0 and view.mean_cost / base_cost > gate.max_cost_ratio:
-            return "rejected", f"cost ratio exceeds {gate.max_cost_ratio}"
-        if base_latency > 0 and view.p95_latency / base_latency > gate.max_latency_ratio:
-            return "rejected", f"latency ratio exceeds {gate.max_latency_ratio}"
-
-        return "promoted", "passed frozen gate"
+        result = evaluate_performance_gate(
+            expected_comparison="validation",
+            comparison=view.uncertainty.get("comparison"),
+            baseline={
+                "accuracy": view.uncertainty.get("baseline_accuracy"),
+                "reliability": view.uncertainty.get("baseline_reliability", view.reliability),
+                "meanCostMicrounits": view.uncertainty.get("baseline_cost"),
+                "p95LatencySeconds": view.uncertainty.get("baseline_latency"),
+                "count": view.uncertainty.get("baseline_count"),
+            },
+            candidate={
+                "accuracy": view.accuracy,
+                "reliability": view.reliability,
+                "meanCostMicrounits": view.mean_cost,
+                "p95LatencySeconds": view.p95_latency,
+                "safetyViolations": view.safety_violations,
+                "count": view.uncertainty.get("candidate_count"),
+            },
+            accuracy_ci_lower=view.uncertainty.get("ci_lower"),
+            environment_cells={
+                env: {
+                    "B0": {
+                        "accuracy": values.get("baseline_accuracy"),
+                        "reliability": values.get("baseline_reliability"),
+                        "count": values.get("baseline_count"),
+                    },
+                    "L": {
+                        "accuracy": values.get("candidate_accuracy"),
+                        "reliability": values.get("candidate_reliability"),
+                        "count": values.get("candidate_count"),
+                    },
+                }
+                for env, values in view.uncertainty.get("per_environment", {}).items()
+            },
+            required_environments=view.required_environments,
+            safety_passed=all(value is True for value in view.safety_results.values()) and bool(view.safety_results),
+            safety_violations=view.safety_violations,
+            safety_case_results=view.safety_results,
+            integrity_failures=(),
+            config=GateConfig(
+                min_accuracy_gain=gate.min_balanced_accuracy_gain,
+                ci_lower_bound=gate.ci_lower_bound,
+                max_cost_ratio=gate.max_cost_ratio,
+                max_latency_ratio=gate.max_latency_ratio,
+                max_cost_microunits=gate.max_cost_microunits,
+                max_latency_seconds=gate.max_latency_seconds,
+                require_per_environment_non_regression=gate.require_per_environment_non_regression,
+            ),
+        )
+        if result.passed:
+            return "promoted", "passed frozen gate"
+        return "rejected", result.reasons[0] if result.reasons else "performance gate failed"
 
     # ------------------------------------------------------------------ rollback
     def rollback(self, target_hash: str, reason: str) -> PromotionDecision:

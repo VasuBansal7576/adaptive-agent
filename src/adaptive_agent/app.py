@@ -767,8 +767,12 @@ class DurableRuntime:
                 PromotionGate(
                     protocolHash=frozen.protocol_hash,
                     minBalancedAccuracyGain=float(thresholds["accuracy_gain"]),
+                    ciLowerBound=float(thresholds.get("ci_lower_bound", 0.0)),
                     maxCostRatio=float(thresholds["cost_ratio"]),
                     maxLatencyRatio=float(thresholds["latency_ratio"]),
+                    maxCostMicrounits=float(thresholds.get("max_cost_microunits", protocol.run_budget.cost_microunits)),
+                    maxLatencySeconds=float(thresholds.get("max_latency_seconds", protocol.run_budget.wall_time_seconds)),
+                    requirePerEnvironmentNonRegression=bool(thresholds.get("require_per_environment_non_regression", True)),
                 ),
                 evaluator_id="|".join(evaluator_refs),
                 evaluator_refs=evaluator_refs,
@@ -895,6 +899,7 @@ class DurableRuntime:
                 "metricCellsComplete": report.get("metricCellsComplete"),
                 "safetyCellsComplete": report.get("safetyCellsComplete"),
                 "modelProvenanceComplete": report.get("modelProvenanceComplete"),
+                "gateConfig": report.get("gateConfig"),
             }
             required = tuple(attestation_payload)
             if any(key not in report for key in required):

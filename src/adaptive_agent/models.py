@@ -417,5 +417,7 @@ class PromotionGate(BaseModel):
     ci_lower_bound: float = Field(0.0, alias="ciLowerBound")
     max_cost_ratio: float = Field(1.10, alias="maxCostRatio")
     max_latency_ratio: float = Field(1.10, alias="maxLatencyRatio")
+    max_cost_microunits: float = Field(100_000.0, alias="maxCostMicrounits")
+    max_latency_seconds: float = Field(90.0, alias="maxLatencySeconds")
     require_per_environment_non_regression: bool = Field(True, alias="requirePerEnvironmentNonRegression")
     frozen_at: datetime = Field(default_factory=now_utc, alias="frozenAt")

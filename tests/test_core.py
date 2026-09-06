@@ -628,8 +628,8 @@ class TestCandidateLifecycle:
             "evaluatorRefs": ["trusted-eval"],
             "partitionHashes": {},
             "armSummaries": {
-                "B0": {"accuracy": 0.5, "reliability": 0.5, "meanCostMicrounits": 1.0, "p95LatencySeconds": 1.0},
-                "L": {"accuracy": 0.9, "reliability": 0.9, "meanCostMicrounits": 1.0, "p95LatencySeconds": 1.0},
+                "B0": {"accuracy": 0.5, "reliability": 0.5, "meanCostMicrounits": 1.0, "p95LatencySeconds": 1.0, "count": 1},
+                "L": {"accuracy": 0.9, "reliability": 0.9, "meanCostMicrounits": 1.0, "p95LatencySeconds": 1.0, "count": 1},
             },
             "environmentCells": {},
             "confidenceIntervals": [{"metric": "accuracy", "lower95": 0.1}],
@@ -664,6 +664,25 @@ class TestCandidateLifecycle:
         manager.freeze_protocol(PromotionGate(protocolHash="proto-ext-fail"), "trusted-eval", evaluator_refs=["trusted-eval"])
         with pytest.raises(PromotionError, match="attestation failed"):
             manager.promote(proposal.candidate_id, self._external_report(cand, base, "proto-ext-fail", "forged"))
+
+    def test_final_report_can_never_activate_a_candidate(self, store: Store):
+        base = SkillBundle(skills=[])
+        manager = CandidateManager(store, report_verifier=lambda _report: True)
+        manager.initialize_active_bundle(base)
+        ev = _evidence(store, "run-final-no-activate")
+        cand = self._candidate(base)
+        proposal = CandidateProposal(baseBundleHash=base.content_hash, predictedEffect="x", proposerVersion="1", supportingEvidenceIds=[ev])
+        manager.submit_candidate(proposal, cand)
+        manager.start_evaluation(proposal.candidate_id)
+        manager.freeze_protocol(PromotionGate(protocolHash="proto-final"), "trusted-eval", evaluator_refs=["trusted-eval"])
+        report = self._external_report(cand, base, "proto-final", "attested")
+        report["comparison"] = "final"
+        report["safetyCaseResults"] = {"EVAL-004": True}
+        report["expectedEnvironments"] = ["neutral"]
+        report["environmentCells"] = {"neutral": {"B0": {"accuracy": 0.5, "reliability": 0.5, "count": 1}, "L": {"accuracy": 0.9, "reliability": 0.9, "count": 1}}}
+        with pytest.raises(PromotionError, match="cannot activate"):
+            manager.promote(proposal.candidate_id, report)
+        assert manager.get_active_bundle().content_hash == base.content_hash
 
     def test_gate_rejection_and_supersede(self, manager: CandidateManager, store: Store):
         base = self._base(manager, store)
