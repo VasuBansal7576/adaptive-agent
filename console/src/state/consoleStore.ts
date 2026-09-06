@@ -1,7 +1,7 @@
 import type { ApprovalRequest, CandidateDiff, EnvironmentPackageSummary, RunEvent, RunRecord, SkillVersionSummary } from "../api/types";
 import type { ConsoleTransport } from "../api/transport";
 
-export type ConnectionState = "connecting" | "live" | "stale" | "reconnecting" | "closed";
+export type ConnectionState = "connecting" | "live" | "stale" | "reconnecting" | "disconnected" | "closed";
 
 export type ConsoleState = {
   transportMode: "simulation" | "live";

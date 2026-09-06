@@ -27,6 +27,7 @@ export const STATUS_META: Record<
   "stale": { glyph: "◌", label: "Stale", tone: "warn" },
   "reconnecting": { glyph: "◌", label: "Reconnecting", tone: "info" },
   "connecting": { glyph: "◌", label: "Connecting", tone: "info" },
+  "disconnected": { glyph: "⨯", label: "Disconnected", tone: "bad" },
   "closed": { glyph: "○", label: "Closed", tone: "neutral" },
   // simulated-stream badges deliberately avoid the green "connected" tone so a
   // fixture stream is never mistaken for live inference

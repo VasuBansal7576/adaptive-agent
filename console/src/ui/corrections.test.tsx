@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { createSimulationTransport } from "../api/simulation";
@@ -32,8 +32,10 @@ describe("ghost-data regression: mode switch clears prior-mode state", () => {
     render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
     await screen.findAllByRole("button", { name: /run-sim-1001/ });
     await user.click(screen.getByRole("button", { name: "Switch to live control API" }));
-    // live API is unreachable in this test: no simulation banner, no ghost runs
-    expect(await screen.findByText(/Failed to load console data/)).toBeInTheDocument();
+    // live API is unreachable in this test: friendly disconnected state, no ghost runs
+    expect(await screen.findByText(/Console not connected/)).toBeInTheDocument();
+    expect(await screen.findByText(/API unavailable/)).toBeInTheDocument();
+    expect(await screen.findByText("Disconnected")).toBeInTheDocument();
     expect(screen.queryAllByText(/run-sim-/)).toHaveLength(0);
     expect(screen.queryByText(/SIMULATED — development fixture/)).not.toBeInTheDocument();
   });
@@ -54,7 +56,8 @@ describe("ghost-data regression: mode switch clears prior-mode state", () => {
 describe("live default and honest stream badges", () => {
   it("defaults to the live transport with no simulation banner (dev-only opt-in)", async () => {
     render(<App />);
-    expect(await screen.findByText(/Failed to load console data/)).toBeInTheDocument();
+    expect(await screen.findByText(/API unavailable/)).toBeInTheDocument();
+    expect(await screen.findByText("Disconnected")).toBeInTheDocument();
     expect(screen.queryByText(/SIMULATED — development fixture/)).not.toBeInTheDocument();
   });
 
@@ -66,29 +69,32 @@ describe("live default and honest stream badges", () => {
 });
 
 describe("createRun, learning cycle, and registration", () => {
-  it("creates a run with goal/environment/model/budget/idempotency and selects it", async () => {
+  it("creates a run with sensible Luna defaults: profile preselected, nonzero token budget, focused goal", async () => {
     const user = userEvent.setup();
     render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
     await screen.findAllByRole("button", { name: /run-sim-1001/ });
     await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
     const dialog = await screen.findByRole("dialog", { name: "Create run" });
+    // Luna profile preselected; token budget prefilled nonzero
+    expect(within(dialog).getByLabelText("Model")).toHaveValue("openai-codex/gpt-5.6-luna");
+    expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000);
+    // goal is focused for immediate typing
+    await waitFor(() => expect(within(dialog).getByLabelText("Goal")).toHaveFocus());
     await user.type(within(dialog).getByLabelText("Goal"), "Sim end-to-end goal");
-    await user.type(within(dialog).getByLabelText("Model profile"), "profile-subscription");
-    await user.type(within(dialog).getByLabelText("Model token cap"), "5000");
     await user.click(within(dialog).getByRole("button", { name: "Create run" }));
     expect((await screen.findAllByText(/run-sim-1007/)).length).toBeGreaterThanOrEqual(1);
   });
 
-  it("requires a nonzero model token cap before creating a run", async () => {
+  it("rejects an empty token budget in the new-run dialog", async () => {
     const user = userEvent.setup();
     render(<App transport={createSimulationTransport({ disconnectAfterEvents: 0 })} />);
     await screen.findAllByRole("button", { name: /run-sim-1001/ });
     await user.click(screen.getAllByRole("button", { name: "New run" })[0]);
     const dialog = await screen.findByRole("dialog", { name: "Create run" });
     await user.type(within(dialog).getByLabelText("Goal"), "Goal");
-    await user.type(within(dialog).getByLabelText("Model profile"), "profile");
+    await user.clear(within(dialog).getByLabelText("Token budget"));
     await user.click(within(dialog).getByRole("button", { name: "Create run" }));
-    expect(await within(dialog).findByText(/nonzero model token\/cost cap is required/)).toBeInTheDocument();
+    expect(await within(dialog).findByText(/Token budget must be a positive number/)).toBeInTheDocument();
   });
 
   it("runs a learning cycle that stages an evidence-linked proposal", async () => {

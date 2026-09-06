@@ -29,12 +29,14 @@ export interface ConsoleTransport {
     fromCursor: number,
     handlers: {
       onEvent: (event: RunEvent) => void;
-      onState: (state: "live" | "stale" | "reconnecting" | "closed") => void;
+      onState: (state: "live" | "stale" | "reconnecting" | "disconnected" | "closed") => void;
     },
   ): () => void;
   cancelRun(runId: string): Promise<void>;
   submitApproval(runId: string, approvalId: string, approve: boolean): Promise<void>;
   requestRollback(candidateId: string, reason: string): Promise<void>;
+  /** Re-run the session handshake after a disconnect; simulation resolves. */
+  reconnect(): Promise<void>;
   /** Create a run via the canonical taskRef; the server pins the active version. */
   createRun(input: CreateRunInput): Promise<RunRecord>;
   /** Launch a created run (POST /runs/{id}/launch, 202 accepted). */
@@ -82,6 +84,7 @@ export type EnvironmentRegistration = {
   evaluatorRef: CanonicalRef;
   resetRef: CanonicalRef;
   executionModes: Array<"dry_run" | "interactive" | "batch" | "replay">;
+  capabilities: string[];
 };
 
 export const EXECUTION_MODES: Array<{ value: EnvironmentRegistration["executionModes"][number]; label: string }> = [
@@ -211,6 +214,7 @@ export async function formToRegistration(fields: EnvironmentPackageForm): Promis
     evaluatorRef: await canonicalRef(fields.evaluatorRef),
     resetRef: await canonicalRef(fields.resetRef),
     executionModes: fields.executionModes,
+    capabilities: [],
   };
 }
 

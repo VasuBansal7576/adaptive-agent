@@ -330,6 +330,10 @@ export function createSimulationTransport(options?: {
       return structuredClone(summary);
     },
 
+    async reconnect() {
+      /* fixture transport never disconnects */
+    },
+
     async launchLearningCycle(input: LearningCycleInput) {
       const actionId = `learn-sim-${(learningActionCount += 1).toString().padStart(3, "0")}`;
       return { actionId, runId: input.runId, status: "staged" as const };

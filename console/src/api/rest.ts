@@ -27,8 +27,12 @@ export class ApiError extends Error {
     const envelope = (payload.detail && typeof payload.detail === "object" && payload.detail !== null
       ? (payload.detail as Record<string, unknown>)
       : payload) as Record<string, unknown>;
-    const code = typeof envelope.code === "string" ? envelope.code : "UNKNOWN";
-    const message = typeof envelope.message === "string" ? envelope.message : typeof payload.detail === "string" ? payload.detail : `HTTP ${status}`;
+    const code = typeof envelope.code === "string" ? envelope.code : typeof payload.code === "string" ? payload.code : "UNKNOWN";
+    const message = typeof envelope.message === "string" && envelope.message
+      ? envelope.message
+      : typeof payload.detail === "string" && payload.detail
+        ? payload.detail
+        : `HTTP ${status}`;
     super(message);
     this.name = "ApiError";
     this.code = code;
@@ -41,32 +45,65 @@ export class ApiError extends Error {
   }
 }
 
+/** Friendly operator-facing text; raw JSON/HTML error bodies never reach the UI. */
+export const DISCONNECTED_MESSAGE = "API unavailable — the control API did not respond.";
+
 /**
- * Live transport against the SPEC control API (aligned with commit 7d3c2b5).
- * - POST /environments takes the strict full manifest (docs[] + taskGoals[] +
- *   canonical refs + executionModes); the string form lives at /environments/form.
- * - POST /runs accepts the canonical taskRef projection; launch is explicit
- *   via POST /runs/{id}/launch; executionMode is recorded on the run and its events.
- * - POST /learning/launch stages an evidence-linked learning proposal.
- * - Every payload passes boundary-schema validation before entering UI state.
+ * Live transport against the local Python control API (same-origin /api proxy).
+ * Session handshake: GET /session/bootstrap (HttpOnly cookie) then GET /session
+ * run before any data request or SSE connection; failures surface as a clear
+ * Disconnected state with a retry action, never an indefinite spinner.
  */
-export function createRestTransport(baseUrl = ""): ConsoleTransport {
-  async function json(path: string, init?: RequestInit): Promise<unknown> {
-    const res = await fetch(`${baseUrl}${path}`, {
-      headers: { "content-type": "application/json" },
-      ...init,
-    });
-    if (!res.ok) {
-      let payload: unknown = null;
+export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
+  let sessionPromise: Promise<void> | null = null;
+
+  const ensureSession = (): Promise<void> => {
+    if (sessionPromise) return sessionPromise;
+    sessionPromise = (async () => {
       try {
-        payload = await res.json();
-      } catch {
-        /* non-JSON error body */
+        const bootstrap = await fetch(`${baseUrl}/session/bootstrap`);
+        if (!bootstrap.ok) {
+          throw new ApiError(await safeJson(bootstrap), bootstrap.status);
+        }
+        await fetch(`${baseUrl}/session`);
+      } catch (error) {
+        // allow a later retry to re-attempt the handshake
+        sessionPromise = null;
+        if (error instanceof ApiError) throw error;
+        throw new ApiError({ code: "DISCONNECTED", message: DISCONNECTED_MESSAGE }, 0);
       }
-      throw new ApiError((payload ?? {}) as Record<string, unknown>, res.status);
+    })();
+    return sessionPromise;
+  };
+
+  async function safeJson(res: Response): Promise<Record<string, unknown>> {
+    try {
+      return (await res.json()) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }
+
+  async function json(path: string, init?: RequestInit): Promise<unknown> {
+    await ensureSession();
+    let res: Response;
+    try {
+      res = await fetch(`${baseUrl}${path}`, {
+        headers: { "content-type": "application/json" },
+        ...init,
+      });
+    } catch {
+      throw new ApiError({ code: "DISCONNECTED", message: DISCONNECTED_MESSAGE }, 0);
+    }
+    if (!res.ok) {
+      throw new ApiError(await safeJson(res), res.status);
     }
     if (res.status === 204) return undefined;
-    return res.json();
+    try {
+      return await res.json();
+    } catch {
+      throw new SchemaError("response envelope");
+    }
   }
 
   function validated<T>(promise: Promise<unknown>, parse: (value: unknown) => T): Promise<T> {
@@ -94,20 +131,24 @@ export function createRestTransport(baseUrl = ""): ConsoleTransport {
     listSkills: () => validated(json("/skills"), parseSkills),
     listCandidates: () => validated(json("/candidates"), parseCandidates),
 
+    async reconnect() {
+      sessionPromise = null;
+      await ensureSession();
+    },
+
     openRunStream(runId, fromCursor, { onEvent, onState }) {
-      // environments without EventSource support (some test DOMs) surface an
-      // honest stale state rather than crashing
-      if (typeof EventSource === "undefined") {
-        onState("stale");
-        return () => undefined;
-      }
       let es: EventSource | null = null;
       let retryTimer: ReturnType<typeof setTimeout> | null = null;
       let closed = false;
       let lastSequence = fromCursor;
 
-      const connect = () => {
+      const start = () => {
         if (closed) return;
+        // environments without EventSource support surface an honest stale state
+        if (typeof EventSource === "undefined") {
+          onState("stale");
+          return;
+        }
         onState(lastSequence === fromCursor ? "live" : "reconnecting");
         es = new EventSource(`${baseUrl}/runs/${encodeURIComponent(runId)}/events?cursor=${lastSequence}`);
         es.onmessage = (message) => {
@@ -126,10 +167,18 @@ export function createRestTransport(baseUrl = ""): ConsoleTransport {
         es.onerror = () => {
           es?.close();
           onState("stale");
-          retryTimer = setTimeout(connect, 1500);
+          retryTimer = setTimeout(() => {
+            ensureSession()
+              .then(start)
+              .catch(() => onState("disconnected"));
+          }, 1500);
         };
       };
-      connect();
+
+      // the HttpOnly session cookie must exist before SSE connects
+      ensureSession()
+        .then(start)
+        .catch(() => onState("disconnected"));
 
       return () => {
         closed = true;
@@ -154,13 +203,10 @@ export function createRestTransport(baseUrl = ""): ConsoleTransport {
       }).then(() => undefined),
 
     async createRun(input: CreateRunInput) {
-      // canonical taskRef projection: {goal, environmentId, environmentRef}
+      // direct projection accepted by the control API
       const body = {
-        taskRef: {
-          goal: input.goal,
-          environmentId: input.environmentId,
-          environmentRef: { id: input.environmentId, version: "1" },
-        },
+        goal: input.goal,
+        environmentId: input.environmentId,
         modelProfileRef: { id: input.modelProfile, version: "1" },
         budgetRef: { id: `budget-${input.idempotencyKey.slice(0, 8)}`, version: "1" },
         idempotencyKey: input.idempotencyKey,
@@ -176,7 +222,7 @@ export function createRestTransport(baseUrl = ""): ConsoleTransport {
       json(`/runs/${encodeURIComponent(runId)}/launch`, { method: "POST", body: "{}" }).then(() => undefined),
 
     async registerEnvironment(manifest: EnvironmentRegistration) {
-      await json("/environments", { method: "POST", body: JSON.stringify(manifest) });
+      await json("/environments/register", { method: "POST", body: JSON.stringify(manifest) });
       const environments = await validated(json("/environments"), parseEnvironments);
       const created = environments.find((e) => e.environmentId === manifest.environmentId);
       if (!created) throw new ApiError({ code: "UNKNOWN", message: "registered environment missing from list" }, 200);

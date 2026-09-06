@@ -291,6 +291,12 @@ function BudgetBar({ label, used, ceiling, unit }: { label: string; used: number
   );
 }
 
+/** Model profiles offered by the control plane; Luna via subscription is the
+ *  verified provider path. Default is preselected so one click starts a run. */
+export const MODEL_PROFILES = [
+  { id: "openai-codex/gpt-5.6-luna", label: "GPT-5.6 Luna (subscription)" },
+];
+
 function NewRunDialog({
   open,
   onClose,
@@ -306,16 +312,20 @@ function NewRunDialog({
 }) {
   const [goal, setGoal] = useState("");
   const [environmentId, setEnvironmentId] = useState("");
-  const [modelProfile, setModelProfile] = useState("");
+  const [modelProfile, setModelProfile] = useState(MODEL_PROFILES[0].id);
   const [executionMode, setExecutionMode] = useState<CreateRunInput["executionMode"]>("interactive");
   const [toolCallCeiling, setToolCallCeiling] = useState("100");
   const [wallSecondsCeiling, setWallSecondsCeiling] = useState("900");
-  const [modelTokenCeiling, setModelTokenCeiling] = useState("");
+  const [modelTokenCeiling, setModelTokenCeiling] = useState("20000");
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const goalRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if (open) {
       setEnvironmentId((prev) => prev || environments[0]?.environmentId || "");
+      // focus the goal field: it is the only decision the operator must make
+      const t = setTimeout(() => goalRef.current?.focus(), 30);
+      return () => clearTimeout(t);
     }
   }, [open, environments]);
 
@@ -329,7 +339,7 @@ function NewRunDialog({
     const wall = Number(wallSecondsCeiling);
     if (!Number.isFinite(wall) || wall <= 0) errors.wallSecondsCeiling = "Wall-time ceiling must be a positive number";
     const tokens = Number(modelTokenCeiling);
-    if (!Number.isFinite(tokens) || tokens <= 0) errors.modelTokenCeiling = "A nonzero model token/cost cap is required before execution (SPEC)";
+    if (!Number.isFinite(tokens) || tokens <= 0) errors.modelTokenCeiling = "Token budget must be a positive number";
     setFieldErrors(errors);
     return Object.keys(errors).length === 0;
   };
@@ -358,14 +368,11 @@ function NewRunDialog({
   return (
     <Modal open={open} title="Create run" onClose={onClose}>
       <form onSubmit={submit} noValidate className="space-y-3 text-sm text-slate-300">
-        <p className="text-xs text-slate-500">
-          The server pins the active skill bundle; the console never chooses it. The idempotency key is generated per
-          submission and reused verbatim on retry.
-        </p>
         <div>
           <label htmlFor="newrun-goal" className="block text-xs font-medium text-slate-400">Goal</label>
           <textarea
             id="newrun-goal"
+            ref={goalRef}
             rows={2}
             value={goal}
             onChange={(e) => setGoal(e.target.value)}
@@ -395,39 +402,41 @@ function NewRunDialog({
             {fieldErrors.environmentId && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.environmentId}</p>}
           </div>
           <div>
-            <label htmlFor="newrun-model" className="block text-xs font-medium text-slate-400">Model profile</label>
-            <input
+            <label htmlFor="newrun-model" className="block text-xs font-medium text-slate-400">Model</label>
+            <select
               id="newrun-model"
               value={modelProfile}
               onChange={(e) => setModelProfile(e.target.value)}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100"
-              placeholder="e.g., profile-subscription"
-            />
-            {fieldErrors.modelProfile && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.modelProfile}</p>}
+            >
+              {MODEL_PROFILES.map((profile) => (
+                <option key={profile.id} value={profile.id}>{profile.label}</option>
+              ))}
+            </select>
           </div>
         </div>
         <div className="grid gap-3 sm:grid-cols-3">
           <div>
-            <label htmlFor="newrun-calls" className="block text-xs font-medium text-slate-400">Tool-call ceiling</label>
+            <label htmlFor="newrun-calls" className="block text-xs font-medium text-slate-400">Tool-call limit</label>
             <input id="newrun-calls" type="number" min="1" value={toolCallCeiling} onChange={(e) => setToolCallCeiling(e.target.value)}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
             {fieldErrors.toolCallCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.toolCallCeiling}</p>}
           </div>
           <div>
-            <label htmlFor="newrun-wall" className="block text-xs font-medium text-slate-400">Wall-time ceiling (s)</label>
+            <label htmlFor="newrun-wall" className="block text-xs font-medium text-slate-400">Time limit (s)</label>
             <input id="newrun-wall" type="number" min="1" value={wallSecondsCeiling} onChange={(e) => setWallSecondsCeiling(e.target.value)}
               className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
             {fieldErrors.wallSecondsCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.wallSecondsCeiling}</p>}
           </div>
           <div>
-            <label htmlFor="newrun-tokens" className="block text-xs font-medium text-slate-400">Model token cap</label>
+            <label htmlFor="newrun-tokens" className="block text-xs font-medium text-slate-400">Token budget</label>
             <input id="newrun-tokens" type="number" min="1" value={modelTokenCeiling} onChange={(e) => setModelTokenCeiling(e.target.value)}
-              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" placeholder="required" />
+              className="mt-1 w-full rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-100" />
             {fieldErrors.modelTokenCeiling && <p role="alert" className="mt-1 text-xs text-rose-400">{fieldErrors.modelTokenCeiling}</p>}
           </div>
         </div>
         <div>
-          <label htmlFor="newrun-mode" className="block text-xs font-medium text-slate-400">Execution mode</label>
+          <label htmlFor="newrun-mode" className="block text-xs font-medium text-slate-400">Mode</label>
           <select
             id="newrun-mode"
             value={executionMode}

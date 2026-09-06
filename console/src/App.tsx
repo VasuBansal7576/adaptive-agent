@@ -33,6 +33,7 @@ function streamBadge(mode: "simulation" | "live", connection: string): { status:
     if (connection === "stale") return { status: "sim_stream_stale" };
     if (connection === "reconnecting") return { status: "sim_stream_reconnecting" };
     if (connection === "closed") return { status: "sim_stream_closed" };
+    if (connection === "disconnected") return { status: "disconnected" };
     return { status: "sim_stream_connecting" };
   }
   return { status: connection };
@@ -51,6 +52,16 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
   const closeStreamRef = useRef<(() => void) | null>(null);
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
+  const retryConnection = async () => {
+    dispatch({ type: "loadStart" });
+    try {
+      await transport.reconnect();
+    } catch {
+      /* the load below renders the disconnected state again */
+    }
+    void load();
+  };
+
   const load = useCallback(async () => {
     dispatch({ type: "loadStart" });
     try {
@@ -63,6 +74,8 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
       dispatch({ type: "loadOk", environments, runs, skills, candidates });
     } catch (error) {
       dispatch({ type: "loadError", message: error instanceof Error ? error.message : "Unknown load failure" });
+      // never leave the header spinner in an indefinite Connecting state
+      if (transport.mode === "live") dispatch({ type: "connection", state: "disconnected" });
     }
   }, [transport]);
 
@@ -213,10 +226,10 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
         )}
         {state.loadError && (
           <div className="mb-4">
-            <Banner tone="bad" title="Failed to load console data" role="alert">
-              {state.loadError} — the console keeps your current view.{" "}
-              <button type="button" onClick={() => void load()} className="underline underline-offset-2">
-                Retry
+            <Banner tone="bad" title="Console not connected" role="alert">
+              {state.loadError} — nothing was changed.{" "}
+              <button type="button" onClick={() => void retryConnection()} className="underline underline-offset-2">
+                Retry connection
               </button>
             </Banner>
           </div>
