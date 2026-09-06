@@ -445,7 +445,8 @@ class LunaPlanner:
             "Use public docs, tool schemas, policy, and active skills as contracts. "
             "Return exactly one JSON object: {\\\"action\\\":\\\"execute\\\",\\\"code\\\":\\\"...\\\"} "
             "for Python to run in the task-scoped Prime kernel, or {\\\"action\\\":\\\"finish\\\",\\\"answer\\\":\\\"...\\\"}. "
-            "Use the provided rlm host_request broker bridge for tools; never import credentials, access the host, or invent outcomes. "
+            "Use `from rlm import host_request` and await host_request(\"broker.call\", {\"capabilityId\": \"...\", \"arguments\": {...}}) for tools; do not import the rlm module itself. "
+            "Never import credentials, access the host, or invent outcomes. "
             "A tool result or error is feedback for the next turn. The contract context is:\n" + contract
         )
 
