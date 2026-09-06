@@ -19,7 +19,7 @@ if core_src:
 
 try:
     from adaptive_agent.candidate import CandidateManager
-    from adaptive_agent.learning_runtime import LearningRuntime
+    from adaptive_agent.learning_runtime import LearningRuntime, StoreModelObservationSink
     from adaptive_agent.models import CandidateProposal, SkillBundle, SkillVersion
 except ImportError as exc:
     pytest.skip(f"durable core is unavailable in this isolated worker: {exc}", allow_module_level=True)
@@ -58,6 +58,23 @@ def test_runtime_composes_durable_learning_and_restart_readback(tmp_path: Path):
     restarted_manager = CandidateManager(restarted_store)
     restarted = LearningRuntime.build(store=restarted_store, manager=restarted_manager, model_client=FakeClient(), token_budget=1000, wall_seconds=20)
     assert restarted.reload_candidate(result.authoritative_candidate["candidate_id"])["state"] == "validated"
+
+
+def test_learning_model_observation_sink_never_writes_parent_model_response(tmp_path: Path):
+    store, _, _ = _setup_store(tmp_path)
+    sink = StoreModelObservationSink(store, RUN)
+
+    sink.record_model_observation(
+        {"provider": "test", "model": "learning-model", "responseId": "learning-resp", "usage": {"totalTokens": 2}},
+        trusted_parent=True,
+    )
+
+    rows = store.list_evidence(RUN)
+    observations = [row for row in rows if row.get("evidence_id") == "learning-model-learning-resp"]
+    assert len(observations) == 1
+    assert observations[0]["event_type"] == "learning_model_observation"
+    assert observations[0]["visibility"] == "operator"
+    assert not any(row.get("event_type") == "model_response" and row.get("evidence_id") == "learning-model-learning-resp" for row in rows)
 
 
 def test_restart_projection_uses_row_bindings_when_json_omits_them(tmp_path: Path):
