@@ -376,6 +376,7 @@ def _validate_proposal_payload(
     retriever: AccessFilteredRetriever,
     environment_id: str,
     run_id: str,
+    allowed_source_runs: frozenset[tuple[str, str]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], str, str, tuple[SourceRecord, ...], dict[str, Any], dict[str, Any]]:
     operations = _canonical_operations(parsed["editOperations"])
     skill = _validate_skill(parsed["skill"])
@@ -387,7 +388,7 @@ def _validate_proposal_payload(
     if not isinstance(evidence_ids, list) or not evidence_ids or not all(isinstance(item, str) and item for item in evidence_ids):
         raise LearningError("supporting evidence must be a non-empty id array")
     try:
-        evidence = retriever.require_development_evidence(evidence_ids, environment_id=environment_id, run_id=run_id)
+        evidence = retriever.require_development_evidence(evidence_ids, environment_id=environment_id, run_id=run_id, allowed_source_runs=allowed_source_runs)
     except RetrievalError as exc:
         raise LearningError(str(exc)) from exc
     config_patch = parsed.get("executionConfigPatch", {})
@@ -415,7 +416,7 @@ class LearningService:
         self.candidate_sink = candidate_sink
         self.active_bundle_hash = active_bundle_hash
 
-    def propose(self, *, run_id: str, environment_id: str, goal: str, base_bundle_hash: str | None = None, environment: Mapping[str, Any] | None = None, feedback: Mapping[str, Any] | None = None, allowed_skill_ids: set[str] | None = None, emit: Callable[[str, str, str | None], None] | None = None, remaining_deadline: float | None = None, cancel: Event | None = None, token_cap: int | None = None, max_repair_attempts: int = 0) -> LearningProposal:
+    def propose(self, *, run_id: str, environment_id: str, goal: str, base_bundle_hash: str | None = None, environment: Mapping[str, Any] | None = None, feedback: Mapping[str, Any] | None = None, allowed_skill_ids: set[str] | None = None, emit: Callable[[str, str, str | None], None] | None = None, remaining_deadline: float | None = None, cancel: Event | None = None, token_cap: int | None = None, max_repair_attempts: int = 0, source_runs: frozenset[tuple[str, str]] | None = None) -> LearningProposal:
         if cancel is not None and cancel.is_set():
             raise LearningError("learning proposal cancelled before model invocation")
         if remaining_deadline is not None and remaining_deadline <= 0:
@@ -427,7 +428,10 @@ class LearningService:
         active = _require_hash(self.active_bundle_hash(), "active bundle hash")
         if base_bundle_hash is not None and base_bundle_hash != active:
             raise LearningError("candidate base is not the pinned active bundle")
-        result = self.retriever.search(goal, environment_id=environment_id, run_id=run_id, allowed_skill_ids=allowed_skill_ids)
+        if source_runs is not None:
+            result = self.retriever.search(goal, environment_id=environment_id, run_id=run_id, allowed_skill_ids=allowed_skill_ids, allowed_source_runs=source_runs)
+        else:
+            result = self.retriever.search(goal, environment_id=environment_id, run_id=run_id, allowed_skill_ids=allowed_skill_ids)
         if not result.evidence:
             raise LearningError("learning requires verified development evidence")
         safe_environment = {key: environment[key] for key in ("environmentId", "version", "toolSchemas", "executionModes", "capabilities") if environment and key in environment}
@@ -477,7 +481,7 @@ class LearningService:
                         total_used_tokens += used_tokens
                     try:
                         parsed = _parse_model_json(invocation.text)
-                        operations, skill, predicted, proposer_version, evidence, config_patch, bundle_patch = _validate_proposal_payload(parsed, retriever=self.retriever, environment_id=environment_id, run_id=run_id)
+                        operations, skill, predicted, proposer_version, evidence, config_patch, bundle_patch = _validate_proposal_payload(parsed, retriever=self.retriever, environment_id=environment_id, run_id=run_id, allowed_source_runs=source_runs)
                         break
                     except LearningError as exc:
                         error = exc

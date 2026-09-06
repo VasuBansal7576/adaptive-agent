@@ -14,7 +14,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .learning import LearningProposal, LearningService, PlannerLearningAdapter
 from .learning_store import CandidateManagerLearningAdapter, DurableLearningSourceAdapter, LearningStoreError
@@ -24,6 +24,11 @@ from .retrieval import AccessFilteredRetriever, InMemorySourceProvider, canonica
 
 class LearningRuntimeError(ValueError):
     """Raised when a completed durable run cannot safely become learning input."""
+
+
+# Hard upper bound on the multi-run source set entering one learning call.  A
+# frozen protocol may pin a lower bound; nothing may exceed this cap.
+LEARNING_SOURCE_RUN_CAP = 8
 
 
 def _artifact_text(value: Any) -> str:
@@ -382,6 +387,97 @@ class LearningRuntime:
         outcome = self.store.get_outcome_by_run_id(run_id)
         status = "succeeded" if bool(outcome.get("passed")) else "failed"
         return self.service.propose(run_id=run_id, environment_id=environment_id, goal=goal or task["goal"], environment=environment, feedback=feedback or {"status": status}, remaining_deadline=self.wall_seconds, token_cap=self.token_budget, max_repair_attempts=1)
+
+    def propose_completed_runs(self, run_ids: Sequence[str], *, primary_run_id: str, goal: str | None = None, feedback: Mapping[str, Any] | None = None, public_documents: Any = ()) -> LearningProposal:
+        """Synthesize one candidate proposal from a bounded, declared set of
+        completed development runs across eligible environments.
+
+        Every selected run must be a completed development run with a trusted
+        outcome; the primary run owns the proposal's identity, evidence sink,
+        and environment binding.  The retriever is exposed to exactly the
+        declared (environment, run) set — nothing outside it becomes learner
+        context.  Failed runs are eligible sources: their outcomes and
+        evidence are part of the selected set.
+        """
+        store = self.store
+        if not isinstance(run_ids, Sequence) or isinstance(run_ids, (str, bytes)):
+            raise LearningRuntimeError("learning source set is malformed")
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for run_id in run_ids:
+            if not isinstance(run_id, str) or not run_id:
+                raise LearningRuntimeError("learning source set is malformed")
+            if run_id not in seen:
+                seen.add(run_id)
+                ordered.append(run_id)
+        if not ordered:
+            raise LearningRuntimeError("learning requires at least one source run")
+        # Reject oversized sets before any evidence is materialized.
+        if len(ordered) > LEARNING_SOURCE_RUN_CAP:
+            raise LearningRuntimeError("learning source set exceeds the frozen bound")
+        if primary_run_id not in seen:
+            ordered.insert(0, primary_run_id)
+            seen.add(primary_run_id)
+            if len(ordered) > LEARNING_SOURCE_RUN_CAP:
+                raise LearningRuntimeError("learning source set exceeds the frozen bound")
+        bindings: list[tuple[str, str, Mapping[str, Any], Mapping[str, Any]]] = []
+        for run_id in ordered:
+            stored = store.get_run(run_id)
+            if not isinstance(stored, Mapping) or stored.get("status") not in {"succeeded", "failed", "cancelled", "timed_out", "outcome_unknown"}:
+                raise LearningRuntimeError("learning requires completed development runs")
+            environment_id = stored.get("environment_id")
+            if not isinstance(environment_id, str) or not environment_id:
+                raise LearningRuntimeError("completed run environment binding is missing")
+            task = store.get_task(stored["task_id"])
+            if not isinstance(task, Mapping) or task.get("partition") != "development":
+                raise LearningRuntimeError("learning sources must be DEVELOPMENT runs")
+            if store.get_outcome_by_run_id(run_id) is None:
+                raise LearningRuntimeError("learning sources require a trusted evaluator outcome")
+            bindings.append((run_id, environment_id, stored, task))
+        # Deterministic stratified order: environment first, then run id; the
+        # caller's primary keeps its identity even when it sorts later.
+        bindings.sort(key=lambda entry: (entry[1], entry[0]))
+        ordered = [run_id for run_id, *_ in bindings]
+        if primary_run_id not in ordered:
+            raise LearningRuntimeError("primary run must be part of the source set")
+        ordered = [primary_run_id, *[run_id for run_id in ordered if run_id != primary_run_id]]
+
+        sources: list[Any] = []
+        seen_source_keys: set[tuple[Any, Any, Any]] = set()
+        for run_id, environment_id, _stored, _task in bindings:
+            raw_records = self._materialize_run_records(
+                environment_id=environment_id,
+                run_id=run_id,
+                public_documents=public_documents if run_id == primary_run_id else (),
+            )
+            for source in self.source_adapter.records_from_raw(raw_records, environment_id=environment_id, run_id=run_id):
+                key = (source.kind, source.source_id, source.run_id)
+                if key not in seen_source_keys:
+                    seen_source_keys.add(key)
+                    sources.append(source)
+
+        primary = next(entry for entry in bindings if entry[0] == primary_run_id)
+        _p_run, primary_env_id, _p_stored, primary_task = primary
+        environment = {"environmentId": primary_env_id, "version": primary_task.get("version", "1")}
+        self.service.retriever = AccessFilteredRetriever(InMemorySourceProvider(sources))
+        sink = StoreModelObservationSink(self.store, primary_run_id)
+        self.service.model_runner = PlannerLearningAdapter(self.service.model_runner.client, sink)
+        outcome = store.get_outcome_by_run_id(primary_run_id)
+        status = "succeeded" if bool(outcome.get("passed")) else "failed"
+        source_runs = frozenset((env_id, run_id) for run_id, env_id, _s, _t in bindings)
+        default_feedback = {"status": status, "sourceRunIds": ordered}
+        merged_feedback = {**default_feedback, **dict(feedback)} if isinstance(feedback, Mapping) else default_feedback
+        return self.service.propose(
+            run_id=primary_run_id,
+            environment_id=primary_env_id,
+            goal=goal or primary_task["goal"],
+            environment=environment,
+            feedback=merged_feedback,
+            remaining_deadline=self.wall_seconds,
+            token_cap=self.token_budget,
+            max_repair_attempts=1,
+            source_runs=source_runs,
+        )
 
     def reload_candidate(self, candidate_id: str) -> Mapping[str, Any]:
         candidate = self.store.get_candidate(candidate_id)

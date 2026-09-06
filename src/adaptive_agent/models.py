@@ -135,6 +135,7 @@ class TaskInput(BaseModel):
     goal: str
     allowed_input_refs: list[ArtifactRef] = Field(default_factory=list, alias="allowedInputRefs")
     partition: str = "development"  # development | validation | final | training
+    provenance: dict[str, Any] = Field(default_factory=dict)
 
 
 class Budget(BaseModel):
