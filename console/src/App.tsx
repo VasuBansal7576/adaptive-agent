@@ -127,10 +127,9 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
 
   const createRun = async (input: Parameters<ConsoleTransport["createRun"]>[0]) => {
     try {
+      // transport-level createRun includes the launch step so runs never stay queued
       const run = await transport.createRun(input);
       dispatch({ type: "runAdded", run });
-      // explicit launch step (POST /runs/{id}/launch)
-      await transport.launchRun(run.runId);
     } catch (error) {
       failAction(error);
     }

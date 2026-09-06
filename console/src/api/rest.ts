@@ -23,16 +23,27 @@ export class ApiError extends Error {
   correlationId: string | null;
   retry: string | null;
   constructor(payload: Record<string, unknown>, status: number) {
-    // FastAPI wraps structured envelopes in `detail` (409/403); plain 422s use a string detail
-    const envelope = (payload.detail && typeof payload.detail === "object" && payload.detail !== null
-      ? (payload.detail as Record<string, unknown>)
-      : payload) as Record<string, unknown>;
+    // FastAPI failure shapes: structured envelope in `detail` (409/403),
+    // string `detail` (plain HTTPException), or array `detail` (validation).
+    const raw = payload.detail;
+    const envelope: Record<string, unknown> =
+      raw && typeof raw === "object" && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>)
+        : payload; // synthetic envelopes carry code/message at the top level
+    let message: string;
+    if (typeof envelope.message === "string" && envelope.message) {
+      message = envelope.message;
+    } else if (typeof raw === "string" && raw) {
+      message = raw;
+    } else if (Array.isArray(raw)) {
+      // validation array: join the human-readable msgs
+      message = raw
+        .map((item) => (item && typeof item === "object" && "msg" in (item as Record<string, unknown>) ? String((item as Record<string, unknown>).msg) : String(item)))
+        .join("; ");
+    } else {
+      message = `HTTP ${status}`;
+    }
     const code = typeof envelope.code === "string" ? envelope.code : typeof payload.code === "string" ? payload.code : "UNKNOWN";
-    const message = typeof envelope.message === "string" && envelope.message
-      ? envelope.message
-      : typeof payload.detail === "string" && payload.detail
-        ? payload.detail
-        : `HTTP ${status}`;
     super(message);
     this.name = "ApiError";
     this.code = code;
@@ -215,6 +226,8 @@ export function createRestTransport(baseUrl = "/api"): ConsoleTransport {
       const run = await validated(json("/runs", { method: "POST", body: JSON.stringify(body) }), (value) =>
         parseRun(value, "run"),
       );
+      // explicit launch step: a created run must not remain queued
+      await json(`/runs/${encodeURIComponent(run.runId)}/launch`, { method: "POST", body: "{}" });
       return run;
     },
 
