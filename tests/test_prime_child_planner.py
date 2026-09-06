@@ -24,7 +24,7 @@ class FakeClient:
     def invoke(self, **kwargs):
         self.calls += 1
         self.last = kwargs
-        child_input = kwargs["environment"]["childInput"]
+        child_input = kwargs["environment"].get("childInput", {"kwargs": {"left": 21, "right": 2}})
         text = self.text if self.text is not None else '{"name":"child","code":"%d * %d"}' % (
             child_input["kwargs"]["left"], child_input["kwargs"]["right"]
         )
@@ -103,6 +103,21 @@ class ChildPlannerTests(unittest.TestCase):
             LunaChildPlanner(over, observation_sink=observations.append)(request(ledger))
         self.assertEqual(observations[0]["responseId"], "child-response-1")
         self.assertEqual(ledger.model_tokens_used, 7)
+
+    def test_parent_proxy_charges_same_ledger_and_blocks_next_dispatch(self):
+        ledger = SharedBudget(30, 1000, 4, 1, 5)
+        budget = ChildPlannerBudget(ledger)
+        client = FakeClient(usage=7)
+        observations = []
+        proxy = LunaChildPlanner(client, budget=budget).parent_model_client(observations.append)
+        with self.assertRaises(SecurityViolation):
+            proxy.invoke(goal="parent", environment={}, messages=[], remaining_deadline=5)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(observations[0]["responseId"], "child-response-1")
+        self.assertEqual(ledger.model_tokens_used, 7)
+        with self.assertRaises(SecurityViolation):
+            proxy.invoke(goal="parent", environment={}, messages=[], remaining_deadline=5)
+        self.assertEqual(client.calls, 1)
 
     def test_parent_receipt_uses_same_ledger_and_overage_is_retained(self):
         ledger = SharedBudget(30, 1000, 4, 1, 5)

@@ -18,6 +18,43 @@ class ChildModelClient(Protocol):
 ChildObservationSink = Callable[[Mapping[str, Any]], Any]
 
 
+class SharedLedgerModelClient:
+    """Parent-client proxy that charges completed calls to the shared ledger."""
+
+    def __init__(self, client: ChildModelClient, budget: ChildPlannerBudget,
+                 observation_sink: ChildObservationSink | None = None):
+        self.client = client
+        self.budget = budget
+        self.observation_sink = observation_sink
+
+    def invoke(self, **kwargs: Any) -> Mapping[str, Any]:
+        cancel = kwargs.get("cancel")
+        if self.budget.cancel_event.is_set() or (cancel is not None and cancel.is_set()):
+            raise SecurityViolation("parent model call cancelled")
+        remaining = kwargs.get("remaining_deadline")
+        if isinstance(remaining, (int, float)) and not isinstance(remaining, bool) and remaining <= 0:
+            raise SecurityViolation("parent model deadline expired")
+        if self.budget.remaining_model_tokens == 0:
+            raise SecurityViolation("shared model token budget exhausted")
+        raw = self.client.invoke(**kwargs)
+        if not isinstance(raw, Mapping):
+            raise AdapterError("parent model response must be an object")
+        usage = raw.get("usage")
+        if not isinstance(usage, Mapping) or not usage:
+            raise AdapterError("parent model response lacks usage accounting")
+        if self.observation_sink is not None:
+            self.observation_sink({
+                "provider": raw.get("provider"),
+                "model": raw.get("model"),
+                "responseId": raw.get("responseId", raw.get("response_id")),
+                "usage": dict(usage),
+            })
+        # Charge exactly once, immediately after the provider call. The
+        # observation sink persists the response envelope before exhaustion.
+        self.budget.record_model_usage(_usage_tokens(usage))
+        return raw
+
+
 def _usage_tokens(usage: Mapping[str, Any]) -> int:
     for key in ("totalTokens", "total_tokens"):
         value = usage.get(key)
@@ -94,6 +131,12 @@ class LunaChildPlanner:
         self.budget = budget
         self.observation_sink = observation_sink
         self.max_code_chars = max_code_chars
+
+    def parent_model_client(self, observation_sink: ChildObservationSink | None = None) -> SharedLedgerModelClient:
+        """Return a parent proxy that shares and charges this planner ledger."""
+        if self.budget is None:
+            raise AdapterError("shared planner budget is required for parent accounting")
+        return SharedLedgerModelClient(self.client, self.budget, observation_sink=observation_sink)
 
     def record_parent_model_usage(self, usage: Mapping[str, Any]) -> int:
         """Record a completed parent receipt in the same trusted ledger.
@@ -183,4 +226,4 @@ class LunaChildPlanner:
         return _bind_kwargs(_parse_plan(text, self.max_code_chars), request.kwargs)
 
 
-__all__ = ["ChildModelClient", "ChildObservationSink", "LunaChildPlanner", "MODEL_NAME", "MODEL_PROVIDER"]
+__all__ = ["ChildModelClient", "ChildObservationSink", "LunaChildPlanner", "MODEL_NAME", "MODEL_PROVIDER", "SharedLedgerModelClient"]
