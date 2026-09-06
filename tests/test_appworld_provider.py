@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+from adaptive_agent.appworld_provider import (
+    AppWorldCatalog,
+    AppWorldConfig,
+    AppWorldError,
+    AppWorldProvider,
+    build_manifest,
+    register_appworld,
+)
+from adaptive_agent.broker import Capability, ToolBroker
+from adaptive_agent.environment import EnvironmentRegistry
+from adaptive_agent.models import ToolRequest
+from adaptive_agent.store import Store
+
+
+def _public_root(tmp_path: Path) -> Path:
+    root = tmp_path / "appworld"
+    data = root / "data"
+    (data / "datasets").mkdir(parents=True)
+    (data / "api_docs" / "function_calling").mkdir(parents=True)
+    (data / "api_docs" / "standard").mkdir(parents=True)
+    (data / "tasks" / "train-1").mkdir(parents=True)
+    (data / "base_dbs").mkdir(parents=True)
+    (data / "version.txt").write_text("0.1.0\n")
+    (data / "LICENSE").write_text("public test fixture\n")
+    (data / "base_dbs" / "version.txt").write_text("0.1.0\n")
+    for split in ("train", "dev", "test_normal", "test_challenge"):
+        (data / "datasets" / f"{split}.txt").write_text({"train": "train-1\n", "dev": "dev-1\n", "test_normal": "test-1\n", "test_challenge": "challenge-1\n"}[split])
+    (data / "tasks" / "train-1" / "specs.json").write_text(json.dumps({"instruction": "read the clock", "allowed_apps": ["phone"], "datetime": "2023-05-18T12:00:00", "db_version": "0.1.0"}))
+    (data / "tasks" / "dev-1").mkdir(parents=True)
+    (data / "tasks" / "dev-1" / "specs.json").write_text(json.dumps({"instruction": "read the clock in dev", "allowed_apps": ["phone"], "datetime": "2023-05-18T12:00:00", "db_version": "0.1.0"}))
+    (data / "api_docs" / "function_calling" / "phone.json").write_text(json.dumps([{"type": "function", "function": {"name": "phone__get_current_date_and_time", "description": "Read the current date and time.", "parameters": {"type": "object", "properties": {}}}}]))
+    (data / "api_docs" / "standard" / "phone.json").write_text(json.dumps({"get_current_date_and_time": {"method": "GET"}}))
+    (data / "base_dbs" / "phone.db").write_bytes(b"fixture")
+    return root
+
+
+def test_catalog_reads_exact_public_split_ids_and_seals_test(tmp_path: Path):
+    root = _public_root(tmp_path)
+    catalog = AppWorldCatalog(AppWorldConfig(root, python=sys.executable))
+    assert catalog.split_ids("train") == ("train-1",)
+    assert catalog.runtime_manifest().split_counts == {"train": 1, "dev": 1, "test_normal": 1, "test_challenge": 1}
+    assert catalog.task("train-1", "train").instruction == "read the clock"
+    with pytest.raises(AppWorldError, match="sealed"):
+        catalog.task("test-1", "test_normal")
+
+
+def test_public_hash_excludes_ground_truth(tmp_path: Path):
+    root = _public_root(tmp_path)
+    catalog = AppWorldCatalog(AppWorldConfig(root, python=sys.executable))
+    ground_truth = root / "data" / "tasks" / "train-1" / "ground_truth"
+    ground_truth.mkdir()
+    (ground_truth / "private.json").write_text("one")
+    first = catalog.public_data_hash()
+    (ground_truth / "private.json").write_text("two")
+    assert catalog.public_data_hash() == first
+
+
+def test_manifest_contains_public_tool_schemas(tmp_path: Path):
+    root = _public_root(tmp_path)
+    manifest = build_manifest(AppWorldConfig(root, python=sys.executable))
+    assert manifest.environment_id == "appworld"
+    assert [schema.name for schema in manifest.tool_schemas] == ["phone__get_current_date_and_time"]
+    assert manifest.tool_schemas[0].effect == "read"
+
+
+def test_register_appworld_defaults_to_train_and_dev(tmp_path: Path):
+    root = _public_root(tmp_path)
+    store = Store(tmp_path / "store")
+    registry = EnvironmentRegistry(store)
+    manifest_ref, task_refs = register_appworld(registry, AppWorldConfig(root, python=sys.executable))
+    assert manifest_ref.sha256
+    assert len(task_refs) == 2
+    assert registry.list_tasks_by_partition("appworld", "train")[0].task_id == "train-1"
+    assert registry.list_tasks_by_partition("appworld", "dev")[0].task_id == "dev-1"
+
+
+def test_provider_uses_one_worker_process_and_brokerable_result(tmp_path: Path):
+    root = _public_root(tmp_path)
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        '''import json, sys
+for line in sys.stdin:
+    f = json.loads(line)
+    op = f["operation"]
+    p = f.get("payload", {})
+    if op == "reset":
+        r = {"taskId": p["taskId"]}
+    elif op == "call":
+        r = {"date": "Thursday, May 18, 2023"}
+    elif op == "evaluate":
+        r = {"success": True, "numTests": 1, "passCount": 1, "failCount": 0, "taskCompleted": True}
+    elif op == "close":
+        print(json.dumps({"id": f["id"], "ok": True, "result": {"closed": True}}), flush=True)
+        break
+    else:
+        raise RuntimeError(op)
+    print(json.dumps({"id": f["id"], "ok": True, "result": r}), flush=True)
+'''
+    )
+    config = AppWorldConfig(root, python=sys.executable)
+    task = AppWorldCatalog(config).task("train-1", "train")
+    command = [sys.executable, "-u", str(worker)]
+    with AppWorldProvider(config, task, "run-1", worker_command=command) as provider:
+        first_pid = provider.process_id
+        result = provider.execute("run-1", "phone__get_current_date_and_time", {})
+        assert result.output == {"date": "Thursday, May 18, 2023"}
+        assert provider.effect("phone__get_current_date_and_time") == "read"
+        assert provider.evaluate_aggregate()["success"] is True
+    with AppWorldProvider(config, task, "run-2", worker_command=command) as second:
+        assert second.process_id != first_pid
+
+
+def test_provider_rejects_wrong_run(tmp_path: Path):
+    root = _public_root(tmp_path)
+    worker = tmp_path / "worker.py"
+    worker.write_text("import json,sys\nfor line in sys.stdin:\n f=json.loads(line); print(json.dumps({'id':f['id'],'ok':True,'result':{}}),flush=True)\n")
+    task = AppWorldCatalog(AppWorldConfig(root, python=sys.executable)).task("train-1", "train")
+    with AppWorldProvider(AppWorldConfig(root, python=sys.executable), task, "run-1", worker_command=[sys.executable, "-u", str(worker)]) as provider:
+        with pytest.raises(AppWorldError, match="different run"):
+            provider.execute("run-2", "phone__get_current_date_and_time", {})
+
+
+def test_appworld_call_crosses_authoritative_broker(tmp_path: Path):
+    root = _public_root(tmp_path)
+    config = AppWorldConfig(root, python=sys.executable)
+    task = AppWorldCatalog(config).task("train-1", "train")
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        'import json,sys\n'
+        'for line in sys.stdin:\n'
+        ' f=json.loads(line); op=f["operation"]\n'
+        ' r={"taskId":"train-1"} if op=="reset" else ({"date":"ok"} if op=="call" else ({"closed":True} if op=="close" else {}))\n'
+        ' print(json.dumps({"id":f["id"],"ok":True,"result":r}),flush=True)\n'
+        ' if op=="close": break\n'
+    )
+    store = Store(tmp_path / "store")
+    registry = EnvironmentRegistry(store)
+    registry.register(build_manifest(config))
+    broker = ToolBroker(store, registry)
+    with AppWorldProvider(config, task, "run-1", worker_command=[sys.executable, "-u", str(worker)]) as provider:
+        result = broker.request_tool_call(
+            "appworld",
+            ToolRequest(runId="run-1", stepId="step-1", tool="phone__get_current_date_and_time", arguments={}, idempotencyKey="read-1"),
+            Capability("run-1", "appworld", "phone__get_current_date_and_time", "read"),
+            provider,
+        )
+        assert result.status == "ok"
+        assert result.output == {"date": "ok"}

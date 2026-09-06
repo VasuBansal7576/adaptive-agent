@@ -1,0 +1,609 @@
+"""Optional AppWorld benchmark adapter.
+
+The adapter keeps AppWorld out of the main runtime dependency graph.  A single
+short-lived worker process owns one AppWorld episode; the parent process exposes
+only task instructions, public API schemas, and broker-dispatched API calls.
+Evaluator output is reduced to aggregate fields before it crosses the process
+boundary.  Test splits are never loaded unless an explicit protocol freeze
+allows them.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.metadata
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+from adaptive_agent.broker import ProviderExecutionOutcome, ToolProvider
+from adaptive_agent.evaluation import sha256_json
+from adaptive_agent.models import (
+    ArtifactRef,
+    EnvironmentManifest,
+    TaskInput as DurableTaskInput,
+    ToolSchema,
+)
+
+
+APPWORLD_ENVIRONMENT_ID = "appworld"
+PUBLISHED_APPWORLD_VERSION = "0.1.3.post1"
+_PUBLIC_DATA_FILES = ("data/version.txt", "data/LICENSE", "data/base_dbs/version.txt")
+_ALLOWED_SPLITS = ("train", "dev", "test_normal", "test_challenge")
+_TEST_SPLITS = {"test_normal", "test_challenge"}
+
+
+class AppWorldError(RuntimeError):
+    """Base error for optional AppWorld integration failures."""
+
+
+class AppWorldUnavailable(AppWorldError):
+    """Raised when the isolated AppWorld Python environment is unavailable."""
+
+
+class AppWorldProtocolError(AppWorldError):
+    """Raised when the worker violates the bounded JSON-lines protocol."""
+
+
+@dataclass(frozen=True)
+class AppWorldConfig:
+    root: Path
+    python: str = ""
+    package_version: str = PUBLISHED_APPWORLD_VERSION
+    environment_id: str = APPWORLD_ENVIRONMENT_ID
+    experiment_name: str = "adaptive-agent"
+    timeout_seconds: float = 30.0
+    allow_test: bool = False
+
+    def resolved_python(self) -> str:
+        return self.python.strip() or os.environ.get("APPWORLD_PYTHON", "appworld")
+
+    @property
+    def data_root(self) -> Path:
+        return self.root / "data"
+
+
+@dataclass(frozen=True)
+class AppWorldTask:
+    task_id: str
+    split: str
+    instruction: str
+    allowed_apps: tuple[str, ...]
+    datetime: str
+    db_version: str
+
+    def __post_init__(self) -> None:
+        if self.split not in _ALLOWED_SPLITS:
+            raise AppWorldError(f"unsupported AppWorld split: {self.split}")
+        if not self.task_id or not self.instruction:
+            raise AppWorldError("AppWorld task requires task_id and instruction")
+
+    @property
+    def is_test(self) -> bool:
+        return self.split in _TEST_SPLITS
+
+
+@dataclass(frozen=True)
+class AppWorldRuntimeManifest:
+    """Hash-pinned public runtime metadata written to run artifacts."""
+
+    environment_id: str
+    package_version: str
+    python: str
+    root: str
+    public_data_sha256: str
+    split_counts: Mapping[str, int]
+    split_ids: Mapping[str, tuple[str, ...]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "environmentId": self.environment_id,
+            "benchmark": "AppWorld",
+            "dataClass": "external_published_simulated_benchmark",
+            "packageVersion": self.package_version,
+            "python": self.python,
+            "root": self.root,
+            "publicDataSha256": self.public_data_sha256,
+            "splitCounts": dict(self.split_counts),
+            "splitIds": {name: list(ids) for name, ids in self.split_ids.items()},
+            "testGroundTruthLoaded": False,
+            "taskReportsLoaded": False,
+        }
+
+
+class _JsonLineProcess:
+    """Bounded request/response protocol for one worker process."""
+
+    def __init__(self, command: Sequence[str], env: Mapping[str, str], timeout_seconds: float) -> None:
+        self._timeout = timeout_seconds
+        self._next_id = 0
+        try:
+            self._proc = subprocess.Popen(
+                list(command),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=dict(env),
+            )
+        except OSError as exc:
+            raise AppWorldUnavailable(f"could not start AppWorld worker: {exc}") from exc
+
+    @property
+    def pid(self) -> int:
+        return int(self._proc.pid)
+
+    def request(self, operation: str, payload: Mapping[str, Any] | None = None) -> Any:
+        if self._proc.poll() is not None:
+            stderr = self._proc.stderr.read()[-2000:] if self._proc.stderr is not None else ""
+            raise AppWorldProtocolError(f"AppWorld worker exited ({self._proc.returncode}): {stderr}")
+        if self._proc.stdin is None or self._proc.stdout is None:
+            raise AppWorldProtocolError("AppWorld worker pipes are unavailable")
+        self._next_id += 1
+        request_id = self._next_id
+        frame = {"id": request_id, "operation": operation, "payload": dict(payload or {})}
+        self._proc.stdin.write(json.dumps(frame, separators=(",", ":")) + "\n")
+        self._proc.stdin.flush()
+        deadline = time.monotonic() + self._timeout
+        while True:
+            if time.monotonic() > deadline:
+                self.close(force=True)
+                raise AppWorldProtocolError(f"AppWorld worker timed out during {operation}")
+            line = self._proc.stdout.readline()
+            if not line:
+                stderr = self._proc.stderr.read()[-2000:] if self._proc.stderr is not None else ""
+                raise AppWorldProtocolError(f"AppWorld worker closed during {operation}: {stderr}")
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise AppWorldProtocolError("AppWorld worker emitted invalid JSON") from exc
+            if not isinstance(response, dict) or response.get("id") != request_id:
+                raise AppWorldProtocolError("AppWorld worker response id mismatch")
+            if response.get("ok") is not True:
+                raise AppWorldError(str(response.get("error", "AppWorld worker operation failed")))
+            return response.get("result")
+
+    def close(self, *, force: bool = False) -> None:
+        if self._proc.poll() is not None:
+            return
+        try:
+            if not force and self._proc.stdin is not None:
+                self._next_id += 1
+                self._proc.stdin.write(json.dumps({"id": self._next_id, "operation": "close", "payload": {}}) + "\n")
+                self._proc.stdin.flush()
+                self._proc.stdout.readline() if self._proc.stdout is not None else None
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            if self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait(timeout=2)
+
+
+class AppWorldCatalog:
+    """Read public AppWorld task metadata and API documentation only."""
+
+    def __init__(self, config: AppWorldConfig) -> None:
+        self.config = config
+        self.data_root = config.data_root
+        if not self.data_root.is_dir():
+            raise AppWorldUnavailable(f"AppWorld data directory does not exist: {self.data_root}")
+
+    def split_ids(self, split: str) -> tuple[str, ...]:
+        if split not in _ALLOWED_SPLITS:
+            raise AppWorldError(f"unsupported AppWorld split: {split}")
+        path = self.data_root / "datasets" / f"{split}.txt"
+        if not path.is_file():
+            raise AppWorldUnavailable(f"AppWorld split file is missing: {path}")
+        ids = tuple(line.strip() for line in path.read_text().splitlines() if line.strip())
+        if len(ids) != len(set(ids)):
+            raise AppWorldError(f"duplicate task id in {split} split")
+        return ids
+
+    def task(self, task_id: str, split: str, *, allow_test: bool | None = None) -> AppWorldTask:
+        if split in _TEST_SPLITS and not (self.config.allow_test if allow_test is None else allow_test):
+            raise AppWorldError("test AppWorld tasks are sealed until protocol freeze")
+        if task_id not in set(self.split_ids(split)):
+            raise AppWorldError(f"task {task_id!r} is not in AppWorld {split}")
+        spec_path = self.data_root / "tasks" / task_id / "specs.json"
+        # specs.json is public task instruction metadata.  Ground-truth files
+        # are deliberately never opened by this catalog.
+        try:
+            spec = json.loads(spec_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AppWorldUnavailable(f"invalid AppWorld task spec: {task_id}") from exc
+        if not isinstance(spec, dict):
+            raise AppWorldError("AppWorld task spec must be an object")
+        allowed_apps = spec.get("allowed_apps", spec.get("allowedApps", ()))
+        if not isinstance(allowed_apps, list) or not all(isinstance(item, str) for item in allowed_apps):
+            allowed_apps = []
+        return AppWorldTask(
+            task_id=task_id,
+            split=split,
+            instruction=str(spec.get("instruction", "")),
+            allowed_apps=tuple(allowed_apps),
+            datetime=str(spec.get("datetime", "")),
+            db_version=str(spec.get("db_version", spec.get("dbVersion", ""))),
+        )
+
+    def tasks(self, splits: Iterable[str] = ("train", "dev"), *, allow_test: bool | None = None) -> tuple[AppWorldTask, ...]:
+        result: list[AppWorldTask] = []
+        for split in splits:
+            for task_id in self.split_ids(split):
+                result.append(self.task(task_id, split, allow_test=allow_test))
+        return tuple(result)
+
+    def public_data_hash(self) -> str:
+        """Hash public manifests/docs/specs without opening ground-truth files."""
+        digest = hashlib.sha256()
+        paths: list[Path] = []
+        for relative in _PUBLIC_DATA_FILES:
+            path = self.config.root / relative
+            if path.is_file():
+                paths.append(path)
+        for path in sorted((self.data_root / "datasets").glob("*.txt")):
+            paths.append(path)
+        for path in sorted((self.data_root / "api_docs").rglob("*.json")):
+            paths.append(path)
+        # Task instructions for train/dev are public learner metadata.  Test
+        # task specifications are intentionally excluded from the hash and are
+        # never opened by setup; only their split ID lists are recorded.
+        public_task_ids = set(self.split_ids("train")) | set(self.split_ids("dev"))
+        for path in sorted((self.data_root / "tasks").glob("*/specs.json")):
+            if path.parent.name in public_task_ids:
+                paths.append(path)
+        for path in sorted((self.data_root / "base_dbs").glob("*.db")):
+            paths.append(path)
+        for path in sorted(paths):
+            digest.update(str(path.relative_to(self.config.root)).encode())
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+        return digest.hexdigest()
+
+    def runtime_manifest(self) -> AppWorldRuntimeManifest:
+        split_ids = {split: self.split_ids(split) for split in _ALLOWED_SPLITS}
+        return AppWorldRuntimeManifest(
+            self.config.environment_id,
+            self.config.package_version,
+            self.config.resolved_python(),
+            str(self.config.root),
+            self.public_data_hash(),
+            {name: len(ids) for name, ids in split_ids.items()},
+            split_ids,
+        )
+
+
+def _schema_from_function_doc(doc: Mapping[str, Any], version: str) -> ToolSchema:
+    function = doc.get("function") if isinstance(doc.get("function"), Mapping) else {}
+    name = str(function.get("name", ""))
+    parameters = function.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+    app, _, api = name.partition("__")
+    method = "GET"
+    standard_path = Path(str(doc.get("_standard_path", "")))
+    if standard_path.is_file():
+        try:
+            standard = json.loads(standard_path.read_text())
+            entry = standard.get(api, {}) if isinstance(standard, dict) else {}
+            method = str(entry.get("method", "GET")).upper()
+        except (OSError, json.JSONDecodeError):
+            pass
+    effect = "read" if method in {"GET", "HEAD"} or api.startswith(("show_", "search_", "get_")) else "write"
+    return ToolSchema(name=name, version=version, inputSchema=parameters, outputSchema={"type": "object"}, effect=effect)
+
+
+def public_tool_schemas(config: AppWorldConfig) -> tuple[ToolSchema, ...]:
+    docs_root = config.data_root / "api_docs" / "function_calling"
+    standard_root = config.data_root / "api_docs" / "standard"
+    schemas: list[ToolSchema] = []
+    for path in sorted(docs_root.glob("*.json")):
+        try:
+            entries = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AppWorldUnavailable(f"invalid AppWorld API docs: {path}") from exc
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            enriched = dict(entry)
+            name = entry.get("function", {}).get("name", "") if isinstance(entry.get("function"), dict) else ""
+            api = str(name).split("__", 1)[-1]
+            enriched["_standard_path"] = str(standard_root / path.name)
+            schema = _schema_from_function_doc(enriched, config.package_version)
+            if schema.name and schema.name not in {item.name for item in schemas}:
+                schemas.append(schema)
+    if not schemas:
+        raise AppWorldUnavailable("AppWorld API documentation contains no callable schemas")
+    return tuple(schemas)
+
+
+def build_manifest(config: AppWorldConfig) -> EnvironmentManifest:
+    catalog = AppWorldCatalog(config)
+    data_hash = catalog.public_data_hash()
+    ref = lambda name: ArtifactRef(id=name, version=config.package_version, sha256=sha256_json({"name": name, "version": config.package_version, "data": data_hash}))
+    docs_ref = ref("appworld-api-docs")
+    return EnvironmentManifest(
+        environmentId=config.environment_id,
+        version=config.package_version,
+        docs=[docs_ref],
+        toolSchemas=list(public_tool_schemas(config)),
+        policyRef=ref("appworld-policy"),
+        evaluatorRef=ref("appworld-evaluator"),
+        resetRef=ref("appworld-reset"),
+        executionModes=["interactive", "batch", "replay"],
+        capabilities=["appworld", "public_api_docs", "supervisor_completion", "aggregate_evaluation"],
+    )
+
+
+def register_appworld(registry: Any, config: AppWorldConfig, splits: Iterable[str] = ("train", "dev")) -> tuple[ArtifactRef, tuple[ArtifactRef, ...]]:
+    """Register public AppWorld task metadata, defaulting to train and dev."""
+    manifest = build_manifest(config)
+    manifest_ref = registry.register(manifest)
+    environment_ref = ArtifactRef(
+        id=config.environment_id,
+        version=config.package_version,
+        sha256=sha256_json(manifest.model_dump(mode="json", by_alias=True)),
+    )
+    task_refs: list[ArtifactRef] = []
+    for task in AppWorldCatalog(config).tasks(splits):
+        durable_task = DurableTaskInput(
+            taskId=task.task_id,
+            environmentRef=environment_ref,
+            goal=task.instruction,
+            allowedInputRefs=[],
+            partition=task.split,
+        )
+        task_refs.append(registry.register_task(durable_task))
+    return manifest_ref, tuple(task_refs)
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(item) for item in value]
+    for method in ("model_dump", "to_dict"):
+        fn = getattr(value, method, None)
+        if callable(fn):
+            try:
+                return _jsonable(fn())
+            except TypeError:
+                continue
+    return str(value)
+
+
+def _worker_main(root: Path) -> int:
+    """Run AppWorld in a process that is never imported by the main runtime."""
+    try:
+        from appworld.environment import AppWorld  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise SystemExit(f"AppWorld package is unavailable: {exc}")
+    world: Any | None = None
+    for raw in sys.stdin:
+        try:
+            frame = json.loads(raw)
+            if not isinstance(frame, dict) or not isinstance(frame.get("id"), int):
+                raise AppWorldProtocolError("request frame requires integer id")
+            operation = frame.get("operation")
+            payload = frame.get("payload") or {}
+            if not isinstance(payload, dict):
+                raise AppWorldProtocolError("request payload must be an object")
+            if operation == "reset":
+                if world is not None:
+                    world.close()
+                task_id = str(payload["taskId"])
+                world = AppWorld(
+                    task_id,
+                    experiment_name=str(payload.get("experimentName", "adaptive-agent")),
+                    random_seed=int(payload.get("seed", 0)),
+                    load_ground_truth=True,
+                    ground_truth_mode="minimal",
+                    raise_on_failure=False,
+                    show_api_response_schemas=False,
+                )
+                result = {
+                    "taskId": task_id,
+                    "instruction": str(world.task.instruction),
+                    "allowedApps": list(getattr(world.task, "allowed_apps", ())),
+                }
+            elif operation == "call":
+                if world is None:
+                    raise AppWorldProtocolError("worker has not been reset")
+                tool = str(payload["tool"])
+                app, sep, api = tool.partition("__")
+                if not sep or not app or not api or app.startswith("_") or api.startswith("_"):
+                    raise AppWorldProtocolError("invalid AppWorld API name")
+                app_obj = getattr(world.apis, app, None)
+                fn = getattr(app_obj, api, None) if app_obj is not None else None
+                if not callable(fn):
+                    raise AppWorldProtocolError(f"unknown AppWorld API: {tool}")
+                arguments = payload.get("arguments", {})
+                if not isinstance(arguments, dict):
+                    raise AppWorldProtocolError("API arguments must be an object")
+                result = _jsonable(fn(**arguments))
+            elif operation == "evaluate":
+                if world is None:
+                    raise AppWorldProtocolError("worker has not been reset")
+                tracker = world.evaluate()
+                result = {
+                    "success": bool(getattr(tracker, "success", False)),
+                    "numTests": int(getattr(tracker, "num_tests", 0) or 0),
+                    "passCount": int(getattr(tracker, "pass_count", 0) or 0),
+                    "failCount": int(getattr(tracker, "fail_count", 0) or 0),
+                    "taskCompleted": bool(world.task_completed()),
+                }
+            elif operation == "close":
+                if world is not None:
+                    world.close()
+                response = {"id": frame["id"], "ok": True, "result": {"closed": True}}
+                print(json.dumps(response, separators=(",", ":")), flush=True)
+                return 0
+            else:
+                raise AppWorldProtocolError(f"unknown worker operation: {operation}")
+            response = {"id": frame["id"], "ok": True, "result": result}
+        except Exception as exc:
+            response = {"id": frame.get("id"), "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        print(json.dumps(response, separators=(",", ":")), flush=True)
+    if world is not None:
+        world.close()
+    return 0
+
+
+class AppWorldProvider(ToolProvider):
+    """Broker provider backed by one isolated AppWorld episode."""
+
+    def __init__(self, config: AppWorldConfig, task: AppWorldTask, run_id: str, seed: int = 0, *, worker_command: Sequence[str] | None = None) -> None:
+        if task.is_test and not config.allow_test:
+            raise AppWorldError("test AppWorld tasks are sealed until protocol freeze")
+        self.config = config
+        self.task = task
+        self.run_id = run_id
+        self.seed = seed
+        self._schemas = {schema.name: schema for schema in public_tool_schemas(config)}
+        worker_script = Path(__file__).with_name("appworld_worker.py")
+        launcher = "import runpy,sys; script=sys.argv[1]; root=sys.argv[2]; sys.argv=[script, '--root', root]; runpy.run_path(script, run_name='__main__')"
+        command = list(worker_command or [config.resolved_python(), "-u", "-c", launcher, str(worker_script), str(config.root)])
+        env = os.environ.copy()
+        # The worker is a standalone script.  In particular, do not expose
+        # this checkout's ``adaptive_agent`` package to AppWorld's pinned
+        # Pydantic 1.x environment; the main runtime uses Pydantic 2.x.
+        env.pop("PYTHONPATH", None)
+        env["APPWORLD_ROOT"] = str(config.root)
+        self._process = _JsonLineProcess(command, env, config.timeout_seconds)
+        try:
+            reset = self._process.request("reset", {"taskId": task.task_id, "seed": seed, "experimentName": config.experiment_name})
+        except Exception:
+            self._process.close(force=True)
+            raise
+        self._reset = reset if isinstance(reset, dict) else {}
+        reset_apps = self._reset.get("allowedApps") if isinstance(self._reset, dict) else None
+        self._allowed_apps = {item for item in reset_apps if isinstance(item, str)} if isinstance(reset_apps, list) else set(task.allowed_apps)
+
+    @property
+    def process_id(self) -> int:
+        return self._process.pid
+
+    def public_context(self) -> dict[str, Any]:
+        allowed_apps = self._reset.get("allowedApps") if isinstance(self._reset, dict) else None
+        if not isinstance(allowed_apps, list):
+            allowed_apps = list(self.task.allowed_apps)
+        schemas = [schema for schema in self._schemas.values() if not self._allowed_apps or schema.name.split("__", 1)[0] in self._allowed_apps or schema.name.split("__", 1)[0] in {"api_docs", "supervisor"}]
+        return {
+            "taskId": self.task.task_id,
+            "split": self.task.split,
+            "instruction": self.task.instruction,
+            "allowedApps": [item for item in allowed_apps if isinstance(item, str)],
+            "apiSchemas": [schema.model_dump(mode="json", by_alias=True) for schema in schemas],
+        }
+
+    def execute(self, run_id: str, tool: str, arguments: dict[str, Any]) -> ProviderExecutionOutcome:
+        if run_id != self.run_id:
+            raise AppWorldError("provider is bound to a different run")
+        schema = self._schemas.get(tool)
+        if schema is None:
+            raise AppWorldError(f"unknown AppWorld API: {tool}")
+        app = tool.split("__", 1)[0]
+        if self._allowed_apps and app not in self._allowed_apps and app not in {"api_docs", "supervisor"}:
+            raise AppWorldError(f"AppWorld API app is not allowed for task: {app}")
+        result = self._process.request("call", {"tool": tool, "arguments": dict(arguments)})
+        return ProviderExecutionOutcome(output=result if isinstance(result, dict) else {"value": result}, effect="confirmed" if schema.effect == "write" else "none")
+
+    def effect(self, tool: str) -> str:
+        schema = self._schemas.get(tool)
+        if schema is None:
+            raise AppWorldError(f"unknown AppWorld API: {tool}")
+        return schema.effect
+
+    def version(self, tool: str) -> str:
+        schema = self._schemas.get(tool)
+        if schema is None:
+            raise AppWorldError(f"unknown AppWorld API: {tool}")
+        return schema.version
+
+    def evaluate_aggregate(self) -> dict[str, Any]:
+        result = self._process.request("evaluate")
+        if not isinstance(result, dict):
+            raise AppWorldProtocolError("AppWorld evaluator returned a non-object")
+        return {key: result[key] for key in ("success", "numTests", "passCount", "failCount", "taskCompleted") if key in result}
+
+    def close(self) -> None:
+        self._process.close()
+
+    def __enter__(self) -> "AppWorldProvider":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+
+def setup_manifest(config: AppWorldConfig, output: Path | None = None) -> dict[str, Any]:
+    """Verify the isolated package and write a public run manifest."""
+    python = config.resolved_python()
+    probe = subprocess.run([python, "-c", "import importlib.metadata as m; print(m.version('appworld'))"], text=True, capture_output=True, check=False)
+    if probe.returncode != 0:
+        raise AppWorldUnavailable(f"AppWorld Python cannot import appworld: {probe.stderr.strip()}")
+    installed = probe.stdout.strip()
+    if installed != config.package_version:
+        raise AppWorldUnavailable(f"AppWorld version mismatch: expected {config.package_version}, got {installed}")
+    manifest = AppWorldCatalog(config).runtime_manifest().to_dict()
+    manifest["installedVersion"] = installed
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return manifest
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Optional AppWorld adapter setup and worker")
+    sub = parser.add_subparsers(dest="command", required=True)
+    setup = sub.add_parser("setup", help="verify isolated AppWorld and write a public manifest")
+    setup.add_argument("--root", required=True)
+    setup.add_argument("--python", default="")
+    setup.add_argument("--package-version", default=PUBLISHED_APPWORLD_VERSION)
+    setup.add_argument("--output", default="")
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    if raw_argv and raw_argv[0] == "--worker":
+        worker_parser = argparse.ArgumentParser(description="AppWorld worker protocol")
+        worker_parser.add_argument("--worker", action="store_true")
+        worker_parser.add_argument("--root", required=True)
+        worker_args = worker_parser.parse_args(raw_argv)
+        return _worker_main(Path(worker_args.root))
+    args = parser.parse_args(raw_argv)
+    config = AppWorldConfig(Path(args.root), python=args.python, package_version=args.package_version)
+    manifest = setup_manifest(config, Path(args.output) if args.output else None)
+    print(json.dumps(manifest, indent=2, sort_keys=True))
+    return 0
+
+
+__all__ = [
+    "APPWORLD_ENVIRONMENT_ID",
+    "PUBLISHED_APPWORLD_VERSION",
+    "AppWorldCatalog",
+    "AppWorldConfig",
+    "AppWorldError",
+    "AppWorldProvider",
+    "AppWorldRuntimeManifest",
+    "AppWorldTask",
+    "AppWorldUnavailable",
+    "build_manifest",
+    "main",
+    "public_tool_schemas",
+    "register_appworld",
+    "setup_manifest",
+]
+
+if __name__ == "__main__":
+    raise SystemExit(main())
