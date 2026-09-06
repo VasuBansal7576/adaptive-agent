@@ -64,7 +64,9 @@ class DurableEvaluatorStoreTests(unittest.TestCase):
             self.assertIsNotNone(canonical_outcome)
             self.assertEqual(canonical_outcome["visibility"], "operator")
             learner_evidence = store.list_learning_evidence(environment_id="finance", run_id=run_id)
-            self.assertFalse(any(item.get("sourceId") == "outcome-1" for item in learner_evidence))
+            self.assertFalse(
+                any(item.get("sourceId") == "outcome-1" or item.get("evidence_id") == "outcome-1" for item in learner_evidence)
+            )
             nominal_accounting = store.put_artifact({
                 "responseId": response_id,
                 "runId": run_id,
