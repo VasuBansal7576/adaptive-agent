@@ -161,7 +161,10 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
         }
       },
       onState: (connection) => {
-        if (connection !== "closed") dispatch({ type: "connection", state: connection });
+        // record every state the transport reports, including a genuine
+        // terminal closed (EOF after a terminal run); teardown cleanup no
+        // longer emits closed, so nothing is mislabeled
+        dispatch({ type: "connection", state: connection });
       },
     });
     closeStreamRef.current = close;

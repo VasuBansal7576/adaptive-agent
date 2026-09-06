@@ -380,10 +380,11 @@ export function createRestTransport(baseUrl: string = defaultApiBase()): Console
         .catch(() => onState("disconnected"));
 
       return () => {
+        // cleanup is NOT an EOF event: emit no connection state so the app can
+        // distinguish operator/unmount teardown from a genuine terminal close
         closed = true;
         if (retryTimer) clearTimeout(retryTimer);
         es?.close();
-        onState("closed");
       };
     },
 
