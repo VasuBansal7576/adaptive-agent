@@ -1257,6 +1257,29 @@ class DurableRuntime:
         now = time.monotonic()
         started = self._run_started_at.get(run_id, now)
         previous_receipt = self._run_last_receipt_at.get(run_id, started)
+        # Rehydrate the immutable receipt ledger when a runtime process is
+        # restarted.  A process-local cache alone would undercount failed
+        # model calls and charge only the final resumed response.
+        if run_id not in self._run_receipts:
+            restored_by_id: dict[str, dict[str, Any]] = {}
+            for row in self.controller.store.list_evidence(run_id):
+                if row.get("event_type") != "model_response":
+                    continue
+                try:
+                    source = json.loads(row.get("source_ref", "{}"))
+                    artifact = self.controller.store.get_artifact(source["sha256"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                prior = artifact.get("receipts") if isinstance(artifact, Mapping) else None
+                if isinstance(prior, list):
+                    for item in prior:
+                        if not isinstance(item, Mapping):
+                            continue
+                        receipt_id = item.get("responseId")
+                        if isinstance(receipt_id, str) and receipt_id:
+                            restored_by_id[receipt_id] = dict(item)
+            self._run_receipts[run_id] = list(restored_by_id.values())
+        existing_receipt_ids = {item.get("responseId") for item in self._run_receipts[run_id]}
         for index, raw in enumerate(receipts_input):
             if not isinstance(raw, Mapping):
                 raise ValueError("model accounting receipt must be an object")
@@ -1304,7 +1327,9 @@ class DurableRuntime:
                 receipt_economic_status = "unknown" if cost_value is None else "measured"
             receipts.append({"responseId": receipt_id, "usage": receipt_usage, "durationSeconds": float(duration_value), "status": str(raw.get("status", "complete")), "economicCostStatus": receipt_economic_status, **({"costMicrounits": cost_value} if cost_value is not None else {}), **({"nominalCostUsd": float(nominal_value)} if nominal_value is not None else {})})
         self._run_last_receipt_at[run_id] = now
-        self._run_receipts.setdefault(run_id, []).extend(receipts)
+        self._run_receipts.setdefault(run_id, []).extend(
+            item for item in receipts if item.get("responseId") not in existing_receipt_ids
+        )
         all_receipts = list(self._run_receipts.get(run_id, ()))
         aggregate = {"inputTokens": sum(item["usage"]["inputTokens"] for item in all_receipts), "outputTokens": sum(item["usage"]["outputTokens"] for item in all_receipts), "totalTokens": sum(item["usage"]["totalTokens"] for item in all_receipts)}
         for key in cache_keys:
@@ -1443,6 +1468,20 @@ class DurableRuntime:
             kwargs["claimed"] = True
         result = execute(run_id, env_id, provider, driver, **kwargs)
         if "evaluate" in parameters:
+            # Controller.execute_run deliberately absorbs driver exceptions and
+            # leaves the run terminally failed.  Reconcile that terminal
+            # attempt through the evaluator seam when any model evidence was
+            # recorded, so measured objective failure remains scoreable and
+            # failed model usage stays attached to the last response.
+            current = self.controller.get_run(run_id)
+            if current is not None and current.status == RunStatus.failed:
+                try:
+                    self._record_evaluated_outcome(run_id, evaluate())
+                except Exception:
+                    # No model receipt means this is an infrastructure failure
+                    # with missing evidence; the caller must not fabricate an
+                    # observation or trusted outcome.
+                    pass
             return result
 
         # The canonical core marks a completed driver run succeeded.  Apply
@@ -1721,7 +1760,7 @@ class DurableRuntime:
         def evaluate() -> DurableOutcome:
             result = driver.result
             if result is None or result.status != "succeeded":
-                return DurableOutcome(runId=run_id, passed=False, metadata={"status": result.status if result else "planner_failed"})
+                return DurableOutcome(runId=run_id, passed=False, metadata={"status": result.status if result else "planner_failed", "arm": arm, "seed": seed, "bundleHash": bundle_hash, "goal": task.goal})
             if runtime.evaluator is not None:
                 evaluated = runtime._invoke_evaluator(
                     run_id=run_id,
