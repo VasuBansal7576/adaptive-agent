@@ -147,7 +147,10 @@ class ResumableEvaluationDriver:
         # Claims and receipt writes remain the serialization boundary. Workers
         # only overlap independent cells, and each cell is independently
         # resumable after a crash or provider failure.
-        worker_count = min(max(1, self.protocol.concurrency_limit), max(1, len(cells)))
+        frozen_concurrency = frozen.inputs.get("concurrencyLimit", self.protocol.concurrency_limit)
+        if isinstance(frozen_concurrency, bool) or not isinstance(frozen_concurrency, int) or frozen_concurrency < 1:
+            raise EvaluationError("frozen protocol has an invalid concurrency limit")
+        worker_count = min(frozen_concurrency, max(1, len(cells)))
         if worker_count == 1:
             # Keep interruption behavior deterministic when concurrency is
             # disabled. A thread pool may start the next queued cell before
