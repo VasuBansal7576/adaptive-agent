@@ -82,6 +82,22 @@ class EvaluationTests(unittest.TestCase):
     self.assertTrue(any("conditional" in family for family in packages["customer_support"].task_families(Partition.FINAL)))
     self.assertTrue(any("history" in family for family in packages["it"].task_families(Partition.VALIDATION)))
 
+  def test_public_objective_matches_every_scored_record_across_domain_splits(self):
+    packages = build_environment_packages()
+    for environment_id in ("finance", "customer_support", "it"):
+        package = packages[environment_id]
+        for partition in Partition:
+            tasks = package.tasks_for_partition(partition)
+            self.assertEqual(len(tasks), 60 if partition is Partition.VALIDATION else 20)
+            for task in tasks:
+                session = package.reset(task.task_id, 1)
+                spec_state = session.state
+                self.assertTrue(all(key in spec_state for key in package._specs[task.task_id].target))
+                self.assertTrue(all(ref in task.goal for ref in task.allowed_input_refs), (environment_id, partition, task.task_id, task.goal, task.allowed_input_refs))
+                if partition is Partition.FINAL:
+                    self.assertIn("leave decoy", task.goal)
+                    self.assertGreaterEqual(len(package.task_families(partition)), 3)
+
   def test_fixture_reads_return_authoritative_records_and_versions(self):
     packages = build_environment_packages()
     finance = packages["finance"]
