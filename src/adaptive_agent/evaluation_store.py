@@ -183,11 +183,15 @@ class SQLiteRunEvidenceStore:
                     calculated[key] += usage[key]
             if aggregate_usage != calculated:
                 return False
-        if sha256_json(response) != evidence.get("content_hash"):
+        if sha256_json(response) != evidence.get("content_hash") or source_ref.get("sha256") != evidence.get("content_hash"):
             return False
-        if response.get("responseId") != observation.response_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response" or outcome_evidence.get("run_id") != observation.run_id or outcome_evidence.get("event_type") != "trusted_outcome":
+        if sha256_json(accounting) != observation.accounting_ref or sha256_json(outcome) != outcome_source.get("sha256") or outcome_source.get("sha256") != outcome_evidence.get("content_hash"):
             return False
-        if evidence.get("visibility") != "operator" or outcome_evidence.get("visibility") != "operator":
+        if response.get("responseId") != observation.response_id or response.get("runId") != observation.run_id or response.get("taskId") != observation.task_id or response.get("environmentId") != observation.environment_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response" or outcome_evidence.get("run_id") != observation.run_id or outcome_evidence.get("event_type") != "trusted_outcome":
+            return False
+        if evidence.get("trust_class") not in {"broker", "system"} or outcome_evidence.get("trust_class") != "evaluator":
+            return False
+        if evidence.get("visibility") not in {"operator", "evaluator_only"} or outcome_evidence.get("visibility") not in {"operator", "evaluator_only"}:
             return False
         if evidence.get("eventType") not in (None, "model_response") or outcome_evidence.get("eventType") not in (None, "trusted_outcome"):
             return False
@@ -197,12 +201,12 @@ class SQLiteRunEvidenceStore:
             return False
         if accounting.get("responseId") != observation.response_id or accounting.get("runId") != observation.run_id or accounting.get("taskId") != observation.task_id or accounting.get("environmentId") != observation.environment_id:
             return False
-        if accounting.get("arm") != observation.arm.value or accounting.get("seed") != observation.seed or accounting.get("bundleHash") != bundle["content_hash"]:
+        if accounting.get("arm") != observation.arm.value or accounting.get("seed") != observation.seed or accounting.get("bundleHash") != bundle["content_hash"] or run_payload.get("bundleHash") != accounting.get("bundleHash"):
             return False
         if observation.bundle_hash != accounting["bundleHash"]:
             return False
-        expected_bundles = run_payload.get("armBundles") or run_payload.get("bundlesByArm") or {}
-        if expected_bundles and expected_bundles.get(observation.arm.value) != accounting["bundleHash"]:
+        expected_bundles = run_payload.get("armBundles") or run_payload.get("bundlesByArm")
+        if not isinstance(expected_bundles, dict) or expected_bundles.get(observation.arm.value) != accounting["bundleHash"]:
             return False
         if response.get("arm") != accounting["arm"] or response.get("seed") != accounting["seed"] or response.get("bundleHash") != accounting["bundleHash"]:
             return False
