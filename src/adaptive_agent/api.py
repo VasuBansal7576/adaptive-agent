@@ -347,6 +347,10 @@ class ControlPlane:
         for kind, reference in (("model", self.default_model_ref), ("budget", self.default_budget_ref)):
             if isinstance(reference, Mapping) and all(isinstance(reference.get(key), str) and reference.get(key) for key in ("id", "version", "sha256")):
                 self._trusted_refs[kind].add(tuple(reference[key] for key in ("id", "version", "sha256")))
+                # Preserve the original identifier-derived fixture reference
+                # for clients that have not yet switched to /run-options.
+                if reference["id"] in {"model-profile", "budget-default"}:
+                    self._trusted_refs[kind].add((reference["id"], reference["version"], _hash(reference["id"])))
 
     def trust_reference(self, kind: str, reference: Mapping[str, Any]) -> None:
         """Register a fully addressed trusted artifact/profile for this process."""
