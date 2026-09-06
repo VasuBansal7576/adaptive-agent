@@ -1705,15 +1705,19 @@ class DurableRuntime:
                 return trusted_result
         return self.controller.record_outcome(run_id, outcome.passed, score=outcome.score, metadata=outcome.metadata)
 
-    def _prepare_launch_identity(self, run_id: str, stored: Mapping[str, Any], run_record: Any, arm: str, seed: int, bundle_hash: str | None) -> tuple[str, int, str]:
-        """Bind ordinary launches to the persisted immutable run bundle."""
+    def _resolve_launch_identity(self, stored: Mapping[str, Any], run_record: Any, arm: str, seed: int, bundle_hash: str | None) -> tuple[str, int, str]:
+        """Resolve launch identity without mutating the durable run row."""
         try:
             artifact = self.controller.store.get_artifact(run_record.skill_bundle_ref)
             from adaptive_agent.models import SkillBundle
             pinned_bundle = SkillBundle.model_validate(artifact)
         except (KeyError, TypeError, ValueError) as exc:
             raise LearningRuntimeError("run skill bundle is missing or malformed") from exc
-        pinned_hash = pinned_bundle.content_hash
+        bundle_payload = pinned_bundle.model_dump(mode="json", by_alias=True, exclude={"content_hash"})
+        pinned_hash = sha256_json(bundle_payload)
+        supplied_hash = artifact.get("contentHash", artifact.get("content_hash")) if isinstance(artifact, Mapping) else None
+        if not isinstance(supplied_hash, str) or supplied_hash != pinned_hash:
+            raise LearningRuntimeError("pinned skill bundle hash does not match its persisted content")
         if stored.get("bundle_hash") != pinned_hash:
             raise LearningRuntimeError("run skill bundle hash does not match its persisted content")
         if bundle_hash is not None and bundle_hash != pinned_hash:
@@ -1724,16 +1728,40 @@ class DurableRuntime:
             raise LearningRuntimeError("run identity is malformed") from exc
         if not isinstance(payload, dict):
             raise LearningRuntimeError("run identity is malformed")
-        if arm == "B0" and isinstance(payload.get("arm"), str):
-            arm = payload["arm"]
-        if seed == 0 and isinstance(payload.get("seed"), int) and not isinstance(payload.get("seed"), bool):
-            seed = payload["seed"]
-        resolved_hash = bundle_hash or pinned_hash
-        payload.update({"arm": arm, "seed": seed, "bundleHash": resolved_hash})
+        persisted_arm = payload.get("arm")
+        if persisted_arm is not None and persisted_arm not in {"B0", "L", "A"}:
+            raise LearningRuntimeError("persisted launch arm is invalid")
+        if persisted_arm is not None and arm != "B0" and arm != persisted_arm:
+            raise LearningRuntimeError("launch arm conflicts with persisted run identity")
+        if isinstance(persisted_arm, str) and arm == "B0":
+            arm = persisted_arm
+        persisted_seed = payload.get("seed")
+        if persisted_seed is not None and (not isinstance(persisted_seed, int) or isinstance(persisted_seed, bool)):
+            raise LearningRuntimeError("persisted launch seed is invalid")
+        if persisted_seed is not None and seed != 0 and seed != persisted_seed:
+            raise LearningRuntimeError("launch seed conflicts with persisted run identity")
+        if isinstance(persisted_seed, int) and seed == 0:
+            seed = persisted_seed
+        persisted_hash = payload.get("bundleHash")
+        if persisted_hash is not None and persisted_hash != pinned_hash:
+            raise LearningRuntimeError("persisted launch bundle hash does not match the run bundle")
+        if bundle_hash is not None and persisted_hash is not None and bundle_hash != persisted_hash:
+            raise LearningRuntimeError("launch bundle hash conflicts with persisted run identity")
+        resolved_hash = persisted_hash or bundle_hash or pinned_hash
+        return arm, seed, resolved_hash
+
+    def _bind_launch_identity(self, run_id: str, stored: Mapping[str, Any], arm: str, seed: int, bundle_hash: str) -> None:
+        """Bind resolved launch identity after this caller successfully claims."""
+        try:
+            payload = json.loads(stored.get("run_json", "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LearningRuntimeError("run identity is malformed") from exc
+        if not isinstance(payload, dict):
+            raise LearningRuntimeError("run identity is malformed")
+        payload.update({"arm": arm, "seed": seed, "bundleHash": bundle_hash})
         row = dict(stored)
         row["run_json"] = json.dumps(payload, sort_keys=True)
         self.controller.store.save_run(run_id, {key: value for key, value in row.items() if key != "run_id"})
-        return arm, seed, resolved_hash
 
     def _bind_terminal_accounting(self, run_id: str, execution_started: float) -> None:
         """Persist one terminal receipt for ordinary runtime launches."""
@@ -1873,13 +1901,19 @@ class DurableRuntime:
             max_cost = int(budget_data.get("costMicrounits", 100000))
             if max_tokens <= 0 or max_cost <= 0 or wall_seconds <= 0:
                 raise RuntimeError("model, cost, and wall-time budgets must be positive before dispatch")
-        arm, seed, bundle_hash = self._prepare_launch_identity(run_id, stored, run_record, arm, seed, bundle_hash)
+        arm, seed, bundle_hash = self._resolve_launch_identity(stored, run_record, arm, seed, bundle_hash)
         execution_started = time.monotonic()
         claimed, current = self._claim_run(run_id)
         if current is None:
             raise KeyError("run not found")
         if not claimed:
             return
+        latest_stored = self.controller.store.get_run(run_id)
+        latest_record = self.controller.get_run(run_id)
+        if latest_stored is None or latest_record is None:
+            raise KeyError("run not found after claim")
+        arm, seed, bundle_hash = self._resolve_launch_identity(latest_stored, latest_record, arm, seed, bundle_hash)
+        self._bind_launch_identity(run_id, latest_stored, arm, seed, bundle_hash)
         self._run_started_at[run_id] = time.monotonic()
         self._run_last_receipt_at[run_id] = self._run_started_at[run_id]
         cancel = self._cancel_events.setdefault(run_id, threading.Event())
