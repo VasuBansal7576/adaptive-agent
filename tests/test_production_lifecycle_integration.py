@@ -182,7 +182,7 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
 
     from fastapi.testclient import TestClient
 
-    api = TestClient(app)
+    api = TestClient(app, base_url="http://127.0.0.1")
     assert api.get("/session/bootstrap").status_code == 200
     published_before_restart = api.get("/evaluations")
     assert published_before_restart.status_code == 200
@@ -210,7 +210,7 @@ def test_full_production_lifecycle_is_durable_and_restartable(tmp_path, monkeypa
     first_calls = task_model.turn
     restarted_app = create_runtime_app(data_dir=tmp_path, model_runner=task_model, learning_model_client=learning_model, evaluator=trusted_evaluator)
     restarted = restarted_app.state.durable_runtime
-    restarted_api = TestClient(restarted_app)
+    restarted_api = TestClient(restarted_app, base_url="http://127.0.0.1")
     assert restarted_api.get("/session/bootstrap").status_code == 200
     published_after_restart = restarted_api.get("/evaluations")
     assert published_after_restart.status_code == 200
