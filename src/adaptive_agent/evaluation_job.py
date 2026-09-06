@@ -616,7 +616,7 @@ class EvaluationJob:
             expected_partitions=frozen.partition_hashes,
             ablation_audit=ablation_audit,
         )
-        if not isinstance(report, EvaluationReport):
+        if not callable(getattr(report, "to_dict", None)):
             raise EvaluationError("durable evaluator returned a malformed lifecycle report")
         return report
 
