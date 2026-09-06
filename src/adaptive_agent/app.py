@@ -23,7 +23,7 @@ from adaptive_agent.broker import Capability, ToolBroker, ToolProvider
 from adaptive_agent.controller import Controller
 from adaptive_agent.environment import EnvironmentRegistry
 from adaptive_agent.evaluation import build_environment_packages, sha256_json, FixtureSession, Outcome as FixtureOutcome
-from adaptive_agent.learning import LearningService
+from adaptive_agent.learning import LearningService, PlannerLearningAdapter
 from adaptive_agent.learning_store import DurableLearningSourceAdapter, CandidateManagerLearningAdapter, LearningStoreError
 from adaptive_agent.planner import PrimeCliModelClient, LunaPlanner, PlannerResult, PlannerLimits
 from adaptive_agent.prime_runtime import Capability as PrimeCapability, CapabilityBroker, PrimeRuntimeAdapter, PrimeRuntimeConfig
@@ -204,8 +204,6 @@ class DurableRuntime:
         return decision.model_dump(mode="json", by_alias=True)
 
     def launch_learning(self, payload: Any) -> dict[str, Any]:
-        if self.model_runner is None:
-            raise RuntimeError("authenticated model runner is not configured")
         stored = self.controller.store.get_run(payload.run_id)
         run = self.controller.get_run(payload.run_id)
         if stored is None or run is None:
@@ -217,9 +215,17 @@ class DurableRuntime:
         source = DurableLearningSourceAdapter(self.controller.store)
         candidate_sink = CandidateManagerLearningAdapter(self.controller.store, self.controller.candidates, proposal_type=__import__("adaptive_agent.models", fromlist=["CandidateProposal"]).CandidateProposal, bundle_type=__import__("adaptive_agent.models", fromlist=["SkillBundle"]).SkillBundle, skill_type=__import__("adaptive_agent.models", fromlist=["SkillVersion"]).SkillVersion)
         model_runner = self.model_runner
+        records_directly = model_runner is not None
+        if model_runner is None:
+            runtime = self
+            class LearningSink:
+                def record_model_observation(self, evidence: Mapping[str, Any], *, trusted_parent: bool = False) -> Any:
+                    return runtime._record_model_response(payload.run_id, package, evidence)
+            model_runner = PlannerLearningAdapter(PrimeCliModelClient(coding_agent_dir=os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")), LearningSink())
         def learning_runner(**kwargs: Any) -> Any:
             invocation = model_runner(**kwargs)
-            self._record_model_response(payload.run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)})
+            if records_directly:
+                self._record_model_response(payload.run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage)})
             return invocation
         service = LearningService(source.retriever(environment_id=stored["environment_id"], run_id=payload.run_id), learning_runner, candidate_sink, lambda: self.controller.candidates.get_active_bundle().content_hash if self.controller.candidates.get_active_bundle() else "")
         proposal = service.propose(run_id=payload.run_id, environment_id=stored["environment_id"], goal=task.goal, environment=self._planner_environment(package, payload.run_id), feedback={"status": run.status.value}, emit=lambda kind, summary, detail=None: self.controller.append_event(payload.run_id, kind, {"summary": summary, "detail": detail}, "learner", "operator"))
