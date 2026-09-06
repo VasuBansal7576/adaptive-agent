@@ -922,7 +922,12 @@ class Store:
         # Older runtime versions persisted tool-result evidence without a
         # prepared-call row. Preserve that history as a minimal safe record.
         for event in self.list_evidence(run_id):
-            if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker" or event.get("visibility") not in {"learner", "operator"}:
+            # An unjoined operator row is raw broker fidelity, not a learner
+            # projection.  Only a learner-visible event may use this legacy
+            # fallback; prepared calls above can still derive a safe row from
+            # their persisted result while retaining the operator evidence
+            # solely for provenance.
+            if event.get("event_type") != "tool_result" or event.get("trust_class") != "broker" or event.get("visibility") != "learner":
                 continue
             try:
                 ref = json.loads(event["source_ref"])
