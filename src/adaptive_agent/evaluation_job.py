@@ -201,13 +201,45 @@ class EvaluationJob:
         if charged_ids:
             if not isinstance(charged_ids, (list, tuple)) or not all(isinstance(value, str) and value for value in charged_ids):
                 raise EvaluationError("charged subcall IDs are malformed")
+            if len(charged_ids) != len(set(charged_ids)):
+                raise EvaluationError("charged subcall IDs must be unique")
             with self.store.connect() as conn:
-                rows = conn.execute("SELECT admission_id, status FROM evaluation_lifecycle_subcalls WHERE admission_id IN (%s)" % ",".join("?" for _ in charged_ids), tuple(charged_ids)).fetchall()
+                rows = conn.execute("SELECT * FROM evaluation_lifecycle_subcalls WHERE admission_id IN (%s)" % ",".join("?" for _ in charged_ids), tuple(charged_ids)).fetchall()
             if len(rows) != len(set(charged_ids)) or any(row["status"] not in {"complete", "failed"} for row in rows):
                 raise EvaluationError("charged subcall IDs are not durably finalized")
+            if any(row["job_id"] != job_id or row["stage"] != stage or row["cell_key"] != cell_key for row in rows):
+                raise EvaluationError("charged subcall IDs are not bound to this lifecycle cell")
+            charged_input = charged_output = charged_tools = charged_wall = charged_cost = 0
+            for row in rows:
+                try:
+                    child = json.loads(row["result_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise EvaluationError("charged subcall receipt is malformed") from exc
+                child_usage = child.get("usage")
+                if not isinstance(child_usage, Mapping) or any(not isinstance(child_usage.get(key), int) or isinstance(child_usage.get(key), bool) or child_usage[key] < 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or child_usage["totalTokens"] != child_usage["inputTokens"] + child_usage["outputTokens"]:
+                    raise EvaluationError("charged subcall receipt usage is malformed")
+                child_tools = child.get("toolCalls", 0)
+                child_wall = child.get("wallSeconds", 0)
+                child_cost = child.get("costMicrounits")
+                if child.get("economicCostStatus") == "unknown" or child_cost is None or not isinstance(child_tools, int) or isinstance(child_tools, bool) or child_tools < 0 or isinstance(child_wall, bool) or not isinstance(child_wall, (int, float)) or not math.isfinite(child_wall) or child_wall < 0 or isinstance(child_cost, bool) or not isinstance(child_cost, (int, float)) or not math.isfinite(child_cost) or child_cost < 0:
+                    raise EvaluationError("charged subcall receipt cost or accounting is unknown")
+                charged_input += child_usage["inputTokens"]
+                charged_output += child_usage["outputTokens"]
+                charged_tools += child_tools
+                charged_wall += int(float(child_wall) * 1_000_000)
+                charged_cost += int(child_cost)
             residual = payload.get("residualUsage")
             if not isinstance(residual, Mapping) or any(not isinstance(residual.get(key), int) or isinstance(residual.get(key), bool) or residual[key] < 0 for key in ("inputTokens", "outputTokens", "totalTokens")) or residual["totalTokens"] != residual["inputTokens"] + residual["outputTokens"]:
                 raise EvaluationError("residual lifecycle accounting is malformed")
+            reported_residual = (residual["inputTokens"], residual["outputTokens"], payload.get("residualToolCalls", 0), payload.get("residualWallSeconds", 0), payload.get("residualCostMicrounits", 0))
+            if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (reported_residual[0], reported_residual[1], reported_residual[2])) or isinstance(reported_residual[3], bool) or not isinstance(reported_residual[3], (int, float)) or not math.isfinite(reported_residual[3]) or reported_residual[3] < 0 or isinstance(reported_residual[4], bool) or not isinstance(reported_residual[4], (int, float)) or not math.isfinite(reported_residual[4]) or reported_residual[4] < 0:
+                raise EvaluationError("residual lifecycle accounting is malformed")
+            full_wall = int(float(wall_seconds or 0) * 1_000_000)
+            full_cost = int(cost_value) if isinstance(cost_value, (int, float)) and not isinstance(cost_value, bool) else None
+            expected_residual = (input_tokens - charged_input, output_tokens - charged_output, tool_calls - charged_tools, full_wall - charged_wall, None if full_cost is None else full_cost - charged_cost)
+            actual_residual = (reported_residual[0], reported_residual[1], reported_residual[2], int(float(reported_residual[3]) * 1_000_000), int(reported_residual[4]))
+            if expected_residual != actual_residual:
+                raise EvaluationError("lifecycle receipt aggregate does not match charged subcalls and residual")
             input_tokens, output_tokens = residual["inputTokens"], residual["outputTokens"]
             tool_calls = payload.get("residualToolCalls", 0)
             wall_seconds = payload.get("residualWallSeconds", 0)
@@ -294,7 +326,10 @@ class EvaluationJob:
                 conn.commit()
                 return {"admissionId": admission_id, "status": row["status"], "result": persisted if isinstance(persisted, dict) else {}, "error": row["error"], "reused": True, "dispatchAllowed": False}
             if result is None and error:
+                # A lost receipt leaves spend unknown.  The reservation cannot
+                # be released based on an operator-supplied error string.
                 conn.execute("UPDATE evaluation_lifecycle_subcalls SET status = 'failed', error = ?, updated_at = datetime('now') WHERE admission_id = ?", (error, admission_id))
+                conn.execute("UPDATE evaluation_lifecycle_budget SET blocked = 1, updated_at = datetime('now') WHERE job_id = ?", (row["job_id"],))
                 conn.commit()
                 return {"admissionId": admission_id, "status": "failed", "result": {}, "error": error, "reused": False, "dispatchAllowed": False}
             usage = payload.get("usage")

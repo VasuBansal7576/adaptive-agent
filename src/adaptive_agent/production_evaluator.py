@@ -54,18 +54,53 @@ def _candidate_bundle(store: Any, candidate_id: str) -> Any:
 def _require_bound_real_receipt(source_dir: str, run_id: str) -> None:
     """Require the supplied run to have canonical trusted evidence already."""
     from adaptive_agent.store import Store
+    from adaptive_agent.evaluation import sha256_json
 
-    source = Store(source_dir)
-    run = source.get_run(run_id)
+    source_store = Store(source_dir)
+    run = source_store.get_run(run_id)
     if run is None or run.get("status") != "succeeded":
         raise RuntimeError(f"bound source run is not a succeeded durable run: {run_id}")
-    evidence = source.list_evidence(run_id)
-    model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("visibility") == "operator"]
-    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("visibility") in {"operator", "evaluator_only"}]
+    evidence = source_store.list_evidence(run_id)
+    model = [row for row in evidence if row.get("event_type") == "model_response" and row.get("trust_class") in {"broker", "system"} and row.get("visibility") in {"operator", "evaluator_only"}]
+    trusted = [row for row in evidence if row.get("event_type") == "trusted_outcome" and row.get("trust_class") == "evaluator" and row.get("visibility") in {"operator", "evaluator_only"}]
     if not model or not trusted:
         raise RuntimeError(
             f"bound source run lacks canonical model/trusted outcome evidence: {run_id}"
         )
+    try:
+        run_payload = json.loads(run.get("run_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"bound source run payload is malformed: {run_id}") from exc
+    if not isinstance(run_payload, dict):
+        raise RuntimeError(f"bound source run payload is malformed: {run_id}")
+
+    def read_canonical(row: dict[str, Any]) -> dict[str, Any]:
+        artifact_ref = json.loads(row["source_ref"])
+        if artifact_ref.get("sha256") != row.get("content_hash"):
+            raise RuntimeError("bound source evidence reference hash mismatch")
+        artifact = artifact_ref.get("sha256")
+        value = source_store.get_artifact(artifact)
+        if not isinstance(value, dict) or sha256_json(value) != artifact_ref.get("sha256"):
+            raise RuntimeError("bound source evidence artifact is not canonical")
+        return value
+
+    try:
+        response = read_canonical(model[-1])
+        outcome = read_canonical(trusted[-1])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+        raise RuntimeError(f"bound source run lacks canonical trusted evidence: {run_id}") from exc
+    task_id = run.get("task_id")
+    environment_id = run.get("environment_id")
+    if not isinstance(task_id, str) or not isinstance(environment_id, str):
+        raise RuntimeError(f"bound source run identity is incomplete: {run_id}")
+    identity = (run_id, task_id, environment_id, run_payload.get("arm"), run_payload.get("seed"), run_payload.get("bundleHash"))
+    if any(value is None for value in identity[3:]):
+        raise RuntimeError(f"bound source run execution identity is incomplete: {run_id}")
+    for payload in (response, outcome):
+        if (payload.get("runId"), payload.get("taskId"), payload.get("environmentId"), payload.get("arm"), payload.get("seed"), payload.get("bundleHash")) != identity:
+            raise RuntimeError(f"bound source evidence identity does not match run: {run_id}")
+    if response.get("responseId") != outcome.get("responseId"):
+        raise RuntimeError(f"bound source outcome is not bound to model response: {run_id}")
 
 
 def _docker_image_digest() -> str:

@@ -158,16 +158,27 @@ def test_unknown_nested_cost_blocks_future_admission(tmp_path: Path):
         job.admit_lifecycle_subcall("unknown-subcall", "transfer", "leave-out:finance", "child-1")
 
 
-def test_error_only_subcall_is_recoverable_without_fake_accounting(tmp_path: Path):
+def test_error_only_subcall_blocks_unknown_spend_across_reopen(tmp_path: Path):
     job = _job(tmp_path)
-    job._lifecycle_budget("error-only", {"attempts": 1, "inputTokens": 10, "outputTokens": 10, "toolCalls": 10, "wallMicros": 10_000, "costMicrounits": 10})
-    admission = job.admit_lifecycle_subcall("error-only", "adaptation", "adapt:finance", "child-0")
+    limits = {"attempts": 2, "inputTokens": 10, "outputTokens": 10, "toolCalls": 10, "wallMicros": 10_000, "costMicrounits": 10}
+    job._lifecycle_budget("error-only", limits)
+    admission = job.admit_lifecycle_subcall("error-only", "adaptation", "adapt:finance", "child-0", estimated_cost_microunits=10)
     recorded = job.record_lifecycle_subcall(admission["admissionId"], error="runtime crashed before receipt")
-    replay = job.admit_lifecycle_subcall("error-only", "adaptation", "adapt:finance", "child-0")
-    assert recorded["status"] == replay["status"] == "failed"
-    assert replay["result"] == {}
-    assert replay["error"] == "runtime crashed before receipt"
+    reopened = _job(tmp_path)
+    with pytest.raises(ValueError, match="budget exhausted"):
+        reopened.admit_lifecycle_subcall("error-only", "adaptation", "adapt:finance", "child-1", estimated_cost_microunits=10)
+    assert recorded["status"] == "failed"
     assert job.lifecycle_accounting("error-only")["inputTokens"] == 0
+    assert job.lifecycle_accounting("error-only")["blocked"] is True
+
+
+def test_charged_subcalls_must_match_parent_cell_and_residual_totals(tmp_path: Path):
+    job = _job(tmp_path)
+    job._lifecycle_budget("bound", {"attempts": 1, "inputTokens": 10, "outputTokens": 10, "toolCalls": 10, "wallMicros": 10_000, "costMicrounits": 10})
+    admission = job.admit_lifecycle_subcall("bound", "adaptation", "adapt:finance", "child-0", estimated_input_tokens=1, estimated_output_tokens=1, estimated_cost_microunits=1)
+    job.record_lifecycle_subcall(admission["admissionId"], result={"usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "toolCalls": 1, "wallSeconds": 0.001, "costMicrounits": 1})
+    with pytest.raises(ValueError, match="bound to this lifecycle cell"):
+        job._finish_lifecycle_launch("bound", "adaptation", "other-cell", 0, "complete", {"status": "complete", "stage": "adaptation", "cellKey": "other-cell", "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}, "toolCalls": 1, "wallSeconds": 0.001, "costMicrounits": 1, "chargedSubcallIds": [admission["admissionId"]], "residualUsage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}})
 
 
 def test_reused_complete_subcall_returns_persisted_result(tmp_path: Path):
