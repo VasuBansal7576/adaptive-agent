@@ -42,6 +42,9 @@ class DurableLearningSourceAdapter:
     def records(self, *, environment_id: str, run_id: str) -> tuple[SourceRecord, ...]:
         list_records = getattr(self.store, "list_learning_records", None)
         raw_records = list_records(environment_id=environment_id, run_id=run_id) if callable(list_records) else self._legacy_records(environment_id=environment_id, run_id=run_id)
+        return self.records_from_raw(raw_records, environment_id=environment_id, run_id=run_id)
+
+    def records_from_raw(self, raw_records: Sequence[Mapping[str, Any]], *, environment_id: str, run_id: str) -> tuple[SourceRecord, ...]:
         sources: list[SourceRecord] = []
         for raw in raw_records:
             if not isinstance(raw, Mapping):
@@ -122,6 +125,9 @@ class DurableLearningSourceAdapter:
 
     def retriever(self, *, environment_id: str, run_id: str) -> AccessFilteredRetriever:
         return AccessFilteredRetriever(InMemorySourceProvider(self.records(environment_id=environment_id, run_id=run_id)))
+
+    def retriever_from_raw(self, raw_records: Sequence[Mapping[str, Any]], *, environment_id: str, run_id: str) -> AccessFilteredRetriever:
+        return AccessFilteredRetriever(InMemorySourceProvider(self.records_from_raw(raw_records, environment_id=environment_id, run_id=run_id)))
 
     @staticmethod
     def _source(raw: Mapping[str, Any], *, kind: SourceKind, run_id: str | None, partition: str | None, visibility: str, trust_class: str) -> SourceRecord:
