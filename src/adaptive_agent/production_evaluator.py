@@ -288,16 +288,28 @@ def _lifecycle_stages(runtime: Any, protocol: Any, declared_retries: int) -> tup
         from adaptive_agent.models import SkillBundle
 
         payload = learned.model_dump(mode="json", by_alias=True)
+        # The ablation is a separate durable lineage object.  A stable ID and
+        # inherited creation timestamp make preparation idempotent across
+        # process restarts without allowing INSERT OR REPLACE to overwrite L.
+        payload["bundle_id"] = f"{learned.bundle_id}:memory-disabled"
         payload["parent"] = learned.content_hash
         payload["skills"] = []
-        payload.setdefault("executionConfig", {})["skillRefs"] = []
+        execution_config = payload.setdefault("executionConfig", {})
+        execution_config["skill_refs"] = []
+        execution_config["instruction_variant"] = "default"
         payload["contentHash"] = ""
         ablation = SkillBundle.model_validate(payload)
-        runtime.controller.store.save_bundle(ablation.bundle_id, ablation.parent, ablation.content_hash, ablation.model_dump_json(by_alias=True), False)
+        existing = runtime.controller.store.get_bundle(ablation.bundle_id)
+        if existing is None:
+            runtime.controller.store.save_bundle(ablation.bundle_id, ablation.parent, ablation.content_hash, ablation.model_dump_json(by_alias=True), False)
+        elif existing.get("content_hash") != ablation.content_hash:
+            raise RuntimeError("durable memory-disabled ablation binding conflicts with existing bundle")
         if not isinstance(bundles, dict):
             bundles = {}
             setattr(runtime, "_evaluation_arm_bundles", bundles)
-        bundles["A"] = ablation
+        # The actual runtime task executor consumes the arm map as hashes.
+        # EvaluationJob receives its own object-valued arm map at construction.
+        bundles["A"] = ablation.content_hash
         return {"ablationBundleHash": ablation.content_hash}
 
     return tuple(LifecycleStage(name, cells[name], invoke, retries=declared_retries, observation_recoverer=recover if name in {"validation", "final"} else None, final_preparer=prepare_final if name == "final" else None, report_required=name in {"validation", "final"}) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final"))
