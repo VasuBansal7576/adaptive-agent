@@ -170,17 +170,32 @@ class SQLiteRunEvidenceStore:
         if receipts is not None:
             if not isinstance(receipts, list) or not isinstance(aggregate_usage, dict):
                 return False
-            calculated = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+            canonical_keys = ("inputTokens", "outputTokens", "totalTokens")
+            cache_keys = ("cacheReadInputTokens", "cacheCreationInputTokens", "cachedInputTokens")
+            calculated = {key: 0 for key in canonical_keys}
+            calculated_cache = {key: 0 for key in cache_keys}
             for receipt in receipts:
                 if not isinstance(receipt, dict) or not isinstance(receipt.get("usage"), dict):
                     return False
                 usage = receipt["usage"]
-                if any(not isinstance(usage.get(key), int) or usage[key] < 0 for key in calculated):
+                if any(not isinstance(usage.get(key), int) or isinstance(usage[key], bool) or usage[key] < 0 for key in canonical_keys):
                     return False
-                for key in calculated:
+                for key in canonical_keys:
                     calculated[key] += usage[key]
-            if aggregate_usage != calculated:
+                for key in cache_keys:
+                    value = usage.get(key, 0)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        return False
+                    calculated_cache[key] += value
+            if any(key not in aggregate_usage or aggregate_usage.get(key) != value for key, value in calculated.items()):
                 return False
+            if any(key not in canonical_keys and key not in cache_keys for key in aggregate_usage):
+                return False
+            for key, value in calculated_cache.items():
+                aggregate_value = aggregate_usage.get(key)
+                if value or key in aggregate_usage:
+                    if not isinstance(aggregate_value, int) or isinstance(aggregate_value, bool) or aggregate_value != value:
+                        return False
         if sha256_json(response) != evidence.get("content_hash"):
             return False
         if response.get("responseId") != observation.response_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response" or outcome_evidence.get("run_id") != observation.run_id or outcome_evidence.get("event_type") != "trusted_outcome":

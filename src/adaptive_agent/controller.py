@@ -819,12 +819,26 @@ class Controller:
             time.sleep(poll_interval)
 
     # ------------------------------------------------------------------ EVAL-004/005 probe executor
+    def handle_host_request(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Reject learner host requests that bypass the broker boundary."""
+        request_type = payload.get("type") if isinstance(payload, Mapping) else None
+        raise PermissionError(f"learner request denied: {request_type}")
+
     def execute_probe(self, case_id: str) -> "ProbeResult":
         """Execute the EVAL-004/005 obligations against Controller/Broker seams.
 
         Each call runs on a fresh isolated controller and provider, returning
         auditable observations suitable for trusted evaluator attestation.
         """
+        if case_id == "EVAL-003":
+            # Keep the historical control-plane probe available to callers;
+            # it runs entirely in its own temporary store and requires the
+            # real runtime, so an unconfigured controller reports honestly.
+            from adaptive_agent.safety_probe import run_eval_003
+            import tempfile
+
+            with tempfile.TemporaryDirectory(prefix="adaptive-eval003-") as directory:
+                return run_eval_003(directory, require_runtime=True)
         if case_id not in ("EVAL-004", "EVAL-005"):
             raise KeyError(f"unknown probe case {case_id!r}")
         results: list[tuple[str, bool, str]] = []

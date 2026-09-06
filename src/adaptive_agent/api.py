@@ -205,6 +205,17 @@ class EvaluationRequest(ApiModel):
     partition_ref: JsonObject = Field(alias="partitionRef")
 
 
+class EvaluationLaunchRequest(ApiModel):
+    """Operator launch input; protocol and partition pins are server-owned."""
+
+    candidate_id: str = Field(alias="candidateId", min_length=1)
+    base_bundle_hash: str = Field(alias="baseBundleHash", min_length=1)
+    # Accepted for compatibility with older clients; durable runtime launch
+    # ignores these and derives the frozen values from its server protocol.
+    protocol_hash: str | None = Field(default=None, alias="protocolHash")
+    partition_ref: JsonObject | None = Field(default=None, alias="partitionRef")
+
+
 class CandidateDecisionRequest(ApiModel):
     evaluation_id: str = Field(alias="evaluationId", min_length=1)
     decision: str
@@ -1087,14 +1098,16 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
             raise HTTPException(status_code=409, detail={"code": "VERSION_CONFLICT", "message": str(exc), "correlationId": uuid.uuid4().hex, "retry": "never"}) from exc
 
     @app.post("/evaluations/launch", status_code=202)
-    def launch_evaluation(payload: EvaluationRequest, background: BackgroundTasks) -> JsonObject:
+    def launch_evaluation(payload: EvaluationLaunchRequest, background: BackgroundTasks) -> JsonObject:
         """Queue and execute one trusted evaluation task in the background."""
         try:
             if runtime is None:
-                return plane.queue_evaluation(payload)
+                raise ValueError("evaluation launch requires the durable runtime")
             if getattr(runtime, "_evaluation_protocol", None) is None:
                 raise ValueError("runtime evaluation launch requires evaluator-owned EvaluationJob.run")
-            queued = runtime.queue_evaluation(payload)
+            # Launch bindings are resolved from the server's frozen protocol;
+            # legacy client-supplied pin fields are intentionally discarded.
+            queued = runtime.queue_evaluation(payload.model_copy(update={"protocol_hash": None, "partition_ref": None}))
             background.add_task(runtime.launch_evaluation, queued["evaluationId"])
             return queued
         except KeyError as exc:

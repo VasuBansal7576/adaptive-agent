@@ -26,7 +26,7 @@ from adaptive_agent.constants import DEFAULT_MODEL_TOKENS
 from adaptive_agent.broker import Capability, ToolBroker, ToolProvider
 from adaptive_agent.controller import Controller
 from adaptive_agent.environment import EnvironmentRegistry
-from adaptive_agent.evaluation import build_environment_packages, sha256_json, FixtureSession, Outcome as FixtureOutcome
+from adaptive_agent.evaluation import build_environment_packages, sha256_json, FixtureSession, Outcome as FixtureOutcome, TrustedEvaluatorRegistry
 from adaptive_agent.learning import LearningService, PlannerLearningAdapter
 from adaptive_agent.learning_store import DurableLearningSourceAdapter, CandidateManagerLearningAdapter, LearningStoreError
 from adaptive_agent.learning_runtime import LearningRuntime, LearningRuntimeError
@@ -342,27 +342,36 @@ class DurableRuntime:
         return value
 
     def queue_evaluation(self, payload: Any) -> dict[str, Any]:
+        protocol = self._evaluation_protocol
+        protocol_hash = getattr(payload, "protocol_hash", None)
+        partition_ref = getattr(payload, "partition_ref", None)
+        if protocol is not None:
+            frozen = protocol.start_candidate_generation()
+            if not isinstance(protocol_hash, str) or not protocol_hash:
+                protocol_hash = frozen.protocol_hash
+            if not isinstance(partition_ref, Mapping):
+                partition_ref = self._validation_partition_ref(frozen)
+            expected_hash = frozen.partition_hashes.get(f"{protocol.known_environments[0]}:validation")
+            supplied_hash = partition_ref.get("sha256") if isinstance(partition_ref, Mapping) else None
+            if protocol_hash != frozen.protocol_hash:
+                raise ValueError("evaluation protocol does not match the frozen server protocol")
+            if not isinstance(expected_hash, str) or supplied_hash != expected_hash:
+                raise ValueError("evaluation partition does not match the frozen server partition")
+        if not isinstance(protocol_hash, str) or not protocol_hash or not isinstance(partition_ref, Mapping):
+            raise ValueError("evaluation launch requires frozen protocol and partition bindings")
         candidate = self.controller.get_candidate(payload.candidate_id)
         if candidate is None:
             raise KeyError("candidate not found")
         if payload.base_bundle_hash != candidate.get("base_bundle_hash"):
             raise ValueError("evaluation base does not match candidate")
-        if self._evaluation_protocol is not None:
-            frozen = self._evaluation_protocol.start_candidate_generation()
-            if payload.protocol_hash != frozen.protocol_hash:
-                raise ValueError("evaluation protocol does not match the frozen server protocol")
-            partition = frozen.partition_hashes.get("validation")
-            supplied = payload.partition_ref.get("sha256") if isinstance(payload.partition_ref, Mapping) else None
-            if isinstance(partition, str) and supplied != partition:
-                raise ValueError("evaluation partition does not match the frozen server partition")
         self.controller.start_evaluation(payload.candidate_id)
         evaluation_id = f"eval_{__import__('uuid').uuid4().hex}"
         response = {
             "evaluationId": evaluation_id,
             "candidateId": payload.candidate_id,
             "baseBundleHash": payload.base_bundle_hash,
-            "protocolHash": payload.protocol_hash,
-            "partitionRef": payload.partition_ref,
+            "protocolHash": protocol_hash,
+            "partitionRef": dict(partition_ref),
             "state": "queued",
             "trusted": False,
         }
@@ -372,13 +381,25 @@ class DurableRuntime:
                 "candidate_id": payload.candidate_id,
                 "candidate_hash": candidate.get("candidate_bundle_hash") or payload.candidate_id,
                 "base_hash": payload.base_bundle_hash,
-                "protocol_hash": payload.protocol_hash,
-                "partition_ref": json.dumps(payload.partition_ref, sort_keys=True),
+                "protocol_hash": protocol_hash,
+                "partition_ref": json.dumps(dict(partition_ref), sort_keys=True),
                 "state": "queued",
                 "payload_json": json.dumps(response, sort_keys=True),
             },
         )
         return response
+
+    @staticmethod
+    def _validation_partition_ref(frozen: Any) -> dict[str, str]:
+        environments = tuple(getattr(frozen, "inputs", {}).get("knownEnvironments", ()))
+        hashes = getattr(frozen, "partition_hashes", {})
+        if not environments:
+            raise ValueError("frozen protocol has no known environments")
+        key = f"{environments[0]}:validation"
+        digest = hashes.get(key)
+        if not isinstance(digest, str) or not digest:
+            raise ValueError("frozen protocol has no validation partition")
+        return {"id": "validation", "version": "1", "sha256": digest}
 
     def launch_evaluation(self, evaluation_id: str) -> dict[str, Any]:
         """Execute one queued evaluation through the bound durable job."""
@@ -398,7 +419,7 @@ class DurableRuntime:
             normalized["candidateId"] = report.get("candidate_id")
             normalized["baseBundleHash"] = report.get("base_hash")
             normalized["protocolHash"] = report.get("protocol_hash")
-            normalized["trusted"] = bool(normalized.get("validityStatus") == "valid" and normalized.get("attestation") and normalized.get("evaluatorRefs"))
+            normalized["trusted"] = self._verify_evaluation_report(normalized, report)
             if not normalized["trusted"]:
                 normalized["trustReason"] = "unverified evaluator report"
             return normalized
@@ -427,7 +448,10 @@ class DurableRuntime:
             raise ValueError("candidate bundle is not durable")
         job = self.build_evaluation_job(protocol, {"B0": active, "L": __import__("adaptive_agent.models", fromlist=["SkillBundle"]).SkillBundle.model_validate(json.loads(bundle["bundle_json"]))})
         result = job.run(evaluation_id, "validation", base_hash=str(queued["base_hash"]), candidate_hash=candidate_hash, candidate_id=candidate_id)
-        return {"evaluationId": evaluation_id, "candidateId": candidate_id, "state": result.status, "trusted": result.report is not None, "error": result.error}
+        result_payload = result.report.to_dict() if hasattr(result.report, "to_dict") else result.report
+        stored_report = self.controller.store.get_evaluation(evaluation_id)
+        trusted = bool(isinstance(result_payload, Mapping) and stored_report is not None and self._verify_evaluation_report(result_payload, stored_report))
+        return {"evaluationId": evaluation_id, "candidateId": candidate_id, "state": result.status, "trusted": trusted, "error": result.error}
 
     def execute_evaluation_task(self, task: Any, frozen_config: Any, bundle: Any) -> Any:
         """Execute one frozen benchmark cell through the shared run path."""
@@ -605,6 +629,7 @@ class DurableRuntime:
         """Wire the evaluator-owned resumable driver to this task executor."""
         from adaptive_agent.benchmark import ResumableEvaluationDriver
 
+        self._evaluation_protocol = protocol
         active = self.controller.get_active_bundle()
         if active is None:
             raise LearningRuntimeError("no active bundle is available for evaluation")
@@ -665,6 +690,70 @@ class DurableRuntime:
             total_budget_microunits=total_budget_microunits,
         )
 
+    def _verify_evaluation_report(self, report: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
+        """Verify a serialized report against the durable evaluator ledger."""
+        protocol = self._evaluation_protocol
+        if protocol is None or not isinstance(report, Mapping):
+            return False
+        try:
+            frozen = protocol.start_candidate_generation()
+            protocol_hash = frozen.protocol_hash
+            if row.get("protocol_hash") != protocol_hash or report.get("protocolHash") != protocol_hash:
+                return False
+            if report.get("candidateHash") != row.get("candidate_hash") or report.get("baseHash") != row.get("base_hash"):
+                return False
+            if report.get("validityStatus") != "valid":
+                return False
+            environments = tuple(getattr(protocol, "known_environments", ()))
+            expected_partitions = {f"{name}:validation": frozen.partition_hashes[f"{name}:validation"] for name in environments}
+            if report.get("partitionHashes") != expected_partitions:
+                return False
+            partition_ref = row.get("partition_ref")
+            if isinstance(partition_ref, str):
+                partition_ref = json.loads(partition_ref)
+            if not isinstance(partition_ref, Mapping) or partition_ref.get("id") != "validation" or partition_ref.get("sha256") != next(iter(expected_partitions.values())):
+                return False
+            expected_refs = tuple(sorted({self.packages[name].manifest.evaluator_ref.id for name in environments if name in self.packages}))
+            refs = report.get("evaluatorRefs")
+            if not isinstance(refs, (list, tuple)) or tuple(sorted(str(value) for value in refs)) != expected_refs:
+                return False
+            attestation_payload = {
+                "comparison": report.get("comparison"),
+                "candidateHash": report.get("candidateHash"),
+                "baseHash": report.get("baseHash"),
+                "protocolHash": report.get("protocolHash"),
+                "partitionHashes": report.get("partitionHashes"),
+                "evaluatorRefs": report.get("evaluatorRefs"),
+                "environmentCells": report.get("environmentCells"),
+                "armSummaries": report.get("armSummaries"),
+                "confidenceIntervals": report.get("confidenceIntervals"),
+                "validityStatus": report.get("validityStatus"),
+                "safetyPassed": report.get("safetyPassed"),
+                "safetyCaseResults": report.get("safetyCaseResults"),
+                "safetyProbeOutputs": report.get("safetyProbeOutputs"),
+                "missingPairs": report.get("missingPairs"),
+                "partitionLeak": report.get("partitionLeak"),
+                "invalidFixtureResets": report.get("invalidFixtureResets"),
+                "infrastructureFailures": report.get("infrastructureFailures"),
+                "metricCellsComplete": report.get("metricCellsComplete"),
+                "safetyCellsComplete": report.get("safetyCellsComplete"),
+                "modelProvenanceComplete": report.get("modelProvenanceComplete"),
+            }
+            required = tuple(attestation_payload)
+            if any(key not in report for key in required):
+                return False
+            ledger = self.controller.evaluator_adapters[0]
+            registry = TrustedEvaluatorRegistry(ledger)
+            for name in environments:
+                package = self.packages.get(name)
+                if package is None:
+                    return False
+                registry.register(package)
+            token = report.get("attestation")
+            return registry.verify(token if isinstance(token, str) else None, attestation_payload)
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+
     def list_evaluations(self) -> list[dict[str, Any]]:
         out = []
         report_ids: set[str] = set()
@@ -687,8 +776,7 @@ class DurableRuntime:
             if "validity" in value and "validityStatus" not in value:
                 value["validityStatus"] = value.pop("validity")
             state = value.get("state")
-            bound = row is not None and value.get("candidateHash") == row.get("candidate_hash") and value.get("baseHash") == row.get("base_hash") and value.get("protocolHash") == row.get("protocol_hash")
-            canonical = bool(bound and value.get("validityStatus") == "valid" and value.get("attestation") and value.get("evaluatorRefs"))
+            canonical = bool(row is not None and self._verify_evaluation_report(value, row))
             value["trusted"] = canonical
             if not canonical:
                 value.setdefault("trustReason", "unverified evaluator report")

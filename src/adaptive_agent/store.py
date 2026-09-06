@@ -103,6 +103,7 @@ class Store:
                     bundle_hash TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL UNIQUE,
+                    request_fingerprint TEXT,
                     last_event_sequence INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
                     completed_at TEXT,
@@ -249,6 +250,8 @@ class Store:
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
             if "bundle_hash" not in cols:
                 conn.execute("ALTER TABLE runs ADD COLUMN bundle_hash TEXT NOT NULL DEFAULT ''")
+            if "request_fingerprint" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN request_fingerprint TEXT")
             frozen_cols = {r["name"] for r in conn.execute("PRAGMA table_info(frozen_protocols)").fetchall()}
             for name, declaration in (
                 ("evaluator_refs_json", "TEXT NOT NULL DEFAULT '[]'"),
