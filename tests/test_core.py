@@ -356,6 +356,12 @@ class TestControllerSeam:
         assert payload["imageDigest"] == "image-unpinned"
         assert payload["maxChildDepth"] == 1  # frozen Budget.max_child_depth propagated
 
+        # Legacy event type rejected at both the Controller and Store layers.
+        with pytest.raises(ValueError):
+            ctl.append_event(r1.run_id, "model_observation", {"x": 1}, "system", "operator")
+        with pytest.raises(ValueError):
+            store.append_evidence("ev-legacy", {"run_id": r1.run_id, "sequence": 99, "event_type": "model_observation"})
+
     def test_execute_run_dispatches_through_broker(self, store, registry, broker, provider):
         from adaptive_agent.models import Budget, ModelProfile, RunRequest
 

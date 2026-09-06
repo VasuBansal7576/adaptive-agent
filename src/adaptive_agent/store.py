@@ -1093,6 +1093,8 @@ class Store:
 
     # ------------------------------------------------------------------ evidence
     def append_evidence(self, evidence_id: str, data: dict[str, Any]) -> None:
+        if data.get("event_type") == "model_observation" or data.get("eventType") == "model_observation":
+            raise ValueError("model_observation is not a canonical evidence event; use model_response")
         self._insert_json("evidence", "evidence_id", evidence_id, data)
 
     def get_evidence(self, evidence_id: str) -> dict[str, Any] | None:
