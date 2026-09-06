@@ -85,6 +85,7 @@ def test_report_assembly_recovers_each_persisted_panel_cell_serially(tmp_path: P
         "adaptive_agent.evaluation_job.build_durable_evaluation_runner",
         lambda *args, **kwargs: Evaluator(),
     )
+    monkeypatch.setattr("adaptive_agent.evaluation_job.EvaluationReport", Report)
 
     def callback(cell, context):
         return {
@@ -101,7 +102,7 @@ def test_report_assembly_recovers_each_persisted_panel_cell_serially(tmp_path: P
         return (f"observation-{cell_key}",)
 
     stages = tuple(
-        LifecycleStage(name, (("validation-0", "validation-1") if name == "validation" else (f"{name}-0",)), callback, observation_recoverer=recover if name == "validation" else None)
+        LifecycleStage(name, (("validation-0", "validation-1") if name == "validation" else (f"{name}-0",)), callback, observation_recoverer=recover if name == "validation" else None, report_required=name == "validation")
         for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final")
     )
     state = {
