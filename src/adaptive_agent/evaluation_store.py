@@ -160,6 +160,22 @@ class SQLiteRunEvidenceStore:
             return False
         if not all(isinstance(value, dict) for value in (response, accounting, outcome)):
             return False
+        receipts = accounting.get("receipts")
+        aggregate_usage = accounting.get("aggregateUsage")
+        if receipts is not None:
+            if not isinstance(receipts, list) or not isinstance(aggregate_usage, dict):
+                return False
+            calculated = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+            for receipt in receipts:
+                if not isinstance(receipt, dict) or not isinstance(receipt.get("usage"), dict):
+                    return False
+                usage = receipt["usage"]
+                if any(not isinstance(usage.get(key), int) or usage[key] < 0 for key in calculated):
+                    return False
+                for key in calculated:
+                    calculated[key] += usage[key]
+            if aggregate_usage != calculated:
+                return False
         if sha256_json(response) != evidence.get("content_hash"):
             return False
         if response.get("responseId") != observation.response_id or evidence.get("run_id") != observation.run_id or evidence.get("event_type") != "model_response" or outcome_evidence.get("run_id") != observation.run_id or outcome_evidence.get("event_type") != "trusted_outcome":

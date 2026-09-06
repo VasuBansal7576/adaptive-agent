@@ -180,6 +180,8 @@ class EvaluationJob:
         nominal_seen = False
         economic_cost_microunits = 0.0
         economic_cost_seen = False
+        inference_duration_seconds = 0.0
+        inference_duration_seen = False
         economic_statuses: set[str] = set()
         for observation in observations:
             if not observation.accounting_ref:
@@ -202,6 +204,10 @@ class EvaluationJob:
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
                         economic_cost_microunits += float(value)
                         economic_cost_seen = True
+                duration = accounting.get("inferenceDurationSeconds")
+                if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
+                    inference_duration_seconds += float(duration)
+                    inference_duration_seen = True
             evidence = self.store.get_evidence(observation.evidence_ref) if observation.evidence_ref else None
             if not evidence:
                 continue
@@ -231,6 +237,7 @@ class EvaluationJob:
             "nominalCostUsd": nominal_cost if nominal_seen else None,
             "economicCostMicrounits": economic_cost_microunits if economic_cost_seen else None,
             "economicCostStatuses": sorted(economic_statuses),
+            "inferenceDurationSeconds": inference_duration_seconds if inference_duration_seen else None,
             "wallDurationSeconds": wall_seconds,
             "billingBasis": billing_basis,
         }
