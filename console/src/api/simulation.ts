@@ -262,6 +262,19 @@ let candidateCatalog: CandidateDiff[] = [
       evaluationRef: { id: "eval-sim-89", version: "1", sha256: hash(28) },
     },
   },
+  {
+    candidateId: "cand-sim-205",
+    baseBundleHash: "d".repeat(64),
+    candidateBundleHash: "e".repeat(64),
+    editOperations: [
+      '{"operation":"modify","path":"skills/recheck-before-update/procedure","value":"Final-sealed candidate procedure."}',
+    ],
+    changedArtifactHashes: ["f".repeat(64)],
+    supportingEvidenceIds: ["broker:ev_sim_99"],
+    proposerVersion: "1",
+    state: "rejected" as const,
+    predictedEffect: "Sealed-final candidate (prediction, not a score).",
+  },
 ];
 
 let environmentCatalog: EnvironmentPackageSummary[] = [
@@ -384,9 +397,70 @@ export function createSimulationTransport(options?: {
 
     async listEvaluations() {
       // raw rows in the API projection shape; the console parser classifies
-      // them (verified vs unverified legacy)
+      // them (verified reports vs unverified legacy). Representative validation
+      // and final report shapes from the durable projection (96a84d3/8fcb18a).
+      const armSummary = (accuracy: number) => ({
+        accuracy,
+        reliability: accuracy + 0.02,
+        meanCostMicrounits: 41250,
+        medianLatencySeconds: 41.2,
+        p95LatencySeconds: 88.4,
+        safetyViolations: 0,
+        count: 60,
+      });
       return [
-        { evaluationId: "eval-sim-001", candidateId: "cand-sim-202", state: "valid", trusted: true },
+        {
+          evaluationId: "eval-sim-001",
+          candidateId: "cand-sim-204",
+          baseBundleHash: "2647d69d89ff03689c5427b675472699ec144d842a58a726ca5d8b59074f74cc",
+          state: "valid",
+          trusted: true,
+          report: {
+            comparison: "validation",
+            validityStatus: "valid",
+            promotionEligible: true,
+            candidateHash: "60d7e19903203cdc430847fc2fae6224539c038bd78a4894db4f6de583f63ced",
+            baseHash: "2647d69d89ff03689c5427b675472699ec144d842a58a726ca5d8b59074f74cc",
+            protocolHash: "p".repeat(64),
+            armSummaries: { B0: armSummary(0.55), L: armSummary(0.65) },
+            confidenceIntervals: [
+              { metric: "accuracy_gain", point: 0.1, lower95: 0.06, upper95: 0.14, draws: 10000, analysisSeed: 20260906 },
+            ],
+            safetyPassed: true,
+            missingPairs: 0,
+            metricCellsComplete: true,
+            safetyCellsComplete: true,
+            modelProvenanceComplete: true,
+            infrastructureFailures: [],
+            analysisSeed: 20260906,
+            nominalCostUsd: 1.25,
+            actualInputTokens: 48120,
+            actualOutputTokens: 6240,
+            wallDurationSeconds: 841,
+            billingBasis: "nominal-usd-pinned",
+          },
+        },
+        {
+          // final B0/L/A report shape (completion/decided states recognized)
+          evaluationId: "eval-sim-002",
+          candidateId: "cand-sim-205",
+          state: "decided",
+          trusted: true,
+          report: {
+            comparison: "final",
+            validityStatus: "valid",
+            promotionEligible: false,
+            armSummaries: { B0: armSummary(0.58), L: armSummary(0.61), A: armSummary(0.56) },
+            confidenceIntervals: [
+              { metric: "accuracy_gain", point: 0.03, lower95: -0.01, upper95: 0.07, draws: 10000, analysisSeed: 20260906 },
+            ],
+            safetyPassed: true,
+            missingPairs: 2,
+            metricCellsComplete: false,
+            infrastructureFailures: ["fixture cell timed out"],
+            billingBasis: "unknown-unreported",
+          },
+        },
         // legacy malformed metadata: preserved explicitly unverified
         { evaluationId: "eval-sim-legacy", state: "completed", trusted: true, validity: "valid" },
       ] as never;

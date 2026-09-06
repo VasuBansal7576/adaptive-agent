@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { ConsoleTransport, LearningCycleInput } from "../api/transport";
-import type { CandidateDiff, EvaluationJob, RunRecord } from "../api/types";
+import type { CandidateDiff, EvaluationJob, EvaluationReportProjection, RunRecord } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
 import { Banner, EmptyState, LoadingState, Modal } from "../components/ui";
 
@@ -250,10 +250,7 @@ export function CandidatesView({
                   <p className="mt-1 break-all font-mono text-[10px] text-slate-600">report {cand.measured.evaluationRef.id} · {cand.measured.evaluationRef.sha256}</p>
                 </div>
               ) : (
-                <div className="rounded-lg bg-slate-800/60 p-3">
-                  <p className="text-xs font-semibold text-slate-400">Measured result</p>
-                  <p className="mt-1 text-[13px] text-slate-500">Awaiting a trusted evaluation report.</p>
-                </div>
+                <MeasuredArea cand={cand} evalJobs={evalJobs} evalJobsError={evalJobsError} />
               )}
             </div>
           </div>
@@ -443,5 +440,133 @@ function LearningCycleModal({
         </div>
       </form>
     </Modal>
+  );
+}
+
+function MeasuredArea({
+  cand,
+  evalJobs,
+  evalJobsError,
+}: {
+  cand: CandidateDiff;
+  evalJobs: EvaluationJob[] | null;
+  evalJobsError: string | null;
+}) {
+  if (evalJobsError) {
+    return (
+      <div className="rounded-lg bg-slate-800/60 p-3">
+        <p className="text-xs font-semibold text-slate-400">Measured result</p>
+        <p className="mt-1 text-[13px] text-slate-500">Evaluation status unavailable: {evalJobsError}</p>
+      </div>
+    );
+  }
+  if (evalJobs === null) {
+    return (
+      <div className="rounded-lg bg-slate-800/60 p-3">
+        <p className="text-xs font-semibold text-slate-400">Measured result</p>
+        <p className="mt-1 text-[13px] text-slate-500">Loading evaluation status…</p>
+      </div>
+    );
+  }
+  const job = evalJobs.find((j) => j.candidateId === cand.candidateId && j.report);
+  if (!job?.report) {
+    return (
+      <div className="rounded-lg bg-slate-800/60 p-3">
+        <p className="text-xs font-semibold text-slate-400">Measured result</p>
+        <p className="mt-1 text-[13px] text-slate-500">Awaiting a trusted evaluation report.</p>
+      </div>
+    );
+  }
+  return <ActualReportPanel report={job.report} evaluationId={job.evaluationId} />;
+}
+
+/** Renders the authoritative trusted report projection verbatim: arms, gate
+ *  outcome, IDs, missing cells, and explicit billing unknowns. No metric is
+ *  ever invented here. */
+function ActualReportPanel({ report, evaluationId }: { report: EvaluationReportProjection; evaluationId: string }) {
+  const arms = Object.entries(report.armSummaries);
+  const isFinal = report.comparison === "final";
+  const billingUnknown = report.nominalCostUsd === undefined || report.nominalCostUsd === null;
+  return (
+    <div className="rounded-lg bg-slate-800/60 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs font-semibold text-emerald-300">
+          Trusted evaluation report — {report.comparison} ({isFinal ? "B0/L/A" : "B0/L"})
+        </p>
+        <StatusBadge status={report.validityStatus === "valid" ? "valid" : "invalid"} />
+      </div>
+      <table className="mt-2 w-full text-[12px]">
+        <caption className="sr-only">Arm metrics: accuracy, reliability, cost, latency</caption>
+        <thead>
+          <tr className="text-left text-slate-500">
+            <th scope="col" className="pr-2 font-medium">Arm</th>
+            <th scope="col" className="pr-2 font-medium">Accuracy</th>
+            <th scope="col" className="pr-2 font-medium">Reliability</th>
+            <th scope="col" className="pr-2 font-medium">Cost (µ)</th>
+            <th scope="col" className="pr-2 font-medium">p95 (s)</th>
+            <th scope="col" className="font-medium">Safety viol.</th>
+          </tr>
+        </thead>
+        <tbody>
+          {arms.map(([arm, a]) => (
+            <tr key={arm} className="border-t border-slate-700/60 text-slate-200">
+              <th scope="row" className="py-1 pr-2 text-left font-mono font-medium">{arm}</th>
+              <td className="py-1 pr-2">{(a.accuracy * 100).toFixed(1)}%</td>
+              <td className="py-1 pr-2">{(a.reliability * 100).toFixed(1)}%</td>
+              <td className="py-1 pr-2">{a.meanCostMicrounits}</td>
+              <td className="py-1 pr-2">{a.p95LatencySeconds.toFixed(2)}</td>
+              <td className="py-1">{a.safetyViolations}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {report.confidenceIntervals && report.confidenceIntervals.length > 0 && (
+        <div className="mt-2">
+          <p className="text-[11px] font-medium text-slate-400">95% confidence intervals</p>
+          <ul className="mt-1 space-y-0.5 font-mono text-[11px] text-slate-300">
+            {report.confidenceIntervals.map((ci) => (
+              <li key={ci.metric}>
+                {ci.metric}: {ci.point.toFixed(3)} [{ci.lower95.toFixed(3)}, {ci.upper95.toFixed(3)}]
+                {ci.draws !== undefined ? ` (${ci.draws} draws)` : ""}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-[11px]">
+        <dt className="text-slate-500">Gate outcome</dt>
+        <dd className="text-slate-200">
+          validity {report.validityStatus} · promotionEligible {report.promotionEligible ? "YES" : "NO"}
+          {report.safetyPassed !== undefined ? ` · safety ${report.safetyPassed ? "passed" : "FAILED"}` : ""}
+        </dd>
+        <dt className="text-slate-500">Report / protocol</dt>
+        <dd className="break-all font-mono text-slate-300">
+          eval {evaluationId.slice(0, 16)}…{report.candidateHash ? ` · cand ${report.candidateHash.slice(0, 12)}…` : ""}
+          {report.baseHash ? ` · base ${report.baseHash.slice(0, 12)}…` : ""}
+          {report.protocolHash ? ` · protocol ${report.protocolHash.slice(0, 12)}…` : ""}
+        </dd>
+        <dt className="text-slate-500">Cells</dt>
+        <dd className="text-slate-200">
+          metric {report.metricCellsComplete ? "complete" : "INCOMPLETE"}
+          {report.safetyCellsComplete !== undefined ? ` · safety ${report.safetyCellsComplete ? "complete" : "INCOMPLETE"}` : ""}
+          {report.missingPairs !== undefined ? ` · missing pairs ${report.missingPairs}` : ""}
+        </dd>
+        <dt className="text-slate-500">Billing</dt>
+        <dd className="text-slate-200">
+          {billingUnknown ? "UNKNOWN — no nominal cost reported" : `nominal ${report.nominalCostUsd} USD`}
+          {report.billingBasis ? ` (${report.billingBasis})` : ""}
+          {report.actualInputTokens !== undefined && report.actualInputTokens !== null
+            ? ` · tokens in/out ${report.actualInputTokens}/${report.actualOutputTokens ?? "?"}`
+            : ""}
+        </dd>
+      </dl>
+      {(report.infrastructureFailures?.length ?? 0) > 0 && (
+        <ul className="mt-1 list-disc pl-5 text-[11px] text-rose-300">
+          {report.infrastructureFailures!.map((f) => (
+            <li key={f} className="break-all">{f}</li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }

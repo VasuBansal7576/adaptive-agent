@@ -173,15 +173,53 @@ export type RunOptions = {
 };
 
 /** GET /evaluations row: durable evaluation job status per candidate. */
+/** Authoritative arm metrics from EvaluationReport.to_dict (per arm B0/L/A). */
+export type ArmSummary = {
+  accuracy: number;
+  reliability: number;
+  meanCostMicrounits: number;
+  medianLatencySeconds: number;
+  p95LatencySeconds: number;
+  safetyViolations: number;
+  count: number;
+};
+
+/** Normalized trusted EvaluationReport projection (a864316-lineage; the
+ *  console renders only these fields — never fabricated metrics). */
+export type EvaluationReportProjection = {
+  comparison: "validation" | "final" | string;
+  validityStatus: string;
+  promotionEligible: boolean;
+  candidateHash?: string;
+  baseHash?: string;
+  protocolHash?: string;
+  armSummaries: Record<string, ArmSummary>;
+  confidenceIntervals?: Array<{ metric: string; point: number; lower95: number; upper95: number; draws?: number; analysisSeed?: number }>;
+  safetyPassed?: boolean;
+  missingPairs?: number;
+  metricCellsComplete?: boolean;
+  safetyCellsComplete?: boolean;
+  modelProvenanceComplete?: boolean;
+  infrastructureFailures?: string[];
+  analysisSeed?: number;
+  nominalCostUsd?: number | null;
+  actualInputTokens?: number | null;
+  actualOutputTokens?: number | null;
+  wallDurationSeconds?: number | null;
+  /** explicit unknown-billing marker from the backend */
+  billingBasis?: string;
+};
+
 export type EvaluationJob = {
   evaluationId: string;
   /** legacy QA rows may lack the binding; preserved as null = unverified */
   candidateId: string | null;
-  state: "queued" | "running" | "valid" | "invalid" | "cancelled" | "unverified";
+  state: "queued" | "running" | "valid" | "invalid" | "cancelled" | "completed" | "decided" | "unverified";
   /** true only when candidateId binds AND the state is a recognized enum */
   verified: boolean;
   trusted?: boolean;
   reason?: string;
+  report?: EvaluationReportProjection;
 };
 
 /** GET /environments/{id}/tasks: registered task goals a run may target. */

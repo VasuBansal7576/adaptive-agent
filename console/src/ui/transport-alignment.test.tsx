@@ -148,6 +148,45 @@ describe("run-options and registered tasks in the new-run dialog", () => {
     await waitFor(() => expect(within(dialog).getByLabelText("Token budget")).toHaveValue(20000));
   });
 
+  it("renders the ACTUAL trusted report projection: validation B0/L arms, gate, IDs, billing; decided/final B0/L/A with unknown billing", async () => {
+    const user = userEvent.setup();
+    const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
+    const sent: Array<{ budgetRef?: { id: string } }> = [];
+    const transport = {
+      ...sim,
+      createRun: async (input: Parameters<typeof sim.createRun>[0]) => {
+        sent.push({ budgetRef: input.budgetRef ? { id: input.budgetRef.id } : undefined });
+        return sim.createRun(input);
+      },
+      getRunOptions: async () => {
+        const options = await sim.getRunOptions();
+        return { ...options, budgetDefaults: { ...options.budgetDefaults }, budgetRef: { id: "budget-default", version: "1", sha256: "top-level" } };
+      },
+      listEvaluations: async () => {
+        const evaluations = await sim.listEvaluations();
+        return evaluations;
+      },
+      listCandidates: async () => {
+        const candidates = await sim.listCandidates();
+        return candidates;
+      },
+    };
+    render(<App transport={transport as never} />);
+    await user.click(await screen.findByRole("tab", { name: "Candidates" }));
+    // validation report: B0/L arms with actual metrics and CI
+    expect(await screen.findByText(/Trusted evaluation report — validation \(B0\/L\)/)).toBeInTheDocument();
+    expect(await screen.findByText("65.0%")).toBeInTheDocument(); // L accuracy from the report
+    expect(await screen.findByText(/accuracy_gain: 0\.100 \[0\.060, 0\.140]/)).toBeInTheDocument();
+    expect(await screen.findByText(/validity valid · promotionEligible YES/)).toBeInTheDocument();
+    // decided/final report renders B0/L/A and reports the explicit billing unknown
+    expect(await screen.findByText(/Trusted evaluation report — final \(B0\/L\/A\)/)).toBeInTheDocument();
+    expect(await screen.findByText(/UNKNOWN — no nominal cost reported/)).toBeInTheDocument();
+    expect(await screen.findByText(/missing pairs 2/)).toBeInTheDocument();
+    expect(await screen.findByText(/INCOMPLETE/)).toBeInTheDocument();
+    // legacy row stays unverified and out of the measured area
+    expect(await screen.findByText(/legacy evaluation record\(s\) preserved as UNVERIFIED/)).toBeInTheDocument();
+  });
+
   it("consumes executionModes advertised on environment summaries (51d476c)", async () => {
     const user = userEvent.setup();
     const sim = createSimulationTransport({ disconnectAfterEvents: 0 });
