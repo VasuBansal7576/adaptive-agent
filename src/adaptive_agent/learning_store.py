@@ -9,11 +9,12 @@ mutation, or candidate authority.
 from __future__ import annotations
 
 import json
+import hashlib
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
 from .learning import _canonical_operations
-from .retrieval import AccessFilteredRetriever, InMemorySourceProvider, SourceKind, SourceRecord, content_hash
+from .retrieval import AccessFilteredRetriever, InMemorySourceProvider, SourceKind, SourceRecord, canonical_json, content_hash
 
 
 class LearningStoreError(ValueError):
@@ -48,7 +49,7 @@ class DurableLearningSourceAdapter:
             kind = raw.get("kind")
             if kind == SourceKind.PUBLIC_DOC.value:
                 if raw.get("environmentId") != environment_id or raw.get("visibility") != "public":
-                    raise LearningStoreError("public documentation is not bound to the requested environment")
+                    continue
                 sources.append(self._source(raw, kind=SourceKind.PUBLIC_DOC, run_id=None, partition=None, visibility="learner", trust_class="operator"))
                 continue
             if kind == SourceKind.LIVE_EVIDENCE.value:
@@ -175,6 +176,30 @@ class CandidateManagerLearningAdapter:
             except json.JSONDecodeError as exc:
                 raise LearningStoreError("candidate operation is not valid JSON") from exc
         operations = _canonical_operations(operations)
+        patch_hashes = payload.get("changedArtifactHashes")
+        if not isinstance(patch_hashes, list) or len(patch_hashes) != 1 or not isinstance(patch_hashes[0], str):
+            raise LearningStoreError("candidate must name exactly one persisted patch")
+        patch_bytes = self._load_patch_bytes(patch_hashes[0])
+        try:
+            persisted_patch = json.loads(patch_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LearningStoreError("persisted candidate patch is not canonical JSON") from exc
+        if not isinstance(persisted_patch, Mapping):
+            raise LearningStoreError("persisted candidate patch is not an object")
+        persisted_operations = _canonical_operations(persisted_patch.get("operations"))
+        if persisted_operations != operations:
+            raise LearningStoreError("persisted patch operations do not match submitted operations")
+        applied_skill: dict[str, Any] = {}
+        applied_config: dict[str, Any] = {}
+        for operation in operations:
+            path = operation["path"]
+            if path == "executionConfig/instructionVariant":
+                applied_config["instructionVariant"] = operation["value"]
+            else:
+                applied_skill[path.split("/")[-1]] = operation["value"]
+        expected_patch = {"operations": operations, "skill": applied_skill, "executionConfigPatch": applied_config}
+        if patch_bytes != canonical_json(expected_patch).encode("utf-8"):
+            raise LearningStoreError("persisted patch bytes do not match canonical operations")
         candidate_bundle = self._apply_operations(active, operations)
         proposal = self.proposal_type(
             baseBundleHash=payload["baseBundleHash"],
@@ -186,6 +211,28 @@ class CandidateManagerLearningAdapter:
         )
         submitted = self.manager.submit_candidate(proposal, candidate_bundle)
         return submitted.model_dump(mode="json", by_alias=True) if hasattr(submitted, "model_dump") else dict(submitted)
+
+    def _load_patch_bytes(self, patch_hash: str) -> bytes:
+        reader = getattr(self.store, "get_immutable_bytes", None)
+        if callable(reader):
+            value = reader(patch_hash)
+            if isinstance(value, bytes):
+                patch_bytes = value
+            elif isinstance(value, Mapping) and isinstance(value.get("data"), bytes):
+                patch_bytes = value["data"]
+            else:
+                raise LearningStoreError("Store immutable patch reader returned no bytes")
+        else:
+            getter = getattr(self.store, "get_artifact", None)
+            if not callable(getter):
+                raise LearningStoreError("Store cannot reload persisted patch bytes")
+            try:
+                patch_bytes = canonical_json(getter(patch_hash)).encode("utf-8")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise LearningStoreError("persisted candidate patch was not found") from exc
+        if hashlib.sha256(patch_bytes).hexdigest() != patch_hash:
+            raise LearningStoreError("persisted candidate patch hash mismatch")
+        return patch_bytes
 
     def _apply_operations(self, active: Any, operations: Sequence[Mapping[str, Any]]) -> Any:
         candidate = self.bundle_type(parent=active.bundle_id, skills=[skill.model_copy(deep=True) for skill in active.skills], executionConfig=active.execution_config.model_copy(deep=True))
@@ -211,10 +258,24 @@ class CandidateManagerLearningAdapter:
                 continue
             if operation["operation"] == "add" and field in {"procedure", "applicability", "preconditions", "failureHandling"} and getattr(skill, field, None) not in (None, "", {}, []):
                 raise LearningStoreError(f"cannot add an existing skill field: {path}")
+            field_name, field_alias = self._skill_field(field)
             if operation["operation"] == "remove":
-                value = {} if field == "applicability" else [] if field in {"preconditions", "failureHandling"} else ""
-            setattr(skill, field, value)
+                value = {} if field_name == "applicability" else [] if field_name in {"preconditions", "failure_handling"} else ""
+            skill_payload = skill.model_dump(mode="python", by_alias=True)
+            skill_payload[field_alias] = value
+            skill_payload["contentHash"] = ""
+            replacement = self.skill_type.model_validate(skill_payload)
+            index = next(index for index, item in enumerate(candidate.skills) if item.skill_id == skill_id)
+            candidate.skills[index] = replacement
+            skills[skill_id] = replacement
         return candidate
+
+    def _skill_field(self, alias: str) -> tuple[str, str]:
+        fields = getattr(self.skill_type, "model_fields", {})
+        for name, field in fields.items():
+            if name == alias or getattr(field, "alias", None) == alias:
+                return name, getattr(field, "alias", None) or name
+        raise LearningStoreError(f"unsupported skill field alias: {alias}")
 
 
 def make_durable_learning_adapters(store: DurableStore, manager: CandidateAuthority, *, proposal_type: Any, bundle_type: Any, skill_type: Any) -> tuple[DurableLearningSourceAdapter, CandidateManagerLearningAdapter]:
