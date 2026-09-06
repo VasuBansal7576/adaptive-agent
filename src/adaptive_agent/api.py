@@ -902,7 +902,10 @@ def create_app(control: ControlPlane | None = None, *, durable_runtime: Any | No
         if runtime is not None:
             if runtime.get_run(run_id) is None:
                 raise HTTPException(status_code=404, detail="run not found")
-            return [event for event in runtime.events(run_id) if event.get("event") != "outcome_recorded"]
+            # DurableRuntime.events applies the visibility projection and
+            # enriches operator-visible payloads.  Do not drop outcome rows
+            # here; evaluator-only rows have already been removed there.
+            return runtime.events(run_id)
         with plane._lock:
             if run_id not in plane.runs:
                 raise HTTPException(status_code=404, detail="run not found")

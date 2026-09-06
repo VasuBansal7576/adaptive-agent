@@ -184,6 +184,40 @@ def test_learning_runtime_uses_durable_projection_and_excludes_operator_evidence
     assert inferred.json()["environmentId"] == "finance"
 
 
+def test_durable_event_projection_exposes_safe_failure_summary_and_hides_evaluator_rows(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "event-projection"}).json()
+    controller = app.state.controller
+    controller.append_event(run["runId"], "run_failed", {"error": "Prime CLI exited status 130: Daemon worker client closed"}, "system", "operator")
+    controller.append_event(
+        run["runId"],
+        "model_response",
+        {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "usage": {"inputTokens": 4, "outputTokens": 2, "totalTokens": 6}},
+        "system",
+        "operator",
+    )
+    controller.append_event(run["runId"], "outcome_recorded", {"passed": False, "score": 0.0, "reason": "objective state not matched"}, "system", "operator")
+    controller.append_event(run["runId"], "trusted_outcome", {"passed": False, "reason": "hidden evaluator answer"}, "evaluator", "evaluator_only")
+
+    response = api.get(f"/runs/{run['runId']}/evidence")
+    assert response.status_code == 200
+    events = response.json()
+    failure = next(event for event in events if event["event"] == "run_failed")
+    assert failure["data"]["summary"] == "Runtime failure recorded"
+    assert failure["data"]["detail"] == "Prime CLI exited status 130: Daemon worker client closed"
+    model = next(event for event in events if event["event"] == "model_response")
+    assert model["data"]["summary"] == "Model response recorded"
+    assert '"totalTokens":6' in model["data"]["detail"]
+    outcome = next(event for event in events if event["event"] == "outcome_recorded")
+    assert outcome["data"]["summary"] == "Trusted outcome check recorded"
+    assert '"reason":"objective state not matched"' in outcome["data"]["detail"]
+    assert all(event["data"].get("visibility") != "evaluator_only" for event in events)
+    assert "hidden evaluator answer" not in response.text
+
+
 def test_durable_restart_does_not_reopen_claimed_run(tmp_path):
     first_app = create_runtime_app(data_dir=tmp_path)
     first_api = TestClient(first_app, base_url="http://127.0.0.1")

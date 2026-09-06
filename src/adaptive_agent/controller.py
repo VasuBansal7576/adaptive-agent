@@ -276,16 +276,54 @@ class Controller:
         return operator_event
 
     def events(self, run_id: str, after_sequence: int = 0) -> list[dict[str, Any]]:
-        """Ordered SSE-ready event payloads: [{id, event, data}]."""
-        rows = [r for r in self.store.list_evidence(run_id) if r["sequence"] > after_sequence]
-        return [
-            {
-                "id": r["sequence"],
-                "event": r["event_type"],
-                "data": r,
-            }
-            for r in rows
-        ]
+        """Ordered SSE-ready operator projection: [{id, event, data}].
+
+        Evidence artifacts remain content-addressed and immutable.  The
+        projection adds a small, visibility-gated summary/detail envelope so
+        operators can understand failures without a second artifact request.
+        Evaluator-only rows are excluded before they reach the API or SSE
+        stream.
+        """
+        rows = [r for r in self.store.list_evidence(run_id) if r["sequence"] > after_sequence and r.get("visibility") != "evaluator_only"]
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            data = dict(row)
+            data.update(self._event_payload_projection(row))
+            events.append({"id": row["sequence"], "event": row["event_type"], "data": data})
+        return events
+
+    def _event_payload_projection(self, row: Mapping[str, Any]) -> dict[str, str]:
+        """Return allowlisted operator-readable fields from an event artifact."""
+        event_type = row.get("event_type")
+        source_ref = row.get("source_ref")
+        if not isinstance(event_type, str) or not isinstance(source_ref, str):
+            return {}
+        try:
+            reference = json.loads(source_ref)
+            payload = self.store.get_artifact(reference["sha256"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, Mapping):
+            return {}
+        if event_type == "run_failed":
+            error = payload.get("error")
+            return {"summary": "Runtime failure recorded", "detail": str(error)} if isinstance(error, str) and error else {"summary": "Runtime failure recorded"}
+        if event_type in {"outcome_recorded", "trusted_outcome"}:
+            fields = {key: payload[key] for key in ("passed", "score", "reason") if key in payload}
+            detail = json.dumps(fields, sort_keys=True, separators=(",", ":")) if fields else ""
+            return {"summary": "Trusted outcome check recorded", **({"detail": detail} if detail else {})}
+        if event_type in {"model_response", "model_observation"}:
+            fields: dict[str, Any] = {}
+            for key in ("provider", "model", "modelProfile"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    fields[key] = value
+            usage = payload.get("usage")
+            if isinstance(usage, Mapping):
+                fields["usage"] = {key: usage[key] for key in ("inputTokens", "outputTokens", "totalTokens") if isinstance(usage.get(key), int)}
+            detail = json.dumps(fields, sort_keys=True, separators=(",", ":")) if fields else ""
+            return {"summary": "Model response recorded", **({"detail": detail} if detail else {})}
+        return {}
 
     def stream_events(self, run_id: str, after_sequence: int = 0, poll_interval: float = 0.5, timeout: float = 300.0) -> Iterator[dict[str, Any]]:
         """Blocking generator for SSE until the run reaches a terminal status."""
