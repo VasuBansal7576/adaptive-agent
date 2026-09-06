@@ -109,7 +109,7 @@ def _candidate_binding(runtime: Any, learned_hash: str, base_hash: str, source_i
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError("learner receipt CAS binding is malformed") from exc
         expected_response = str(row.get("evidence_id", "")).removeprefix("learning-model-")
-        if not isinstance(artifact, Mapping) or row.get("content_hash") != artifact_hash or artifact.get("responseId") != expected_response:
+        if not isinstance(artifact, Mapping) or sha256_json(artifact) != artifact_hash or row.get("content_hash") != artifact_hash or row.get("trust_class") not in {"system", "operator"} or row.get("visibility") != "operator" or artifact.get("provider") != MODEL_PROVIDER or artifact.get("model") != MODEL_NAME or artifact.get("responseId") != expected_response:
             raise RuntimeError("learner receipt CAS binding failed")
         usage = artifact.get("usage")
         if not isinstance(usage, Mapping) or any(key not in usage for key in ("inputTokens", "outputTokens", "totalTokens")):

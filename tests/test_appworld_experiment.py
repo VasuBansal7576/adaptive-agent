@@ -49,6 +49,7 @@ class _Process:
 class _Model:
     calls = 0
     evaluation_calls = 0
+    turns: dict[str, int] = {}
     def __init__(self, **kwargs): pass
     def invoke(self, *, goal, environment, messages=None, **kwargs):
         type(self).calls += 1
@@ -56,15 +57,18 @@ class _Model:
             evidence = environment["learningContext"]["developmentEvidence"][0]["sourceId"]
             procedure = "Reuse the observed date-reading procedure."
             payload = {"predictedEffect": "reuse procedure", "editOperations": [{"path": "skills/appworld/procedure", "operation": "add", "value": procedure}], "supportingEvidenceIds": [evidence], "proposerVersion": "test", "skill": {"procedure": procedure}}
-            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"learn-{self.calls}", "text": json.dumps(payload), "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5, "cacheReadInputTokens": 1, "cost": {"total": 0.001}}}
+            return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"learn-{self.calls}", "text": json.dumps(payload), "usage": {"input": 2, "output": 3, "totalTokens": 5, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 0.001}}}
         type(self).evaluation_calls += 1
+        run_key = environment["capabilities"][0]
+        turn = type(self).turns.get(run_key, 0) + 1
+        type(self).turns[run_key] = turn
         capability = next(item for item in environment["capabilities"] if item.endswith("appworld__call_read"))
-        if type(self).evaluation_calls % 2:
+        if turn == 1:
             code = f'result = host_request({json.dumps({"capabilityId": capability, "arguments": {"apiName": "phone__get_current_date_and_time", "arguments": {}}})})'
             text = json.dumps({"action": "execute", "code": code})
         else:
             text = json.dumps({"action": "finish", "answer": "date read"})
-        return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"eval-{self.calls}", "text": text, "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5, "cacheReadInputTokens": 1, "cost": {"total": 0.001}}}
+        return {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "responseId": f"eval-{self.calls}", "text": text, "usage": {"input": 2, "output": 3, "totalTokens": 5, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 0.001}}}
 
 
 def _prime(monkeypatch):
@@ -91,7 +95,22 @@ def _prime(monkeypatch):
     monkeypatch.setattr(experiment_module, "PrimeCliModelClient", _Model)
 
 
+def _args(data_dir: Path, root: Path, mode: str):
+    return build_parser().parse_args([f"--{mode}", "--data-dir", str(data_dir), "--appworld-root", str(root), "--appworld-python", sys.executable, "--source-revision", "source", "--image-digest", "sha256:image", "--core-planner-hash", "core"])
+
+
+class _Interrupted(RuntimeError):
+    pass
+
+
+def _reset_model():
+    _Model.calls = 0
+    _Model.evaluation_calls = 0
+    _Model.turns = {}
+
+
 def test_cli_runs_and_resumes_real_runtime_panels(tmp_path, monkeypatch):
+    _reset_model()
     _prime(monkeypatch)
     monkeypatch.setenv("ADAPTIVE_AGENT_SOURCE_REVISION", "source")
     monkeypatch.setenv("ADAPTIVE_AGENT_IMAGE_DIGEST", "sha256:image")
@@ -152,11 +171,11 @@ def test_cli_runs_and_resumes_real_runtime_panels(tmp_path, monkeypatch):
     state_path.write_text(json.dumps(checkpoint))
     checkpoint = json.loads(state_path.read_text())
     checkpoint["learningStatus"] = "in_flight"
-    (tmp_path / "run" / "appworld-experiment-state.json").write_text(json.dumps(checkpoint))
+    state_path.write_text(json.dumps(checkpoint))
     with pytest.raises(RuntimeError, match="authenticated recoverable receipt"):
         run_experiment(resume)
     assert _Model.calls == calls
-    (tmp_path / "run" / "appworld-experiment-state.json").write_text(json.dumps({**checkpoint, "learningStatus": "complete"}))
+    state_path.write_text(json.dumps({**checkpoint, "learningStatus": "complete"}))
     bad = build_parser().parse_args(["--resume", "--data-dir", str(tmp_path / "run"), "--appworld-root", str(root), "--appworld-python", sys.executable, "--source-revision", "changed", "--image-digest", "sha256:image", "--core-planner-hash", "core"])
     with pytest.raises(RuntimeError, match="SOURCE_REVISION"):
         run_experiment(bad)
@@ -167,3 +186,61 @@ def test_cli_runs_and_resumes_real_runtime_panels(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="budget-expanding retry"):
         run_experiment(resume)
     assert _Model.calls == calls
+
+
+def test_cli_recovers_after_learning_checkpoint_without_redispatch(tmp_path, monkeypatch):
+    _reset_model()
+    _prime(monkeypatch)
+    monkeypatch.setenv("ADAPTIVE_AGENT_SOURCE_REVISION", "source")
+    monkeypatch.setenv("ADAPTIVE_AGENT_IMAGE_DIGEST", "sha256:image")
+    monkeypatch.setenv("ADAPTIVE_AGENT_CORE_PLANNER_HASH", "core")
+    root = _root(tmp_path)
+    data_dir = tmp_path / "learning-interrupted"
+
+    def stop_after_learning(event):
+        if event["stage"] == "learning" and event["status"] == "complete":
+            raise _Interrupted("after learning checkpoint")
+
+    with pytest.raises(_Interrupted):
+        run_experiment(_args(data_dir, root, "initialize"), progress=stop_after_learning)
+    calls = _Model.calls
+    assert json.loads((data_dir / "appworld-experiment-state.json").read_text())["learningStatus"] == "complete"
+    result = run_experiment(_args(data_dir, root, "resume"))
+    assert len(result["reports"]) == 2
+    assert _Model.calls == 257
+    assert _Model.calls > calls
+
+
+def test_cli_recovers_after_one_new_dev_cell_without_repeating_finished_work(tmp_path, monkeypatch):
+    _reset_model()
+    _prime(monkeypatch)
+    monkeypatch.setenv("ADAPTIVE_AGENT_SOURCE_REVISION", "source")
+    monkeypatch.setenv("ADAPTIVE_AGENT_IMAGE_DIGEST", "sha256:image")
+    monkeypatch.setenv("ADAPTIVE_AGENT_CORE_PLANNER_HASH", "core")
+    root = _root(tmp_path)
+    data_dir = tmp_path / "dev-interrupted"
+    import adaptive_agent.appworld_experiment as experiment_module
+    original_factory = experiment_module.create_appworld_benchmark_runner
+    interrupted = {"done": False}
+
+    def interrupting_factory(*args, **kwargs):
+        runner = original_factory(*args, **kwargs)
+        if runner.protocol.official_split == "dev":
+            original_cell = runner.runtime.run_appworld_cell
+
+            def one_cell_then_stop(**cell_kwargs):
+                result = original_cell(**cell_kwargs)
+                if not interrupted["done"]:
+                    interrupted["done"] = True
+                    raise _Interrupted("after one new dev cell")
+                return result
+
+            runner.runtime.run_appworld_cell = one_cell_then_stop
+        return runner
+
+    monkeypatch.setattr(experiment_module, "create_appworld_benchmark_runner", interrupting_factory)
+    with pytest.raises(_Interrupted):
+        run_experiment(_args(data_dir, root, "initialize"))
+    monkeypatch.setattr(experiment_module, "create_appworld_benchmark_runner", original_factory)
+    run_experiment(_args(data_dir, root, "resume"))
+    assert _Model.calls == 257
