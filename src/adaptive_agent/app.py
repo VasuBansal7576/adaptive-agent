@@ -415,6 +415,41 @@ class DurableRuntime:
             arm_bundles=selected,
         )
 
+    def build_evaluation_job(self, protocol: Any, arm_bundles: Mapping[Any, Any], *, total_budget_microunits: int | None = None) -> Any:
+        """Build the production evaluation job around this runtime's executor.
+
+        The returned job uses the same controller, durable store, package
+        instances, and bound ``execute_evaluation_task`` callback as the HTTP
+        runtime.  This keeps CLI or application factories from accidentally
+        substituting a synthetic evaluator or a second model invocation path.
+        """
+        from adaptive_agent.evaluation import Arm
+        from adaptive_agent.evaluation_job import build_evaluation_job
+
+        active = self.controller.get_active_bundle()
+        if active is None:
+            raise LearningRuntimeError("no active bundle is available for evaluation")
+        selected = dict(arm_bundles)
+        if Arm.B0 not in selected and Arm.B0.value not in selected:
+            selected[Arm.B0] = active
+        arm_hashes: dict[str, str] = {}
+        for key, value in selected.items():
+            arm_name = getattr(key, "value", str(key))
+            content_hash = getattr(value, "content_hash", None)
+            if not isinstance(content_hash, str) or not content_hash:
+                raise LearningRuntimeError(f"evaluation arm bundle {arm_name!r} has no content hash")
+            arm_hashes[arm_name] = content_hash
+        self._evaluation_arm_bundles = arm_hashes
+        return build_evaluation_job(
+            self.controller.store,
+            self.controller,
+            protocol,
+            self.packages,
+            selected,
+            self.execute_evaluation_task,
+            total_budget_microunits=total_budget_microunits,
+        )
+
     def list_evaluations(self) -> list[dict[str, Any]]:
         out = []
         for row in self.controller.store.list_evaluations():

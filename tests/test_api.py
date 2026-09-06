@@ -156,6 +156,22 @@ def test_durable_model_accounting_payloads_keep_arm_seed_and_bundle_identity(tmp
     assert json.loads(store.get_run(run["runId"])["run_json"])["armBundles"]["L"] == bundle_hash
 
 
+def test_durable_runtime_builds_production_job_with_bound_executor(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    runtime = app.state.durable_runtime
+    protocol = EvaluationProtocol()
+    protocol.freeze(runtime.packages)
+    active = runtime.controller.get_active_bundle()
+    assert active is not None
+
+    job = runtime.build_evaluation_job(protocol, {Arm.B0: active, Arm.L: active})
+
+    assert job.execute.__self__ is runtime
+    assert job.execute.__func__ is runtime.execute_evaluation_task.__func__
+    assert job.arm_bundles[Arm.B0] is active
+    assert job.arm_bundles[Arm.L] is active
+
+
 def test_fixture_provider_reset_uses_executor_seed():
     class Package:
         def __init__(self):
