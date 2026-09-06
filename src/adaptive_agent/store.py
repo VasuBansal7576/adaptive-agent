@@ -697,9 +697,13 @@ class Store:
                 ref = json.loads(ev["source_ref"])
                 payload = self.get_artifact(ref["sha256"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                # Unresolvable artifact: still emit a minimal bound row so the
+                # run has live evidence; content fields stay null rather than
+                # leaking an unsanitized payload.
+                payload = None
+            if payload is not None and not isinstance(payload, dict):
                 continue
-            if not isinstance(payload, dict):
-                continue
+            payload = payload or {}
             call_id = payload.get("callId")
             if isinstance(call_id, str) and call_id in matched:
                 continue
