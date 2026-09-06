@@ -75,6 +75,31 @@ class CostGuardTests(unittest.TestCase):
         with self.assertRaises(AdapterError):
             parse_model_usage({"inputTokens": 9, "outputTokens": 1, "cost": {"total": 0.00001, "currency": "EUR"}}, require_cost=True)
 
+    def test_sdk_cost_is_nominal_proxy_for_parent_and_child_receipts(self):
+        ledger = SharedBudget(30, 1000, 4, 2, 100, max_model_cost_microunits=20000)
+        client = FakeClient(usage={"inputTokens": 9, "outputTokens": 1, "cost": {"input": 0.003588, "output": 0.004596, "total": 0.008184}})
+        observations = []
+        planner = LunaChildPlanner(client, budget=ChildPlannerBudget(ledger), observation_sink=observations.append)
+        parent = planner.parent_model_client(observation_sink=observations.append)
+        parent.invoke(goal="parent", environment={}, messages=[], remaining_deadline=5)
+        planner(request(ledger))
+        self.assertEqual(ledger.model_cost_microunits_used, 16368)
+        self.assertEqual([item["economicCostStatus"] for item in observations], ["unknown", "unknown"])
+        self.assertEqual([item["costBasis"] for item in observations], ["nominal_budget_proxy", "nominal_budget_proxy"])
+        self.assertEqual([item["nominalCostUsd"] for item in observations], [0.008184, 0.008184])
+        self.assertTrue(all("costMicrounits" not in item for item in observations))
+
+    def test_explicit_measured_economic_cost_stays_distinguishable(self):
+        usage = {"inputTokens": 1, "outputTokens": 1, "economicCost": {"status": "measured", "microunits": 17}}
+        receipt = parse_model_usage(usage, require_cost=True)
+        self.assertEqual((receipt.cost_microunits, receipt.economic_cost_microunits), (17, 17))
+        observations = []
+        ledger = SharedBudget(30, 1000, 4, 1, 100, max_model_cost_microunits=20)
+        LunaChildPlanner(FakeClient(usage=usage), budget=ChildPlannerBudget(ledger), observation_sink=observations.append)(request(ledger))
+        self.assertEqual(observations[0]["costMicrounits"], 17)
+        self.assertEqual(observations[0]["economicCostStatus"], "measured")
+        self.assertEqual(observations[0]["costBasis"], "explicit_measured")
+
     def test_unknown_cost_preserves_receipt_tokens_and_blocks_future_dispatch(self):
         ledger = SharedBudget(30, 1000, 4, 1, 100, max_model_cost_microunits=10)
         observations = []
@@ -142,7 +167,10 @@ class CostGuardTests(unittest.TestCase):
         with self.assertRaises(SecurityViolation):
             planner(request(ledger))
         self.assertEqual(ledger.model_cost_microunits_used, 11)
-        self.assertEqual([item["costMicrounits"] for item in observations], [7, 4])
+        self.assertEqual([item["economicCostStatus"] for item in observations], ["unknown", "unknown"])
+        self.assertEqual([item["costBasis"] for item in observations], ["nominal_budget_proxy", "nominal_budget_proxy"])
+        self.assertEqual([item["nominalCostUsd"] for item in observations], [0.000007, 0.000004])
+        self.assertTrue(all("costMicrounits" not in item for item in observations))
         self.assertEqual(len(observations), 2)
         with self.assertRaises(SecurityViolation):
             parent.invoke(goal="blocked", environment={}, messages=[], remaining_deadline=5)
