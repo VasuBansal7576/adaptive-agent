@@ -70,7 +70,7 @@ def _manifest(args: argparse.Namespace, protocols: Sequence[AppWorldProtocol], b
     return {"experiment": "appworld-train-learn-evaluate", "baseBundleHash": base_hash, "protocols": {p.official_split: p.to_dict() for p in protocols}, "pins": {"sourceRevision": args.source_revision, "imageDigest": args.image_digest, "provider": MODEL_PROVIDER, "modelProfile": args.model_profile, "corePlannerHash": args.core_planner_hash, "datasetContentHash": protocols[0].dataset_content_hash, "budget": protocols[0].budget.to_dict()}}
 
 
-def _candidate_binding(runtime: Any, learned_hash: str, base_hash: str, source_ids: Sequence[str]) -> None:
+def _candidate_binding(runtime: Any, learned_hash: str, base_hash: str, source_ids: Sequence[str], expected_receipts: Sequence[str] | None = None) -> list[str]:
     store = runtime.controller.store
     bundle = store.get_bundle_by_hash(learned_hash)
     candidate = store.get_candidate_by_bundle_hash(learned_hash)
@@ -97,8 +97,27 @@ def _candidate_binding(runtime: Any, learned_hash: str, base_hash: str, source_i
         provenance = store.evidence_provenance(evidence_id)
         if not isinstance(provenance, Mapping) or provenance.get("run_id") not in allowed:
             raise RuntimeError("learned candidate evidence is outside the frozen training source set")
-    if not any(row.get("event_type") == "learning_model_observation" for run_id in source_ids for row in store.list_evidence(run_id)):
+    learner_rows = [row for run_id in source_ids for row in store.list_evidence(run_id) if row.get("event_type") == "learning_model_observation"]
+    if not learner_rows:
         raise RuntimeError("learned candidate lacks an authenticated learner receipt")
+    receipt_bindings: list[str] = []
+    for row in learner_rows:
+        try:
+            source_ref = json.loads(row["source_ref"])
+            artifact_hash = source_ref["sha256"]
+            artifact = store.get_artifact(artifact_hash)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("learner receipt CAS binding is malformed") from exc
+        expected_response = str(row.get("evidence_id", "")).removeprefix("learning-model-")
+        if not isinstance(artifact, Mapping) or row.get("content_hash") != artifact_hash or artifact.get("responseId") != expected_response:
+            raise RuntimeError("learner receipt CAS binding failed")
+        usage = artifact.get("usage")
+        if not isinstance(usage, Mapping) or any(key not in usage for key in ("inputTokens", "outputTokens", "totalTokens")):
+            raise RuntimeError("learner receipt usage binding is incomplete")
+        receipt_bindings.append(f"{row['evidence_id']}:{artifact_hash}")
+    if expected_receipts is not None and list(expected_receipts) != receipt_bindings:
+        raise RuntimeError("learner receipt binding changed after learning")
+    return receipt_bindings
 
 
 def _derive_ablation(runtime: Any, learned_hash: str) -> str:
@@ -191,6 +210,7 @@ def run_experiment(args: argparse.Namespace, *, progress: Any | None = None) -> 
     source_ids = current.get("trainingRunIds") if current else None
     learned_hash = current.get("learnedBundleHash") if current else None
     ablation_hash = current.get("ablationBundleHash") if current else None
+    receipt_bindings = current.get("learningReceiptBindings") if current else None
     if not source_ids:
         state = {"manifestHash": protocols[0].protocol_hash, "baseBundleHash": base_hash, "trainingRunIds": [], "trainingStatus": "running", "learningStatus": "pending", "devStatus": "pending", "finalStatus": "pending"}
         _atomic_json(state_path, state)
@@ -201,7 +221,13 @@ def run_experiment(args: argparse.Namespace, *, progress: Any | None = None) -> 
             train_runner.run("train", bundles, arms=(Arm.B0,))
         except Exception as exc:
             with sqlite3.connect(train_runner.db) as conn:
-                run_ids = [row[0] for row in conn.execute("SELECT run_id FROM appworld_cells WHERE benchmark_id=?", ("train",))]
+                result_rows = [row[0] for row in conn.execute("SELECT result_json FROM appworld_cells WHERE benchmark_id=?", ("train",))]
+            run_ids = []
+            for result_json in result_rows:
+                try:
+                    run_ids.append(json.loads(result_json)["observation"]["run_id"])
+                except (TypeError, KeyError, json.JSONDecodeError):
+                    continue
             terminal_failure = any(
                 isinstance((run := runtime.controller.store.get_run(run_id)), Mapping)
                 and run.get("status") in {"failed", "timed_out", "outcome_unknown"}
@@ -227,12 +253,12 @@ def run_experiment(args: argparse.Namespace, *, progress: Any | None = None) -> 
         learned_hash = candidate.get("candidateBundleHash") or candidate.get("candidate_bundle_hash")
         if not isinstance(learned_hash, str) or not learned_hash:
             raise RuntimeError("learning proposal did not produce a durable candidate bundle")
-        _candidate_binding(runtime, learned_hash, base_hash, source_ids)
+        receipt_bindings = _candidate_binding(runtime, learned_hash, base_hash, source_ids)
         ablation_hash = _derive_ablation(runtime, learned_hash)
-        state.update({"learnedBundleHash": learned_hash, "ablationBundleHash": ablation_hash, "learningStatus": "complete", "devStatus": "pending"})
+        state.update({"learnedBundleHash": learned_hash, "learningReceiptBindings": receipt_bindings, "ablationBundleHash": ablation_hash, "learningStatus": "complete", "devStatus": "pending"})
         _atomic_json(state_path, state)
         emit("learning", "complete", sourceCount=8)
-    if not isinstance(source_ids, list) or len(source_ids) != 8 or not isinstance(learned_hash, str):
+    if not isinstance(source_ids, list) or len(source_ids) != 8 or len(set(source_ids)) != 8 or not isinstance(learned_hash, str):
         raise RuntimeError("experiment state lacks a complete authenticated learning result")
     # Re-open the train panel on every invocation.  The runner verifies every
     # persisted receipt and only dispatches missing cells, so editable state
@@ -242,11 +268,14 @@ def run_experiment(args: argparse.Namespace, *, progress: Any | None = None) -> 
     recovered_source_ids = _training_ids(train_runner)
     if recovered_source_ids != source_ids:
         raise RuntimeError("durable train receipts do not match the frozen eight-run source declaration")
-    _candidate_binding(runtime, learned_hash, base_hash, source_ids)
-    if not isinstance(ablation_hash, str) or not ablation_hash:
-        raise RuntimeError("experiment state lacks an authenticated ablation bundle")
+    if not isinstance(receipt_bindings, list) or not receipt_bindings:
+        raise RuntimeError("experiment state lacks authenticated learning receipt bindings")
+    _candidate_binding(runtime, learned_hash, base_hash, source_ids, receipt_bindings)
+    expected_ablation_hash = _derive_ablation(runtime, learned_hash)
+    if isinstance(ablation_hash, str) and ablation_hash and ablation_hash != expected_ablation_hash:
+        raise RuntimeError("saved ablation bundle does not match deterministic L-derived ablation")
+    ablation_hash = expected_ablation_hash
     if not current or current.get("ablationBundleHash") != ablation_hash:
-        ablation_hash = _derive_ablation(runtime, learned_hash)
         saved_state = _read_state(state_path) or {}
         saved_state["ablationBundleHash"] = ablation_hash
         _atomic_json(state_path, saved_state)
