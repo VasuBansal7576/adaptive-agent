@@ -47,13 +47,16 @@ def test_runtime_retry_uses_fresh_run_identity_after_pre_receipt_failure(tmp_pat
     task = runtime.registry.list_tasks_by_partition("finance", "development")[0]
     bundle = runtime.controller.get_active_bundle()
     assert bundle is not None
+    bundle_hash = getattr(bundle, "content_hash", None)
+    if not isinstance(bundle_hash, str):
+        bundle_hash = bundle["content_hash"]
 
     def config(attempt: int) -> FrozenExecutionConfig:
         return FrozenExecutionConfig(
             protocol.start_candidate_generation(),
             Arm.B0,
             17,
-            bundle["content_hash"],
+            bundle_hash,
             attempt=attempt,
         )
 
