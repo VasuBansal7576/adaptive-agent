@@ -480,6 +480,44 @@ def test_durable_model_accounting_payloads_keep_arm_seed_and_bundle_identity(tmp
     assert json.loads(store.get_run(run["runId"])["run_json"])["armBundles"]["L"] == bundle_hash
 
 
+def test_durable_model_accounting_preserves_sdk_nominal_cost_and_cache_usage(tmp_path):
+    app = create_runtime_app(data_dir=tmp_path)
+    api = TestClient(app, base_url="http://127.0.0.1")
+    api.get("/session/bootstrap")
+    task = api.get("/environments/finance/tasks").json()[0]
+    run = api.post("/runs", json={"goal": task["goal"], "environmentId": "finance", "idempotencyKey": "sdk-cost-cache"}).json()
+    runtime = app.state.durable_runtime
+    store = runtime.controller.store
+    bundle_hash = runtime.controller.get_active_bundle().content_hash
+    runtime._record_model_response(
+        run["runId"],
+        runtime.packages["finance"],
+        {
+            "provider": "openai-codex",
+            "model": "openai-codex/gpt-5.6-luna",
+            "responseId": "sdk-cost-response",
+            "usage": {
+                "inputTokens": 4,
+                "outputTokens": 2,
+                "totalTokens": 6,
+                "cacheReadInputTokens": 3,
+                "cost": {"total": 0.0125},
+            },
+            "arm": "B0",
+            "seed": 7,
+            "bundleHash": bundle_hash,
+        },
+    )
+    row = next(item for item in store.list_evidence(run["runId"]) if item["event_type"] == "model_response")
+    payload = store.get_artifact(json.loads(row["source_ref"])["sha256"])
+    accounting = store.get_artifact(payload["accountingRef"]["sha256"])
+    assert payload["nominalCostUsd"] == 0.0125
+    assert accounting["nominalCostUsd"] == 0.0125
+    assert accounting["economicCost"]["microunits"] is None
+    assert accounting["aggregateUsage"]["cacheReadInputTokens"] == 3
+    assert accounting["receipts"][0]["usage"]["cost"]["total"] == 0.0125
+
+
 def test_durable_runtime_builds_production_job_with_bound_executor(tmp_path):
     app = create_runtime_app(data_dir=tmp_path)
     runtime = app.state.durable_runtime

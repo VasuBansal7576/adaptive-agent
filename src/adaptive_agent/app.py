@@ -757,9 +757,7 @@ class DurableRuntime:
         raw_receipts = evidence.get("receipts")
         receipts_input = raw_receipts if isinstance(raw_receipts, list) and raw_receipts else [evidence]
         receipts: list[dict[str, Any]] = []
-        aggregate = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
-        aggregate_cost = 0.0
-        explicit_cost = False
+        cache_keys = ("cacheReadInputTokens", "cacheCreationInputTokens", "cachedInputTokens")
         aggregate_inference = 0.0
         now = time.monotonic()
         started = self._run_started_at.get(run_id, now)
@@ -767,7 +765,26 @@ class DurableRuntime:
         for index, raw in enumerate(receipts_input):
             if not isinstance(raw, Mapping):
                 raise ValueError("model accounting receipt must be an object")
-            receipt_usage = canonical_usage(raw.get("usage"))
+            raw_usage = raw.get("usage")
+            receipt_usage = canonical_usage(raw_usage)
+            if isinstance(raw_usage, Mapping):
+                for key in cache_keys:
+                    value = raw_usage.get(key)
+                    if value is None:
+                        value = raw_usage.get({
+                            "cacheReadInputTokens": "cache_read_input_tokens",
+                            "cacheCreationInputTokens": "cache_creation_input_tokens",
+                            "cachedInputTokens": "cached_input_tokens",
+                        }[key])
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        receipt_usage[key] = value
+                if isinstance(raw_usage.get("cost"), Mapping):
+                    receipt_usage["cost"] = dict(raw_usage["cost"])
+                details = raw_usage.get("prompt_tokens_details") or raw_usage.get("promptTokensDetails")
+                if isinstance(details, Mapping) and "cachedInputTokens" not in receipt_usage:
+                    value = details.get("cached_tokens")
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        receipt_usage["cachedInputTokens"] = value
             receipt_id = raw.get("responseId") or raw.get("response_id")
             if not isinstance(receipt_id, str) or not receipt_id.strip():
                 receipt_id = response_id if index == 0 else f"{response_id}:receipt:{index}"
@@ -778,20 +795,32 @@ class DurableRuntime:
             if cost_value is not None:
                 if isinstance(cost_value, bool) or not isinstance(cost_value, (int, float)) or not math.isfinite(cost_value) or cost_value < 0:
                     raise ValueError("model accounting costMicrounits must be finite and non-negative")
-                aggregate_cost += float(cost_value)
-                explicit_cost = True
+            nominal_value = raw.get("nominalCostUsd")
+            if nominal_value is None and isinstance(raw_usage, Mapping):
+                sdk_cost = raw_usage.get("cost")
+                if isinstance(sdk_cost, Mapping):
+                    nominal_value = sdk_cost.get("total")
+            if nominal_value is not None:
+                if isinstance(nominal_value, bool) or not isinstance(nominal_value, (int, float)) or not math.isfinite(float(nominal_value)) or float(nominal_value) < 0:
+                    raise ValueError("model accounting nominalCostUsd must be finite and non-negative")
             aggregate_inference += float(duration_value)
-            for key in aggregate:
-                aggregate[key] += receipt_usage[key]
-            receipts.append({"responseId": receipt_id, "usage": receipt_usage, "durationSeconds": float(duration_value), "status": str(raw.get("status", "complete")), **({"costMicrounits": cost_value} if cost_value is not None else {})})
+            receipts.append({"responseId": receipt_id, "usage": receipt_usage, "durationSeconds": float(duration_value), "status": str(raw.get("status", "complete")), **({"costMicrounits": cost_value} if cost_value is not None else {}), **({"nominalCostUsd": float(nominal_value)} if nominal_value is not None else {})})
         self._run_last_receipt_at[run_id] = now
         self._run_receipts.setdefault(run_id, []).extend(receipts)
         all_receipts = list(self._run_receipts.get(run_id, ()))
         aggregate = {"inputTokens": sum(item["usage"]["inputTokens"] for item in all_receipts), "outputTokens": sum(item["usage"]["outputTokens"] for item in all_receipts), "totalTokens": sum(item["usage"]["totalTokens"] for item in all_receipts)}
+        for key in cache_keys:
+            total = sum(int(item["usage"].get(key, 0)) for item in all_receipts)
+            if total:
+                aggregate[key] = total
         aggregate_inference = sum(float(item.get("durationSeconds", 0.0)) for item in all_receipts)
-        aggregate_cost = sum(float(item.get("costMicrounits", 0.0)) for item in all_receipts if isinstance(item.get("costMicrounits"), (int, float)) and not isinstance(item.get("costMicrounits"), bool))
         explicit_cost = any("costMicrounits" in item for item in all_receipts)
-        usage = canonical_usage(evidence.get("usage"))
+        aggregate_cost = sum(float(item["costMicrounits"]) for item in all_receipts if "costMicrounits" in item)
+        nominal_values = [float(item["nominalCostUsd"]) for item in all_receipts if "nominalCostUsd" in item]
+        nominal_cost_usd = sum(nominal_values) if nominal_values else None
+        usage = dict(canonical_usage(evidence.get("usage")))
+        if all_receipts:
+            usage.update({key: value for key, value in all_receipts[-1]["usage"].items() if key in cache_keys or key == "cost"})
         frozen_core_planner = evidence.get("corePlannerHash") if isinstance(evidence.get("corePlannerHash"), str) and evidence.get("corePlannerHash") else self.core_planner_hash
         frozen_image = evidence.get("imageDigest") if isinstance(evidence.get("imageDigest"), str) and evidence.get("imageDigest") else self.image_digest
         version_refs = {
@@ -823,8 +852,7 @@ class DurableRuntime:
         whole_run_duration = max(now - started, 1e-6)
         economic_status = evidence.get("economicCostStatus")
         if not isinstance(economic_status, str):
-            economic_status = "measured" if explicit_cost else ("subscription_marginal" if provider == "openai-codex" else "unavailable")
-        cost: float | None = aggregate_cost if explicit_cost else (0.0 if economic_status == "subscription_marginal" else None)
+            economic_status = "measured" if explicit_cost else "unknown"
         payload = {
             "runId": run_id,
             "taskId": stored["task_id"],
@@ -843,6 +871,7 @@ class DurableRuntime:
             "corePlannerHash": frozen_core_planner,
             "versionRefs": version_refs,
             "planner": {"responseId": response_id, "modelProfile": model, "corePlannerHash": frozen_core_planner, "versionRefs": version_refs, "bundleHash": bundle_hash, "arm": arm, "seed": seed},
+            "nominalCostUsd": nominal_cost_usd,
         }
         accounting = {
             "responseId": response_id,
@@ -856,8 +885,9 @@ class DurableRuntime:
             "seed": seed,
             "bundleHash": bundle_hash,
             "versionRefs": version_refs,
-            "costMicrounits": cost,
-            "economicCost": {"status": economic_status, "microunits": cost},
+            "costMicrounits": aggregate_cost if explicit_cost else None,
+            "economicCost": {"status": economic_status, "microunits": aggregate_cost if explicit_cost else None},
+            "nominalCostUsd": nominal_cost_usd,
             "durationSeconds": whole_run_duration,
             "inferenceDurationSeconds": aggregate_inference,
         }
