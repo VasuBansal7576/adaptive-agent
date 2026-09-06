@@ -20,6 +20,7 @@ MODEL_TOKENS = 20_000
 WALL_SECONDS = 90
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SHARED_ROOT_QA_DATA = Path("/private/tmp/adaptive-agent-browser-api")
+LIFECYCLE_NESTED_SUBCALLS = {"learning": 1, "transfer": 2, "adaptation": 3}
 
 
 def _reject_shared_qa_path(*values: str | os.PathLike[str] | None) -> None:
@@ -243,6 +244,30 @@ def _workload(protocol: Any, candidate_count: int, training: int, transfer: int,
     return plan.to_dict()
 
 
+def _lifecycle_execution_plan(expected_counts: Mapping[str, int], retries: int) -> dict[str, int]:
+    """Freeze every lifecycle admission needed by the real stage runner.
+
+    ``EvaluationJob`` accounts for top-level stage launches and nested
+    admissions in one attempts budget.  Nested work is charged separately
+    from its parent receipt, so each possible stage invocation gets its own
+    nested capacity exactly once.
+    """
+    if retries < 0 or any(not isinstance(count, int) or isinstance(count, bool) or count < 0 for count in expected_counts.values()):
+        raise ValueError("lifecycle execution counts must be non-negative")
+    invocation_factor = retries + 1
+    primary_cells = sum(expected_counts.values())
+    primary_attempts = primary_cells * invocation_factor
+    nested_subcalls = sum(expected_counts.get(stage, 0) * count * invocation_factor for stage, count in LIFECYCLE_NESTED_SUBCALLS.items())
+    return {
+        "primaryCells": primary_cells,
+        "primaryAttempts": primary_attempts,
+        "retryAttempts": primary_attempts - primary_cells,
+        "nestedSubcalls": nested_subcalls,
+        "totalAdmissions": primary_attempts + nested_subcalls,
+        "retriesPerCell": retries,
+    }
+
+
 def _lifecycle_stages(runtime: Any, protocol: Any, declared_retries: int) -> tuple[Any, ...]:
     """Bind the evaluator lifecycle to the runtime-owned stage callback."""
     from adaptive_agent.evaluation_job import LifecycleStage
@@ -313,7 +338,11 @@ def main(argv: list[str] | None = None) -> int:
         expected_counts = {stage.name: len(stage.cells) for stage in stages}
         if args.candidate_count != 1 or args.training_runs != expected_counts["training"] or args.transfer_runs != expected_counts["transfer"] or args.safety_runs != expected_counts["safety"]:
             parser.error(f"complete experiment requires execution counts training={expected_counts['training']}, transfer={expected_counts['transfer']}, safety={expected_counts['safety']}, candidate-count=1")
-        actual_attempts = sum(expected_counts.values()) + args.retries
+        try:
+            execution_plan = _lifecycle_execution_plan(expected_counts, args.retries)
+        except ValueError as exc:
+            parser.error(str(exc))
+        actual_attempts = execution_plan["totalAdmissions"]
         limits = {
             "attempts": actual_attempts,
             "inputTokens": actual_attempts * protocol.run_budget.model_tokens,
@@ -322,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
             "wallMicros": int(actual_attempts * protocol.run_budget.wall_time_seconds * 1_000_000),
             "costMicrounits": actual_attempts * protocol.run_budget.cost_microunits,
         }
+        print(json.dumps({"executionPlan": execution_plan}, sort_keys=True))
         result = job.run_experiment(args.job, stages, limits=limits, context={"resume": args.resume or not args.initialize})
         print(json.dumps({"status": result.status, "error": result.error, "runtimeAccounting": result.runtime_accounting}, sort_keys=True, default=str))
         return 0 if result.status == "complete" else 1
