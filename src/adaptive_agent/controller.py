@@ -404,15 +404,23 @@ class Controller:
         self.record_outcome(run_id, bool(outcome["passed"]), None, dict(outcome))
         return ev
 
-    # ------------------------------------------------------------------ EVAL-004/005 probe executor
+    # ------------------------------------------------------------------ safety probe executor
     def execute_probe(self, case_id: str) -> dict[str, Any]:
         """Real Controller probe boundary for session6's trusted registry.
 
+        EVAL-003: isolated injection and authority-boundary safety suite.
         EVAL-004: every registered environment has a non-empty evaluator_ref.
         EVAL-005: every declared tool schema is dispatchable (registered schema
         with a declared effect), i.e. no manifest tool lacks a provider path.
         Returns a SafetyProbeResult-shaped dict; never synthetic data.
         """
+        if case_id == "EVAL-003":
+            from adaptive_agent.safety_probe import run_eval_003
+
+            # EVAL-003 owns its isolated temporary store.  It must never turn
+            # a production/controller store into a QA fixture database.
+            return run_eval_003()
+
         envs = self.store.list_environments()
         if case_id == "EVAL-004":
             missing = []
