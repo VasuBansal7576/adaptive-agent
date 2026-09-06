@@ -35,7 +35,7 @@ def _observation(env, task, seed, arm, passed=True, *, partition=Partition.VALID
 
 
 class EvaluationTests(unittest.TestCase):
-  def _gate(self, *, baseline=None, candidate=None, ci=0.01, environments=None, config=None, safety=True, safety_cases=None, integrity=()):
+  def _gate(self, *, baseline=None, candidate=None, ci=0.01, environments=None, required_environments=None, config=None, safety=True, safety_cases=None, integrity=()):
     baseline = baseline or {"accuracy": 0.5, "reliability": 0.8, "meanCostMicrounits": 100.0, "p95LatencySeconds": 10.0, "count": 10}
     candidate = candidate or {"accuracy": 0.6, "reliability": 0.8, "meanCostMicrounits": 105.0, "p95LatencySeconds": 10.0, "count": 10}
     environments = environments or {"finance": {"B0": baseline, "L": candidate}}
@@ -46,7 +46,7 @@ class EvaluationTests(unittest.TestCase):
         candidate=candidate,
         accuracy_ci_lower=ci,
         environment_cells=environments,
-        required_environments=tuple(environments),
+        required_environments=tuple(required_environments or environments),
         required_safety_case_ids=("EVAL-004",),
         safety_passed=safety,
         safety_violations=0,
@@ -78,6 +78,14 @@ class EvaluationTests(unittest.TestCase):
     self.assertFalse(self._gate(integrity=("report has missing pairs",)).passed)
     self.assertFalse(self._gate(candidate={"accuracy": 1.1, "reliability": 0.8, "meanCostMicrounits": 105.0, "p95LatencySeconds": 10.0, "count": 10}).passed)
     self.assertFalse(self._gate(safety_cases={"EVAL-005": True}).passed)
+
+  def test_performance_gate_rejects_unexpected_environment_cells(self):
+    environments = {
+        "finance": {"B0": {"accuracy": 0.5, "reliability": 0.8, "count": 10}, "L": {"accuracy": 0.6, "reliability": 0.8, "count": 10}},
+        "unexpected": {"B0": {"accuracy": 0.5, "reliability": 0.8, "count": 10}, "L": {"accuracy": 0.6, "reliability": 0.8, "count": 10}},
+    }
+    self.assertFalse(self._gate(environments=environments, required_environments=("finance",)).passed)
+    self.assertFalse(self._gate(environments=environments, required_environments=("finance",), config=GateConfig(require_per_environment_non_regression=False)).passed)
 
   def test_protocol_freezes_nondefault_gate_thresholds(self):
     protocol = EvaluationProtocol(thresholds=(("accuracy_gain", 0.20), ("ci_lower_bound", 0.05), ("cost_ratio", 1.05), ("latency_ratio", 1.05)))

@@ -175,12 +175,14 @@ def evaluate_performance_gate(
     if ci is not None and "CI lower bound" in valid_config and ci <= valid_config["CI lower bound"]:
         reasons.append(f"accuracy CI lower bound {ci:.3f} is not above {valid_config['CI lower bound']}")
 
+    cells = environment_cells if isinstance(environment_cells, Mapping) else None
+    expected = tuple(dict.fromkeys(required_environments))
+    if cells is not None and (set(cells) != set(expected) or len(cells) != len(expected)):
+        reasons.append("per-environment metric cells contain unexpected environments")
     if config.require_per_environment_non_regression is True:
-        cells = environment_cells if isinstance(environment_cells, Mapping) else None
         if cells is None:
             reasons.append("per-environment metric cells are missing")
         else:
-            expected = tuple(dict.fromkeys(required_environments))
             if not expected or len(expected) != len(tuple(required_environments)) or any(not isinstance(environment, str) or not environment for environment in expected):
                 reasons.append("required environment list is missing")
             for environment in expected:

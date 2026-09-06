@@ -455,7 +455,11 @@ class CandidateManager:
         if not isinstance(expected_environments, (list, tuple)) or any(not isinstance(environment, str) or not environment for environment in expected_environments) or len(set(expected_environments)) != len(expected_environments):
             raise PromotionError("report expected environments are missing or invalid")
         env_cells = report["environmentCells"]
-        if not isinstance(env_cells, Mapping) or tuple(env_cells) != tuple(expected_environments):
+        if (
+            not isinstance(env_cells, Mapping)
+            or set(env_cells) != set(expected_environments)
+            or len(env_cells) != len(expected_environments)
+        ):
             raise PromotionError("report environment metric cells do not match expected environments")
         for environment in expected_environments:
             cells = env_cells.get(environment)
