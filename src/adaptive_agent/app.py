@@ -1105,13 +1105,13 @@ class DurableRuntime:
             result = driver.result
             if result is None or result.status != "succeeded":
                 return DurableOutcome(runId=run_id, passed=False, metadata={"status": result.status if result else "planner_failed"})
-            evaluated = runtime._invoke_evaluator(
-                run_id=run_id,
-                goal=task.goal,
-                model_output=result.answer or "",
-                environment=runtime._planner_environment(package, run_id),
-            )
-            if evaluated is not None:
+            if runtime.evaluator is not None:
+                evaluated = runtime._invoke_evaluator(
+                    run_id=run_id,
+                    goal=task.goal,
+                    model_output=result.answer or "",
+                    environment=runtime._planner_environment(package, run_id),
+                ) or {"passed": False, "diagnostic": "trusted evaluator returned a non-object"}
                 passed = evaluated.get("passed") is True
                 try:
                     score = float(evaluated.get("score", 1.0 if passed else 0.0))
