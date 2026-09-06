@@ -48,7 +48,9 @@ def _freeze_core_planner_hash() -> str:
     if configured and configured.strip():
         return configured.strip()
     digest = hashlib.sha256()
-    for name in ("planner.py", "prime_runtime.py"):
+    # Include every executable planner boundary, including the child planner
+    # adapter and provider client implementation imported by planner.py.
+    for name in ("planner.py", "prime_child_planner.py", "prime_runtime.py"):
         path = Path(__file__).with_name(name)
         digest.update(name.encode("utf-8"))
         digest.update(path.read_bytes())
