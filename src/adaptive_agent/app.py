@@ -38,6 +38,10 @@ from adaptive_agent.store import Store
 from adaptive_agent.evaluation_store import build_durable_adapters
 
 
+_MAX_PROVIDER_CONTEXT_BYTES = 64 * 1024
+_MAX_PROVIDER_CONTEXT_DEPTH = 8
+
+
 def _manifest_value(value: Any) -> Any:
     """Serialize manifest boundary objects independent of their implementation."""
     model_dump = getattr(value, "model_dump", None)
@@ -50,6 +54,44 @@ def _manifest_value(value: Any) -> Any:
     if callable(to_dict):
         return to_dict()
     return value
+
+
+def _provider_public_context(provider: ToolProvider) -> dict[str, Any] | None:
+    """Validate optional provider metadata before exposing it to a model."""
+    public_context = getattr(provider, "public_context", None)
+    if not callable(public_context):
+        return None
+    context = public_context()
+    if not isinstance(context, dict):
+        raise RuntimeError("provider public context must be a dictionary")
+
+    def validate_json(value: Any, depth: int = 0) -> None:
+        if depth > _MAX_PROVIDER_CONTEXT_DEPTH:
+            raise RuntimeError("provider public context exceeds the nesting limit")
+        if isinstance(value, dict):
+            if any(not isinstance(key, str) for key in value):
+                raise RuntimeError("provider public context keys must be strings")
+            for child in value.values():
+                validate_json(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                validate_json(child, depth + 1)
+        elif value is None or isinstance(value, (str, int, float, bool)):
+            return
+        else:
+            raise RuntimeError("provider public context must contain JSON values")
+
+    validate_json(context)
+    try:
+        encoded = json.dumps(context, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        normalized = json.loads(encoded)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("provider public context must be valid JSON") from exc
+    if len(encoded.encode("utf-8")) > _MAX_PROVIDER_CONTEXT_BYTES:
+        raise RuntimeError("provider public context exceeds the size limit")
+    if not isinstance(normalized, dict):
+        raise RuntimeError("provider public context must be a dictionary")
+    return normalized
 
 
 def _effective_observation_cost(accounting: Mapping[str, Any]) -> int:
@@ -1356,9 +1398,9 @@ class DurableRuntime:
         selected = {ref.id for ref in run.active_skill_refs}
         return [skill.model_dump(mode="json", by_alias=True) for skill in bundle.skills if not selected or skill.skill_id in selected]
 
-    def _planner_environment(self, package: Any, run_id: str) -> dict[str, Any]:
+    def _planner_environment(self, package: Any, run_id: str, *, provider: ToolProvider | None = None) -> dict[str, Any]:
         run = self.controller.get_run(run_id)
-        return {
+        environment = {
             "environmentId": package.environment_id,
             "version": package.manifest.version,
             "docs": [_manifest_value(ref) for ref in package.manifest.docs],
@@ -1370,6 +1412,13 @@ class DurableRuntime:
             "activeSkills": self._active_skills(run_id),
             "budgetRef": run.budget_ref.model_dump(mode="json", by_alias=True) if run else None,
         }
+        if provider is not None:
+            context = _provider_public_context(provider)
+            if context is not None:
+                # Provider metadata is deliberately namespaced so it cannot
+                # shadow controller-owned capabilities, schemas, or pins.
+                environment["taskContext"] = context
+        return environment
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         run = self.controller.get_run(run_id)
@@ -1935,7 +1984,7 @@ class DurableRuntime:
             class DirectDriver:
                 def act(self, _ctx: Any) -> None:
                     nonlocal invocation
-                    invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
+                    invocation = model_runner(goal=task.goal, environment=runtime._planner_environment(package, run_id, provider=provider), emit=lambda kind, summary, detail=None: runtime.controller.append_event(run_id, kind, {"summary": summary, "detail": detail}, "system", "operator"))
                     runtime._record_model_response(run_id, package, {"provider": invocation.provider, "model": invocation.model, "responseId": invocation.response_id, "usage": dict(invocation.usage), "arm": arm, "seed": seed, "bundleHash": bundle_hash, "corePlannerHash": core_planner_hash, "imageDigest": image_digest, **({"nominalCostUsd": invocation.nominalCostUsd} if hasattr(invocation, "nominalCostUsd") else {}), **({"costMicrounits": invocation.costMicrounits} if hasattr(invocation, "costMicrounits") else ({"costMicrounits": invocation.cost_microunits} if hasattr(invocation, "cost_microunits") else {})), **({"economicCostStatus": invocation.economicCostStatus} if hasattr(invocation, "economicCostStatus") else {})})
             def evaluate() -> DurableOutcome:
                 outcome = runtime._invoke_evaluator(run_id=run_id, goal=task.goal, model_output=invocation.text, environment=runtime._planner_environment(package, run_id)) if invocation is not None and runtime.evaluator is not None else None
@@ -2061,7 +2110,7 @@ class DurableRuntime:
                     self.result = PlannerResult("timed_out", None, 0, 0, 0, (), ())
                     return
                 planner = LunaPlanner(parent_client, prime, Sink(self._controller), limits=PlannerLimits(max_model_tokens=max_tokens, max_wall_seconds=wall_seconds), emit=lambda event: self._controller.append_event(run_id, event.kind, {"summary": event.summary, "detail": event.detail}, "system", "operator"))
-                self.result = planner.run(goal=task.goal, environment=runtime._planner_environment(package, run_id), active_skills=runtime._active_skills(run_id), cancel=cancel)
+                self.result = planner.run(goal=task.goal, environment=runtime._planner_environment(package, run_id, provider=provider), active_skills=runtime._active_skills(run_id), cancel=cancel)
         driver = Driver(self.controller)
         def evaluate() -> DurableOutcome:
             result = driver.result
