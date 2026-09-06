@@ -122,15 +122,15 @@ APPWORLD_PYTHON="/path/to/appworld-python"
 APPWORLD_SETUP_MANIFEST="$(mktemp)"
 APPWORLD_DATA_DIR="$(mktemp -d)"
 cd "$ADAPTIVE_AGENT_CHECKOUT"
-test -z "$(git status --porcelain)"
+test -z "$(git status --porcelain)" || { printf '%s\n' "Adaptive Agent checkout must be clean" >&2; exit 1; }
 SOURCE_REVISION="$(git rev-parse HEAD)"
 IMAGE_DIGEST="sha256:<exact-frozen-image-digest>"
 unset ADAPTIVE_AGENT_CORE_PLANNER_HASH
 CORE_PLANNER_HASH="$(uv run python -c 'from adaptive_agent.app import _freeze_core_planner_hash; print(_freeze_core_planner_hash())')"
 
-test -d "$APPWORLD_ROOT/data"
-test -x "$APPWORLD_PYTHON"
-test "$("$APPWORLD_PYTHON" -c 'import importlib.metadata as m; print(m.version("appworld"))')" = "0.1.3.post1"
+test -d "$APPWORLD_ROOT/data" || { printf '%s\n' "AppWorld root must contain data/" >&2; exit 1; }
+test -x "$APPWORLD_PYTHON" || { printf '%s\n' "AppWorld Python executable is missing or not executable" >&2; exit 1; }
+test "$("$APPWORLD_PYTHON" -c 'import importlib.metadata as m; print(m.version("appworld"))')" = "0.1.3.post1" || { printf '%s\n' "AppWorld version must be 0.1.3.post1" >&2; exit 1; }
 
 uv run adaptive-agent-appworld setup \
   --root "$APPWORLD_ROOT" \
