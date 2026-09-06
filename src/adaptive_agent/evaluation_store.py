@@ -108,34 +108,35 @@ class SQLiteRunEvidenceStore:
         self.store = store
 
     def verify(self, observation: RunObservation, frozen: FrozenProtocol, package: EnvironmentPackage) -> bool:
-        if observation.model_provenance.value != "real_model" or not observation.response_id or not observation.accounting_ref or not observation.evidence_ref:
+        if observation.model_provenance.value != "real_model" or not observation.run_id or not observation.response_id or not observation.accounting_ref or not observation.evidence_ref:
             return False
         evidence = self.store.get_evidence(observation.evidence_ref)
-        call = self.store.get_tool_call(observation.response_id)
-        if not evidence or not call or call.get("environment_id") != observation.environment_id:
+        if not evidence or evidence.get("run_id") != observation.run_id:
             return False
-        if call.get("result_json") is None:
+        if evidence.get("event_type") != "model_observation":
             return False
         try:
             source_ref = json.loads(evidence["source_ref"])
-            response = json.loads(call["result_json"])
+            response = self.store.get_artifact(source_ref["sha256"])
             accounting = self.store.get_artifact(observation.accounting_ref)
-            observed = self.store.get_artifact(source_ref["sha256"])
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return False
-        if sha256_json(observed) != evidence.get("content_hash"):
+        if sha256_json(response) != evidence.get("content_hash"):
             return False
-        if sha256_json(response) != source_ref.get("sha256") and response != observed:
+        if not isinstance(response, dict) or response.get("responseId") != observation.response_id or response.get("provider") != frozen.payload.get("provider"):
             return False
-        if not isinstance(accounting, dict) or accounting.get("responseId") != observation.response_id:
+        if not isinstance(accounting, dict) or accounting.get("responseId") != observation.response_id or accounting.get("runId") != observation.run_id or accounting.get("taskId") != observation.task_id or accounting.get("environmentId") != observation.environment_id:
+            return False
+        tool_evidence = [row for row in self.store.list_evidence(observation.run_id) if row.get("trust_class") == "broker" and row.get("event_type") == "tool_result"]
+        if not tool_evidence:
             return False
         expected = {
             "model": sha256_json({"profile": frozen.payload["modelProfile"], "provider": frozen.payload["provider"]}),
             "planner": frozen.payload["corePlannerHash"],
-            "budget": sha256_json(BudgetSpec()),
+            "budget": sha256_json(frozen.payload["runBudget"]),
             "policy": sha256_json(package.manifest.policy_ref),
             "schema": sha256_json(package.manifest.tool_schemas),
-            "image": sha256_json({"modelProfile": frozen.payload["modelProfile"]}),
+            "image": sha256_json({"imageDigest": frozen.payload["imageDigest"]}),
         }
         return dict(observation.config_hashes) == expected
 

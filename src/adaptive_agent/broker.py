@@ -212,6 +212,7 @@ class ToolBroker:
         capability: Capability,
         provider: ToolProvider,
         budget_remaining: dict[str, Any] | None = None,
+        dry_run: bool = False,
     ) -> ToolResult:
         """Validate, authorize, and dispatch (or replay) a tool call."""
         schema = self.registry.get_tool_schema(env_id, request.tool)
@@ -298,7 +299,7 @@ class ToolBroker:
             "arguments_json": canonical_args,
             "idempotency_key": request.idempotency_key,
         }
-        if schema.effect == "write":
+        if schema.effect == "write" and not dry_run:
             if not request.approval_token:
                 return self._error_result(
                     request.call_id,
@@ -359,8 +360,8 @@ class ToolBroker:
 
         # Execute
         try:
-            output = provider.execute(request.run_id, request.tool, request.arguments)
-            effect = "confirmed" if provider.effect(request.tool) == "write" else "none"
+            output = {"dryRun": True, "tool": request.tool} if dry_run else provider.execute(request.run_id, request.tool, request.arguments)
+            effect = "none" if dry_run else "confirmed" if provider.effect(request.tool) == "write" else "none"
             result = ToolResult(
                 call_id=request.call_id,
                 tool_version=schema.version,

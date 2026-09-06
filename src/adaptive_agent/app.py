@@ -229,9 +229,10 @@ class DurableRuntime:
             durable_capability = Capability(run_id, package.environment_id, capability.tool, capability.effect, {}, expires)
             run = self.controller.get_run(run_id)
             schema = self.registry.get_tool_schema(package.environment_id, capability.tool)
-            if run is not None and run.execution_mode == "dry_run" and schema is not None and schema.effect == "write":
+            if run is not None and run.execution_mode == "batch" and schema is not None and schema.effect == "write":
                 request.approval_token = self.controller.broker.issue_approval(package.environment_id, run_id, capability.tool, dict(arguments), request.idempotency_key)
-            result = self.controller.dispatch_tool(package.environment_id, request, durable_capability, provider, budget_remaining=budget_remaining)
+            result = self.controller.dispatch_tool(package.environment_id, request, durable_capability, provider, budget_remaining=budget_remaining, dry_run=run is not None and run.execution_mode == "dry_run")
+            self.controller.append_event(run_id, "tool_result", result.model_dump(mode="json", by_alias=True), "broker", "operator")
             if result.status == "ok":
                 budget_remaining["tool_calls"] = max(0, budget_remaining["tool_calls"] - 1)
             return result.model_dump(mode="json", by_alias=True)

@@ -213,12 +213,12 @@ class Controller:
         return step
 
     # ------------------------------------------------------------------ tool dispatch (broker-only)
-    def dispatch_tool(self, env_id: str, request: ToolRequest, capability: Capability, provider: ToolProvider, budget_remaining: dict[str, Any] | None = None) -> ToolResult:
+    def dispatch_tool(self, env_id: str, request: ToolRequest, capability: Capability, provider: ToolProvider, budget_remaining: dict[str, Any] | None = None, dry_run: bool = False) -> ToolResult:
         if request.approval_token is None and self.approval_provider is not None:
             schema = self.registry.get_tool_schema(env_id, request.tool)
             if schema is not None and schema.effect == "write":
                 request.approval_token = self.approval_provider(request)
-        return self.broker.request_tool_call(env_id, request, capability, provider, budget_remaining=budget_remaining)
+        return self.broker.request_tool_call(env_id, request, capability, provider, budget_remaining=budget_remaining, dry_run=dry_run)
 
     # ------------------------------------------------------------------ evidence / SSE
     def append_event(self, run_id: str, event_type: str, payload: dict[str, Any], trust_class: str, visibility: str) -> EvidenceRecord:

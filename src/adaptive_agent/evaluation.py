@@ -303,6 +303,7 @@ class RunObservation:
     accounting_ref: str | None = None
     evidence_ref: str | None = None
     config_hashes: Mapping[str, str] = field(default_factory=dict)
+    run_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.cost_microunits < 0 or self.latency_seconds < 0 or self.safety_violations < 0:
@@ -942,6 +943,7 @@ class EvaluationProtocol:
     model_profile: str = "openai-codex/gpt-5.6-luna"
     model_tier: str = "medium"
     provider: str = "openai-codex"
+    image_digest: str = "image-unset"
     core_planner_hash: str = "core-planner-unset"
     analysis_code_hash: str = "evaluation-analysis-v1"
     retrieval_engine_version: str = "fixture-retrieval-v1"
@@ -1007,7 +1009,7 @@ class EvaluationProtocol:
                 raise PromotionEvidenceRefused(f"partition hash changed for {key}")
 
     def to_dict(self, *, include_frozen: bool = True) -> JsonObject:
-        value: JsonObject = {"modelProfile": self.model_profile, "modelTier": self.model_tier, "provider": self.provider, "corePlannerHash": self.core_planner_hash, "analysisCodeHash": self.analysis_code_hash, "retrievalEngineVersion": self.retrieval_engine_version, "seeds": list(self.seeds), "tasksPerEnvironment": self.tasks_per_environment, "bootstrapDraws": self.bootstrap_draws, "analysisSeed": self.analysis_seed, "validationCandidateLimit": self.validation_candidate_limit, "runBudget": self.run_budget.to_dict(), "concurrencyLimit": self.concurrency_limit, "knownEnvironments": list(self.known_environments), "sealedEnvironment": self.sealed_environment, "thresholds": dict(self.thresholds)}
+        value: JsonObject = {"modelProfile": self.model_profile, "modelTier": self.model_tier, "provider": self.provider, "imageDigest": self.image_digest, "corePlannerHash": self.core_planner_hash, "analysisCodeHash": self.analysis_code_hash, "retrievalEngineVersion": self.retrieval_engine_version, "seeds": list(self.seeds), "tasksPerEnvironment": self.tasks_per_environment, "bootstrapDraws": self.bootstrap_draws, "analysisSeed": self.analysis_seed, "validationCandidateLimit": self.validation_candidate_limit, "runBudget": self.run_budget.to_dict(), "concurrencyLimit": self.concurrency_limit, "knownEnvironments": list(self.known_environments), "sealedEnvironment": self.sealed_environment, "thresholds": dict(self.thresholds)}
         if include_frozen and self._frozen is not None:
             value["protocolHash"] = self._frozen.protocol_hash
         return value
@@ -1125,7 +1127,7 @@ def _paired_metric(pairs: Sequence[tuple[RunObservation, RunObservation]]) -> di
 
 
 def _trusted_observation(row: RunObservation, protocol: EvaluationProtocol, package: EnvironmentPackage) -> bool:
-    if row.model_provenance is not ModelProvenance.REAL_MODEL or not row.response_id or not row.accounting_ref or not row.evidence_ref:
+    if row.model_provenance is not ModelProvenance.REAL_MODEL or not row.run_id or not row.response_id or not row.accounting_ref or not row.evidence_ref:
         return False
     expected = {
         "model": sha256_json({"profile": protocol.model_profile, "provider": protocol.provider}),
@@ -1133,7 +1135,7 @@ def _trusted_observation(row: RunObservation, protocol: EvaluationProtocol, pack
         "budget": sha256_json(protocol.run_budget),
         "policy": sha256_json(package.manifest.policy_ref),
         "schema": sha256_json(package.manifest.tool_schemas),
-        "image": sha256_json({"modelProfile": protocol.model_profile}),
+        "image": sha256_json({"imageDigest": protocol.image_digest}),
     }
     return dict(row.config_hashes) == expected
 
