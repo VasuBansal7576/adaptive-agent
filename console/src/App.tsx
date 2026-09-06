@@ -246,8 +246,15 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
     if (next !== null) {
       event.preventDefault();
       tabRefs.current[next]?.focus();
-      setActiveTab(TABS[next].id);
+      selectTab(TABS[next].id);
     }
+  };
+
+  const selectTab = (id: TabId) => {
+    setActiveTab(id);
+    // narrow viewports scroll the tab row horizontally: keep the active tab visible
+    const index = TABS.findIndex((t) => t.id === id);
+    requestAnimationFrame(() => tabRefs.current[index]?.scrollIntoView({ block: "nearest", inline: "nearest" }));
   };
 
   const switchTransport = () => {
@@ -351,7 +358,7 @@ export function App({ transport: transportProp }: { transport?: ConsoleTransport
               aria-controls={`panel-${tab.id}`}
               tabIndex={activeTab === tab.id ? 0 : -1}
               onKeyDown={(e) => onTabKeyDown(e, index)}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => selectTab(tab.id)}
               className={`whitespace-nowrap border-b-2 px-4 py-2 text-sm font-medium transition-colors ${
                 activeTab === tab.id
                   ? "border-sky-500 text-sky-300"
