@@ -236,6 +236,11 @@ class BenchmarkDriverTests(unittest.TestCase):
             self.assertEqual(result.expected_count, 360)
             self.assertEqual(len(calls), 360)
             self.assertEqual(len(set(calls)), 360)
+            with store.connect() as conn:
+                receipt_count = conn.execute("SELECT COUNT(*) AS count FROM benchmark_task_runs WHERE benchmark_id = 'resume-360' AND partition = 'validation' AND status = 'complete' AND observation_json IS NOT NULL").fetchone()["count"]
+                attempt_count = conn.execute("SELECT COUNT(*) AS count FROM benchmark_task_attempts WHERE benchmark_id = 'resume-360' AND partition = 'validation'").fetchone()["count"]
+            self.assertEqual(receipt_count, 360)
+            self.assertEqual(attempt_count, 360)
 
     def test_benchmark_id_is_fenced_to_frozen_inputs_and_bundle(self):
         packages = build_environment_packages()

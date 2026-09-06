@@ -152,7 +152,7 @@ class ResumableEvaluationDriver:
                             continue
                         try:
                             selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
-                            bundle_hash = selected_bundle.content_hash if hasattr(selected_bundle, "content_hash") else None
+                            bundle_hash = self._bundle_hash(selected_bundle)
                             observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash), selected_bundle)
                             self._validate_observation(observation, task, environment_id, partition, seed, arm, bundle_hash)
                             if not self.evidence_store.verify(observation, frozen, package):
@@ -184,9 +184,7 @@ class ResumableEvaluationDriver:
         else:
             bundle_value = {"type": f"{type(self.bundle).__module__}.{type(self.bundle).__qualname__}"}
         arm_bundle_values = {
-            str(key.value if isinstance(key, Arm) else key): (
-                value.model_dump(mode="json") if hasattr(value, "model_dump") else value.to_dict() if hasattr(value, "to_dict") else dict(value) if isinstance(value, Mapping) else {"type": f"{type(value).__module__}.{type(value).__qualname__}"}
-            )
+            str(key.value if isinstance(key, Arm) else key): self._bundle_hash(value)
             for key, value in self.arm_bundles.items()
         }
         plan_fingerprint = sha256_json({"protocol": frozen.protocol_hash, "partition": partition.value, "base": base_hash, "candidate": candidate_hash, "bundle": sha256_json(bundle_value), "armBundles": arm_bundle_values, "smoke": smoke})
@@ -252,6 +250,17 @@ class ResumableEvaluationDriver:
             conn.execute("INSERT INTO benchmark_task_attempts(attempt_id, benchmark_id, task_id, environment_id, partition, arm, seed, status, error, observation_json, owner_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))", (secrets.token_urlsafe(18), benchmark_id, task.task_id, task.environment_ref.id, task.partition.value, arm.value, seed, status, error, observation_json, self.owner_id))
             conn.execute("INSERT INTO benchmark_task_runs(benchmark_id, task_id, environment_id, partition, arm, seed, status, error, observation_json, owner_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(benchmark_id, task_id, arm, seed) DO UPDATE SET status=excluded.status, error=excluded.error, observation_json=excluded.observation_json, owner_id=excluded.owner_id, updated_at=excluded.updated_at", (benchmark_id, task.task_id, task.environment_ref.id, task.partition.value, arm.value, seed, status, error, observation_json, self.owner_id))
             conn.commit()
+
+    @staticmethod
+    def _bundle_hash(bundle: object) -> str:
+        bundle_hash = getattr(bundle, "content_hash", None)
+        if not isinstance(bundle_hash, str) or not bundle_hash:
+            raise EvaluationError("selected arm bundle has no content hash")
+        if hasattr(bundle, "model_dump"):
+            payload = bundle.model_dump(mode="json", by_alias=True, exclude={"content_hash"})
+            if sha256_json(payload) != bundle_hash:
+                raise EvaluationError("selected arm bundle content hash is invalid")
+        return bundle_hash
 
     @staticmethod
     def _validate_observation(observation: RunObservation, task: TaskInput, environment_id: str, partition: Partition, seed: int, arm: Arm, bundle_hash: str | None) -> None:
