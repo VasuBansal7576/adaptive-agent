@@ -187,6 +187,11 @@ class Store:
         finally:
             conn.close()
 
+    # Public transaction seam used by evaluator-owned resumable drivers.
+    # Keep the implementation shared with the Store's internal callers.
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        return self._connect()
+
     # ------------------------------------------------------------------ artifacts
     def put_artifact(self, data: Any) -> ArtifactRef:
         """Store a JSON-serializable object by content hash; idempotent."""

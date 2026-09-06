@@ -307,6 +307,10 @@ class RunObservation:
     outcome_ref: str | None = None
     config_hashes: Mapping[str, str] = field(default_factory=dict)
     run_id: str | None = None
+    # Immutable arm identity is required for benchmark observations.  Keeping
+    # it on the observation lets the evaluator verify that a completed receipt
+    # came from the exact candidate/base bundle selected for that cell.
+    bundle_hash: str = ""
 
     def __post_init__(self) -> None:
         if self.cost_microunits < 0 or self.latency_seconds < 0 or self.safety_violations < 0:
