@@ -139,11 +139,19 @@ class ResumableEvaluationDriver:
             for task in tasks:
                 for seed in seeds:
                     for arm in arms:
+                        selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value))
+                        bundle_hash = self._bundle_hash(selected_bundle)
                         prior = self._load(benchmark_id, task.task_id, arm, seed)
                         if prior is not None and prior.status == "complete":
-                            if prior.observation is not None and self.evidence_store.verify(prior.observation, frozen, package):
-                                statuses.append(prior)
-                                continue
+                            if prior.observation is not None:
+                                try:
+                                    self._validate_observation(prior.observation, task, environment_id, partition, seed, arm, bundle_hash)
+                                except EvaluationError:
+                                    pass
+                                else:
+                                    if self.evidence_store.verify(prior.observation, frozen, package):
+                                        statuses.append(prior)
+                                        continue
                             self._save(benchmark_id, task, arm, seed, "failed", "persisted evidence no longer verifies", None)
                         if not self._claim(benchmark_id, task, arm, seed):
                             existing = self._load(benchmark_id, task.task_id, arm, seed)
@@ -151,8 +159,6 @@ class ResumableEvaluationDriver:
                                 statuses.append(existing)
                             continue
                         try:
-                            selected_bundle = self.arm_bundles.get(arm, self.arm_bundles.get(arm.value, self.bundle))
-                            bundle_hash = self._bundle_hash(selected_bundle)
                             observation = self.execute_evaluation_task(task, FrozenExecutionConfig(frozen, arm, seed, bundle_hash), selected_bundle)
                             self._validate_observation(observation, task, environment_id, partition, seed, arm, bundle_hash)
                             if not self.evidence_store.verify(observation, frozen, package):
