@@ -13,7 +13,8 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Mapping
+<<<<<<< HEAD
+from typing import Any, Mapping, Sequence
 
 
 MODEL_TOKENS = 20_000
@@ -304,7 +305,31 @@ def _lifecycle_stages(runtime: Any, protocol: Any, declared_retries: int) -> tup
             raise RuntimeError("runtime does not expose durable observation recovery")
         return recovery(receipt, stage=stage, cell_key=cell_key)
 
-    return tuple(LifecycleStage(name, cells[name], invoke, retries=declared_retries, observation_recoverer=recover if name in {"validation", "final"} else None) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final"))
+    def prepare_final(state: Mapping[str, Any]) -> Mapping[str, Any]:
+        bundles = getattr(runtime, "_evaluation_arm_bundles", None)
+        if isinstance(bundles, Mapping) and isinstance(bundles.get("A"), str) and bundles["A"]:
+            return {"ablationBundleHash": bundles["A"]}
+        learning = state.get("results", {}).get("learning", {}) if isinstance(state.get("results"), Mapping) else {}
+        candidate_hash = next((value.get("candidateBundleHash") for value in learning.values() if isinstance(value, Mapping) and isinstance(value.get("candidateBundleHash"), str)), None) if isinstance(learning, Mapping) else None
+        if not isinstance(candidate_hash, str) or not candidate_hash:
+            raise RuntimeError("cannot derive final ablation without a frozen learned bundle")
+        learned = _bundle_by_hash(runtime.controller.store, candidate_hash)
+        from adaptive_agent.models import SkillBundle
+
+        payload = learned.model_dump(mode="json", by_alias=True)
+        payload["parent"] = learned.content_hash
+        payload["skills"] = []
+        payload.setdefault("executionConfig", {})["skillRefs"] = []
+        payload["contentHash"] = ""
+        ablation = SkillBundle.model_validate(payload)
+        runtime.controller.store.save_bundle(ablation.bundle_id, ablation.parent, ablation.content_hash, ablation.model_dump_json(by_alias=True), False)
+        if not isinstance(bundles, dict):
+            bundles = {}
+            setattr(runtime, "_evaluation_arm_bundles", bundles)
+        bundles["A"] = ablation
+        return {"ablationBundleHash": ablation.content_hash}
+
+    return tuple(LifecycleStage(name, cells[name], invoke, retries=declared_retries, observation_recoverer=recover if name in {"validation", "final"} else None, final_preparer=prepare_final if name == "final" else None, report_required=name in {"validation", "final"}) for name in ("bootstrap", "training", "learning", "transfer", "adaptation", "safety", "validation", "final"))
 
 
 def main(argv: list[str] | None = None) -> int:

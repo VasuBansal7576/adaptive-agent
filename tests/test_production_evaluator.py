@@ -51,6 +51,38 @@ def test_lifecycle_stages_freeze_declared_retry_semantics():
     assert all(stage.retries == 2 for stage in stages)
 
 
+def test_final_preparer_persists_memory_disabled_ablation_from_learning_bundle(tmp_path: Path):
+    from adaptive_agent.evaluation import EvaluationProtocol, build_environment_packages
+    from adaptive_agent.models import SkillBundle
+
+    packages = build_environment_packages()
+    protocol = EvaluationProtocol()
+    protocol.freeze(packages)
+    store = Store(tmp_path)
+    learned = SkillBundle()
+    store.save_bundle(learned.bundle_id, learned.parent, learned.content_hash, learned.model_dump_json(by_alias=True))
+
+    class Controller:
+        def __init__(self):
+            self.store = store
+
+    class Runtime:
+        controller = Controller()
+        experiment_stage_runner = None
+
+        def run_experiment_stage(self, **kwargs):
+            return kwargs
+
+    Runtime.packages = packages
+    final = _lifecycle_stages(Runtime(), protocol, declared_retries=0)[-1]
+    prepared = final.final_preparer({"results": {"learning": {"candidate-generation": {"candidateBundleHash": learned.content_hash}}}})
+    assert prepared["ablationBundleHash"]
+    ablation_row = store.get_bundle_by_hash(prepared["ablationBundleHash"])
+    assert ablation_row is not None
+    ablation = SkillBundle.model_validate_json(ablation_row["bundle_json"])
+    assert ablation.skills == [] and ablation.execution_config.skill_refs == []
+
+
 def test_bound_private_outcome_requires_trusted_canonical_identity():
     with tempfile.TemporaryDirectory() as directory:
         store = Store(Path(directory))
