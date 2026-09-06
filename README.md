@@ -12,8 +12,8 @@ This is procedural adaptation, not model-weight training or a promise of univers
 - [SPEC.md](SPEC.md) defines requirements, contracts, architecture, learning, evaluation, security, and acceptance.
 - [MILESTONES.md](MILESTONES.md) defines the runnable vertical slice, full delivery gates, AO ownership, and submission traceability.
 
-Implementation is active in parallel AO worktrees, but implementation code is not integrated into this documentation branch.
-This update records the root-verified current checkpoint beyond `d8e9293` without changing active workers or claiming a merge.
+The authorized local-main assembly is complete for the committed session-2 backend tip `feef752`, session-5 console tip `eea3bdc`, and documentation tip `eeb5f05`.
+Dirty worker overlays were not included, and no heldout, final, or public release is implied.
 The exact branch refs, dirty-worktree status, and component ownership are tracked in [MILESTONES.md](MILESTONES.md).
 
 The Python package is configured through `pyproject.toml` on the implementation branches.
@@ -70,10 +70,9 @@ The related evaluator-owned probe path observed on session 2 is `Controller.exec
 That path creates `tempfile.TemporaryDirectory(prefix="aa-probe-")` and a `Store` under its temporary directory, but this code-level property does not prove that `run_2fc` was isolated.
 Session 6 must create clean independent evaluation data, regenerate and validate real development evidence and its candidate, and retain exact path-level isolation proof before any sealed panel runs.
 
-The documentation phase is complete on this branch.
-The local-main assembly plan is limited to the complete session-2 integration at `f3785f0` plus its reviewed overlay, followed by the session-5 console lineage `29afe35` through `ae482da`.
-It has not been performed here.
-After those two inputs are materialized and reviewed, run the isolated backend and console checks with fresh Store and data paths, then reassess M2-M4 against the evidence gates.
+The documentation phase and authorized local-main assembly are complete.
+The assembly used only committed session-2 backend integration, session-5 console, and documentation refs.
+Post-assembly isolated backend and console checks, cost accounting, ablation, and report validation remain required before reassessing M2-M4.
 Session 3, session 4, session 6, and session 7 work remains separate evidence or follow-up input and is not part of that assembly plan.
 Implementation, local verification, and M2-M4 coordination remain active across the worker branches.
 Public remote creation, publication, pushes to public remotes, pull requests, and submission remain unauthorized and incomplete.

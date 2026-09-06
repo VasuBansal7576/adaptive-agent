@@ -9,11 +9,11 @@ Product acceptance and competition compliance remain unverified until implementa
 M0 and M1 completed the documentation phase.
 M0 is complete through the supplied product and official-rule clarification.
 M1 ends with a verified local commit containing only `SPEC.md`, `MILESTONES.md`, and `README.md`.
-The local `main` fast-forward and filesystem-only origin synchronization for the documentation commits are authorized and complete.
+The local `main` assembly of the committed backend, console, and documentation refs is authorized and complete.
 M2 through M4 are active implementation and evaluation gates across the worker branches.
 M5 and M6 require future publication or submission authority appropriate to each action.
-This documentation worker does not install dependencies, create application code, or edit implementation branches.
-It records the current implementation refs and evidence without treating parallel branch work as integrated.
+This documentation worker did not install dependencies, create application code, or edit implementation branches.
+The committed local-main assembly is recorded below; dirty worker overlays remain excluded.
 Public remote creation, publication, pushes to public remotes, pull requests, and submission remain incomplete.
 
 The dependency chain is M0 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6.
@@ -78,15 +78,16 @@ The focused safety, core, and lifecycle verification was 39 passed, with no serv
 The session-4 probe closure did not modify the cost ledger, EVAL-003, or evaluator lifecycle.
 It used no services or paid calls.
 
-## Local-main assembly plan
+## Local-main assembly result
 
-The local-main assembly is intentionally limited to the complete session-2 integration at `f3785f0` plus its reviewed overlay, followed by the session-5 console lineage `29afe35` through `ae482da`.
-It has not been performed by this documentation worker.
+The authorized local-main assembly is complete for backend tip `feef752`, console tip `eea3bdc`, and documentation tip `eeb5f05`.
+The backend tip contains the requested session-2 ancestry through `83d7e87`, `2168124`, `8fcb18a`, and `96a84d3`, plus `dbf412d` and `889a10f`.
+The console tip contains the requested session-5 lineage through `29afe35` and `ae482da`.
+Dirty worker overlays and uncommitted lock files were excluded from the assembly.
 
-1. Materialize and review the complete session-2 integration at `f3785f0` plus its current tracked overlay before assembly.
-2. Add the session-5 console lineage from `29afe35` through `ae482da` after the backend wire contract is present.
-3. Run the backend and console checks with newly allocated temporary Store and data paths, preserving the reported 171 backend tests and 61/61 console result as prior evidence rather than replaying paid or shared-data smoke.
-4. Reassess M2-M4 from retained receipts and exact paths before considering any further assembly.
+Post-assembly verification must use newly allocated temporary Store and data paths and must preserve the reported 171 backend tests and 61/61 console result as prior evidence rather than replaying paid or shared-data smoke.
+Cost accounting, the B0/L/A ablation, and the final report remain incomplete.
+The assembled tree is not release-ready.
 
 Session 3, session 4, session 6, and session 7 are not assembly inputs in this plan.
 Their runtime and probe results remain separately attributed evidence.
@@ -120,6 +121,7 @@ M2 has substantial implementation and narrow real-run evidence, but remains unme
 M3 has core learning, storage, broker, candidate, and benchmark components, but the complete three-pack lifecycle and all required acceptance scenarios are not verified as one integrated product.
 M4 is unmet because there is no clean sealed four-environment B0/L/A evaluation, measured cross-domain result, or final resource-budget evidence.
 M5 and M6 have not started, and there are no public repository, social-demo, deployment, or submission claims.
+Cost, ablation, and final-report gates remain incomplete, so this assembled tree is not release-ready.
 
 One user-accepted subscription limitation is still an UNMET criterion.
 The accepted Luna-through-ChatGPT subscription path has no API-key or provider switch.
