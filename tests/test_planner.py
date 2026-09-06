@@ -136,6 +136,76 @@ def test_prime_cli_client_parses_json_lines_and_normalizes_bare_model(tmp_path, 
     assert result["usage"]["totalTokens"] == 10
 
 
+def test_prime_cli_client_reports_error_terminal_event_with_bounded_redacted_detail(tmp_path):
+    executable = tmp_path / "prime-agent-error"
+    event = {
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "stopReason": "error",
+            "errorMessage": "provider token=super-secret failure " + ("x" * 20_000),
+            "content": [],
+        },
+    }
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        f"print(json.dumps({json.dumps(event)}))\n"
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    with pytest.raises(PlannerError) as caught:
+        PrimeCliModelClient(executable=str(executable), coding_agent_dir=tmp_path).invoke(
+            goal="goal", environment={}, messages=[], remaining_deadline=5
+        )
+    message = str(caught.value)
+    assert "stopReason=error" in message
+    assert "super-secret" not in message
+    assert "token=[REDACTED]" in message
+    assert len(message) < 4_300
+
+
+def test_prime_cli_client_reports_aborted_terminal_event_even_with_partial_text(tmp_path):
+    executable = tmp_path / "prime-agent-aborted"
+    event = {
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "stopReason": "aborted",
+            "errorMessage": "request cancelled",
+            "responseId": "partial-response",
+            "content": [{"type": "text", "text": '{"action":"finish","answer":"partial"}'}],
+        },
+    }
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        f"print(json.dumps({json.dumps(event)}))\n"
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    with pytest.raises(PlannerError, match="stopReason=aborted"):
+        PrimeCliModelClient(executable=str(executable), coding_agent_dir=tmp_path).invoke(
+            goal="goal", environment={}, messages=[], remaining_deadline=5
+        )
+
+
+def test_prime_cli_client_reports_bounded_redacted_stderr_when_final_event_is_missing(tmp_path):
+    executable = tmp_path / "prime-agent-no-final"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stderr.write('password=super-secret provider diagnostic\\n')\n"
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    with pytest.raises(PlannerError) as caught:
+        PrimeCliModelClient(executable=str(executable), coding_agent_dir=tmp_path).invoke(
+            goal="goal", environment={}, messages=[], remaining_deadline=5
+        )
+    message = str(caught.value)
+    assert "did not contain a final assistant message" in message
+    assert "super-secret" not in message
+    assert "password=[REDACTED]" in message
+
+
 def test_prime_cli_serialization_keeps_full_environment_once_with_unicode(tmp_path):
     captured = tmp_path / "request.bin"
     executable = tmp_path / "prime-agent-capture"
